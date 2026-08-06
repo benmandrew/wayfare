@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wayfare"
+version = "0.1.0"
+description = "UK bus routes snapped to the road network"
+requires-python = ">=3.12"
+dependencies = [
+    "requests>=2.32",
+    "duckdb>=1.1",
+]
+
+[project.optional-dependencies]
+art = ["pycairo>=1.26"]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=5",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "types-requests",
+]
+
+[project.scripts]
+wayfare = "wayfare.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["wayfare*"]
+
+[tool.ruff]
+line-length = 92
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["wayfare"]
+strict = true
+warn_return_any = false
+
+[[tool.mypy.overrides]]
+module = ["duckdb.*", "cairo.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: needs the real datasets on disk",
+    "valhalla: needs a running Valhalla server",
+]

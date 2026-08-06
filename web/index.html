@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wayfare — UK bus routes on the road network</title>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+<style>
+:root {
+  --bg:        #ffffff;
+  --panel:     rgba(255,255,255,.94);
+  --border:    #dcdfe4;
+  --text:      #16181d;
+  --muted:     #6b7280;
+  --chip-bg:   #eef1f5;
+  --chip-text: #2b3440;
+  --accent:    #d64512;
+  --shadow:    0 1px 2px rgba(16,24,40,.06), 0 8px 24px rgba(16,24,40,.10);
+  --radius:    8px;
+}
+[data-theme="dark"] {
+  --bg:        #0d1014;
+  --panel:     rgba(20,24,30,.92);
+  --border:    #2b323c;
+  --text:      #e8ecf1;
+  --muted:     #8b949e;
+  --chip-bg:   #232a33;
+  --chip-text: #d7dee7;
+  --accent:    #ffd15c;
+  --shadow:    0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.45);
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+}
+#map { position: absolute; inset: 0; }
+
+/* --- panel chrome --- */
+.panel {
+  background: var(--panel);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+.stack { position: absolute; z-index: 2; display: flex; flex-direction: column; gap: 8px; }
+.stack--tl { top: 12px; left: 12px; width: 272px; }
+.stack--tr { top: 12px; right: 12px; width: 300px; max-height: calc(100% - 100px); }
+
+h1 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: .02em;
+}
+.sub { color: var(--muted); font-size: 11.5px; margin-top: 2px; }
+.head { padding: 10px 12px; display: flex; align-items: flex-start; gap: 8px; }
+.head > div { flex: 1; min-width: 0; }
+
+.btn {
+  font: inherit;
+  font-size: 11.5px;
+  color: var(--muted);
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 7px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.btn:hover { color: var(--text); border-color: var(--muted); }
+
+/* --- search --- */
+.search { padding: 0 12px 10px; }
+.search input {
+  width: 100%;
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+.search input:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+.search input::placeholder { color: var(--muted); }
+.hint { color: var(--muted); font-size: 11px; margin-top: 5px; min-height: 15px; }
+
+/* --- info card --- */
+.card { padding: 11px 12px; overflow-y: auto; min-height: 0; }
+.road { font-size: 14px; font-weight: 600; margin: 0 0 1px; }
+.road.empty { color: var(--muted); font-weight: 400; font-size: 13px; }
+.meta { color: var(--muted); font-size: 11.5px; }
+.meta b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 9px; }
+.chip {
+  font: 500 11.5px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--chip-bg);
+  color: var(--chip-text);
+  border-radius: 4px;
+  padding: 4px 6px;
+}
+.chip.on { background: var(--accent); color: var(--bg); }
+.note { color: var(--muted); font-size: 11px; margin-top: 8px; font-style: italic; }
+
+/* --- legend --- */
+.legend { padding: 10px 12px; }
+.legend-title { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+.ramp { height: 8px; border-radius: 2px; margin: 7px 0 4px; }
+.ticks { display: flex; justify-content: space-between; color: var(--muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+
+/* --- help --- */
+.help { padding: 0 12px 11px; color: var(--muted); font-size: 11.5px; }
+.help p { margin: 0 0 6px; }
+.help p:last-child { margin: 0; }
+[hidden] { display: none !important; }
+
+/* --- boot / error overlay --- */
+#boot {
+  position: absolute; inset: 0; z-index: 10;
+  display: grid; place-items: center;
+  background: var(--bg);
+  padding: 24px;
+}
+#boot .panel { max-width: 460px; padding: 20px 22px; box-shadow: none; }
+#boot h2 { margin: 0 0 8px; font-size: 15px; }
+#boot p { margin: 0 0 10px; color: var(--muted); }
+#boot code {
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--chip-bg); color: var(--chip-text);
+  padding: 1px 5px; border-radius: 4px;
+}
+#boot pre {
+  font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--chip-bg); color: var(--chip-text);
+  padding: 10px 12px; border-radius: 6px; margin: 0 0 10px; overflow-x: auto;
+}
+.spin { color: var(--muted); font-size: 12px; }
+
+.maplibregl-ctrl-attrib { font-size: 10.5px; }
+
+@media (max-width: 720px) {
+  .stack--tl, .stack--tr { width: auto; left: 12px; right: 12px; }
+  .stack--tr { top: auto; bottom: 30px; max-height: 44%; }
+}
+</style>
+</head>
+<body>
+
+<div id="map"></div>
+
+<div class="stack stack--tl">
+  <div class="panel">
+    <div class="head">
+      <div>
+        <h1>Wayfare</h1>
+        <div class="sub">UK bus services by road segment</div>
+      </div>
+      <button class="btn" id="theme" title="Toggle light/dark">Dark</button>
+      <button class="btn" id="helpBtn" title="What am I looking at?">?</button>
+    </div>
+    <div class="search">
+      <input id="q" type="search" placeholder="Filter by bus number, e.g. 42, X57" autocomplete="off" spellcheck="false">
+      <div class="hint" id="hint">Press <b>/</b> to search.</div>
+    </div>
+    <div class="help" id="help" hidden>
+      <p>Each line is a road segment — a stretch of road between two junctions. Colour and thickness both show <b>how many distinct bus services</b> use it, so trunk corridors stand out from the tail.</p>
+      <p>Hover a segment for its service list. Filtering matches whole bus numbers, so <code>4</code> will not match <code>42</code>.</p>
+    </div>
+  </div>
+
+  <div class="panel legend">
+    <div class="legend-title">Services per segment</div>
+    <div class="ramp" id="ramp"></div>
+    <div class="ticks"><span>1</span><span>6</span><span>12</span><span>24</span><span>40+</span></div>
+  </div>
+</div>
+
+<div class="stack stack--tr">
+  <div class="panel card" id="card">
+    <p class="road empty" id="road">Hover a road to see its bus services.</p>
+    <div class="meta" id="meta"></div>
+    <div class="chips" id="chips"></div>
+    <div class="note" id="note" hidden></div>
+  </div>
+</div>
+
+<div id="boot">
+  <div class="panel">
+    <div class="spin" id="bootMsg">Loading tiles…</div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script src="https://unpkg.com/pmtiles@4.4.1/dist/pmtiles.js"></script>
+<script>
+"use strict";
+
+// The tile archive is configurable so the same file works against a local copy
+// or a bucket: ?tiles=https://pub-xxxx.r2.dev/bus.pmtiles
+const TILES = new URL(
+  new URLSearchParams(location.search).get("tiles") || "./bus.pmtiles",
+  location.href
+).href;
+
+const SRC = "bus";          // source id
+const LAYER_SRC = "bus";    // the single vector layer inside the archive
+const REF_CAP = 12;         // the pipeline truncates `refs` at this many entries
+
+// Sequential ramps over service count. Light goes pale-blue -> deep violet so
+// busy roads darken against the light basemap; dark goes the other way, into
+// warm yellow, so they glow against the dark one.
+const RAMPS = {
+  light: [[1,"#a9c3dc"],[3,"#6f9cc6"],[6,"#4275ac"],[12,"#2e5290"],[24,"#3a3672"],[40,"#3d1d4e"]],
+  dark:  [[1,"#2f4d6b"],[3,"#3d7ea8"],[6,"#3fa8bd"],[12,"#5fcf9f"],[24,"#c0e86f"],[40,"#ffdf5c"]],
+};
+const BASEMAP = {
+  light: "light_all",
+  dark:  "dark_all",
+};
+const HOVER_COLOUR = { light: "#d64512", dark: "#ffffff" };
+
+const $ = (id) => document.getElementById(id);
+let theme = localStorage.getItem("wayfare-theme")
+  || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+
+/* ---------- expressions ---------- */
+
+const colourExpr = (t) => [
+  "interpolate", ["linear"], ["to-number", ["get", "n"], 1],
+  ...RAMPS[t].flat(),
+];
+
+// Width ramps on service count, and the whole thing ramps on zoom so hairlines
+// at z6 grow into readable strokes at z16. `bump` is added at the leaf: a
+// ["zoom"] expression is only legal as the input to the outermost interpolate,
+// so the widened hover/match strokes cannot wrap this from outside.
+const byCount = (a, b, c, bump) => [
+  "+",
+  ["interpolate", ["linear"], ["to-number", ["get", "n"], 1], 1, a, 8, b, 40, c],
+  bump,
+];
+const width = (bump) => [
+  "interpolate", ["linear"], ["zoom"],
+  6,  byCount(0.35, 1.0, 2.0, bump),
+  9,  byCount(0.60, 1.8, 3.4, bump),
+  12, byCount(1.10, 3.0, 5.6, bump),
+  16, byCount(2.20, 5.5, 10.0, bump),
+];
+const HOVER_BUMP = ["case", ["boolean", ["feature-state", "hover"], false], 2, 0];
+
+// `refs` is a comma-separated list ("42,43,142,X57"). A naive substring test for
+// "4" would hit "42" and "X4", so wrap both sides in commas and look for ",4,"
+// inside ",42,43,142,X57,". Upcased so "x57" finds "X57".
+const tokenFilter = (tokens) => [
+  "any",
+  ...tokens.map((tok) => [
+    "in",
+    "," + tok + ",",
+    ["upcase", ["concat", ",", ["to-string", ["get", "refs"]], ","]],
+  ]),
+];
+const NEVER = ["==", ["get", "id"], -1];
+
+/* ---------- boot ---------- */
+
+document.documentElement.dataset.theme = theme;
+$("theme").textContent = theme === "dark" ? "Light" : "Dark";
+paintRamp();
+
+const protocol = new pmtiles.Protocol();
+maplibregl.addProtocol("pmtiles", protocol.tile);
+
+const archive = new pmtiles.PMTiles(TILES);
+protocol.add(archive); // share the instance so the header is fetched once
+
+archive.getHeader().then(start).catch(failed);
+
+function failed(err) {
+  console.error(err);
+  $("boot").innerHTML = `
+    <div class="panel">
+      <h2>No tiles found</h2>
+      <p>Could not read <code>${escapeHtml(TILES)}</code>. Run the wayfare pipeline to
+         build the archive, put it next to this page, then serve the directory:</p>
+      <pre>cd web &amp;&amp; python3 -m http.server 8000</pre>
+      <p>Already have tiles elsewhere? Point at them with
+         <code>?tiles=https://…/bus.pmtiles</code> — the host must allow CORS and
+         HTTP range requests.</p>
+    </div>`;
+}
+
+function start(header) {
+  $("boot").remove();
+
+  const map = new maplibregl.Map({
+    container: "map",
+    hash: true, // shareable #zoom/lat/lon
+    center: [-2.4, 54.2],
+    zoom: 5.6,
+    minZoom: 4,
+    maxZoom: 18,
+    attributionControl: { compact: true },
+    style: {
+      version: 8,
+      sources: {
+        basemap: {
+          type: "raster",
+          tiles: basemapTiles(theme),
+          tileSize: 256,
+          attribution:
+            '<a href="https://carto.com/attributions">CARTO</a> · ' +
+            '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+        },
+        [SRC]: {
+          type: "vector",
+          url: "pmtiles://" + TILES,
+          // Feature ids in MVT are not preserved by default; promoting the `id`
+          // property makes setFeatureState addressable by edge id.
+          promoteId: "id",
+          maxzoom: header.maxZoom,
+        },
+      },
+      layers: [
+        { id: "basemap", type: "raster", source: "basemap" },
+        {
+          id: "bus",
+          type: "line",
+          source: SRC,
+          "source-layer": LAYER_SRC,
+          layout: { "line-cap": "round", "line-join": "round" },
+          paint: {
+            "line-color": [
+              "case",
+              ["boolean", ["feature-state", "hover"], false],
+              HOVER_COLOUR[theme],
+              colourExpr(theme),
+            ],
+            "line-width": width(HOVER_BUMP),
+            "line-opacity": 0.85,
+          },
+        },
+        // Drawn only while a filter is active: the matching services on top of
+        // the dimmed network.
+        {
+          id: "bus-match",
+          type: "line",
+          source: SRC,
+          "source-layer": LAYER_SRC,
+          filter: NEVER,
+          layout: { "line-cap": "round", "line-join": "round", visibility: "none" },
+          paint: {
+            "line-color": HOVER_COLOUR[theme],
+            "line-width": width(1.4),
+          },
+        },
+      ],
+    },
+  });
+
+  map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom-right");
+  map.addControl(new maplibregl.ScaleControl({ maxWidth: 90, unit: "metric" }), "bottom-left");
+
+  /* ---------- hover ---------- */
+
+  let hovered = null;
+  const setHover = (id, on) =>
+    map.setFeatureState({ source: SRC, sourceLayer: LAYER_SRC, id }, { hover: on });
+
+  map.on("mousemove", "bus", (e) => {
+    const f = e.features[0];
+    if (!f || f.id === hovered) return;
+    if (hovered !== null) setHover(hovered, false);
+    hovered = f.id;
+    setHover(hovered, true);
+    map.getCanvas().style.cursor = "pointer";
+    showFeature(f.properties);
+  });
+
+  // The card deliberately keeps the last segment on mouseout — the service
+  // lists run long and reading one shouldn't require holding the cursor still.
+  map.on("mouseleave", "bus", () => {
+    map.getCanvas().style.cursor = "";
+  });
+
+  /* ---------- filter ---------- */
+
+  let active = [];
+  const input = $("q");
+
+  function applyFilter() {
+    active = input.value
+      .toUpperCase()
+      .split(/[\s,]+/)
+      .filter(Boolean);
+
+    if (!active.length) {
+      map.setFilter("bus-match", NEVER);
+      map.setLayoutProperty("bus-match", "visibility", "none");
+      map.setPaintProperty("bus", "line-opacity", 0.85);
+      $("hint").innerHTML = "Press <b>/</b> to search.";
+    } else {
+      map.setFilter("bus-match", tokenFilter(active));
+      map.setLayoutProperty("bus-match", "visibility", "visible");
+      map.setPaintProperty("bus", "line-opacity", 0.12);
+      countMatches();
+    }
+    redrawChips();
+  }
+
+  function countMatches() {
+    if (!active.length || !map.isStyleLoaded()) return;
+    const seen = new Set(
+      map.queryRenderedFeatures({ layers: ["bus-match"] }).map((f) => f.id)
+    );
+    const label = active.map((t) => `<b>${escapeHtml(t)}</b>`).join(", ");
+    $("hint").innerHTML = seen.size
+      ? `${label} — ${seen.size} segment${seen.size === 1 ? "" : "s"} in view.`
+      : `${label} — nothing in view. Try zooming out.`;
+  }
+
+  input.addEventListener("input", applyFilter);
+  map.on("idle", countMatches);
+  addEventListener("keydown", (e) => {
+    if (e.key === "/" && document.activeElement !== input) {
+      e.preventDefault();
+      input.focus();
+    }
+    if (e.key === "Escape" && document.activeElement === input) {
+      input.value = "";
+      applyFilter();
+      input.blur();
+    }
+  });
+
+  /* ---------- theme ---------- */
+
+  $("theme").addEventListener("click", () => {
+    theme = theme === "dark" ? "light" : "dark";
+    localStorage.setItem("wayfare-theme", theme);
+    document.documentElement.dataset.theme = theme;
+    $("theme").textContent = theme === "dark" ? "Light" : "Dark";
+    paintRamp();
+
+    map.getSource("basemap").setTiles(basemapTiles(theme));
+    map.setPaintProperty("bus", "line-color", [
+      "case",
+      ["boolean", ["feature-state", "hover"], false],
+      HOVER_COLOUR[theme],
+      colourExpr(theme),
+    ]);
+    map.setPaintProperty("bus-match", "line-color", HOVER_COLOUR[theme]);
+  });
+
+  /* ---------- info card ---------- */
+
+  let current = null;
+
+  function showFeature(p) {
+    current = p;
+    const n = Number(p.n) || 0;
+    $("road").textContent = p.name || "Unnamed road";
+    $("road").classList.remove("empty");
+    $("meta").innerHTML =
+      `<b>${n}</b> service${n === 1 ? "" : "s"} · ` +
+      `<b>${Number(p.trips || 0).toLocaleString()}</b> trips/week · ` +
+      `way <b>${escapeHtml(p.way)}</b>`;
+    $("note").hidden = n <= REF_CAP;
+    $("note").textContent = `Showing the first ${REF_CAP} of ${n} services.`;
+    redrawChips();
+  }
+
+  function redrawChips() {
+    if (!current) return;
+    const refs = String(current.refs || "").split(",").filter(Boolean);
+    $("chips").innerHTML = refs
+      .map((r) => {
+        const on = active.includes(r.toUpperCase());
+        return `<span class="chip${on ? " on" : ""}">${escapeHtml(r)}</span>`;
+      })
+      .join("");
+  }
+
+  $("helpBtn").addEventListener("click", () => {
+    $("help").hidden = !$("help").hidden;
+  });
+}
+
+/* ---------- helpers ---------- */
+
+function basemapTiles(t) {
+  // MapLibre has no {s} or {r} placeholder: expand the subdomains itself and
+  // pick the retina variant up front.
+  const r = devicePixelRatio > 1.4 ? "@2x" : "";
+  return ["a", "b", "c", "d"].map(
+    (s) => `https://${s}.basemaps.cartocdn.com/${BASEMAP[t]}/{z}/{x}/{y}${r}.png`
+  );
+}
+
+function paintRamp() {
+  const stops = RAMPS[theme];
+  const max = stops[stops.length - 1][0];
+  const css = stops.map(([n, c]) => `${c} ${Math.round((n / max) * 100)}%`).join(", ");
+  $("ramp").style.background = `linear-gradient(90deg, ${css})`;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
+  );
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,79 @@
+# Server deployment. The matching stage runs for a day or two, so both services
+# restart unless explicitly stopped and all state lives on named volumes.
+#
+#   docker compose up -d valhalla     # first run builds the GB graph: 30-90 min
+#   docker compose run --rm wayfare acquire
+#   docker compose run --rm wayfare patterns
+#   docker compose up -d matcher      # the long one; watch with `docker compose logs -f matcher`
+#   docker compose run --rm wayfare aggregate
+#   docker compose run --rm wayfare publish
+
+services:
+  # Routing and map-matching engine. This is the image that builds its own graph
+  # from a pbf on first start; the plain ghcr.io/valhalla/valhalla image expects
+  # you to run the build steps yourself.
+  valhalla:
+    image: ghcr.io/valhalla/valhalla-scripted:latest
+    container_name: wayfare-valhalla
+    ports:
+      - "8002:8002"
+    volumes:
+      - valhalla:/custom_files
+    environment:
+      # Geofabrik rebuilds daily. Once the graph is built, edge ids are only
+      # meaningful against this exact extract -- so after the first successful
+      # build, set force_rebuild=False and leave it alone for the whole run.
+      tile_urls: https://download.geofabrik.de/europe/great-britain-latest.osm.pbf
+      server_threads: 8
+      force_rebuild: "False"
+      force_rebuild_elevation: "False"
+      build_elevation: "False"      # not needed for map matching, and it is large
+      build_admins: "True"
+      build_time_zones: "False"
+      use_tiles_ignore_pbf: "True"
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8002/status"]
+      interval: 30s
+      timeout: 10s
+      # The graph build has to finish before the first health check can pass.
+      start_period: 90m
+      retries: 5
+    restart: unless-stopped
+    shm_size: 2gb
+
+  # One-shot stages: acquire, patterns, aggregate, publish, status, art.
+  wayfare:
+    build: .
+    image: wayfare:latest
+    volumes:
+      - data:/data
+      - ./data/out:/data/out       # artefacts are useful outside the container
+    environment:
+      WAYFARE_DATA: /data
+      WAYFARE_VALHALLA: http://valhalla:8002
+      WAYFARE_MEM: 8GB
+    depends_on:
+      - valhalla
+    entrypoint: ["wayfare"]
+
+  # The long-running stage, as its own service so it survives a disconnected shell
+  # and comes back after a reboot. `match` resumes from its checkpoint, so an
+  # unclean restart costs at most one batch.
+  matcher:
+    image: wayfare:latest
+    volumes:
+      - data:/data
+    environment:
+      WAYFARE_DATA: /data
+      WAYFARE_VALHALLA: http://valhalla:8002
+      WAYFARE_WORKERS: 6
+    depends_on:
+      valhalla:
+        condition: service_healthy
+    command: ["match"]
+    entrypoint: ["wayfare"]
+    restart: unless-stopped
+
+volumes:
+  valhalla:
+  data:
