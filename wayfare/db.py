@@ -87,13 +87,21 @@ CREATE TABLE IF NOT EXISTS match_status (
 -- Valhalla graph edges, deduplicated across every pattern that traverses them.
 -- edge_id is a Valhalla GraphId: stable within one graph build, meaningless
 -- across builds. way_id is the durable OSM identity.
+-- Geometry is micro-degree INTEGER lists rather than WKT text: no parsing on read,
+-- roughly a third of the bytes, and DuckDB bit-packs the lists. The bbox columns
+-- are what make a window query exact and cheap -- see art.load_edges.
 CREATE TABLE IF NOT EXISTS edges (
     edge_id     BIGINT PRIMARY KEY,
     way_id      BIGINT,
     road_name   VARCHAR,
     road_class  VARCHAR,
     length_m    DOUBLE,
-    geom        VARCHAR    -- WKT LINESTRING, WGS84
+    lon_e6      INTEGER[],
+    lat_e6      INTEGER[],
+    min_lon_e6  INTEGER,
+    min_lat_e6  INTEGER,
+    max_lon_e6  INTEGER,
+    max_lat_e6  INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS pattern_edges (
@@ -177,6 +185,44 @@ def migrate(con: duckdb.DuckDBPyConnection) -> None:
         con.execute("ALTER TABLE shapes_new RENAME TO shapes")
         log_rows = scalar(con, "SELECT count(*) FROM shapes")
         logs.get("db").info("migrated shapes to one row per shape (%d rows)", log_rows)
+
+    if "geom" in columns(con, "edges"):
+        # edges.geom was a WKT LINESTRING; split it into micro-degree lists and
+        # precompute the bbox that the window query now filters on.
+        con.execute("""
+            CREATE OR REPLACE TABLE edges_new AS
+            WITH pt AS (
+                SELECT e.edge_id, u.i,
+                       round(split_part(trim(u.p), ' ', 1)::DOUBLE * 1e6)::INTEGER
+                           AS lon_e6,
+                       round(split_part(trim(u.p), ' ', 2)::DOUBLE * 1e6)::INTEGER
+                           AS lat_e6
+                FROM edges e,
+                     unnest(string_split(
+                         substr(e.geom,
+                                position('(' IN e.geom) + 1,
+                                length(e.geom) - position('(' IN e.geom) - 1),
+                         ',')) WITH ORDINALITY AS u(p, i)
+                WHERE e.geom IS NOT NULL
+            ), g AS (
+                SELECT edge_id,
+                       list(lon_e6 ORDER BY i) AS lon_e6, list(lat_e6 ORDER BY i) AS lat_e6,
+                       min(lon_e6) AS min_lon_e6, min(lat_e6) AS min_lat_e6,
+                       max(lon_e6) AS max_lon_e6, max(lat_e6) AS max_lat_e6
+                FROM pt GROUP BY edge_id
+            )
+            SELECT e.edge_id, e.way_id, e.road_name, e.road_class, e.length_m,
+                   g.lon_e6, g.lat_e6,
+                   g.min_lon_e6, g.min_lat_e6, g.max_lon_e6, g.max_lat_e6
+            FROM edges e LEFT JOIN g USING (edge_id)
+        """)
+        con.execute("DROP TABLE edges")
+        con.execute("ALTER TABLE edges_new RENAME TO edges")
+        con.execute("CREATE UNIQUE INDEX edges_pk ON edges (edge_id)")
+        logs.get("db").info(
+            "migrated %d edges from WKT to micro-degree lists",
+            scalar(con, "SELECT count(*) FROM edges"),
+        )
 
 
 def prune_shapes(con: duckdb.DuckDBPyConnection) -> int:

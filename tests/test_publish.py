@@ -7,15 +7,17 @@ import pytest
 from wayfare import config, publish
 
 
-def test_wkt_parses_back_to_lon_lat():
-    coords = publish._wkt_to_coords("LINESTRING(-2.245000 53.480000, -2.240000 53.480000)")
+def test_micro_degrees_come_back_as_lon_lat():
+    coords = publish._coords([-2245000, -2240000], [53480000, 53480000])
     assert coords == [[-2.245, 53.48], [-2.24, 53.48]]
 
 
 def _edge(con, edge_id: int, refs: list[str]) -> None:
     con.execute(
-        "INSERT INTO edges VALUES (?, ?, 'Oxford Road', 'secondary', 100.0, ?)",
-        [edge_id, edge_id, "LINESTRING(-2.245 53.48, -2.240 53.48)"],
+        "INSERT INTO edges VALUES (?, ?, 'Oxford Road', 'secondary', 100.0, "
+        "[-2245000, -2240000], [53480000, 53480000], "
+        "-2245000, 53480000, -2240000, 53480000)",
+        [edge_id, edge_id],
     )
     for i, ref in enumerate(refs):
         con.execute(
@@ -70,7 +72,10 @@ def test_overflow_goes_to_the_sidecar(con, tmp_path, monkeypatch):
 
 def test_edges_without_geometry_are_skipped(con, tmp_path, monkeypatch):
     monkeypatch.setattr(config, "OUT", tmp_path)
-    con.execute("INSERT INTO edges VALUES (1, 1, 'X', 'residential', 100.0, NULL)")
+    con.execute(
+        "INSERT INTO edges VALUES "
+        "(1, 1, 'X', 'residential', 100.0, NULL, NULL, NULL, NULL, NULL, NULL)"
+    )
     con.execute("INSERT INTO edge_services VALUES (1, '42', 'OP1', 1, 10)")
     path = publish.export_geojsonl(con, tmp_path / "edges.geojsonl")
     assert path.read_text() == ""

@@ -359,14 +359,7 @@ def _commit(con: duckdb.DuckDBPyConnection, batch: list[Outcome]) -> None:
         for seq, e in enumerate(o.edges):
             link_rows.append((o.pattern_id, seq, e.edge_id))
             edge_rows.append(
-                (
-                    e.edge_id,
-                    e.way_id,
-                    e.road_name,
-                    e.road_class,
-                    e.length_m,
-                    _wkt(e.geom),
-                )
+                (e.edge_id, e.way_id, e.road_name, e.road_class, e.length_m, *_geom(e.geom))
             )
 
     if link_rows:
@@ -377,17 +370,30 @@ def _commit(con: duckdb.DuckDBPyConnection, batch: list[Outcome]) -> None:
         for row in edge_rows:
             seen.setdefault(row[0], row)
         con.executemany(
-            "INSERT INTO edges VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (edge_id) DO NOTHING",
+            "INSERT INTO edges VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (edge_id) DO NOTHING",
             list(seen.values()),
         )
         con.executemany("INSERT INTO pattern_edges VALUES (?, ?, ?)", link_rows)
 
 
-def _wkt(points: list[tuple[float, float]]) -> str | None:
+# lon_e6, lat_e6, then the bounding box. Empty for an edge with too few points, so
+# a degenerate edge still gets its row and is filtered on read like any other.
+_NO_GEOM: tuple[Any, ...] = (None, None, None, None, None, None)
+
+
+def _geom(points: list[tuple[float, float]]) -> tuple[Any, ...]:
+    """Valhalla's (lat, lon) floats to the micro-degree lists the table stores.
+
+    Rounding here rather than at read time is what lets the bbox be stored: the
+    window query compares integers against integers and never has to look inside
+    the geometry.
+    """
     if len(points) < 2:
-        return None
-    inner = ", ".join(f"{lon:.6f} {lat:.6f}" for lat, lon in points)
-    return f"LINESTRING({inner})"
+        return _NO_GEOM
+    lats = [round(lat * 1e6) for lat, _ in points]
+    lons = [round(lon * 1e6) for _, lon in points]
+    return (lons, lats, min(lons), min(lats), max(lons), max(lats))
 
 
 def _progress(done: int, total: int, started: float, tally: dict[str, int]) -> None:

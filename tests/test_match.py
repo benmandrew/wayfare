@@ -141,11 +141,20 @@ def test_coverage_reports_service_weighted_share(loaded):
     assert cov["services"] == 1
 
 
-def test_wkt_needs_two_points():
-    assert match._wkt([(53.0, -2.0)]) is None
-    assert match._wkt([(53.0, -2.0), (53.1, -2.1)]) == (
-        "LINESTRING(-2.000000 53.000000, -2.100000 53.100000)"
+def test_geometry_needs_two_points():
+    assert match._geom([(53.0, -2.0)]) == (None,) * 6
+
+
+def test_geometry_carries_its_own_bounding_box():
+    """The window query in `art` compares integers against integers and never looks
+    inside the geometry, which only works if the bbox is stored alongside it."""
+    lon_e6, lat_e6, min_lon, min_lat, max_lon, max_lat = match._geom(
+        [(53.0, -2.0), (53.1, -2.1), (53.05, -1.9)]
     )
+    assert lon_e6 == [-2_000_000, -2_100_000, -1_900_000]
+    assert lat_e6 == [53_000_000, 53_100_000, 53_050_000]
+    assert (min_lon, max_lon) == (-2_100_000, -1_900_000)
+    assert (min_lat, max_lat) == (53_000_000, 53_100_000)
 
 
 def test_retry_clears_only_the_named_statuses(loaded):

@@ -84,32 +84,6 @@ def test_mercator_is_conformal_so_bearings_survive():
     assert abs(xb - xa) == pytest.approx(abs(yb - ya), rel=1e-3)
 
 
-# --- WKT --------------------------------------------------------------------
-
-
-def test_parse_linestring():
-    pts = art.parse_linestring("LINESTRING(-2.245000 53.480000, -2.240000 53.481000)")
-    assert pts == [(-2.245, 53.48), (-2.24, 53.481)]
-
-
-@pytest.mark.parametrize(
-    "wkt",
-    [
-        "LINESTRING (-2.245 53.48, -2.24 53.481)",
-        "linestring(-2.245 53.48, -2.24 53.481)",
-        "  LINESTRING(-2.245 53.48, -2.24 53.481)  ",
-    ],
-)
-def test_parse_linestring_tolerates_formatting(wkt):
-    assert art.parse_linestring(wkt)[0] == (-2.245, 53.48)
-
-
-def test_wrong_geometry_type_raises():
-    """Silently rendering nothing would look like a data gap rather than a bug."""
-    with pytest.raises(ValueError, match="not a WKT LINESTRING"):
-        art.parse_linestring("POINT(-2.245 53.48)")
-
-
 # --- Windowing --------------------------------------------------------------
 
 
@@ -121,11 +95,6 @@ def test_hits_is_a_bbox_overlap_not_containment():
     assert not b.hits([-2.40, -2.35], [53.47, 53.47])
     assert not b.hits([-2.25], [53.60])
 
-
-def test_padded_expands_symmetrically():
-    b = art.Bounds(-2.0, 53.0, -1.0, 54.0).padded(0.5, 0.25)
-    assert (b.min_lon, b.max_lon) == (-2.5, -0.5)
-    assert (b.min_lat, b.max_lat) == (52.75, 54.25)
 
 
 # --- Styles -----------------------------------------------------------------

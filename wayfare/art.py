@@ -16,7 +16,6 @@ from __future__ import annotations
 import colorsys
 import hashlib
 import math
-import re
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -59,14 +58,6 @@ class Bounds:
     @property
     def mid_lat(self) -> float:
         return (self.min_lat + self.max_lat) / 2
-
-    def padded(self, d_lon: float, d_lat: float) -> Bounds:
-        return Bounds(
-            self.min_lon - d_lon,
-            self.min_lat - d_lat,
-            self.max_lon + d_lon,
-            self.max_lat + d_lat,
-        )
 
     def hits(self, lons: Sequence[float], lats: Sequence[float]) -> bool:
         """True if the bbox of these points overlaps this window."""
@@ -164,7 +155,6 @@ def parse_bbox(text: str) -> Bounds:
 
 # Web Mercator's cut-off, where y runs to infinity.
 _MERC_MAX_LAT = 85.05112878
-_M_PER_DEG_LAT = 111_320.0
 
 
 def _merc(lon: float, lat: float) -> tuple[float, float]:
@@ -228,30 +218,6 @@ class Projection:
 
 # --- Data -------------------------------------------------------------------
 
-# Tolerates 'LINESTRING (...)', trailing whitespace and a Z suffix; anything with
-# a different geometry type is a bug upstream and should raise rather than silently
-# render nothing.
-_WKT = re.compile(r"\s*LINESTRING\s*Z?\s*\((.*)\)\s*", re.IGNORECASE | re.DOTALL)
-
-# Matches only the first coordinate pair, right after the opening bracket. Used in
-# SQL, where a full regexp_extract_all over every geometry would be the expensive
-# part of the query.
-_SQL_FIRST_POINT = r"\(\s*(-?[0-9.]+)\s+(-?[0-9.]+)"
-
-
-def parse_linestring(wkt: str) -> list[tuple[float, float]]:
-    """WKT LINESTRING to a list of (lon, lat). No shapely: this is the only
-    geometry operation the renderer needs, and it is two splits."""
-    m = _WKT.fullmatch(wkt)
-    if m is None:
-        raise ValueError(f"not a WKT LINESTRING: {wkt[:60]!r}")
-    out: list[tuple[float, float]] = []
-    for part in m.group(1).split(","):
-        xy = part.split()
-        out.append((float(xy[0]), float(xy[1])))
-    return out
-
-
 @dataclass(frozen=True, slots=True)
 class Edge:
     """One road segment plus what runs over it."""
@@ -267,34 +233,23 @@ class Edge:
 
 # The bbox filter.
 #
-# `geom` is WKT text, so there is no spatial index and no numeric column to compare
-# against. Three options were on the table:
+# `edges` stores each geometry's bounding box as four micro-degree integers, so the
+# window test is an exact integer overlap in SQL and nothing has to look inside the
+# geometry. That is worth stating because it used not to be: when geom was WKT text
+# there was no numeric column to compare against, and the filter matched the *first*
+# vertex only, over-selected a collar of edges padded by the longest edge in the
+# table, and re-tested each one in Python. This does the same job in one pass, with
+# no collar and no false positives.
 #
-#   1. String comparison on the WKT. Wrong -- lexicographic order on '-2.24 53.48'
-#      has nothing to do with geography, and it silently returns plausible garbage.
-#   2. Parse every geometry in SQL (regexp_extract_all + list_min/list_max). Exact,
-#      but it runs a regex over every byte of every geometry in the table on every
-#      render, which at UK scale is the dominant cost of an otherwise cheap query.
-#   3. Filter on the *first* vertex only, with the window padded by the longest
-#      edge in the table, then do the exact test in Python.
-#
-# (3) is what runs below. It is conservative and never drops a real hit: an edge's
-# path length is at least the distance from its first vertex to any other vertex,
-# so padding by max(length_m) cannot miss an edge that reaches into the window. It
-# over-selects a thin collar of edges around the window, which Python then discards
-# with a four-comparison bbox test -- cheap, and only on the collar. The SQL regex
-# stops at the first coordinate pair rather than scanning the whole string.
-#
-# Cost, roughly: one full scan of `edges` with a short anchored regex per row, plus
-# an indexed aggregate over `edge_services` for the surviving rows. Fine for a city.
-# For `uk` it reads the whole table, which is the honest price of no spatial index.
+# There is still no spatial index, so a window over `uk` reads the whole table. That
+# is the honest price, and four integer comparisons per row is a cheap way to pay it.
 
 _QUERY = """
 WITH win AS (
-    SELECT edge_id, road_class, length_m, geom
+    SELECT edge_id, road_class, length_m, lon_e6, lat_e6
     FROM edges
-    WHERE try_cast(regexp_extract(geom, '{pat}', 1) AS DOUBLE) BETWEEN ? AND ?
-      AND try_cast(regexp_extract(geom, '{pat}', 2) AS DOUBLE) BETWEEN ? AND ?
+    WHERE min_lon_e6 <= ? AND max_lon_e6 >= ?
+      AND min_lat_e6 <= ? AND max_lat_e6 >= ?
 ), svc AS (
     SELECT s.edge_id,
            count(DISTINCT s.short_name) AS n_services,
@@ -303,20 +258,10 @@ WITH win AS (
     FROM edge_services s JOIN win USING (edge_id)
     GROUP BY s.edge_id
 )
-SELECT win.edge_id, win.road_class, win.length_m, win.geom,
+SELECT win.edge_id, win.road_class, win.length_m, win.lon_e6, win.lat_e6,
        coalesce(svc.n_services, 0), coalesce(svc.n_trips, 0){services_col}
 FROM win LEFT JOIN svc USING (edge_id)
 """
-
-
-def _pad_degrees(con: duckdb.DuckDBPyConnection, b: Bounds) -> tuple[float, float]:
-    row = con.execute("SELECT max(length_m) FROM edges").fetchone()
-    longest = float(row[0]) if row and row[0] is not None else 0.0
-    d_lat = longest / _M_PER_DEG_LAT
-    # Cap the cosine so a window near the pole cannot ask for an absurd longitude
-    # pad. The UK never gets near that, but `uk` reaches 60.9N and the guard is free.
-    d_lon = d_lat / max(math.cos(math.radians(b.mid_lat)), 0.25)
-    return d_lon, d_lat
 
 
 def load_edges(
@@ -334,16 +279,18 @@ def load_edges(
     con = con or db.connect(read_only=True)
     t0 = time.monotonic()
     try:
-        d_lon, d_lat = _pad_degrees(con, bounds)
-        coarse = bounds.padded(d_lon, d_lat)
         sql = _QUERY.format(
-            pat=_SQL_FIRST_POINT,
             services=", list(DISTINCT s.short_name) AS services" if with_services else "",
             services_col=", svc.services" if with_services else "",
         )
         rows = con.execute(
             sql,
-            [coarse.min_lon, coarse.max_lon, coarse.min_lat, coarse.max_lat],
+            [
+                round(bounds.max_lon * 1e6),
+                round(bounds.min_lon * 1e6),
+                round(bounds.max_lat * 1e6),
+                round(bounds.min_lat * 1e6),
+            ],
         ).fetchall()
     finally:
         if own:
@@ -351,24 +298,22 @@ def load_edges(
 
     edges: list[Edge] = []
     for row in rows:
-        coords = parse_linestring(row[3])
-        lons = [c[0] for c in coords]
-        lats = [c[1] for c in coords]
-        if len(coords) < 2 or not bounds.hits(lons, lats):
+        lon_e6, lat_e6 = row[3], row[4]
+        if not lon_e6 or len(lon_e6) < 2:
             continue
-        names = tuple(sorted(row[6])) if with_services and row[6] else ()
+        names = tuple(sorted(row[7])) if with_services and row[7] else ()
         edges.append(
             Edge(
                 edge_id=int(row[0]),
                 road_class=row[1],
                 length_m=float(row[2] or 0.0),
-                coords=coords,
-                n_services=int(row[4]),
-                n_trips=int(row[5]),
+                coords=[(x / 1e6, y / 1e6) for x, y in zip(lon_e6, lat_e6, strict=True)],
+                n_services=int(row[5]),
+                n_trips=int(row[6]),
                 services=names,
             )
         )
-    log.info("%d edges (%d coarse) in %.1fs", len(edges), len(rows), time.monotonic() - t0)
+    log.info("%d edges in %.1fs", len(edges), time.monotonic() - t0)
     return edges
 
 

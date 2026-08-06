@@ -36,7 +36,7 @@ def export_geojsonl(con: duckdb.DuckDBPyConnection, path: Path | None = None) ->
 
     rows = con.execute(
         """
-        SELECT e.edge_id, e.way_id, e.road_name, e.geom,
+        SELECT e.edge_id, e.way_id, e.road_name, e.lon_e6, e.lat_e6,
                s.n, s.refs, s.trips
         FROM edges e
         JOIN (
@@ -46,7 +46,7 @@ def export_geojsonl(con: duckdb.DuckDBPyConnection, path: Path | None = None) ->
                    sum(n_trips)      AS trips
             FROM edge_services GROUP BY edge_id
         ) s USING (edge_id)
-        WHERE e.geom IS NOT NULL
+        WHERE e.lon_e6 IS NOT NULL
         """
     ).fetchall()
 
@@ -54,8 +54,8 @@ def export_geojsonl(con: duckdb.DuckDBPyConnection, path: Path | None = None) ->
     overflow: dict[str, list[str]] = {}
 
     with path.open("w") as fh:
-        for edge_id, way_id, name, wkt, n, refs, trips in rows:
-            coords = _wkt_to_coords(wkt)
+        for edge_id, way_id, name, lon_e6, lat_e6, n, refs, trips in rows:
+            coords = _coords(lon_e6, lat_e6)
             if len(coords) < 2:
                 continue
             capped = refs[: config.MAX_REFS_IN_TILE]
@@ -175,15 +175,11 @@ def build(con: duckdb.DuckDBPyConnection) -> Path:
     return build_tiles(export_geojsonl(con))
 
 
-def _wkt_to_coords(wkt: str) -> list[list[float]]:
-    """Parse 'LINESTRING(lon lat, lon lat, ...)'.
+def _coords(lon_e6: list[int], lat_e6: list[int]) -> list[list[float]]:
+    """Micro-degrees to the degrees GeoJSON wants.
 
-    The WKT here is written by this codebase, never read from elsewhere, so a split
-    is sufficient and a WKT parser dependency is not warranted.
+    Nationally this runs over tens of millions of coordinates, so it is two integer
+    divisions per point and nothing else -- the string splitting and float parsing
+    a WKT column needed here was the bulk of the export's cost.
     """
-    inner = wkt[wkt.index("(") + 1 : wkt.rindex(")")]
-    coords = []
-    for pair in inner.split(","):
-        lon, lat = pair.split()
-        coords.append([round(float(lon), 6), round(float(lat), 6)])
-    return coords
+    return [[lon / 1e6, lat / 1e6] for lon, lat in zip(lon_e6, lat_e6, strict=True)]
