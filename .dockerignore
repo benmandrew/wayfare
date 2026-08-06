@@ -1,0 +1,22 @@
+# The build context is sent to the daemon in full. data/ holds the downloads and
+# the graph -- tens of gigabytes after a national run -- and none of it belongs in
+# an image.
+data/
+*.pmtiles
+*.duckdb
+*.duckdb.wal
+*.osm.pbf
+*.part
+
+.venv/
+.git/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+.env
+.DS_Store

@@ -1,17 +1,43 @@
-# Server deployment. The matching stage runs for a day or two, so both services
-# restart unless explicitly stopped and all state lives on named volumes.
+# Server deployment.
 #
-#   docker compose up -d valhalla     # first run builds the GB graph: 30-90 min
+# One command, start to finish:
+#
+#   docker compose up -d valhalla        # first run builds the graph: 45-90 min for GB
+#   docker compose run --rm pipeline     # acquire -> patterns -> match -> aggregate -> publish
+#   docker compose up -d web             # viewer on :8099
+#
+# `pipeline` is safe to interrupt and re-run: every stage skips work that is
+# already done, and `match` resumes from its last committed batch.
+#
+# To run the stages by hand instead (useful when redoing just one):
+#
 #   docker compose run --rm wayfare acquire
 #   docker compose run --rm wayfare patterns
-#   docker compose up -d matcher      # the long one; watch with `docker compose logs -f matcher`
+#   docker compose up -d matcher         # the long one; docker compose logs -f matcher
 #   docker compose run --rm wayfare aggregate
 #   docker compose run --rm wayfare publish
+#
+# For a regional dev run, set WAYFARE_REGION and WAYFARE_OSM_URL to match --
+# they must describe the same area, or the matcher will be asking a Welsh graph
+# about Yorkshire stops. See .env.example.
+
+x-wayfare: &wayfare
+  build: .
+  image: wayfare:latest
+  volumes:
+    - data:/data
+  environment:
+    WAYFARE_DATA: /data
+    WAYFARE_VALHALLA: http://valhalla:8002
+    WAYFARE_REGION: ${WAYFARE_REGION:-all}
+    WAYFARE_MEM: ${WAYFARE_MEM:-8GB}
+    WAYFARE_WORKERS: ${WAYFARE_WORKERS:-6}
+  entrypoint: ["wayfare"]
 
 services:
-  # Routing and map-matching engine. This is the image that builds its own graph
-  # from a pbf on first start; the plain ghcr.io/valhalla/valhalla image expects
-  # you to run the build steps yourself.
+  # Routing and map-matching engine. This image builds its own graph from a pbf on
+  # first start; the plain ghcr.io/valhalla/valhalla image expects you to run the
+  # build steps yourself.
   valhalla:
     image: ghcr.io/valhalla/valhalla-scripted:latest
     container_name: wayfare-valhalla
@@ -20,13 +46,12 @@ services:
     volumes:
       - valhalla:/custom_files
     environment:
-      # Geofabrik rebuilds daily. Once the graph is built, edge ids are only
-      # meaningful against this exact extract -- so after the first successful
-      # build, set force_rebuild=False and leave it alone for the whole run.
-      # Override for a regional dev run, e.g.
-      #   WAYFARE_OSM_URL=https://download.geofabrik.de/europe/united-kingdom/wales-latest.osm.pbf
+      # Geofabrik rebuilds daily. Once the graph exists, every edge_id in the
+      # database belongs to this exact extract -- so force_rebuild stays False and
+      # the graph is left alone for the whole run. Rebuilding it silently
+      # invalidates all stored edge ids.
       tile_urls: ${WAYFARE_OSM_URL:-https://download.geofabrik.de/europe/great-britain-latest.osm.pbf}
-      server_threads: 8
+      server_threads: ${VALHALLA_THREADS:-8}
       force_rebuild: "False"
       force_rebuild_elevation: "False"
       build_elevation: "False"      # not needed for map matching, and it is large
@@ -37,43 +62,52 @@ services:
       test: ["CMD", "curl", "-fs", "http://localhost:8002/status"]
       interval: 30s
       timeout: 10s
-      # The graph build has to finish before the first health check can pass.
+      # The graph build has to finish before the first check can pass.
       start_period: 90m
       retries: 5
     restart: unless-stopped
     shm_size: 2gb
 
-  # One-shot stages: acquire, patterns, aggregate, publish, status, art.
-  wayfare:
-    build: .
-    image: wayfare:latest
-    volumes:
-      - data:/data
-      - ./data/out:/data/out       # artefacts are useful outside the container
-    environment:
-      WAYFARE_DATA: /data
-      WAYFARE_VALHALLA: http://valhalla:8002
-      WAYFARE_MEM: 8GB
-    depends_on:
-      - valhalla
-    entrypoint: ["wayfare"]
-
-  # The long-running stage, as its own service so it survives a disconnected shell
-  # and comes back after a reboot. `match` resumes from its checkpoint, so an
-  # unclean restart costs at most one batch.
-  matcher:
-    image: wayfare:latest
-    volumes:
-      - data:/data
-    environment:
-      WAYFARE_DATA: /data
-      WAYFARE_VALHALLA: http://valhalla:8002
-      WAYFARE_WORKERS: 6
+  # The whole pipeline, in order. Run it with `docker compose run --rm pipeline`.
+  pipeline:
+    <<: *wayfare
+    profiles: ["manual"]        # only ever run explicitly, never by `up`
+    command: ["all"]
     depends_on:
       valhalla:
         condition: service_healthy
+
+  # Individual stages: acquire, patterns, match, aggregate, publish, status, art.
+  wayfare:
+    <<: *wayfare
+    profiles: ["manual"]
+    depends_on:
+      valhalla:
+        condition: service_healthy
+
+  # The long stage on its own, so it survives a disconnected shell and comes back
+  # after a reboot.
+  matcher:
+    <<: *wayfare
     command: ["match"]
-    entrypoint: ["wayfare"]
+    profiles: ["manual"]
+    depends_on:
+      valhalla:
+        condition: service_healthy
+    # on-failure, NOT unless-stopped: matching ends by exiting 0, and a policy
+    # that restarts on success would relaunch it forever against an empty queue.
+    restart: on-failure
+
+  # Serves the viewer. PMTiles needs HTTP range requests, which this handles and
+  # `python -m http.server` does not.
+  web:
+    <<: *wayfare
+    entrypoint:
+      ["python3", "scripts/serve.py", "--dir", "web", "--out", "/data/out", "--port", "8099"]
+    command: []
+    ports:
+      - "${WEB_PORT:-8099}:8099"
+    depends_on: []
     restart: unless-stopped
 
 volumes:

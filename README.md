@@ -105,8 +105,20 @@ defaults to `http://localhost:8002`. `publish` needs felt/tippecanoe 2.17 or new
 
 ### Server
 
+Copy `.env.example` to `.env` and set the area, then:
+
 ```
-docker compose up -d valhalla     # first run builds the GB graph: 30-90 min
+docker compose up -d valhalla     # first run builds the graph: 45-90 min for GB
+docker compose run --rm pipeline  # acquire -> patterns -> match -> aggregate -> publish
+docker compose up -d web          # viewer on :8099
+```
+
+`pipeline` is safe to interrupt and re-run: every stage skips work already done, and
+`match` resumes from its last committed batch.
+
+To redo a single stage rather than the lot:
+
+```
 docker compose run --rm wayfare acquire
 docker compose run --rm wayfare patterns
 docker compose up -d matcher      # the long one
@@ -114,6 +126,10 @@ docker compose logs -f matcher
 docker compose run --rm wayfare aggregate
 docker compose run --rm wayfare publish
 ```
+
+`WAYFARE_REGION` and `WAYFARE_OSM_URL` must describe the same area. Nothing checks
+this, and a mismatch is not obvious from the logs — the matcher simply asks one
+region's road graph about another region's stops and fails every pattern.
 
 The matcher runs as its own service so it survives a disconnected shell and comes back
 after a reboot. It is designed to be interrupted: work is selected by the absence of a
