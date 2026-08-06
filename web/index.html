@@ -203,10 +203,14 @@ h1 {
 
 // The tile archive is configurable so the same file works against a local copy
 // or a bucket: ?tiles=https://pub-xxxx.r2.dev/bus.pmtiles
-const TILES = new URL(
-  new URLSearchParams(location.search).get("tiles") || "./bus.pmtiles",
-  location.href
-).href;
+//
+// With no ?tiles= the page asks the server what it has rather than assuming a
+// name. `bus.pmtiles` is only the fallback for a static host with no index --
+// assuming it outright meant that renaming an archive, which is exactly what
+// holding two regions requires, left the page reporting no tiles at all.
+const WANTED = new URLSearchParams(location.search).get("tiles");
+let TILES = "";
+let ARCHIVES = [];
 
 const SRC = "bus";          // source id
 const LAYER_SRC = "bus";    // the single vector layer inside the archive
@@ -275,18 +279,42 @@ paintRamp();
 const protocol = new pmtiles.Protocol();
 maplibregl.addProtocol("pmtiles", protocol.tile);
 
-const archive = new pmtiles.PMTiles(TILES);
-protocol.add(archive); // share the instance so the header is fetched once
+boot();
 
-archive.getHeader().then(start).catch(failed);
+async function boot() {
+  // Ask before assuming. A server that offers an index tells us what exists; one
+  // that does not is a plain static host, where `bus.pmtiles` is the convention.
+  try {
+    ARCHIVES = await (await fetch("archives.json")).json();
+  } catch {
+    ARCHIVES = [];
+  }
+  TILES = new URL(WANTED || ARCHIVES[0] || "./bus.pmtiles", location.href).href;
+
+  const archive = new pmtiles.PMTiles(TILES);
+  protocol.add(archive); // share the instance so the header is fetched once
+  try {
+    start(await archive.getHeader());
+  } catch (err) {
+    failed(err);
+  }
+}
 
 function failed(err) {
   console.error(err);
+  // If the server does have archives, the useful thing is a way into one of them,
+  // not instructions for building the archive that is already there.
+  const offer = ARCHIVES.length
+    ? `<p>This server does have:</p><ul>${ARCHIVES.map(
+        (n) => `<li><a href="${escapeHtml(regionHref(n))}">${escapeHtml(regionLabel(n))}</a></li>`
+      ).join("")}</ul>`
+    : "";
   $("boot").innerHTML = `
     <div class="panel">
       <h2>No tiles found</h2>
-      <p>Could not read <code>${escapeHtml(TILES)}</code>. Build the archive and
-         serve it:</p>
+      <p>Could not read <code>${escapeHtml(TILES)}</code>.</p>
+      ${offer}
+      <p>To build one and serve it:</p>
       <pre>wayfare publish
 python3 scripts/serve.py</pre>
       <p>Use that script, not <code>python3 -m http.server</code> — the built-in
@@ -303,27 +331,26 @@ python3 scripts/serve.py</pre>
 // which archives it has. One archive and the control stays hidden; several and
 // you get a picker. Switching reloads with ?tiles= and drops the #hash, because
 // a position in Cardiff means nothing in an archive covering London.
-async function offerRegions(current) {
-  let names = [];
-  try {
-    names = await (await fetch("archives.json")).json();
-  } catch {
-    return; // served from somewhere without the index; ?tiles= still works
-  }
-  const label = (n) =>
-    n.replace(/\.pmtiles$/, "").replace(/[-_]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+const regionLabel = (n) =>
+  n.replace(/\.pmtiles$/, "").replace(/[-_]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+
+const regionHref = (n) => `${location.pathname}?tiles=${encodeURIComponent(n)}`;
+
+function offerRegions(current) {
   const here = decodeURIComponent(current.split("/").pop());
-  if (names.length < 2) return;
+  if (ARCHIVES.includes(here)) {
+    $("sub").textContent = `${regionLabel(here)} — bus services by road segment`;
+  }
+  if (ARCHIVES.length < 2) return; // one region needs no picker
 
   const sel = $("region");
-  sel.innerHTML = names
-    .map((n) => `<option value="${n}"${n === here ? " selected" : ""}>${label(n)}</option>`)
-    .join("");
+  sel.innerHTML = ARCHIVES.map(
+    (n) => `<option value="${n}"${n === here ? " selected" : ""}>${regionLabel(n)}</option>`
+  ).join("");
   sel.hidden = false;
   sel.addEventListener("change", () => {
-    location.href = `${location.pathname}?tiles=${encodeURIComponent(sel.value)}`;
+    location.href = regionHref(sel.value);
   });
-  if (names.includes(here)) $("sub").textContent = `${label(here)} — bus services by road segment`;
 }
 
 function start(header) {
