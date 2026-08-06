@@ -17,7 +17,8 @@ import colorsys
 import hashlib
 import math
 import time
-from collections.abc import Callable, Sequence
+from array import array
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -244,24 +245,213 @@ class Edge:
 # There is still no spatial index, so a window over `uk` reads the whole table. That
 # is the honest price, and four integer comparisons per row is a cheap way to pay it.
 
-_QUERY = """
-WITH win AS (
+_WINDOW = """
     SELECT edge_id, road_class, length_m, lon_e6, lat_e6
     FROM edges
     WHERE min_lon_e6 <= ? AND max_lon_e6 >= ?
       AND min_lat_e6 <= ? AND max_lat_e6 >= ?
+"""
+
+_QUERY = f"""
+WITH win AS ({_WINDOW}
 ), svc AS (
     SELECT s.edge_id,
            count(DISTINCT s.short_name) AS n_services,
            sum(s.n_trips)               AS n_trips
-           {services}
+           {{services}}
     FROM edge_services s JOIN win USING (edge_id)
     GROUP BY s.edge_id
 )
 SELECT win.edge_id, win.road_class, win.length_m, win.lon_e6, win.lat_e6,
-       coalesce(svc.n_services, 0), coalesce(svc.n_trips, 0){services_col}
+       coalesce(svc.n_services, 0), coalesce(svc.n_trips, 0){{services_col}}
 FROM win LEFT JOIN svc USING (edge_id)
+{{order}}
 """
+
+# Just the trip counts, for the percentile pass. Eight bytes an edge against the
+# hundreds its geometry costs, which is what lets the bounds be known before a
+# single coordinate is read.
+_WEIGHTS_QUERY = f"""
+WITH win AS ({_WINDOW})
+SELECT coalesce(sum(s.n_trips), 0)
+FROM win LEFT JOIN edge_services s USING (edge_id)
+GROUP BY win.edge_id
+"""
+
+# The shared part of the two strand queries.
+#
+# `pair` is DISTINCT because a service registered by two operators has two rows per
+# edge in edge_services, and a ribbon must cover each edge once.
+#
+# `trips` deliberately sums each edge's total traffic across every service, not the
+# service's own -- so a minor route along a busy corridor gets a wide ribbon. That
+# is what the list version measured and what the existing renders look like; it is
+# a property of the picture rather than an accident worth silently changing here.
+_STRAND_BASE = f"""
+WITH win AS ({_WINDOW}
+), edge_trips AS (
+    SELECT s.edge_id, sum(s.n_trips) AS n_trips
+    FROM edge_services s JOIN win USING (edge_id)
+    GROUP BY s.edge_id
+), pair AS (
+    SELECT DISTINCT s.short_name, s.edge_id
+    FROM edge_services s JOIN win USING (edge_id)
+), svc AS (
+    SELECT p.short_name, count(*) AS n_edges, sum(t.n_trips) AS trips
+    FROM pair p JOIN edge_trips t USING (edge_id)
+    GROUP BY p.short_name
+)
+"""
+
+# One row per service in the window. Small -- hundreds for a city, thousands
+# nationally -- so it is materialised, and it both orders the draw and scales the
+# ribbon widths.
+_SERVICE_QUERY = f"""
+{_STRAND_BASE}
+SELECT short_name, n_edges, trips FROM svc
+ORDER BY n_edges DESC, short_name
+"""
+
+# Every (service, edge) pair in the window, ordered so a service's edges arrive
+# together and the widest service comes first. An edge carrying five services
+# appears five times, which is the point: the geometry streams past rather than
+# being held in a dict of service to edge list.
+_STRAND_QUERY = f"""
+{_STRAND_BASE}
+SELECT p.short_name, win.lon_e6, win.lat_e6
+FROM pair p
+JOIN win USING (edge_id)
+JOIN svc USING (short_name)
+ORDER BY svc.n_edges DESC, p.short_name
+"""
+
+FETCH_ROWS = 20_000
+
+
+class Window:
+    """The edges of a view, offered as a stream that can be walked more than once.
+
+    A style never needs more than one edge at a time, but it does need the weight
+    scale for the whole window up front. Holding every edge to get that is what made
+    a national render expensive -- Wales over the `uk` preset is 439 MB of Edge
+    objects, and the country is roughly twenty-five times Wales.
+
+    So the scale comes from its own pass over the trip counts alone, and the
+    geometry is pulled through in chunks afterwards. Each `edges()` call reopens the
+    query; the cost is another scan, which is cheap next to holding the result.
+    """
+
+    def __init__(
+        self,
+        bounds: Bounds,
+        con: duckdb.DuckDBPyConnection,
+        *,
+        with_services: bool = False,
+    ) -> None:
+        self.bounds = bounds
+        self.con = con
+        self.with_services = with_services
+        self._params = [
+            round(bounds.max_lon * 1e6),
+            round(bounds.min_lon * 1e6),
+            round(bounds.max_lat * 1e6),
+            round(bounds.min_lat * 1e6),
+        ]
+        self.weights = Weights.over(
+            array("q", (r[0] for r in con.execute(_WEIGHTS_QUERY, self._params).fetchall()))
+        )
+
+    def edges(self, *, by_weight: bool = False) -> Iterator[Edge]:
+        """Every edge whose bbox overlaps the window.
+
+        `by_weight` orders quietest first in SQL, which is what `spectrum` used to
+        get by sorting the whole list in memory. The weight is monotonic in the trip
+        count, so ordering by one orders by the other.
+        """
+        sql = _QUERY.format(
+            services=", list(DISTINCT s.short_name) AS services"
+            if self.with_services
+            else "",
+            services_col=", svc.services" if self.with_services else "",
+            # edge_id breaks the tie, so equally busy roads draw in a fixed order
+            # rather than whichever way the scan happened to return them.
+            order="ORDER BY coalesce(svc.n_trips, 0), win.edge_id" if by_weight else "",
+        )
+        cur = self.con.execute(sql, self._params)
+        while chunk := cur.fetchmany(FETCH_ROWS):
+            for row in chunk:
+                edge = _to_edge(row, with_services=self.with_services)
+                if edge is not None and self.bounds.hits(
+                    [c[0] for c in edge.coords], [c[1] for c in edge.coords]
+                ):
+                    yield edge
+
+    def strands(self) -> Iterator[tuple[str, float, list[tuple[float, float]]]]:
+        """(service, its weight, one edge's coordinates), grouped by service.
+
+        Consecutive tuples sharing a service name belong to the same ribbon, widest
+        service first. The caller strokes a name's geometry as one path and moves on.
+        """
+        rows = self.con.execute(_SERVICE_QUERY, self._params).fetchall()
+        if not rows:
+            return
+        weights = Weights.over(array("q", (r[2] for r in rows)))
+        weight_of = {r[0]: weights.of(r[2]) for r in rows}
+
+        cur = self.con.execute(_STRAND_QUERY, self._params)
+        while chunk := cur.fetchmany(FETCH_ROWS):
+            for name, lon_e6, lat_e6 in chunk:
+                if not lon_e6 or len(lon_e6) < 2:
+                    continue
+                coords = [(x / 1e6, y / 1e6) for x, y in zip(lon_e6, lat_e6, strict=True)]
+                if self.bounds.hits([c[0] for c in coords], [c[1] for c in coords]):
+                    yield name, weight_of[name], coords
+
+
+class Held(Window):
+    """A window backed by edges already in memory.
+
+    `render(edges=...)` exists so a caller can re-render a window it already has,
+    which is worth keeping for anyone tuning options against one area. It is the
+    only path that still holds everything, and it is the caller's choice to.
+    """
+
+    def __init__(self, edges: Sequence[Edge]) -> None:
+        self._edges = list(edges)
+        self.weights = Weights.over([e.n_trips for e in self._edges])
+
+    def edges(self, *, by_weight: bool = False) -> Iterator[Edge]:
+        if by_weight:
+            return iter(sorted(self._edges, key=lambda e: e.n_trips))
+        return iter(self._edges)
+
+    def strands(self) -> Iterator[tuple[str, float, list[tuple[float, float]]]]:
+        by_service: dict[str, list[Edge]] = {}
+        for e in self._edges:
+            for name in e.services:
+                by_service.setdefault(name, []).append(e)
+        if not by_service:
+            return
+        trips = {n: sum(e.n_trips for e in es) for n, es in by_service.items()}
+        weights = Weights.over(list(trips.values()))
+        for name in sorted(by_service, key=lambda n: (-len(by_service[n]), n)):
+            for e in by_service[name]:
+                yield name, weights.of(trips[name]), e.coords
+
+
+def _to_edge(row: tuple[Any, ...], *, with_services: bool) -> Edge | None:
+    lon_e6, lat_e6 = row[3], row[4]
+    if not lon_e6 or len(lon_e6) < 2:
+        return None
+    return Edge(
+        edge_id=int(row[0]),
+        road_class=row[1],
+        length_m=float(row[2] or 0.0),
+        coords=[(x / 1e6, y / 1e6) for x, y in zip(lon_e6, lat_e6, strict=True)],
+        n_services=int(row[5]),
+        n_trips=int(row[6]),
+        services=tuple(sorted(row[7])) if with_services and row[7] else (),
+    )
 
 
 def load_edges(
@@ -270,49 +460,19 @@ def load_edges(
     with_services: bool = False,
     con: duckdb.DuckDBPyConnection | None = None,
 ) -> list[Edge]:
-    """Every edge whose geometry's bbox overlaps `bounds`.
+    """Every edge whose geometry's bbox overlaps `bounds`, all at once.
 
-    `with_services` also returns the distinct service names per edge, which only
-    `strands` needs and which costs a list aggregate over `edge_services`.
+    Kept for callers that genuinely want the list -- `render(edges=...)` and tests.
+    Rendering itself streams; see :class:`Window`.
     """
     own = con is None
     con = con or db.connect(read_only=True)
     t0 = time.monotonic()
     try:
-        sql = _QUERY.format(
-            services=", list(DISTINCT s.short_name) AS services" if with_services else "",
-            services_col=", svc.services" if with_services else "",
-        )
-        rows = con.execute(
-            sql,
-            [
-                round(bounds.max_lon * 1e6),
-                round(bounds.min_lon * 1e6),
-                round(bounds.max_lat * 1e6),
-                round(bounds.min_lat * 1e6),
-            ],
-        ).fetchall()
+        edges = list(Window(bounds, con, with_services=with_services).edges())
     finally:
         if own:
             con.close()
-
-    edges: list[Edge] = []
-    for row in rows:
-        lon_e6, lat_e6 = row[3], row[4]
-        if not lon_e6 or len(lon_e6) < 2:
-            continue
-        names = tuple(sorted(row[7])) if with_services and row[7] else ()
-        edges.append(
-            Edge(
-                edge_id=int(row[0]),
-                road_class=row[1],
-                length_m=float(row[2] or 0.0),
-                coords=[(x / 1e6, y / 1e6) for x, y in zip(lon_e6, lat_e6, strict=True)],
-                n_services=int(row[5]),
-                n_trips=int(row[6]),
-                services=names,
-            )
-        )
     log.info("%d edges in %.1fs", len(edges), time.monotonic() - t0)
     return edges
 
@@ -320,25 +480,58 @@ def load_edges(
 # --- Weighting --------------------------------------------------------------
 
 
-def _normalise(
-    values: Sequence[float], lo_q: float = 0.02, hi_q: float = 0.98
-) -> list[float]:
-    """Map values to [0, 1] through log1p, clamped to a percentile range.
+@dataclass(frozen=True, slots=True)
+class Weights:
+    """A log scale clamped to a percentile range, held as just its two bounds.
 
     Trip counts span three orders of magnitude: a city-centre corridor carries
     thousands of buses a week and a village loop carries eight. Linear scaling
     renders everything but the busiest half-dozen roads as invisible hairlines,
     and a raw min/max lets one outlier flatten the rest, hence log plus clipping.
+
+    Two bounds rather than a list of normalised values, so a style can weight an
+    edge as it arrives instead of holding the whole window to weight it.
+    """
+
+    lo: float  # in log space
+    hi: float
+
+    @classmethod
+    def over(
+        cls, values: Iterable[float], lo_q: float = 0.02, hi_q: float = 0.98
+    ) -> Weights:
+        # log1p is monotonic, so taking the percentiles of the raw values and
+        # logging the two picks is the same as logging everything first -- and it
+        # means the pass that finds them never has to build a second list.
+        ordered = sorted(values)
+        if not ordered:
+            return cls(0.0, 0.0)
+        lo = ordered[min(len(ordered) - 1, int(lo_q * len(ordered)))]
+        hi = ordered[min(len(ordered) - 1, int(hi_q * len(ordered)))]
+        return cls(math.log1p(max(lo, 0.0)), math.log1p(max(hi, 0.0)))
+
+    def of(self, value: float) -> float:
+        if self.hi <= self.lo:
+            return 0.5
+        v = math.log1p(max(value, 0.0))
+        return min(1.0, max(0.0, (v - self.lo) / (self.hi - self.lo)))
+
+
+def _normalise(
+    values: Sequence[float], lo_q: float = 0.02, hi_q: float = 0.98
+) -> list[float]:
+    """The original list-at-a-time scale, kept as the reference :class:`Weights` is
+    tested against.
+
+    Nothing draws through it any more -- the styles weight each edge as it streams
+    past -- but the two must agree exactly, or the same window would come out
+    differently depending on which path rendered it. Pinning that here is what makes
+    the change from one to the other checkable.
     """
     if not values:
         return []
-    logged = [math.log1p(max(v, 0.0)) for v in values]
-    ordered = sorted(logged)
-    lo = ordered[min(len(ordered) - 1, int(lo_q * len(ordered)))]
-    hi = ordered[min(len(ordered) - 1, int(hi_q * len(ordered)))]
-    if hi <= lo:
-        return [0.5] * len(values)
-    return [min(1.0, max(0.0, (v - lo) / (hi - lo))) for v in logged]
+    w = Weights.over(values, lo_q, hi_q)
+    return [w.of(v) for v in values]
 
 
 def _stable_unit(text: str) -> float:
@@ -370,7 +563,7 @@ class RenderOpts:
 
 
 StyleFn = Callable[
-    ["cairo.Context[cairo.Surface]", Sequence[Edge], Projection, RenderOpts], None
+    ["cairo.Context[cairo.Surface]", "Window", Projection, RenderOpts], None
 ]
 
 
@@ -385,10 +578,6 @@ class Style:
 # --- Styles -----------------------------------------------------------------
 
 
-def _segments(edges: Sequence[Edge], proj: Projection) -> list[list[tuple[float, float]]]:
-    return [[proj(lon, lat) for lon, lat in e.coords] for e in edges]
-
-
 def _stroke_path(
     ctx: cairo.Context[cairo.Surface], pts: Sequence[tuple[float, float]]
 ) -> None:
@@ -399,7 +588,7 @@ def _stroke_path(
 
 def draw_density(
     ctx: cairo.Context[cairo.Surface],
-    edges: Sequence[Edge],
+    window: Window,
     proj: Projection,
     opts: RenderOpts,
 ) -> None:
@@ -408,11 +597,12 @@ def draw_density(
     Two additive passes -- a wide, almost invisible halo under a narrow bright
     core. ADD is commutative, so overlapping routes accumulate light exactly the
     way a long exposure does and draw order does not matter.
+
+    The two passes are two walks of the window rather than two walks of a list, so
+    the geometry is read twice and held never.
     """
     import cairo
 
-    weights = _normalise([e.n_trips for e in edges])
-    paths = _segments(edges, proj)
     ctx.set_operator(cairo.Operator.ADD)
 
     # (width, alpha, saturation) as functions of normalised traffic: first the
@@ -426,18 +616,19 @@ def draw_density(
         ),
     )
     for width_of, alpha_of, sat_of in passes:
-        for pts, t in zip(paths, weights, strict=True):
+        for e in window.edges():
+            t = window.weights.of(e.n_trips)
             r, g, b = colorsys.hsv_to_rgb(opts.hue, sat_of(t), 1.0)
             ctx.set_source_rgba(r, g, b, min(1.0, alpha_of(t) * opts.alpha_scale))
             ctx.set_line_width(width_of(t) * opts.line_scale)
             ctx.new_path()
-            _stroke_path(ctx, pts)
+            _stroke_path(ctx, [proj(lon, lat) for lon, lat in e.coords])
             ctx.stroke()
 
 
 def draw_spectrum(
     ctx: cairo.Context[cairo.Surface],
-    edges: Sequence[Edge],
+    window: Window,
     proj: Projection,
     opts: RenderOpts,
 ) -> None:
@@ -454,14 +645,14 @@ def draw_spectrum(
     """
     import cairo
 
-    weights = _normalise([e.n_trips for e in edges])
-    paths = _segments(edges, proj)
     ctx.set_operator(cairo.Operator.OVER)
 
-    # Quietest first so the busy roads finish on top and stay legible.
-    for idx in sorted(range(len(paths)), key=lambda i: weights[i]):
-        t = weights[idx]
-        pts = paths[idx]
+    # Quietest first so the busy roads finish on top and stay legible. The ordering
+    # is done in SQL rather than by sorting the window in memory -- the weight is
+    # monotonic in the trip count, so ordering by one orders by the other.
+    for e in window.edges(by_weight=True):
+        t = window.weights.of(e.n_trips)
+        pts = [proj(lon, lat) for lon, lat in e.coords]
         sat = 0.30 + 0.62 * t
         val = 0.52 + 0.48 * t
         alpha = min(1.0, (0.30 + 0.62 * t) * opts.alpha_scale)
@@ -482,7 +673,7 @@ def draw_spectrum(
 
 def draw_strands(
     ctx: cairo.Context[cairo.Surface],
-    edges: Sequence[Edge],
+    window: Window,
     proj: Projection,
     opts: RenderOpts,
 ) -> None:
@@ -493,40 +684,48 @@ def draw_strands(
     doubles back on itself stays evenly translucent, and only *different* services
     build up on top of each other. Stroking edge by edge would blotch every
     terminus and shared corridor.
+
+    That requirement is why this one streams grouped rather than flat: the window
+    hands back (service, edge) pairs already ordered by service, so a ribbon is
+    accumulated into cairo's current path and stroked when the name changes. Only
+    one service's geometry is ever live.
     """
     import cairo
 
-    by_service: dict[str, list[Edge]] = {}
-    for e in edges:
-        for name in e.services:
-            by_service.setdefault(name, []).append(e)
-    if not by_service:
-        log.warning("no service names on these edges; strands has nothing to draw")
-        return
-
-    trips = {n: sum(e.n_trips for e in es) for n, es in by_service.items()}
-    weights = dict(zip(trips, _normalise(list(trips.values())), strict=True))
     ctx.set_operator(cairo.Operator.SCREEN)
+    current: str | None = None
+    drew = False
+
+    def finish() -> None:
+        if current is not None:
+            ctx.stroke()
 
     # Widest first, so the long trunk routes lie underneath the local fiddly ones.
-    for name in sorted(by_service, key=lambda n: -len(by_service[n])):
-        u = _stable_unit(name)
-        # Golden-ratio hue stepping off a stable hash: adjacent services in the
-        # list land far apart on the wheel without a hand-built palette.
-        hue = (u + _GOLDEN * len(name)) % 1.0
-        # Held deliberately saturated and a little dark: SCREEN washes everything
-        # toward white where services pile up, so pale ribbons turn the busy middle
-        # of a city into a grey blur instead of a weave.
-        r, g, b = colorsys.hsv_to_rgb(
-            (hue + opts.hue) % 1.0, 0.68 + 0.27 * u, 0.68 + 0.24 * (1.0 - u)
-        )
-        w = weights[name]
-        ctx.set_source_rgba(r, g, b, min(1.0, (0.22 + 0.26 * w) * opts.alpha_scale))
-        ctx.set_line_width((0.9 + 3.0 * w) * opts.line_scale)
-        ctx.new_path()
-        for e in by_service[name]:
-            _stroke_path(ctx, [proj(lon, lat) for lon, lat in e.coords])
-        ctx.stroke()
+    for name, weight, coords in window.strands():
+        if name != current:
+            finish()
+            current = name
+            drew = True
+            u = _stable_unit(name)
+            # Golden-ratio hue stepping off a stable hash: adjacent services in the
+            # list land far apart on the wheel without a hand-built palette.
+            hue = (u + _GOLDEN * len(name)) % 1.0
+            # Held deliberately saturated and a little dark: SCREEN washes everything
+            # toward white where services pile up, so pale ribbons turn the busy
+            # middle of a city into a grey blur instead of a weave.
+            r, g, b = colorsys.hsv_to_rgb(
+                (hue + opts.hue) % 1.0, 0.68 + 0.27 * u, 0.68 + 0.24 * (1.0 - u)
+            )
+            ctx.set_source_rgba(
+                r, g, b, min(1.0, (0.22 + 0.26 * weight) * opts.alpha_scale)
+            )
+            ctx.set_line_width((0.9 + 3.0 * weight) * opts.line_scale)
+            ctx.new_path()
+        _stroke_path(ctx, [proj(lon, lat) for lon, lat in coords])
+    finish()
+
+    if not drew:
+        log.warning("no service names on these edges; strands has nothing to draw")
 
 
 STYLES: dict[str, Style] = {
@@ -653,10 +852,14 @@ def render(
     config.ensure_dirs()
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    if edges is None:
-        edges = load_edges(bounds, with_services=spec.needs_services, con=con)
-    if not edges:
-        log.warning("no edges in %s; writing an empty frame", bounds)
+    # Streamed from the database unless the caller handed over edges it already
+    # holds; either way the styles see the same interface.
+    own_con = con is None and edges is None
+    if edges is not None:
+        window: Window = Held(edges)
+    else:
+        con = con or db.connect(read_only=True)
+        window = Window(bounds, con, with_services=spec.needs_services)
 
     width = opts.width_px
     height = opts.height_px or Projection.canvas_height(bounds, width)
@@ -679,7 +882,11 @@ def render(
     ctx.rectangle(*proj.content_rect(bounds))
     ctx.clip()
     t0 = time.monotonic()
-    spec.draw(ctx, edges, proj, opts)
+    try:
+        spec.draw(ctx, window, proj, opts)
+    finally:
+        if own_con and con is not None:
+            con.close()
     ctx.restore()
 
     if opts.caption:

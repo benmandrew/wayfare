@@ -166,3 +166,99 @@ def test_preset_names_still_win():
 def test_unknown_name_mentions_the_window_form():
     with pytest.raises(KeyError, match="minlon"):
         art.resolve("swansea")
+
+
+# --- Streaming ---------------------------------------------------------------
+
+
+def _art_edge(con, edge_id, lon, trips, services=("42",)):
+    con.execute(
+        "INSERT INTO edges VALUES (?, 1, 'R', 'secondary', 100.0, [?, ?], "
+        "[51480000, 51480000], ?, 51480000, ?, 51480000)",
+        [edge_id, lon, lon + 1000, lon, lon + 1000],
+    )
+    for s in services:
+        con.execute(
+            "INSERT INTO edge_services VALUES (?, ?, 'OP1', 1, ?)", [edge_id, s, trips]
+        )
+
+
+def test_weights_agree_with_the_list_form():
+    """The streaming scale and the list form must be the same scale, or a window
+    would be weighted differently depending on which path drew it."""
+    values = [0, 1, 5, 40, 900, 3000, 12000]
+    w = art.Weights.over(values)
+    assert [w.of(v) for v in values] == art._normalise(values)
+
+
+def test_an_empty_window_has_a_usable_scale():
+    w = art.Weights.over([])
+    assert w.of(10) == 0.5
+
+
+def test_window_streams_the_same_edges_the_list_form_returns(con):
+    for i, lon in enumerate([-3200000, -3190000, -3180000]):
+        _art_edge(con, i + 1, lon, trips=100 * (i + 1))
+    bounds = art.Bounds(-3.30, 51.40, -3.10, 51.60)
+
+    streamed = list(art.Window(bounds, con).edges())
+    listed = art.load_edges(bounds, con=con)
+    assert [e.edge_id for e in streamed] == [e.edge_id for e in listed]
+    assert len(streamed) == 3
+
+
+def test_window_can_be_walked_more_than_once(con):
+    """density makes two additive passes, so the stream has to reopen."""
+    _art_edge(con, 1, -3200000, trips=100)
+    w = art.Window(art.Bounds(-3.30, 51.40, -3.10, 51.60), con)
+    assert [e.edge_id for e in w.edges()] == [e.edge_id for e in w.edges()] == [1]
+
+
+def test_by_weight_orders_quietest_first(con):
+    """spectrum draws in this order so busy roads finish on top. It used to sort the
+    whole window in memory; the ordering is now the database's job."""
+    _art_edge(con, 1, -3200000, trips=900)
+    _art_edge(con, 2, -3190000, trips=10)
+    _art_edge(con, 3, -3180000, trips=300)
+    w = art.Window(art.Bounds(-3.30, 51.40, -3.10, 51.60), con)
+    assert [e.edge_id for e in w.edges(by_weight=True)] == [2, 3, 1]
+
+
+def test_strands_arrive_grouped_by_service_widest_first(con):
+    """A ribbon is stroked as one path, so a service's edges must arrive together
+    and never be revisited once the next service starts."""
+    _art_edge(con, 1, -3200000, trips=100, services=("42", "9A"))
+    _art_edge(con, 2, -3190000, trips=100, services=("42",))
+    _art_edge(con, 3, -3180000, trips=100, services=("42",))
+    w = art.Window(art.Bounds(-3.30, 51.40, -3.10, 51.60), con, with_services=True)
+
+    names = [name for name, _weight, _coords in w.strands()]
+    assert names == ["42", "42", "42", "9A"]  # widest service first, then grouped
+    # Once a name is left behind it never comes back, which is what lets the caller
+    # stroke and forget.
+    assert len(set(names)) == len({n for n in names})
+    seen, order = set(), []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            order.append(n)
+    assert order == ["42", "9A"]
+
+
+def test_held_window_matches_the_streaming_one(con):
+    """`render(edges=...)` re-renders a window a caller already has; it must draw
+    the same picture as the streaming path."""
+    _art_edge(con, 1, -3200000, trips=900, services=("42", "9A"))
+    _art_edge(con, 2, -3190000, trips=10, services=("42",))
+    bounds = art.Bounds(-3.30, 51.40, -3.10, 51.60)
+
+    streamed = art.Window(bounds, con, with_services=True)
+    held = art.Held(art.load_edges(bounds, with_services=True, con=con))
+
+    assert held.weights == streamed.weights
+    assert [e.edge_id for e in held.edges(by_weight=True)] == [
+        e.edge_id for e in streamed.edges(by_weight=True)
+    ]
+    assert [(n, round(w, 9)) for n, w, _ in held.strands()] == [
+        (n, round(w, 9)) for n, w, _ in streamed.strands()
+    ]
