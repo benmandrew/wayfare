@@ -265,10 +265,14 @@ def test_dropping_is_reported_not_silent(caplog):
     assert "thinned 2 tiles" in caplog.text
 
 
-def test_no_dropping_says_so(caplog):
+def test_no_dropping_reports_only_the_size_limit(caplog):
+    """It must not claim every zoom holds every road. Sub-pixel geometry is
+    discarded at low zoom regardless -- z5 carries a sixth of the features -- and
+    saying "nothing was dropped" made a generalised map read as a complete one."""
     with caplog.at_level("INFO"):
         publish._report_dropping("tile 6/31/21 written\n")
-    assert "no features dropped" in caplog.text
+    assert "no tile hit the size limit" in caplog.text
+    assert "full network" not in caplog.text
 
 
 def test_tippecanoe_failure_surfaces_stderr(monkeypatch, tmp_path):

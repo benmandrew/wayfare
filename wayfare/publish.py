@@ -389,15 +389,23 @@ _DROPPED = re.compile(r"keeping the sparsest ([\d.]+)% of the features")
 
 
 def _report_dropping(stderr: str) -> None:
-    """Say how hard the tiles were thinned.
+    """Say how hard the tiles were thinned to fit the size limit.
 
     --drop-densest-as-needed silently sheds features to keep a tile under the size
     limit. That is the right behaviour, but a build that kept a quarter of the
     network at low zoom should say so rather than look like full coverage.
+
+    This reports that backstop only. It is *not* a statement that every zoom holds
+    every road, and must not be read as one: a tile is a 4096-unit grid, so at z5 a
+    unit is about 300 m and a 40 m segment simplifies to nothing and is discarded
+    long before any size limit is reached. Measured on Wales and London together,
+    z5 carries 21,720 of 136,393 features for that reason alone. Losing sub-pixel
+    geometry at low zoom is correct; conflating it with "nothing was dropped" is
+    what makes a thinned map look complete.
     """
     kept = [float(m) for m in _DROPPED.findall(stderr)]
     if not kept:
-        log.info("no features dropped; every zoom holds the full network")
+        log.info("no tile hit the size limit; nothing was thinned to fit")
         return
     log.info(
         "thinned %d tiles to fit; sparsest kept %.1f%% of its features "
