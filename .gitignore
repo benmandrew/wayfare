@@ -1,5 +1,8 @@
 # Everything the pipeline downloads or builds. Tens of gigabytes.
+# The glob, not a bare `data/`: each region gets its own data root, and
+# `data-london/` was committed once because only `data/` was listed here.
 data/
+data-*/
 *.pmtiles
 *.duckdb
 *.duckdb.wal
