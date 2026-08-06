@@ -28,6 +28,16 @@ log = logs.get("acquire")
 REQUIRED_GTFS = ("stop_times.txt", "trips.txt", "routes.txt", "stops.txt")
 
 
+class Invalid(Exception):
+    """The transfer completed but the bytes are wrong.
+
+    Kept apart from network faults on purpose. A server that hands back a
+    complete-but-unusable file will hand back the same bytes next time, so
+    retrying costs a full re-download and changes nothing. Retries are for
+    connections that dropped, not for content that is wrong.
+    """
+
+
 @dataclass(frozen=True)
 class Source:
     name: str
@@ -35,6 +45,10 @@ class Source:
     filename: str
     min_bytes: int = 0
     check: Callable[[Path], None] | None = None
+    # Whether the host honours Range requests, so an interrupted transfer can
+    # continue instead of starting over. Measured, not assumed -- of our three
+    # sources only Geofabrik does, and it is also much the largest.
+    resumable: bool = False
 
 
 def check_gtfs(path: Path) -> None:
@@ -67,7 +81,9 @@ def sources(region: str | None = None, with_osm: bool = False) -> list[Source]:
     ]
     if with_osm:
         url = config.osm_url(region)
-        out.append(Source("osm", url, url.rsplit("/", 1)[-1], 50 << 20))
+        # Geofabrik answers Range requests with a 206; BODS and NaPTAN both ignore
+        # the header and resend the whole file. Verified against all three hosts.
+        out.append(Source("osm", url, url.rsplit("/", 1)[-1], 50 << 20, resumable=True))
     return out
 
 
@@ -88,17 +104,35 @@ def download(src: Source, dest_dir: Path | None = None, force: bool = False) -> 
             _stream(src, part)
             size = part.stat().st_size
             if size < src.min_bytes:
-                raise OSError(
+                raise Invalid(
                     f"{src.name}: got {size} bytes, expected at least {src.min_bytes}"
                 )
             if src.check:
-                src.check(part)
+                try:
+                    src.check(part)
+                except OSError as exc:
+                    raise Invalid(f"{src.name}: {exc}") from exc
             part.replace(dest)
             log.info("%s: fetched %s (%.2f GB)", src.name, dest.name, _gb(dest))
             return dest
+
+        except Invalid:
+            # Complete but wrong. Re-fetching gets the same bytes, so stop now
+            # rather than spending four more full transfers to prove it.
+            part.unlink(missing_ok=True)
+            raise
+
         except Exception as exc:  # noqa: BLE001 - retried, then re-raised below
             last_error = exc
-            part.unlink(missing_ok=True)
+            # A partial file is only worth keeping if the host will let us
+            # continue from where it stopped. Otherwise it is dead weight that
+            # would be mistaken for progress.
+            if src.resumable:
+                log.warning(
+                    "%s: keeping %.2f GB already fetched", src.name, _gb(part)
+                )
+            else:
+                part.unlink(missing_ok=True)
             if attempt < config.DOWNLOAD_RETRIES:
                 wait = config.DOWNLOAD_BACKOFF * attempt
                 log.warning(
@@ -117,14 +151,30 @@ def download(src: Source, dest_dir: Path | None = None, force: bool = False) -> 
 
 def _stream(src: Source, part: Path) -> None:
     headers = {"User-Agent": config.USER_AGENT}
+    have = part.stat().st_size if (src.resumable and part.exists()) else 0
+    if have:
+        headers["Range"] = f"bytes={have}-"
+
     with requests.get(src.url, headers=headers, stream=True, timeout=(30, 300)) as r:
         r.raise_for_status()
+        # Asking to resume is not the same as being allowed to. A 206 carries the
+        # remainder and is appended; anything else carries the whole file from byte
+        # zero, so the partial must be discarded or the two get concatenated into
+        # a corrupt file that is the right shape and the wrong size.
+        resumed = have > 0 and r.status_code == 206
+        if have and not resumed:
+            log.info("%s: server ignored the range request; starting over", src.name)
+            have = 0
+
         # BODS sends no Content-Length, so progress is reported in absolute bytes
         # rather than as a percentage.
-        total = int(r.headers.get("Content-Length") or 0)
-        written = 0
-        next_report = 0
-        with part.open("wb") as fh:
+        total = int(r.headers.get("Content-Length") or 0) + have
+        written = have
+        next_report = written
+        if resumed:
+            log.info("%s: resuming from %.2f GB", src.name, have / 1e9)
+
+        with part.open("ab" if resumed else "wb") as fh:
             for chunk in r.iter_content(config.DOWNLOAD_CHUNK):
                 fh.write(chunk)
                 written += len(chunk)
