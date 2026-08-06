@@ -158,8 +158,9 @@ h1 {
     <div class="head">
       <div>
         <h1>Wayfare</h1>
-        <div class="sub">UK bus services by road segment</div>
+        <div class="sub" id="sub">UK bus services by road segment</div>
       </div>
+      <select class="btn" id="region" title="Which region to show" hidden></select>
       <button class="btn" id="theme" title="Toggle light/dark">Dark</button>
       <button class="btn" id="helpBtn" title="What am I looking at?">?</button>
     </div>
@@ -296,8 +297,48 @@ python3 scripts/serve.py</pre>
     </div>`;
 }
 
+/* ---------- regions ---------- */
+
+// The page is a static bundle and cannot list a directory, so the server says
+// which archives it has. One archive and the control stays hidden; several and
+// you get a picker. Switching reloads with ?tiles= and drops the #hash, because
+// a position in Cardiff means nothing in an archive covering London.
+async function offerRegions(current) {
+  let names = [];
+  try {
+    names = await (await fetch("archives.json")).json();
+  } catch {
+    return; // served from somewhere without the index; ?tiles= still works
+  }
+  const label = (n) =>
+    n.replace(/\.pmtiles$/, "").replace(/[-_]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+  const here = decodeURIComponent(current.split("/").pop());
+  if (names.length < 2) return;
+
+  const sel = $("region");
+  sel.innerHTML = names
+    .map((n) => `<option value="${n}"${n === here ? " selected" : ""}>${label(n)}</option>`)
+    .join("");
+  sel.hidden = false;
+  sel.addEventListener("change", () => {
+    location.href = `${location.pathname}?tiles=${encodeURIComponent(sel.value)}`;
+  });
+  if (names.includes(here)) $("sub").textContent = `${label(here)} — bus services by road segment`;
+}
+
 function start(header) {
   $("boot").remove();
+  offerRegions(TILES);
+
+  // Frame the archive rather than the country. A regional build is a small part
+  // of the British Isles, and opening at a UK-wide view puts London on screen as
+  // a smudge a few pixels across. The header carries the bounds, and it has
+  // already been fetched to get here.
+  const covered = [
+    [header.minLon, header.minLat],
+    [header.maxLon, header.maxLat],
+  ];
+  const framed = Number.isFinite(header.minLon) && header.maxLon > header.minLon;
 
   const map = new maplibregl.Map({
     container: "map",
@@ -368,6 +409,11 @@ function start(header) {
       ],
     },
   });
+
+  // A #hash in the URL is someone sharing a place, so it outranks the framing.
+  if (framed && !location.hash) {
+    map.fitBounds(covered, { padding: 24, animate: false });
+  }
 
   map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom-right");
   map.addControl(new maplibregl.ScaleControl({ maxWidth: 90, unit: "metric" }), "bottom-left");

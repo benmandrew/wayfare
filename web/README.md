@@ -10,15 +10,34 @@ From the repository root, after `wayfare publish`:
 python3 scripts/serve.py
 ```
 
-Open http://localhost:8099. There is nothing to copy — the script serves `index.html` from `web/` and picks `bus.pmtiles` straight out of `data/out/`, so a rebuild is visible on refresh.
+Open http://localhost:8099. There is nothing to copy — the script serves `index.html` from `web/` and any `*.pmtiles` file it finds in `data/out/`, so a rebuild is visible on refresh.
 
 Use that script rather than `python3 -m http.server`. PMTiles reads slices of one large archive with HTTP `Range` requests, and Python's built-in server does not implement Range — it answers `200` with the whole file. The viewer then re-fetches all 24 MB for every tile it wants, so the symptom is a map that is unbearably slow rather than one that is obviously broken. `scripts/serve.py` answers `206` properly, including the suffix ranges PMTiles uses to locate its footer.
 
 A plain `file://` open does not work either, because the browser blocks `fetch` against file URLs.
 
+## Hold several regions side by side
+
+Because the server takes any archive rather than a fixed name, one machine can carry several regions at once:
+
+```
+data/out/wales.pmtiles
+data/out/london.pmtiles
+```
+
+`wayfare publish` still writes `bus.pmtiles` every time, so this means renaming or copying the archives into one output directory. Wales was published to `data/out/` and then renamed; London's was copied in from its own data root.
+
+`scripts/serve.py` answers `GET /archives.json` with a JavaScript Object Notation (JSON) list of the archive filenames it can see. The viewer is a static page and cannot list a directory, so without that request the region names would have to be compiled into it.
+
+The header shows a region dropdown when more than one archive exists, and hides it when there is only one. Choosing a region reloads the page with `?tiles=<name>` and drops any `#hash`, because a saved map position in Cardiff means nothing in an archive that covers London.
+
+## Opening view
+
+The viewer frames itself from the bounds in the PMTiles header rather than opening on a fixed UK-wide view. A regional archive covers a small part of the British Isles, and a UK-wide opening view put London on screen as a smudge a few pixels across. A `#hash` in the URL still wins, because that is someone sharing a place.
+
 ## Point at a remote archive
 
-The viewer reads the tiles URL from the `?tiles=` query parameter and defaults to `./bus.pmtiles`.
+The viewer reads the tiles URL from the `?tiles=` query parameter, which defaults to whichever archive is chosen.
 
 ```
 http://localhost:8000/?tiles=https://pub-xxxx.r2.dev/bus.pmtiles

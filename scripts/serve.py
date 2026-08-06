@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import functools
 import http.server
+import json
 import os
 import re
 import socketserver
@@ -26,8 +27,15 @@ from pathlib import Path
 
 RANGE = re.compile(r"bytes=(\d*)-(\d*)")
 
-# Emitted by `wayfare publish` into the output directory, not into web/.
-ARTEFACTS = ("bus.pmtiles", "overflow.json")
+# Emitted by `wayfare publish` into the output directory, not into web/. Any
+# archive there is servable, not a fixed pair of names, so a machine holding
+# several regions can offer all of them -- `wales.pmtiles` beside
+# `london.pmtiles` -- and the viewer picks between them with ?tiles=.
+ARTEFACT_SUFFIXES = (".pmtiles",)
+
+
+def archives(out_dir: Path) -> list[str]:
+    return sorted(p.name for p in out_dir.glob("*.pmtiles")) if out_dir.is_dir() else []
 
 
 class RangeHandler(http.server.SimpleHTTPRequestHandler):
@@ -40,11 +48,31 @@ class RangeHandler(http.server.SimpleHTTPRequestHandler):
         stays a plain static bundle.
         """
         name = path.split("?", 1)[0].split("#", 1)[0].lstrip("/")
-        if name in ARTEFACTS:
+        # A bare name only: no directory part, so a request cannot climb out of the
+        # artefact directory with "../".
+        if name.endswith(ARTEFACT_SUFFIXES) and "/" not in name:
             candidate = self.out_dir / name
             if candidate.exists():
                 return str(candidate)
         return super().translate_path(path)
+
+    def do_GET(self) -> None:
+        """Answer /archives.json so the page can offer whatever regions are built.
+
+        The viewer is a static bundle and cannot list a directory, so without this
+        it would need the region names compiled into it -- and a machine that had
+        just built a new one would not show it.
+        """
+        if self.path.split("?", 1)[0] == "/archives.json":
+            body = json.dumps(archives(self.out_dir)).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        super().do_GET()
 
     def send_head(self):  # type: ignore[no-untyped-def]
         header = self.headers.get("Range")
@@ -139,11 +167,13 @@ def main() -> None:
     args = ap.parse_args()
 
     RangeHandler.out_dir = args.out.resolve()
-    tiles = args.out / "bus.pmtiles"
-    if tiles.exists():
-        print(f"tiles: {tiles} ({tiles.stat().st_size / 1e6:.1f} MB)")
+    found = archives(RangeHandler.out_dir)
+    if found:
+        for name in found:
+            size = (RangeHandler.out_dir / name).stat().st_size / 1e6
+            print(f"tiles: {name} ({size:.1f} MB)")
     else:
-        print(f"no tiles at {tiles} -- run `wayfare publish` first")
+        print(f"no .pmtiles in {args.out} -- run `wayfare publish` first")
 
     handler = functools.partial(RangeHandler, directory=str(args.dir.resolve()))
     socketserver.TCPServer.allow_reuse_address = True
