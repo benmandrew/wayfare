@@ -9,7 +9,7 @@ Scaffold, end to end. 78 tests pass, ruff and mypy clean.
 - `patterns` — GTFS to distinct ordered stop sequences, in DuckDB.
 - `match` — Valhalla, two strategies, interruption-safe.
 - `aggregate` — pattern-to-edges inverted to edge-to-services.
-- `publish` — GeoJSONL, tippecanoe, PMTiles, with an overflow sidecar.
+- `publish` — GeoJSONL, tippecanoe, PMTiles.
 - `art` — three styles (`density`, `spectrum`, `strands`), PNG and SVG.
 - `web/index.html` — MapLibre viewer, hover, service filter, light/dark.
 - Docker Compose: `valhalla`, `wayfare`, `matcher`.
@@ -72,11 +72,6 @@ subsequence of a longer pattern on the same service. Matching the longest and
 deriving the rest could cut Valhalla calls substantially. Worth measuring the
 share of patterns this covers before building it — do this after the throughput
 measurement, since it only matters if matching turns out to be the bottleneck.
-
-**Wire the overflow sidecar into the viewer.** `publish` writes
-`out/overflow.json`, and the viewer currently shows the truncated list with a
-note. Central London edges will exceed the cap. Have the viewer fetch the full
-list on hover for those.
 
 ## Known gaps
 

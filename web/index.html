@@ -209,7 +209,6 @@ const TILES = new URL(
 
 const SRC = "bus";          // source id
 const LAYER_SRC = "bus";    // the single vector layer inside the archive
-const REF_CAP = 12;         // the pipeline truncates `refs` at this many entries
 
 // Sequential ramps over service count. Light goes pale-blue -> deep violet so
 // busy roads darken against the light basemap; dark goes the other way, into
@@ -478,8 +477,12 @@ function start(header) {
       `<b>${n}</b> service${n === 1 ? "" : "s"} · ` +
       `<b>${Number(p.trips || 0).toLocaleString()}</b> trips/week · ` +
       `way <b>${escapeHtml(p.way)}</b>`;
-    $("note").hidden = n <= REF_CAP;
-    $("note").textContent = `Showing the first ${REF_CAP} of ${n} services.`;
+    // The pipeline caps `refs` generously and always carries the true count in
+    // `n`, so the shortfall is read off the data rather than from a constant here
+    // that has to be kept in step with config.MAX_REFS_IN_TILE.
+    const shown = String(p.refs || "").split(",").filter(Boolean).length;
+    $("note").hidden = shown >= n;
+    $("note").textContent = `Showing ${shown} of ${n} services.`;
     redrawChips();
   }
 

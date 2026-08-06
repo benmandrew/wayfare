@@ -99,10 +99,18 @@ CHECKPOINT_EVERY = 200
 
 MIN_ZOOM = 5
 MAX_ZOOM = 14
-# Tile attributes are per-feature per-zoom, so a long service list on a busy city
-# centre edge dominates tile size. Beyond this many, the tile carries a count and
-# the viewer fetches the full list from the sidecar.
-MAX_REFS_IN_TILE = 12
+# A backstop against one pathological city-centre edge, not a routine truncation.
+#
+# The original 12 assumed a long service list would dominate tile size. It does not:
+# MVT pools attribute *values* per layer per tile, so an edge carrying "1,2,42,X57"
+# costs a value-pool entry shared with every other edge carrying the same set, plus
+# two varints on the feature. Measured on Wales, only 1,405 of 169,857 edges held
+# more than 12 services and the longest held 53 -- a few hundred KB across a handful
+# of city tiles, against a sidecar file, a fetch path and a cap to keep in sync.
+#
+# 64 clears Wales entirely. Where it does bite the feature still carries the true
+# count in `n`, so the viewer says so rather than quietly showing a short list.
+MAX_REFS_IN_TILE = 64
 
 
 def ensure_dirs() -> None:

@@ -5,11 +5,11 @@ tile server. For a dataset that is rebuilt occasionally and read constantly that
 the right shape -- it can sit on R2 or S3 behind a CDN and cost nothing to serve.
 
 The one real design decision here is what goes *in* the tiles. Tippecanoe stores
-attributes per feature per zoom, so a full service list on every edge in central
-London would dominate tile size. Instead each edge carries a capped list of service
-numbers plus the true count, and the viewer falls back to a sidecar lookup for the
-handful of edges that overflow. Almost every edge is under the cap, so the sidecar
-is rarely touched and the common case stays a pure tile read.
+attributes per feature per zoom, so the cost that matters is per *feature*, not per
+value: MVT pools attribute values per layer per tile, and a feature pays two varints
+to point into that pool. Long service lists are therefore cheap and feature counts
+are not, which is why the export carries a generous ref cap and coalesces edges
+rather than the other way round.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ def export_geojsonl(con: duckdb.DuckDBPyConnection, path: Path | None = None) ->
     ).fetchall()
 
     n_written = 0
-    overflow: dict[str, list[str]] = {}
+    n_capped = 0
 
     with path.open("w") as fh:
         for edge_id, way_id, name, lon_e6, lat_e6, n, refs, trips in rows:
@@ -59,8 +59,7 @@ def export_geojsonl(con: duckdb.DuckDBPyConnection, path: Path | None = None) ->
             if len(coords) < 2:
                 continue
             capped = refs[: config.MAX_REFS_IN_TILE]
-            if n > config.MAX_REFS_IN_TILE:
-                overflow[str(edge_id)] = refs
+            n_capped += n > config.MAX_REFS_IN_TILE
             props = {
                 "id": int(edge_id),
                 "way": int(way_id),
@@ -83,15 +82,11 @@ def export_geojsonl(con: duckdb.DuckDBPyConnection, path: Path | None = None) ->
             fh.write("\n")
             n_written += 1
 
-    sidecar = config.OUT / "overflow.json"
-    sidecar.parent.mkdir(parents=True, exist_ok=True)
-    sidecar.write_text(json.dumps(overflow, separators=(",", ":")))
-
     log.info(
         "%d features to %s (%d edges exceed the %d-service tile cap)",
         n_written,
         path,
-        len(overflow),
+        n_capped,
         config.MAX_REFS_IN_TILE,
     )
     return path

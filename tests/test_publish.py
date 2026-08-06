@@ -50,7 +50,9 @@ def test_refs_are_ordered_by_service_frequency(con, tmp_path, monkeypatch):
     assert props["refs"].split(",") == ["busiest", "quieter", "quietest"]
 
 
-def test_overflow_goes_to_the_sidecar(con, tmp_path, monkeypatch):
+def test_a_capped_edge_still_reports_its_true_count(con, tmp_path, monkeypatch):
+    """The cap is a backstop, not a routine truncation, and there is no sidecar to
+    fall back on -- so a capped feature must say how many services it really has."""
     monkeypatch.setattr(config, "OUT", tmp_path)
     monkeypatch.setattr(config, "MAX_REFS_IN_TILE", 3)
     _edge(con, 1, [str(i) for i in range(10)])
@@ -61,13 +63,19 @@ def test_overflow_goes_to_the_sidecar(con, tmp_path, monkeypatch):
         json.loads(line)["properties"]["id"]: json.loads(line)["properties"]
         for line in path.read_text().splitlines()
     }
-    # The tile carries a truncated list but the honest count, so the viewer knows.
     assert len(props[1]["refs"].split(",")) == 3
     assert props[1]["n"] == 10
+    assert not (tmp_path / "overflow.json").exists()
 
-    overflow = json.loads((tmp_path / "overflow.json").read_text())
-    assert len(overflow["1"]) == 10
-    assert "2" not in overflow  # edges under the cap stay out of the sidecar
+
+def test_wales_fits_under_the_cap(con, tmp_path, monkeypatch):
+    """53 services was the busiest edge in the Wales run. The default cap clears it,
+    so the common case carries a complete list."""
+    monkeypatch.setattr(config, "OUT", tmp_path)
+    _edge(con, 1, [str(i) for i in range(53)])
+    path = publish.export_geojsonl(con, tmp_path / "edges.geojsonl")
+    props = json.loads(path.read_text().splitlines()[0])["properties"]
+    assert len(props["refs"].split(",")) == 53
 
 
 def test_edges_without_geometry_are_skipped(con, tmp_path, monkeypatch):
