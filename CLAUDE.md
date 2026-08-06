@@ -46,6 +46,29 @@ GB, `shapes.txt` 2.53 GB, 1.55M trips. OSM Great Britain: 2.16 GB. NaPTAN CSV:
 `west_midlands`, `east_anglia`, `london`, `south_east`, `south_west`. Use
 `wales` (41 MB) for development.
 
+**Geofabrik files Greater London under `england/`**, not at the top level like the
+nations. The `london` slug therefore fell back silently to the 2.16 GB Great
+Britain extract until `config.OSM_EXTRACTS` got an entry.
+
+**In Mapbox Vector Tiles (MVT) the cost that matters is per feature, not per
+attribute value.** MVT pools attribute values per layer per tile, so a feature
+pays two varints to point into the pool. Long service lists are cheap; feature
+counts are not. A Valhalla directed edge averages 4.14 coordinates and tens of
+metres, so one feature per edge was the root cost — and at four points a feature
+`--simplification=4` had nothing to remove, so low zooms carried full-detail
+geometry and tippecanoe fell back on `--drop-densest-as-needed`, shedding whole
+roads.
+
+**DuckDB cannot spill an ordered list aggregate.** `list(x ORDER BY y)` pins its
+per-group sort state in memory. Collapsing trips to stop sequences died on the
+London feed (480,412 trips, 1.5 GB `stop_times.txt`) at "failed to pin block",
+identically at a 7.4 GB limit and at a 10.2 GB limit on a 17 GB machine. Raising
+the limit is not a fix, it only moves the wall. The fix is to project the needed
+columns into a table in one streaming scan (which does spill), then aggregate in
+16 partitions keyed on `hash(trip_id)`. London then collapsed 17,611,239 stop
+times in 6 seconds inside an 8 GB limit. `stop_times.txt` is 5.09 GB nationally,
+so this would have hit there too.
+
 **OSM `route=bus` relations are not viable as a source.** 12,968 nationally, only
 818 `route_master` relations, and Greater London alone is 13% of the total. BODS
 is the authority for what services exist; OSM is only the geometry substrate.
@@ -84,6 +107,17 @@ because the central operation is a group-by over a 5 GB CSV, done out of core. T
 minimal-dependency discipline that governs `ontime` does not apply here — this is
 an offline batch pipeline, not a 62 MB container.
 
+**Geometry is stored as integer micro-degrees, not WKT.** `edges` carries
+`lon_e6`/`lat_e6` INTEGER lists plus four bbox columns; 1e-6 of a degree is 11 cm.
+This deleted the first-vertex regex, the pad-by-longest-edge collar and the Python
+re-test that the art window query needed — the window test is now an exact integer
+overlap. `shapes` is one row per shape rather than one row per point: 1.7M rows
+for Wales, on the order of 100M nationally. It is input to `match` and nothing
+else, so `wayfare prune` drops it once matching completes. Wales: 160 MB -> 114 MB
+compacted. Migration runs on connect and rewrites in place, because a national
+match run costs a day or two and a schema change it cannot survive is one nobody
+applies.
+
 ## Constraints
 
 **The match stage must survive interruption.** It runs for days on a server that
@@ -114,9 +148,23 @@ loses every service with a leading zero. Hence `all_varchar=true` on every
 **DuckDB takes a single writer.** Match workers do HTTP only; the main thread
 writes.
 
-**Tile attributes are per-feature per-zoom.** A full service list on every central
-London edge would dominate tile size. Edges carry a capped `refs` list plus the
-true count `n`; the overflow goes to a sidecar the viewer fetches on demand.
+**Tile features are coalesced, and coalescing must stay lossless.** Runs of edges
+that share every tile attribute (`way_id`, road name, service set, trip count) and
+meet end to end merge into one feature. Chaining stops where three of a group's
+edges meet: at a fork, picking a continuation draws a line that doubles back.
+Directed pairs collapse only where the service sets agree, so a one-way pair
+carrying different buses each way still renders as two lines, while an ordinary
+two-way street no longer renders one line invisibly under another. Wales: 169,857
+directed edges -> 102,925 after collapsing pairs -> 59,358 after chaining. This is
+a publish-stage concern only; `art` reads raw directed edges and is unaffected.
+
+**The `refs` cap is 64 and there is no overflow sidecar.** Only 1,405 of Wales's
+169,857 edges held more than 12 services and the longest held 53, so 64 clears
+Wales outright. Raise the cap again rather than reintroducing a sidecar — pooling
+makes the list cheap. Card-only attributes are confined to z11+. Bucketing `trips`
+to a log scale was tried and rejected: it saves a further 2.1%, because MVT
+already pools the 1,759 distinct values, and costs an approximate figure in the
+info card.
 
 ## Standards
 
@@ -142,11 +190,18 @@ from `wales-latest.osm.pbf`.
 | | ok 3,400 (94.9%) · skipped 148 · error 23 · low_confidence 13 |
 | | **95.6% of timetabled trips** represented |
 | aggregate | 169,857 edges, 413,915 edge-service pairs, 478 distinct services |
-| publish | 44 MB GeoJSONL -> **24 MB PMTiles**; 1,405 edges over the 12-service cap |
+| publish | 169,857 edges -> 59,358 features -> **11.1 MB PMTiles**, no features dropped |
 | art | 0.5s per 2400px render |
 
 3.6/s is the honest throughput. An earlier 15.3/s was measured while the
 confidence bug was rejecting most patterns instantly, and meant nothing.
+
+**Archive size, same data throughout.** 23.8 MB baseline -> 20.9 MB with the edge
+id moved into the MVT feature id field (`--use-attribute-for-id`, 12%) -> 13.7 MB
+with coalescing (34%) -> 11.1 MB with card-only attributes confined to z11+ (19%).
+53% in total. Tippecanoe now reports no features dropped and every zoom holds the
+full network; the first build was thinning the densest tiles to 27% of their
+features, so Wales renders complete at every zoom for the first time.
 
 **Extrapolating to GB is not a straight multiply.** Wales is 2.4% of national
 trips, which suggests roughly 12 hours -- but Wales is 85% `shape` and the nation
@@ -156,5 +211,6 @@ this number.
 
 ## Current state
 
-Wales complete end to end. 78 tests pass, ruff and mypy clean. GB not yet
-attempted. See PLAN.md.
+Wales complete end to end. Greater London matching in progress in its own data
+root against its own Valhalla instance. 97 tests pass, ruff and mypy clean. GB not
+yet attempted. See PLAN.md.

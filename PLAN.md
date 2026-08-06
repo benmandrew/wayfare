@@ -2,7 +2,7 @@
 
 ## Done
 
-Scaffold, end to end. 78 tests pass, ruff and mypy clean.
+Scaffold, end to end. 97 tests pass, ruff and mypy clean.
 
 - `acquire` — `.part` staging, archive validation rather than a size floor, and
   Range resumption for the one host that supports it.
@@ -21,15 +21,50 @@ throughput 3.6/s. Four defects found that the mini fixture could not reach: the
 GTFS size floor, the missing `confidence_score`, the redundant OSM download, and
 retrying files that were complete but invalid.
 
+## Done — data representation
+
+Ran 2026-08-06. Numbers in CLAUDE.md.
+
+- **Tile coalescing.** Runs of edges with identical tile attributes that meet end
+  to end merge into one feature: 169,857 directed edges -> 102,925 after
+  collapsing directed pairs -> 59,358 after chaining along the way. Lossless.
+- **Archive 23.8 MB -> 11.1 MB (53%)**, and tippecanoe now drops no features at
+  any zoom. The first build was thinning the densest tiles to 27%.
+- **`refs` cap 12 -> 64, overflow sidecar deleted.** Wales's longest list is 53.
+- **Geometry as micro-degree integer lists** plus bbox columns, replacing WKT.
+  `shapes` is one row per shape and `wayfare prune` drops it after matching.
+  Wales database 160 MB -> 114 MB compacted, migrated in place on connect.
+- **`patterns` partitioned on `hash(trip_id)`** to get round DuckDB's inability to
+  spill an ordered list aggregate.
+
+## In progress — Greater London
+
+Running in a separate data root (`data-london`) against its own Valhalla instance
+on port 8003, built from
+`europe/united-kingdom/england/greater-london-latest.osm.pbf`. A second instance
+rather than a rebuild, because rebuilding the shared graph invalidates every
+`edge_id` in the Wales database.
+
+- 304 MB zip, 1.5 GB unpacked, `stop_times.txt` 1.50 GB, 17,611,239 stop times.
+- 480,412 trips -> **4,709 patterns**, a 102x collapse against Wales's 10.3x.
+  London runs the same route all day at high frequency.
+- Only **0.9% carry operator geometry** (44 shapes), against Wales's 85.2% and the
+  national 48.3%. London is almost entirely the `stops` path, at two Valhalla
+  calls per pattern.
+- Matching at **1.0/s** against Wales's 3.6/s, ETA about 1h15m. This is the honest
+  cost of `stops` at London road density, and a far better basis than Wales for
+  extrapolating to GB.
+
 ## Next — GB
 
-1. **Re-measure on the first national batch.** Wales extrapolates to roughly 12
-   hours, but Wales is 85% `shape` and the nation is 48%, and `stops` costs two
-   Valhalla calls to `shape`'s one. Treat the Wales rate as a lower bound.
-2. **Watch memory on `patterns`.** The group-by over Wales's 0.12 GB
-   `stop_times.txt` was trivial; nationally it is 5.09 GB. `WAYFARE_MEM` defaults
-   to 8 GB and DuckDB will spill to `temp_directory` — make sure that path has
-   room.
+1. **Extrapolate from London, not Wales.** Wales's 3.6/s is a `shape`-path rate on
+   sparse roads; London's 1.0/s is a `stops`-path rate on dense ones, and the
+   nation at 48% `shape` sits between them. Re-measure on the first national batch
+   regardless.
+2. **Watch memory on `patterns`.** The partitioned aggregate handled London's 1.50
+   GB `stop_times.txt` in 6 seconds inside an 8 GB limit; nationally the file is
+   5.09 GB. `WAYFARE_MEM` defaults to 8 GB and DuckDB spills to `temp_directory` —
+   make sure that path has room.
 3. **Pin the OSM extract.** Set `force_rebuild: "False"` and leave the graph alone
    for the whole run; every `edge_id` in the database depends on it.
 4. **Budget the disk.** ~40 GB including the graph.
@@ -53,12 +88,18 @@ the same edge set. This is the single best available check on the primary code
 path, and it costs almost nothing because the data is already there. Report it as
 a coverage/agreement figure alongside `status`.
 
+**Eyeball the coalescing on the rendered map.** The merge is lossless by
+construction and the counts check out, but nobody has yet confirmed that the
+merged segments read well on hover — a feature now spans a run of edges, so the
+highlighted stretch and the info card cover more road than before. Look in
+particular at forks, where chaining stops, and at long uniform ways.
+
 **Direction.** Valhalla edges are directed, and `edge_id` distinguishes the two
-directions of a one-way pair. Two things are currently unverified: whether
-opposite directions of the same service render as two parallel lines (they
-should, on dual carriageways and one-way systems, but should not on ordinary
-two-way streets), and whether that reads well on the map. Decide after seeing
-Wales rendered.
+directions of a one-way pair. Coincident pairs now collapse where the service sets
+agree, which handles ordinary two-way streets, and a one-way pair carrying
+different buses each way still renders as two lines. What remains unverified is
+whether dual carriageways and one-way systems read well as two parallel lines on
+the map. Decide after seeing Wales rendered.
 
 **Tune the rejection bounds against real output.** Wales rejected 13 patterns as
 low confidence and skipped 148 on stop gap. `MIN_MATCH_CONFIDENCE` in particular
@@ -91,6 +132,11 @@ bank holidays is weighted as if it ran a normal week.
 re-run currently redoes everything. Fine for now, since the dataset is a snapshot,
 but worth revisiting if this becomes a standing service rather than a one-off
 build.
+
+**`art` still consumes raw directed edges.** Coalescing is a publish-stage
+transform, so the renders are unaffected by it — no benefit, no regression. If a
+future change moves coalescing upstream into `aggregate`, art becomes a second
+consumer of that decision and would need its own check.
 
 **`agency_id` is carried but unused.** Colouring or filtering by operator is
 plausible for both the map and the art, and the data is already there.
