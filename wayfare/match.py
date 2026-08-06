@@ -168,17 +168,13 @@ def _fetch_shapes(
     con: duckdb.DuckDBPyConnection, shape_ids: list[str]
 ) -> dict[str, list[tuple[float, float]]]:
     rows = con.execute(
-        """
-        SELECT shape_id, lat, lon FROM shapes
-        WHERE shape_id IN (SELECT unnest(?))
-        ORDER BY shape_id, seq
-        """,
+        "SELECT shape_id, lat_e6, lon_e6 FROM shapes WHERE shape_id IN (SELECT unnest(?))",
         [shape_ids],
     ).fetchall()
-    out: dict[str, list[tuple[float, float]]] = {}
-    for shape_id, lat, lon in rows:
-        out.setdefault(shape_id, []).append((lat, lon))
-    return out
+    return {
+        shape_id: [(la / 1e6, lo / 1e6) for la, lo in zip(lat_e6, lon_e6, strict=True)]
+        for shape_id, lat_e6, lon_e6 in rows
+    }
 
 
 def _fetch_max_gap(con: duckdb.DuckDBPyConnection, ids: list[int]) -> dict[int, float]:

@@ -54,6 +54,17 @@ def test_orphaned_shapes_are_not_loaded(gtfs_dir: Path, con):
     assert {r[0] for r in rows} == {"SH1"}
 
 
+def test_a_shape_is_one_row_holding_its_points_in_order(gtfs_dir: Path, con):
+    gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB")
+    assert con.execute("SELECT count(*) FROM shapes").fetchone()[0] == 1
+    lat_e6, lon_e6 = con.execute(
+        "SELECT lat_e6, lon_e6 FROM shapes WHERE shape_id = 'SH1'"
+    ).fetchone()
+    # shape_pt_sequence orders the list, not the order the rows happen to arrive in.
+    assert lon_e6 == [-2245000, -2240000, -2235000, -2230000]
+    assert lat_e6 == [53480000] * 4
+
+
 def test_ids_stay_strings(gtfs_dir: Path, con):
     """A route named "07" must not become 7, or the join to patterns silently
     loses every service whose number has a leading zero."""

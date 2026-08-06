@@ -187,10 +187,15 @@ def _fill_span(con: duckdb.DuckDBPyConnection) -> None:
 
 
 def _load_shapes(gtfs_dir: Path, con: duckdb.DuckDBPyConnection) -> None:
-    """Keep only the shapes some pattern actually refers to.
+    """Keep only the shapes some pattern actually refers to, one row per shape.
 
     shapes.txt is 2.5 GB nationally, but it is written per shape_id and many are
     orphaned once trips collapse into patterns.
+
+    The aggregation happens here rather than on read because nothing downstream
+    wants a single point of a shape -- the matcher takes the whole trace. Collapsing
+    at load turns roughly 100M national rows into roughly 750k, and the group-by
+    costs one pass that the CSV read is already paying for.
     """
     path = gtfs_dir / "shapes.txt"
     if not path.exists():
@@ -200,15 +205,19 @@ def _load_shapes(gtfs_dir: Path, con: duckdb.DuckDBPyConnection) -> None:
     con.execute("DELETE FROM shapes")
     con.execute(f"""
         INSERT INTO shapes
-        SELECT s.shape_id,
-               TRY_CAST(s.shape_pt_sequence AS INTEGER),
-               TRY_CAST(s.shape_pt_lat AS DOUBLE),
-               TRY_CAST(s.shape_pt_lon AS DOUBLE)
-        FROM {_csv(gtfs_dir, "shapes.txt")} s
-        WHERE s.shape_id IN (SELECT DISTINCT shape_id FROM patterns
-                             WHERE shape_id IS NOT NULL)
+        SELECT shape_id,
+               list(lat_e6 ORDER BY seq),
+               list(lon_e6 ORDER BY seq)
+        FROM (
+            SELECT s.shape_id,
+                   TRY_CAST(s.shape_pt_sequence AS INTEGER)               AS seq,
+                   round(TRY_CAST(s.shape_pt_lat AS DOUBLE) * 1e6)::INTEGER AS lat_e6,
+                   round(TRY_CAST(s.shape_pt_lon AS DOUBLE) * 1e6)::INTEGER AS lon_e6
+            FROM {_csv(gtfs_dir, "shapes.txt")} s
+            WHERE s.shape_id IN (SELECT DISTINCT shape_id FROM patterns
+                                 WHERE shape_id IS NOT NULL)
+        )
+        WHERE lat_e6 IS NOT NULL AND lon_e6 IS NOT NULL
+        GROUP BY shape_id
     """)
-    log.info(
-        "%d referenced shapes",
-        db.scalar(con, "SELECT count(DISTINCT shape_id) FROM shapes"),
-    )
+    log.info("%d referenced shapes", db.scalar(con, "SELECT count(*) FROM shapes"))

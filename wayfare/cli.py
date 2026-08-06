@@ -53,6 +53,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("aggregate", help="invert to edge -> services")
     sub.add_parser("publish", help="export GeoJSON and build PMTiles")
     sub.add_parser("status", help="show progress and coverage")
+    sub.add_parser(
+        "prune", help="drop operator geometry once matching is complete (reclaims space)"
+    )
 
     p = sub.add_parser("art", help="render an area")
     p.add_argument(
@@ -151,6 +154,19 @@ def _dispatch(args: argparse.Namespace) -> int:
         out = publish.build(con)
         con.close()
         log.info("done: %s", out)
+        return 0
+
+    if args.cmd == "prune":
+        _require_db()
+        con = db.connect()
+        try:
+            n = db.prune_shapes(con)
+        except RuntimeError as exc:
+            log.error("%s", exc)
+            return 1
+        finally:
+            con.close()
+        log.info("dropped %d shapes", n)
         return 0
 
     if args.cmd == "status":
