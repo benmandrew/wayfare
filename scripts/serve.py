@@ -7,7 +7,11 @@ Range at all -- it replies 200 with the whole file, which makes the viewer fetch
 all 24 MB for every tile it wants. That looks like "slow" rather than "broken",
 which is the annoying way to discover it.
 
-    python3 scripts/serve.py [--port 8099] [--dir web]
+The pipeline writes its artefacts to ``data/out`` and the page lives in ``web``.
+Rather than making you copy a 24 MB archive between the two every rebuild, the
+files the pipeline emits are served from where it put them.
+
+    python3 scripts/serve.py [--port 8099] [--dir web] [--out data/out]
 """
 
 from __future__ import annotations
@@ -22,8 +26,26 @@ from pathlib import Path
 
 RANGE = re.compile(r"bytes=(\d*)-(\d*)")
 
+# Emitted by `wayfare publish` into the output directory, not into web/.
+ARTEFACTS = ("bus.pmtiles", "overflow.json")
+
 
 class RangeHandler(http.server.SimpleHTTPRequestHandler):
+    out_dir: Path = Path("data/out")
+
+    def translate_path(self, path: str) -> str:
+        """Resolve the pipeline's own outputs out of the artefact directory.
+
+        Anything else is served from the page directory as usual, so the viewer
+        stays a plain static bundle.
+        """
+        name = path.split("?", 1)[0].split("#", 1)[0].lstrip("/")
+        if name in ARTEFACTS:
+            candidate = self.out_dir / name
+            if candidate.exists():
+                return str(candidate)
+        return super().translate_path(path)
+
     def send_head(self):  # type: ignore[no-untyped-def]
         header = self.headers.get("Range")
         if not header:
@@ -113,9 +135,17 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--port", type=int, default=8099)
     ap.add_argument("--dir", type=Path, default=Path("web"))
+    ap.add_argument("--out", type=Path, default=Path("data/out"))
     args = ap.parse_args()
 
-    handler = functools.partial(RangeHandler, directory=str(args.dir))
+    RangeHandler.out_dir = args.out.resolve()
+    tiles = args.out / "bus.pmtiles"
+    if tiles.exists():
+        print(f"tiles: {tiles} ({tiles.stat().st_size / 1e6:.1f} MB)")
+    else:
+        print(f"no tiles at {tiles} -- run `wayfare publish` first")
+
+    handler = functools.partial(RangeHandler, directory=str(args.dir.resolve()))
     socketserver.TCPServer.allow_reuse_address = True
     with socketserver.ThreadingTCPServer(("", args.port), handler) as httpd:
         print(f"serving {args.dir} at http://localhost:{args.port}/  (ctrl-c to stop)")

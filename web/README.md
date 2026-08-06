@@ -4,13 +4,13 @@
 
 ## Serve locally
 
-Copy the `bus.pmtiles` archive that `wayfare` emits into `web/`, next to `index.html`, then run:
+From the repository root, after `wayfare publish`:
 
 ```
-python3 scripts/serve.py --port 8099
+python3 scripts/serve.py
 ```
 
-Open http://localhost:8099.
+Open http://localhost:8099. There is nothing to copy — the script serves `index.html` from `web/` and picks `bus.pmtiles` and `overflow.json` straight out of `data/out/`, so a rebuild is visible on refresh.
 
 Use that script rather than `python3 -m http.server`. PMTiles reads slices of one large archive with HTTP `Range` requests, and Python's built-in server does not implement Range — it answers `200` with the whole file. The viewer then re-fetches all 24 MB for every tile it wants, so the symptom is a map that is unbearably slow rather than one that is obviously broken. `scripts/serve.py` answers `206` properly, including the suffix ranges PMTiles uses to locate its footer.
 

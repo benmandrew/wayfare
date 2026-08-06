@@ -285,9 +285,12 @@ function failed(err) {
   $("boot").innerHTML = `
     <div class="panel">
       <h2>No tiles found</h2>
-      <p>Could not read <code>${escapeHtml(TILES)}</code>. Run the wayfare pipeline to
-         build the archive, put it next to this page, then serve the directory:</p>
-      <pre>cd web &amp;&amp; python3 -m http.server 8000</pre>
+      <p>Could not read <code>${escapeHtml(TILES)}</code>. Build the archive and
+         serve it:</p>
+      <pre>wayfare publish
+python3 scripts/serve.py</pre>
+      <p>Use that script, not <code>python3 -m http.server</code> — the built-in
+         server does not answer HTTP range requests, which PMTiles needs.</p>
       <p>Already have tiles elsewhere? Point at them with
          <code>?tiles=https://…/bus.pmtiles</code> — the host must allow CORS and
          HTTP range requests.</p>
