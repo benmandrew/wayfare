@@ -61,6 +61,9 @@ def export_geojsonl(con: duckdb.DuckDBPyConnection, path: Path | None = None) ->
             capped = refs[: config.MAX_REFS_IN_TILE]
             n_capped += n > config.MAX_REFS_IN_TILE
             props = {
+                # Consumed by --use-attribute-for-id and then excluded, so it costs
+                # nothing in the tile: it lands in the MVT feature id field, which
+                # is what setFeatureState addresses.
                 "id": int(edge_id),
                 "way": int(way_id),
                 "n": int(n),
@@ -112,6 +115,14 @@ def build_tiles(geojsonl: Path, out: Path | None = None) -> Path:
         "-l", LAYER,
         "-Z", str(config.MIN_ZOOM),
         "-z", str(config.MAX_ZOOM),
+        # The edge id belongs in the MVT feature id field, not in the attributes.
+        # It is two varints and a pool entry per feature cheaper there, and it is
+        # where setFeatureState looks -- so the viewer needs no promoteId either.
+        "--use-attribute-for-id=id",
+        "-x", "id",
+        # The national GeoJSONL is around 1.6 GB. Reading it single-threaded is
+        # minutes of wall clock for nothing.
+        "-P",
         # Keep every road at high zoom; shed the quietest ones when a low-zoom tile
         # would otherwise be too large. Without this, dense cities lose whole areas
         # rather than losing their least-served streets.

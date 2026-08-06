@@ -35,6 +35,11 @@ OSM_EXTRACTS = {
     "england": "united-kingdom/england-latest.osm.pbf",
     "scotland": "united-kingdom/scotland-latest.osm.pbf",
     "wales": "united-kingdom/wales-latest.osm.pbf",
+    # Geofabrik files Greater London under england/, not at the top level like the
+    # nations. Without this the london region silently falls back to the 2.16 GB
+    # Great Britain extract, which builds a graph for hours to answer questions
+    # about one city.
+    "london": "united-kingdom/england/greater-london-latest.osm.pbf",
     # There is no standalone Northern Ireland extract.
     "northern_ireland": "ireland-and-northern-ireland-latest.osm.pbf",
 }

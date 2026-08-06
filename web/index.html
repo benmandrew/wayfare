@@ -263,7 +263,7 @@ const tokenFilter = (tokens) => [
     ["upcase", ["concat", ",", ["to-string", ["get", "refs"]], ","]],
   ]),
 ];
-const NEVER = ["==", ["get", "id"], -1];
+const NEVER = ["==", ["id"], -1];
 
 /* ---------- boot ---------- */
 
@@ -327,9 +327,8 @@ function start(header) {
         [SRC]: {
           type: "vector",
           url: "pmtiles://" + TILES,
-          // Feature ids in MVT are not preserved by default; promoting the `id`
-          // property makes setFeatureState addressable by edge id.
-          promoteId: "id",
+          // No promoteId: tippecanoe writes the edge id into the MVT feature id
+          // field itself, which is what setFeatureState addresses.
           maxzoom: header.maxZoom,
         },
       },
