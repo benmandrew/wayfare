@@ -36,13 +36,32 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("patterns", help="reduce the timetable to distinct route patterns")
     p.add_argument("--memory", default=None, help="DuckDB memory limit, e.g. 8GB")
+    p.add_argument(
+        "--upgrade-shapes",
+        action="store_true",
+        help="re-match patterns that were matched from bare stops and have since "
+        "gained operator geometry",
+    )
 
     p = sub.add_parser(
         "match", help="map-match patterns onto the road graph (the long one)"
     )
     p.add_argument("--workers", type=int, default=None)
     p.add_argument("--limit", type=int, default=None, help="stop after N patterns")
+    p.add_argument(
+        "--max-seconds",
+        type=float,
+        default=None,
+        help="stop after this long, at the next batch boundary; what a scheduled "
+        "run uses to take a slice of the queue rather than all of it",
+    )
     p.add_argument("--valhalla", default=None, help="Valhalla base URL")
+    p.add_argument(
+        "--force-graph",
+        action="store_true",
+        help="match on even though Valhalla reports a different graph build than "
+        "the stored edge ids belong to",
+    )
     p.add_argument(
         "--retry",
         default=None,
@@ -124,8 +143,12 @@ def _dispatch(args: argparse.Namespace) -> int:
         if not (gtfs_dir / "stop_times.txt").exists():
             log.error("no unpacked feed at %s -- run `wayfare acquire` first", gtfs_dir)
             return 1
-        gtfs.build_patterns(gtfs_dir, con, memory_limit=args.memory)
-        db.set_meta(con, "feed_version", acquire.feed_version(gtfs_dir))
+        gtfs.build_patterns(
+            gtfs_dir,
+            con,
+            memory_limit=args.memory,
+            upgrade_shapes=args.upgrade_shapes,
+        )
         con.close()
         return 0
 
@@ -136,7 +159,14 @@ def _dispatch(args: argparse.Namespace) -> int:
         client = valhalla.Client(args.valhalla)
         if args.retry:
             match.retry(con, [s.strip() for s in args.retry.split(",") if s.strip()])
-        match.run(con, client_=client, workers=args.workers, limit=args.limit)
+        match.run(
+            con,
+            client_=client,
+            workers=args.workers,
+            limit=args.limit,
+            max_seconds=args.max_seconds,
+            force_graph=args.force_graph,
+        )
         for row in match.summary(con):
             log.info("  %-16s %-6s n=%-7d edges=%-6s detour=%s", *row)
         con.close()

@@ -29,7 +29,11 @@ def build(con: duckdb.DuckDBPyConnection) -> None:
     # short_name is what the public calls the bus. It is occasionally blank in the
     # feed, in which case route_id is the only handle we have; a subquery gives the
     # fallback a name that GROUP BY can refer to without repeating the expression.
-    con.execute("""
+    # The join to patterns is what drops departed services. pattern_edges keeps the
+    # matched geometry of a pattern that has left the timetable -- it is a cache, and
+    # a seasonal service that returns should not be paid for twice -- but a road
+    # nobody runs on any more must not still be drawn as if buses used it.
+    con.execute(f"""
         INSERT INTO edge_services
         SELECT edge_id, short_name, agency_id,
                count(DISTINCT pattern_id) AS n_patterns,
@@ -39,6 +43,7 @@ def build(con: duckdb.DuckDBPyConnection) -> None:
                    COALESCE(NULLIF(trim(p.short_name), ''), p.route_id) AS short_name
             FROM (SELECT DISTINCT pattern_id, edge_id FROM pattern_edges) pe
             JOIN patterns p USING (pattern_id)
+            WHERE {db.current_feed()}
         )
         GROUP BY edge_id, short_name, agency_id
     """)
@@ -56,29 +61,47 @@ def coverage(con: duckdb.DuckDBPyConnection) -> dict[str, object]:
     Reported as a funnel rather than a single number: a run that matched 95% of
     patterns but dropped the busiest ones is worse than the percentage suggests.
     """
+    live = db.current_feed()
     matched, total = db.row(
         con,
-        """
+        f"""
         SELECT
-          (SELECT count(*) FROM match_status WHERE status = 'ok'),
-          (SELECT count(*) FROM patterns)
+          (SELECT count(*) FROM patterns p JOIN match_status m USING (pattern_id)
+             WHERE m.status = 'ok' AND {live}),
+          (SELECT count(*) FROM patterns p WHERE {live})
         """,
     )
 
     trips_ok, trips_all = db.row(
         con,
-        """
+        f"""
         SELECT
-          (SELECT COALESCE(sum(n_trips), 0) FROM patterns p
-             JOIN match_status m USING (pattern_id) WHERE m.status = 'ok'),
-          (SELECT COALESCE(sum(n_trips), 0) FROM patterns)
+          (SELECT COALESCE(sum(p.n_trips), 0) FROM patterns p
+             JOIN match_status m USING (pattern_id)
+             WHERE m.status = 'ok' AND {live}),
+          (SELECT COALESCE(sum(p.n_trips), 0) FROM patterns p WHERE {live})
         """,
     )
 
     return {
+        "feed_version": db.get_meta(con, "feed_version"),
+        "graph_id": db.get_meta(con, "graph_id"),
         "patterns_total": total,
         "patterns_matched": matched,
         "patterns_pct": round(100.0 * matched / max(total, 1), 1),
+        # What a scheduled run needs to know: how much of this feed is still owed
+        # to the matcher, and therefore whether the tiles are complete yet.
+        "patterns_pending": db.scalar(
+            con,
+            f"""
+            SELECT count(*) FROM patterns p WHERE {live}
+              AND NOT EXISTS (SELECT 1 FROM match_status m
+                              WHERE m.pattern_id = p.pattern_id)
+            """,
+        ),
+        "patterns_departed": db.scalar(
+            con, f"SELECT count(*) FROM patterns p WHERE NOT ({live})"
+        ),
         # The number that actually matters: share of timetabled service represented.
         "trips_pct": round(100.0 * trips_ok / max(trips_all, 1), 1),
         "edges": db.scalar(con, "SELECT count(*) FROM edges"),
@@ -86,7 +109,11 @@ def coverage(con: duckdb.DuckDBPyConnection) -> dict[str, object]:
         "by_status": {
             row[0]: row[1]
             for row in con.execute(
-                "SELECT status, count(*) FROM match_status GROUP BY status"
+                f"""
+                SELECT m.status, count(*) FROM match_status m
+                JOIN patterns p USING (pattern_id) WHERE {live}
+                GROUP BY m.status
+                """
             ).fetchall()
         },
     }

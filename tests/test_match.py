@@ -4,39 +4,9 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from conftest import FakeClient
 
 from wayfare import aggregate, config, gtfs, match, valhalla
-
-
-class FakeClient:
-    """Stands in for Valhalla. Returns two edges for anything it is asked to match,
-    which is enough to exercise checkpointing, resumption and aggregation."""
-
-    def __init__(self, road_m: float = 1000.0, fail: Exception | None = None):
-        self.road_m = road_m
-        self.fail = fail
-        self.calls: list[str] = []
-
-    def healthy(self) -> bool:
-        return True
-
-    def _match(self, source: str) -> valhalla.Match:
-        self.calls.append(source)
-        if self.fail:
-            raise self.fail
-        edges = [
-            valhalla.Edge(1001, 44556677, self.road_m / 2, "Oxford Road", "secondary",
-                          [(53.48, -2.245), (53.48, -2.240)]),
-            valhalla.Edge(1002, 44556678, self.road_m / 2, "Oxford Road", "secondary",
-                          [(53.48, -2.240), (53.48, -2.235)]),
-        ]
-        return valhalla.Match(edges, confidence=0.9, road_m=self.road_m, source=source)
-
-    def match_shape(self, shape):
-        return self._match("shape")
-
-    def match_stops(self, stops):
-        return self._match("stops")
 
 
 @pytest.fixture

@@ -74,9 +74,10 @@ def pending_count(con: duckdb.DuckDBPyConnection) -> int:
     return int(
         db.scalar(
             con,
-            """
+            f"""
             SELECT count(*) FROM patterns p
-            WHERE NOT EXISTS (
+            WHERE {db.current_feed()}
+              AND NOT EXISTS (
                 SELECT 1 FROM match_status m WHERE m.pattern_id = p.pattern_id
             )
             """,
@@ -115,14 +116,21 @@ def load_batch(con: duckdb.DuckDBPyConnection, limit: int) -> list[Pattern]:
 
     Ordering by trip count means that if the run is cut short, what got matched is
     the part of the network that carries the most service -- the output degrades
-    gracefully instead of having a random hole in it.
+    gracefully instead of having a random hole in it. That is also what makes the
+    queue safe to drain a slice at a time: a nightly run under a time budget spends
+    it on the busiest roads first.
+
+    Patterns that have left the timetable are excluded. Their match results stay
+    cached against their identity, so if the service returns they cost nothing, but
+    matching one now would be work spent on a journey nobody runs.
     """
     rows = con.execute(
-        """
+        f"""
         SELECT p.pattern_id, p.short_name, p.span_m, p.shape_id
         FROM patterns p
-        WHERE NOT EXISTS (SELECT 1 FROM match_status m WHERE m.pattern_id = p.pattern_id)
-        ORDER BY p.n_trips DESC
+        WHERE {db.current_feed()}
+          AND NOT EXISTS (SELECT 1 FROM match_status m WHERE m.pattern_id = p.pattern_id)
+        ORDER BY p.n_trips DESC, p.pattern_id
         LIMIT ?
         """,
         [limit],
@@ -260,13 +268,63 @@ def match_one(client: valhalla.Client, p: Pattern) -> Outcome:
 # -- the run ----------------------------------------------------------------
 
 
+def pin_graph(
+    con: duckdb.DuckDBPyConnection, client: valhalla.Client, force: bool = False
+) -> None:
+    """Tie the database to one Valhalla graph build, and keep it there.
+
+    Every edge_id already stored belongs to the build that produced it. Matching
+    new patterns against a different build mixes two id spaces in one table, and
+    the damage is invisible: the geometry renders, it is just attached to the wrong
+    roads. Geofabrik rebuilds daily, so this is not a hypothetical.
+
+    The first run records the build. Later runs refuse to add to it against
+    anything else -- which is the point, because the alternative is discovering it
+    after a match run of several days.
+    """
+    seen = client.graph_id()
+    if seen is None:
+        log.warning(
+            "Valhalla did not report a tileset timestamp; cannot verify that this "
+            "is the graph build the stored edge ids belong to"
+        )
+        return
+    pinned = db.get_meta(con, "graph_id")
+    if pinned is None:
+        db.set_meta(con, "graph_id", seen)
+        log.info("pinned to Valhalla graph %s", seen)
+        return
+    if pinned == seen or force:
+        if pinned != seen:
+            log.warning("graph changed %s -> %s; continuing under --force", pinned, seen)
+            db.set_meta(con, "graph_id", seen)
+        return
+    raise RuntimeError(
+        f"this database's edge ids belong to Valhalla graph {pinned}, but "
+        f"{client.base} is now serving {seen}. Valhalla edge ids are only "
+        "meaningful within one build, so matching further patterns would mix two "
+        "id spaces. Either point at the original graph, or re-match from scratch "
+        "(delete match_status, pattern_edges and edges), or override with --force "
+        "if you are certain the graph is unchanged."
+    )
+
+
 def run(
     con: duckdb.DuckDBPyConnection,
     client_: valhalla.Client | None = None,
     workers: int | None = None,
     limit: int | None = None,
+    max_seconds: float | None = None,
+    force_graph: bool = False,
 ) -> dict[str, int]:
-    """Match every pending pattern. Safe to interrupt and re-run."""
+    """Match every pending pattern. Safe to interrupt and re-run.
+
+    ``limit`` and ``max_seconds`` both bound one invocation without changing what
+    it leaves behind, because work is selected by the absence of a status row: a
+    run that stops early is indistinguishable from one that was killed. That is
+    what lets a national queue be drained by a nightly job with a half-hour budget
+    instead of one run that has to survive for days.
+    """
     client = client_ or valhalla.Client()
     workers = workers or config.VALHALLA_WORKERS
 
@@ -276,6 +334,7 @@ def run(
             "Start it with `docker compose up -d valhalla` and wait for the graph "
             "to finish building (the first build takes 30-90 minutes)."
         )
+    pin_graph(con, client, force=force_graph)
 
     total = pending_count(con)
     if limit:
@@ -312,6 +371,18 @@ def run(
             tally[o.status] = tally.get(o.status, 0) + 1
         done += len(outcomes)
         _progress(done, total, started, tally)
+
+        # Checked between batches, never inside one. A batch is the unit of
+        # checkpointing, so stopping mid-batch would throw away work already paid
+        # for -- the budget is a floor on how long the run takes, not a ceiling.
+        if max_seconds is not None and time.monotonic() - started >= max_seconds:
+            log.info(
+                "time budget of %.0fs reached after %d patterns; %d still pending",
+                max_seconds,
+                done,
+                pending_count(con),
+            )
+            break
 
     return tally
 

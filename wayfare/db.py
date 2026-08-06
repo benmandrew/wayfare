@@ -34,6 +34,17 @@ CREATE TABLE IF NOT EXISTS routes (
 
 -- A pattern is one distinct ordered stop sequence. 1.55M trips collapse to a far
 -- smaller number of these, and the pattern is the unit we pay Valhalla for.
+--
+-- pattern_id is a hash of the identity itself -- route, direction and stop
+-- sequence -- so the same physical journey keeps the same id across feed
+-- versions. That is what makes an incremental rebuild possible: match_status is
+-- keyed on it, so a pattern already matched last month is not paid for again.
+-- It used to be a popularity rank, which changed under every feed.
+--
+-- first_seen/last_seen are feed versions. A pattern that leaves the timetable
+-- keeps its row and its match results -- seasonal services come back, and when
+-- they do they are free -- but only patterns whose last_seen is the loaded feed
+-- are matched, aggregated or rendered.
 CREATE TABLE IF NOT EXISTS patterns (
     pattern_id  BIGINT PRIMARY KEY,
     route_id    VARCHAR,
@@ -43,7 +54,9 @@ CREATE TABLE IF NOT EXISTS patterns (
     shape_id    VARCHAR,   -- NULL for ~52% of trips; see CLAUDE.md
     n_stops     INTEGER,
     n_trips     INTEGER,   -- how many timetabled trips use this pattern
-    span_m      DOUBLE     -- straight-line length of the stop chain
+    span_m      DOUBLE,    -- straight-line length of the stop chain
+    first_seen  VARCHAR,   -- feed version this pattern first appeared in
+    last_seen   VARCHAR    -- feed version it was last present in
 );
 
 CREATE TABLE IF NOT EXISTS pattern_stops (
@@ -138,6 +151,39 @@ INDICES = [
 ]
 
 
+def pattern_id_sql(route_id: str, direction: str, stop_key: str) -> str:
+    """SQL for a pattern's identity hash, from expressions for its three parts.
+
+    The identity of a pattern is exactly what defines it: the route it belongs to,
+    the direction it runs in, and the ordered stops it calls at. Nothing that
+    varies between feeds -- trip counts, shape ids, operator -- may enter it, or
+    the id moves and the match cache misses.
+
+    ``stop_key`` is the stop sequence already joined into one string. The two call
+    sites reach it differently (a list column when patterns are built, a group-by
+    over pattern_stops when an old database is migrated), so it is a parameter.
+
+    hash() is a 64-bit UBIGINT; shifting right by one keeps it inside a signed
+    BIGINT without a cast that could overflow. The lost bit doubles the collision
+    rate, which at a few million patterns is still around one in a million -- and
+    build_patterns asserts uniqueness rather than trusting the arithmetic.
+    """
+    return (
+        f"(hash({route_id} || '|' || COALESCE(({direction})::VARCHAR, '') "
+        f"|| '|' || {stop_key}) >> 1)::BIGINT"
+    )
+
+
+def current_feed(alias: str = "p") -> str:
+    """Predicate restricting `patterns` to the feed version currently loaded.
+
+    Departed patterns keep their rows so that their match results stay cached, so
+    every consumer of `patterns` has to say which ones it means. Written against
+    meta rather than a parameter so the answer cannot drift between stages.
+    """
+    return f"{alias}.last_seen = (SELECT value FROM meta WHERE key = 'feed_version')"
+
+
 def connect(path: Path | None = None, read_only: bool = False) -> duckdb.DuckDBPyConnection:
     p = path or config.DB_PATH
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -224,6 +270,110 @@ def migrate(con: duckdb.DuckDBPyConnection) -> None:
             scalar(con, "SELECT count(*) FROM edges"),
         )
 
+    if "last_seen" not in columns(con, "patterns"):
+        _migrate_pattern_ids(con)
+
+
+def _migrate_pattern_ids(con: duckdb.DuckDBPyConnection) -> None:
+    """Renumber patterns from popularity rank to identity hash, in place.
+
+    pattern_id used to be ``row_number() OVER (ORDER BY count(*) DESC)`` -- a rank
+    recomputed from scratch on every run, so the same journey got a different id
+    whenever some other route gained a trip. Every match result is keyed on it, so
+    a second run against an existing database would have silently re-pointed
+    matched edges at the wrong patterns.
+
+    The new id is derivable from what is already stored, so this is a rewrite
+    rather than a re-run: the stop sequence that produced a pattern is still in
+    pattern_stops, and hashing it recovers the id the pattern would get today. A
+    national match run costs a day or two; it must survive this.
+    """
+    log = logs.get("db")
+    if not scalar(con, "SELECT count(*) FROM patterns"):
+        con.execute("ALTER TABLE patterns ADD COLUMN first_seen VARCHAR")
+        con.execute("ALTER TABLE patterns ADD COLUMN last_seen VARCHAR")
+        return
+
+    feed = get_meta(con, "feed_version") or "unknown"
+    new_id = pattern_id_sql("p.route_id", "p.direction", "k.stop_key")
+    con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE pattern_remap AS
+        SELECT p.pattern_id AS old_id, {new_id} AS new_id
+        FROM patterns p
+        JOIN (
+            SELECT pattern_id, array_to_string(list(stop_id ORDER BY seq), '>') AS stop_key
+            FROM pattern_stops GROUP BY pattern_id
+        ) k ON k.pattern_id = p.pattern_id
+    """)
+
+    n_patterns = scalar(con, "SELECT count(*) FROM patterns")
+    n_mapped, n_distinct = row(
+        con, "SELECT count(*), count(DISTINCT new_id) FROM pattern_remap"
+    )
+    # Both of these mean the rewrite would lose match work, and losing it silently
+    # is far worse than refusing to open the database.
+    if n_mapped != n_patterns:
+        raise RuntimeError(
+            f"cannot migrate pattern ids: {n_patterns - n_mapped} of {n_patterns} "
+            "patterns have no rows in pattern_stops, so their identity cannot be "
+            "recovered. Rebuild with `wayfare patterns`."
+        )
+    if n_distinct != n_mapped:
+        raise RuntimeError(
+            f"cannot migrate pattern ids: {n_mapped - n_distinct} hash collisions "
+            f"across {n_mapped} patterns. Report this -- the identity hash needs "
+            "widening."
+        )
+
+    con.execute("""
+        CREATE TABLE patterns_new (
+            pattern_id BIGINT PRIMARY KEY, route_id VARCHAR, agency_id VARCHAR,
+            short_name VARCHAR, direction INTEGER, shape_id VARCHAR,
+            n_stops INTEGER, n_trips INTEGER, span_m DOUBLE,
+            first_seen VARCHAR, last_seen VARCHAR
+        )
+    """)
+    con.execute(
+        """
+        INSERT INTO patterns_new
+        SELECT r.new_id, p.* EXCLUDE (pattern_id), ?::VARCHAR, ?::VARCHAR
+        FROM patterns p JOIN pattern_remap r ON r.old_id = p.pattern_id
+        """,
+        [feed, feed],
+    )
+    con.execute("DROP TABLE patterns")
+    con.execute("ALTER TABLE patterns_new RENAME TO patterns")
+
+    con.execute("""
+        CREATE TABLE match_status_new (
+            pattern_id BIGINT PRIMARY KEY, status VARCHAR, source VARCHAR,
+            confidence DOUBLE, road_m DOUBLE, detour DOUBLE, n_edges INTEGER,
+            detail VARCHAR, matched_at TIMESTAMP
+        );
+        INSERT INTO match_status_new
+        SELECT r.new_id, m.* EXCLUDE (pattern_id)
+        FROM match_status m JOIN pattern_remap r ON r.old_id = m.pattern_id;
+        DROP TABLE match_status;
+        ALTER TABLE match_status_new RENAME TO match_status;
+    """)
+
+    for table in ("pattern_stops", "pattern_edges"):
+        con.execute(f"""
+            CREATE OR REPLACE TABLE {table}_new AS
+            SELECT r.new_id AS pattern_id, t.* EXCLUDE (pattern_id)
+            FROM {table} t JOIN pattern_remap r ON r.old_id = t.pattern_id;
+            DROP TABLE {table};
+            ALTER TABLE {table}_new RENAME TO {table};
+        """)
+
+    con.execute("DROP TABLE pattern_remap")
+    index(con)
+    log.info(
+        "migrated %d patterns from rank ids to identity hashes, feed %s",
+        n_patterns,
+        feed,
+    )
+
 
 def prune_shapes(con: duckdb.DuckDBPyConnection) -> int:
     """Drop the operator geometry once every pattern has been matched.
@@ -234,9 +384,10 @@ def prune_shapes(con: duckdb.DuckDBPyConnection) -> int:
     """
     pending = scalar(
         con,
-        """
+        f"""
         SELECT count(*) FROM patterns p
-        WHERE NOT EXISTS (SELECT 1 FROM match_status m WHERE m.pattern_id = p.pattern_id)
+        WHERE {current_feed()}
+          AND NOT EXISTS (SELECT 1 FROM match_status m WHERE m.pattern_id = p.pattern_id)
         """,
     )
     if pending:

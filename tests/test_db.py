@@ -33,8 +33,16 @@ def test_a_row_per_point_shapes_table_migrates_in_place(tmp_path: Path):
     con.close()
 
 
+def _one_live_pattern(con) -> None:
+    db.set_meta(con, "feed_version", "F1")
+    con.execute(
+        "INSERT INTO patterns "
+        "VALUES (1, 'R1', 'OP1', '42', 0, 'SH1', 4, 10, 1.0, 'F1', 'F1')"
+    )
+
+
 def test_prune_refuses_while_patterns_are_still_pending(con):
-    con.execute("INSERT INTO patterns VALUES (1, 'R1', 'OP1', '42', 0, 'SH1', 4, 10, 1.0)")
+    _one_live_pattern(con)
     con.execute("INSERT INTO shapes VALUES ('SH1', [53480000], [-2245000])")
 
     with pytest.raises(RuntimeError, match="still unmatched"):
@@ -43,7 +51,7 @@ def test_prune_refuses_while_patterns_are_still_pending(con):
 
 
 def test_prune_drops_shapes_once_every_pattern_is_resolved(con):
-    con.execute("INSERT INTO patterns VALUES (1, 'R1', 'OP1', '42', 0, 'SH1', 4, 10, 1.0)")
+    _one_live_pattern(con)
     con.execute("INSERT INTO shapes VALUES ('SH1', [53480000], [-2245000])")
     con.execute(
         "INSERT INTO match_status "

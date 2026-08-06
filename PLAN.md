@@ -2,7 +2,7 @@
 
 ## Done
 
-Scaffold, end to end. 109 tests pass, ruff and mypy clean.
+Scaffold, end to end. 123 tests pass, ruff and mypy clean.
 
 - `acquire` — `.part` staging, archive validation rather than a size floor, and
   Range resumption for the one host that supports it.
@@ -46,6 +46,26 @@ Ran 2026-08-06. Numbers in CLAUDE.md.
   density 479 -> 259 MB, strands 617 -> 312 MB. `publish.export_geojsonl` streams
   by `way_id`: 617 -> 372 MB on Wales.
 - **All three art styles are byte-identical run to run**, which none of them were.
+
+## Done — incremental rebuild
+
+Ran 2026-08-07. Detail in CLAUDE.md. A monthly refresh now costs only the patterns
+that are new.
+
+- **`pattern_id` is an identity hash**, not a popularity rank recomputed every
+  run. A second run against an existing database would have re-pointed matched
+  edges at the wrong patterns; every region so far used a fresh data root, so
+  nobody hit it.
+- **`match_status` is a permanent cache.** `patterns` carries
+  `first_seen`/`last_seen` and merges rather than deletes, and every consumer
+  filters on the current feed version.
+- **`--max-seconds`** spreads matching over nightly runs, checked between batches
+  and paired with `ORDER BY n_trips DESC` so the busiest roads go first.
+- **`match.pin_graph`** refuses to add to a database matched against a different
+  Valhalla tileset; `--force-graph` overrides.
+- **Old databases migrate in place** from the stored `pattern_stops`, aborting on
+  a collision rather than merging two patterns.
+- `tests/test_incremental.py` is new; 109 -> 123 tests.
 
 ## In progress — Greater London
 
@@ -138,10 +158,16 @@ week. They shift individual days rather than the shape of the week, and the numb
 is only ever a rendering weight — but it does mean a service that runs only on
 bank holidays is weighted as if it ran a normal week.
 
-**No incremental update path.** BODS refreshes and Geofabrik rebuilds daily; a
-re-run currently redoes everything. Fine for now, since the dataset is a snapshot,
-but worth revisiting if this becomes a standing service rather than a one-off
-build.
+**Feed churn is unmeasured.** The incremental path is built and `patterns` logs
+new / carried over / departed on every run, but nobody has yet put two consecutive
+BODS feeds through it. That number decides whether a monthly refresh takes minutes
+or hours, and it is one refresh away from being known.
+
+**A graph rebuild is still a full re-match.** Geofabrik rebuilds daily and every
+`edge_id` depends on the build, so a new graph invalidates the whole edge table.
+`match.pin_graph` refuses rather than silently mixing two GraphId spaces, but
+nothing reuses matches across builds. `way_id` survives a rebuild, so re-anchoring
+on it is the obvious thing to try.
 
 **`art` still consumes raw directed edges.** Coalescing is a publish-stage
 transform, so the renders are unaffected by it — no benefit, no regression. If a

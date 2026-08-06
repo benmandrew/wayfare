@@ -5,7 +5,48 @@ from pathlib import Path
 
 import pytest
 
-from wayfare import db
+from wayfare import db, valhalla
+
+
+class FakeClient:
+    """Stands in for Valhalla. Returns two edges for anything it is asked to match,
+    which is enough to exercise checkpointing, resumption and aggregation."""
+
+    def __init__(
+        self,
+        road_m: float = 1000.0,
+        fail: Exception | None = None,
+        graph: str | None = "valhalla-test/1",
+    ):
+        self.base = "http://fake-valhalla/"
+        self.road_m = road_m
+        self.fail = fail
+        self.graph = graph
+        self.calls: list[str] = []
+
+    def healthy(self) -> bool:
+        return True
+
+    def graph_id(self) -> str | None:
+        return self.graph
+
+    def _match(self, source: str) -> valhalla.Match:
+        self.calls.append(source)
+        if self.fail:
+            raise self.fail
+        edges = [
+            valhalla.Edge(1001, 44556677, self.road_m / 2, "Oxford Road", "secondary",
+                          [(53.48, -2.245), (53.48, -2.240)]),
+            valhalla.Edge(1002, 44556678, self.road_m / 2, "Oxford Road", "secondary",
+                          [(53.48, -2.240), (53.48, -2.235)]),
+        ]
+        return valhalla.Match(edges, confidence=0.9, road_m=self.road_m, source=source)
+
+    def match_shape(self, shape):
+        return self._match("shape")
+
+    def match_stops(self, stops):
+        return self._match("stops")
 
 # A four-stop line running east along a single street, with two trips sharing one
 # pattern and a third trip that turns short. Enough to exercise the collapse from

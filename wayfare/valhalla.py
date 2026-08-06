@@ -116,6 +116,31 @@ class Client:
         except requests.RequestException:
             return False
 
+    def graph_id(self) -> str | None:
+        """A label for the graph build these edge ids belong to.
+
+        ``edge.id`` is a Valhalla GraphId: stable within one build, meaningless
+        across builds. Every pattern_edges row in the database is keyed on it, so
+        pointing a resumed run at a rebuilt graph produces geometry that looks fine
+        and is wrong. This is the value the run is pinned to.
+
+        ``tileset_last_modified`` is what actually changes on a rebuild; version
+        alone would not catch a rebuild of the same Valhalla release. Returns None
+        if the endpoint reports neither, because a guard that cannot tell builds
+        apart should not pretend to.
+        """
+        try:
+            r = self.session.get(urljoin(self.base, "status"), timeout=10)
+            if not r.ok:
+                return None
+            data = r.json()
+        except (requests.RequestException, ValueError):
+            return None
+        stamp = data.get("tileset_last_modified")
+        if stamp is None:
+            return None
+        return f"{data.get('version', '?')}/{stamp}"
+
     # -- primitives ---------------------------------------------------------
 
     def route_shape(self, points: list[tuple[float, float]]) -> list[tuple[float, float]]:

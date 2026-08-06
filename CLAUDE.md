@@ -132,6 +132,63 @@ boundaries without adding an in-flight exclusion.
 by road will never succeed. A matcher that retries it on every restart never
 finishes. Every outcome gets a row, including `no_route`, `error` and `skipped`.
 
+**`pattern_id` is an identity hash, not a popularity rank.** It used to be
+`row_number() OVER (ORDER BY count(*) DESC)` in `gtfs.py`, recomputed every run, so
+a journey got a different id whenever some other route gained a trip. `patterns`
+also did `DELETE FROM patterns` while leaving `match_status` and `pattern_edges`
+alone, so a second run against an existing database would have silently re-pointed
+matched edges at the wrong patterns. Nobody had hit it because each region so far
+used a fresh data root. It is now `hash(route_id || direction || ordered stop ids)
+>> 1` cast to BIGINT — the shift keeps it inside a signed BIGINT — built by
+`db.pattern_id_sql`. Nothing that varies between feeds may enter the identity:
+not trip counts, not shape ids, not operator, or the cache misses.
+`gtfs._check_unique_ids` refuses to build on a collision rather than merging two
+patterns.
+
+**`match_status` is a permanent cache keyed on pattern identity**, not a per-run
+table. `patterns` gained `first_seen`/`last_seen` feed-version columns and merges
+rather than deletes. A pattern that leaves the timetable keeps its row and its
+match results; a seasonal service that returns is already matched and costs
+nothing. Every consumer of `patterns` filters on `db.current_feed()` — match work
+selection, aggregate, coverage, prune and shape loading — so departed patterns are
+never matched, aggregated or rendered.
+
+**A graph rebuild is still a full re-match, and is now guarded rather than
+silent.** `match.pin_graph` records Valhalla's `tileset_last_modified` in
+`meta.graph_id` on the first run and refuses to add to the database against a
+different build; `--force-graph` overrides. Mixing two GraphId spaces in one table
+renders fine and is wrong. If Valhalla reports no tileset timestamp the guard
+warns and stands down rather than pretending to work.
+
+**Spreading the work is `--max-seconds`.** Checked between batches, never inside
+one, because a batch is the unit of checkpointing — so the budget is a floor on
+run length, not a ceiling. It composes with the existing absence-of-a-status-row
+work selection with no other bookkeeping: a run stopped by the budget is
+indistinguishable from one that was killed. Combined with `ORDER BY n_trips DESC`,
+a nightly job with a half-hour budget spends it on the busiest roads first, so a
+partially drained queue degrades gracefully. `publish` can be spread by rebuilding
+one region's PMTiles per night, which the multi-region viewer already supports.
+
+**Old databases migrate in place; they are not re-matched.**
+`db._migrate_pattern_ids` recovers each pattern's identity from the
+`pattern_stops` rows already stored and renumbers `patterns`, `pattern_stops`,
+`match_status` and `pattern_edges` together. It aborts loudly on a collision or on
+a pattern whose stops are missing. Same rule as the geometry migration above: a
+national match run costs a day or two, so every migration must be a rewrite rather
+than a re-run.
+
+**An operator switching on `TrackPoint`s is an opt-in re-match.** A pattern
+matched from bare stops that later gains a `shape_id` is worth redoing — it turns
+a guess into an observation — but it adds work to a queue meant to be predictable.
+The count is always logged; `wayfare patterns --upgrade-shapes` is what acts on
+it.
+
+**The unmeasured number that decides everything is feed churn** — how many
+patterns are new month to month. `patterns` now logs new / carried over still
+unmatched / departed every run, and `wayfare status` reports `patterns_pending`
+and `patterns_departed`. It has not yet been measured against two real consecutive
+BODS feeds.
+
 **Bad geometry is worse than missing geometry.** A wrong match produces a
 confident-looking line down a road no bus uses. `low_confidence` rows are kept (so
 they are never retried) but their edges are dropped.
@@ -259,5 +316,5 @@ this number.
 ## Current state
 
 Wales complete end to end. Greater London matching in progress in its own data
-root against its own Valhalla instance. 109 tests pass, ruff and mypy clean. GB
+root against its own Valhalla instance. 123 tests pass, ruff and mypy clean. GB
 not yet attempted. See PLAN.md.
