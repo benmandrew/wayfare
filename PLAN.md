@@ -2,7 +2,7 @@
 
 ## Done
 
-Scaffold, end to end. 97 tests pass, ruff and mypy clean.
+Scaffold, end to end. 109 tests pass, ruff and mypy clean.
 
 - `acquire` — `.part` staging, archive validation rather than a size floor, and
   Range resumption for the one host that supports it.
@@ -36,6 +36,16 @@ Ran 2026-08-06. Numbers in CLAUDE.md.
   Wales database 160 MB -> 114 MB compacted, migrated in place on connect.
 - **`patterns` partitioned on `hash(trip_id)`** to get round DuckDB's inability to
   spill an ordered list aggregate.
+
+## Done — streaming and determinism
+
+Ran 2026-08-06. Numbers in CLAUDE.md.
+
+- **`art` streams its window** rather than materialising it, and the weight scale
+  comes from a trip-count pass at 8 bytes an edge. Peak RSS on the `uk` window:
+  density 479 -> 259 MB, strands 617 -> 312 MB. `publish.export_geojsonl` streams
+  by `way_id`: 617 -> 372 MB on Wales.
+- **All three art styles are byte-identical run to run**, which none of them were.
 
 ## In progress — Greater London
 

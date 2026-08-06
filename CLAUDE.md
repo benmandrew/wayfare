@@ -158,6 +158,28 @@ two-way street no longer renders one line invisibly under another. Wales: 169,85
 directed edges -> 102,925 after collapsing pairs -> 53,013 after chaining. This is
 a publish-stage concern only; `art` reads raw directed edges and is unaffected.
 
+**Nothing holds a whole window or a whole table.** `art` streams its window:
+`Window` pulls geometry in chunks, and the percentile weight scale comes from a
+separate pass over trip counts alone — 8 bytes an edge, held as two bounds rather
+than a list of normalised values. Holding every edge cost 439 MB for the `uk`
+preset on Wales alone, and the country is about 25x Wales. Each style needed a
+different accommodation: `density` walks the window twice (ADD is commutative, so
+order is free); `spectrum` moved its quietest-first ordering into SQL, which is
+sound because weight is monotonic in trip count; `strands` strokes a service's
+edges as one cairo path, so the window hands back (service, edge) pairs already
+grouped and one ribbon is live at a time. `render(edges=...)` still works via
+`Held`, which presents a list through the same interface. Peak *resident set size*
+(RSS) on the `uk` window: density 479 -> 259 MB, strands 617 -> 312 MB.
+`publish.export_geojsonl` streams by `way_id` for the same reason: 617 -> 372 MB
+on Wales. The Python side no longer grows with the window; what still grows is
+DuckDB's own aggregate, which spills to disk rather than failing.
+
+**Two `strands` behaviours are deliberate.** A service is weighted by the total
+traffic on every road it uses, not by its own trips, so a minor route along a busy
+corridor keeps a wide ribbon. A service registered by two operators covers each
+edge once, hence the DISTINCT on the service/edge pair. Neither is a bug to fix in
+passing; changing either changes the picture, so decide that first.
+
 **The `refs` cap is 64 and there is no overflow sidecar.** Only 1,405 of Wales's
 169,857 edges held more than 12 services and the longest held 53, so 64 clears
 Wales outright. Raise the cap again rather than reintroducing a sidecar — pooling
@@ -211,6 +233,13 @@ key; and `_chain` starting a closed loop wherever the scan happened to begin. A
 rebuild now produces byte-identical output, which is what makes tiles cacheable
 and two runs comparable.
 
+All three art styles are byte-identical run to run as well, which none of them
+were. Ties previously fell in whatever order the scan returned, and two runs of
+the old `spectrum` differed by 426 bytes. Verified by rendering Cardiff before and
+after the streaming rewrite: `density` byte-identical, `strands` differing by 7
+bytes out of 5.8M at delta 1, `spectrum` differing more because its ties now
+resolve differently.
+
 **DuckDB inserts about 2,700 rows/s through executemany, and 1.6M/s from a file.**
 It is columnar; every bound-parameter insert pays the full per-statement
 machinery. This is not a small constant -- roughly 450 of the Wales match run's
@@ -230,5 +259,5 @@ this number.
 ## Current state
 
 Wales complete end to end. Greater London matching in progress in its own data
-root against its own Valhalla instance. 97 tests pass, ruff and mypy clean. GB not
-yet attempted. See PLAN.md.
+root against its own Valhalla instance. 109 tests pass, ruff and mypy clean. GB
+not yet attempted. See PLAN.md.
