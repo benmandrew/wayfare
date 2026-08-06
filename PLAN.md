@@ -2,10 +2,10 @@
 
 ## Done
 
-Scaffold, end to end. 39 tests pass, ruff and mypy clean.
+Scaffold, end to end. 78 tests pass, ruff and mypy clean.
 
-- `acquire` — resumable downloads with `.part` staging and a size floor, because
-  BODS sends no `Content-Length`.
+- `acquire` — `.part` staging, archive validation rather than a size floor, and
+  Range resumption for the one host that supports it.
 - `patterns` — GTFS to distinct ordered stop sequences, in DuckDB.
 - `match` — Valhalla, two strategies, interruption-safe.
 - `aggregate` — pattern-to-edges inverted to edge-to-services.
@@ -44,8 +44,6 @@ than a hypothetical.
 
 **Check `break_through` at termini and on one-way pairs.** Still untested; the
 choice over plain `through` is reasoned but unverified against real geometry.
-
-## Next — correctness
 
 **Validate the `stops` strategy against the `shape` strategy.** Wales is 85%
 `shape`, which makes it an unusually good validation set: those patterns are

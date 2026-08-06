@@ -7,11 +7,14 @@
 Copy the `bus.pmtiles` archive that `wayfare` emits into `web/`, next to `index.html`, then run:
 
 ```
-cd web
-python3 -m http.server 8000
+python3 scripts/serve.py --port 8099
 ```
 
-Open http://localhost:8000. PMTiles reads slices of one large archive with HTTP `Range` requests, which `http.server` has honoured since Python 3.7. A plain `file://` open does not work, because the browser blocks `fetch` against file URLs.
+Open http://localhost:8099.
+
+Use that script rather than `python3 -m http.server`. PMTiles reads slices of one large archive with HTTP `Range` requests, and Python's built-in server does not implement Range — it answers `200` with the whole file. The viewer then re-fetches all 24 MB for every tile it wants, so the symptom is a map that is unbearably slow rather than one that is obviously broken. `scripts/serve.py` answers `206` properly, including the suffix ranges PMTiles uses to locate its footer.
+
+A plain `file://` open does not work either, because the browser blocks `fetch` against file URLs.
 
 ## Point at a remote archive
 
