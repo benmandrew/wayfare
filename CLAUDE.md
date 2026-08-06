@@ -127,7 +127,34 @@ true count `n`; the overflow goes to a sidecar the viewer fetches on demand.
 - Comment the non-obvious and leave the obvious alone.
 - Use `wayfare.db.row` / `db.scalar` rather than `.fetchone()[0]`.
 
+## Measured — Wales, end to end, 2026-08-06
+
+The first real run. Feed version `20260806_022608`, Valhalla 3.8.3, graph built
+from `wales-latest.osm.pbf`.
+
+| Stage | Result |
+|---|---|
+| acquire | 41 MB zip, 0.26 GB unpacked |
+| patterns | 37,028 trips -> **3,584 patterns** (10.3x), 2s |
+| | 85.2% carry operator geometry (Wales runs far above the 48.3% national figure) |
+| Valhalla graph | ~6 min for Wales |
+| match | 3,552 patterns in **16m23s at 3.6/s**, 6 workers |
+| | ok 3,400 (94.9%) · skipped 148 · error 23 · low_confidence 13 |
+| | **95.6% of timetabled trips** represented |
+| aggregate | 169,857 edges, 413,915 edge-service pairs, 478 distinct services |
+| publish | 44 MB GeoJSONL -> **24 MB PMTiles**; 1,405 edges over the 12-service cap |
+| art | 0.5s per 2400px render |
+
+3.6/s is the honest throughput. An earlier 15.3/s was measured while the
+confidence bug was rejecting most patterns instantly, and meant nothing.
+
+**Extrapolating to GB is not a straight multiply.** Wales is 2.4% of national
+trips, which suggests roughly 12 hours -- but Wales is 85% `shape` and the nation
+is 48%, and the `stops` path costs two Valhalla calls instead of one. Budget
+appreciably more, and re-measure on the first national batch rather than trusting
+this number.
+
 ## Current state
 
-Scaffold complete and green: 39 tests pass, ruff and mypy clean. Nothing has been
-downloaded and no real data has been through the pipeline yet. See PLAN.md.
+Wales complete end to end. 78 tests pass, ruff and mypy clean. GB not yet
+attempted. See PLAN.md.

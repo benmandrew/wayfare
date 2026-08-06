@@ -14,26 +14,42 @@ Scaffold, end to end. 39 tests pass, ruff and mypy clean.
 - `web/index.html` — MapLibre viewer, hover, service filter, light/dark.
 - Docker Compose: `valhalla`, `wayfare`, `matcher`.
 
-## Next — first real run
+## Done — Wales, end to end
 
-Nothing has been downloaded yet. The order that de-risks fastest:
+Ran 2026-08-06. Numbers in CLAUDE.md. 95.6% of timetabled trips represented;
+throughput 3.6/s. Four defects found that the mini fixture could not reach: the
+GTFS size floor, the missing `confidence_score`, the redundant OSM download, and
+retrying files that were complete but invalid.
 
-1. **Run Wales end to end first.** 41 MB against 1.28 GB, so the whole pipeline
-   completes in an evening and every assumption gets tested cheaply. Build the
-   Valhalla graph from the `wales-latest.osm.pbf` extract (146 MB) rather than GB
-   for this pass.
-2. **Measure Valhalla throughput.** This is the one number in the whole design
-   that is a guess. The GB run is planned around "a day or two" with no evidence.
-   Time 500 patterns of each strategy and extrapolate before committing.
-3. **Check `break_through` behaviour at termini and on one-way pairs.** The choice
-   over plain `through` is reasoned but untested against real stop coordinates.
-4. **Then GB.** Pin the OSM extract, set `force_rebuild: "False"`, and leave the
-   graph alone for the whole run — every `edge_id` in the database depends on it.
+## Next — GB
+
+1. **Re-measure on the first national batch.** Wales extrapolates to roughly 12
+   hours, but Wales is 85% `shape` and the nation is 48%, and `stops` costs two
+   Valhalla calls to `shape`'s one. Treat the Wales rate as a lower bound.
+2. **Watch memory on `patterns`.** The group-by over Wales's 0.12 GB
+   `stop_times.txt` was trivial; nationally it is 5.09 GB. `WAYFARE_MEM` defaults
+   to 8 GB and DuckDB will spill to `temp_directory` — make sure that path has
+   room.
+3. **Pin the OSM extract.** Set `force_rebuild: "False"` and leave the graph alone
+   for the whole run; every `edge_id` in the database depends on it.
+4. **Budget the disk.** ~40 GB including the graph.
 
 ## Next — correctness
 
-**Validate the `stops` strategy against the `shape` strategy.** The 48% of
-patterns with operator geometry are ground truth for the other 52%. Match a
+**Look at the 148 skipped and 23 errored patterns.** Wales skipped 4.2% on the
+`MAX_STOP_GAP_M` bound. Some are certainly TrawsCymru long-distance coaches, which
+genuinely have huge stop gaps and should probably be matched rather than dropped.
+Others may be bad stop coordinates. This is now a concrete list to inspect rather
+than a hypothetical.
+
+**Check `break_through` at termini and on one-way pairs.** Still untested; the
+choice over plain `through` is reasoned but unverified against real geometry.
+
+## Next — correctness
+
+**Validate the `stops` strategy against the `shape` strategy.** Wales is 85%
+`shape`, which makes it an unusually good validation set: those patterns are
+ground truth for the synthesised ones. Match a
 sample of them *both* ways and measure how often the synthesised route recovers
 the same edge set. This is the single best available check on the primary code
 path, and it costs almost nothing because the data is already there. Report it as
@@ -46,10 +62,10 @@ should, on dual carriageways and one-way systems, but should not on ordinary
 two-way streets), and whether that reads well on the map. Decide after seeing
 Wales rendered.
 
-**Tune the rejection bounds against real output.** `MIN_MATCH_CONFIDENCE`,
-`MAX_DETOUR_RATIO`, `DETOUR_SLACK_M` and `MAX_STOP_GAP_M` are all reasoned
-defaults with no data behind them. After the Wales run, look at what each one
-actually rejected and whether it deserved it.
+**Tune the rejection bounds against real output.** Wales rejected 13 patterns as
+low confidence and skipped 148 on stop gap. `MIN_MATCH_CONFIDENCE` in particular
+has still never rejected anything on merit -- the one shape-path rejection was on
+detour, not score -- so 0.30 remains an untested guess.
 
 ## Next — scale
 

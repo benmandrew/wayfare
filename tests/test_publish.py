@@ -80,3 +80,35 @@ def test_missing_tippecanoe_says_which_fork(monkeypatch, tmp_path):
     monkeypatch.setattr(publish.shutil, "which", lambda _: None)
     with pytest.raises(RuntimeError, match="felt/tippecanoe"):
         publish.build_tiles(tmp_path / "edges.geojsonl")
+
+
+def test_dropping_is_reported_not_silent(caplog):
+    """--drop-densest-as-needed sheds features to fit a tile. A build that kept a
+    quarter of the network at low zoom must not read as full coverage."""
+    stderr = (
+        "Going to try keeping the sparsest 42.26% of the features to make it fit\n"
+        "Going to try keeping the sparsest 27.47% of the features to make it fit\n"
+    )
+    with caplog.at_level("INFO"):
+        publish._report_dropping(stderr)
+    assert "27.5%" in caplog.text
+    assert "thinned 2 tiles" in caplog.text
+
+
+def test_no_dropping_says_so(caplog):
+    with caplog.at_level("INFO"):
+        publish._report_dropping("tile 6/31/21 written\n")
+    assert "no features dropped" in caplog.text
+
+
+def test_tippecanoe_failure_surfaces_stderr(monkeypatch, tmp_path):
+    import subprocess
+
+    monkeypatch.setattr(publish.shutil, "which", lambda _: "/usr/local/bin/tippecanoe")
+    monkeypatch.setattr(
+        publish.subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(a[0], 1, "", "boom: out of memory"),
+    )
+    with pytest.raises(subprocess.CalledProcessError):
+        publish.build_tiles(tmp_path / "edges.geojsonl", tmp_path / "o.pmtiles")

@@ -15,6 +15,7 @@ is rarely touched and the common case stays a pure tile read.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -128,9 +129,45 @@ def build_tiles(geojsonl: Path, out: Path | None = None) -> Path:
         str(geojsonl),
     ]
     log.info("tippecanoe -> %s", out)
-    subprocess.run(cmd, check=True)
+    # tippecanoe writes a per-tile progress bar to stderr -- hundreds of kilobytes
+    # of it for a national build. On a server run that buries everything else in
+    # the log, so it is captured and reduced to what actually matters.
+    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    if proc.returncode != 0:
+        log.error("tippecanoe failed:\n%s", _tail(proc.stderr))
+        raise subprocess.CalledProcessError(proc.returncode, cmd, proc.stdout, proc.stderr)
+
+    _report_dropping(proc.stderr)
     log.info("tiles built: %.1f MB", out.stat().st_size / 1e6)
     return out
+
+
+# tippecanoe announces each thinning decision as it fills a tile.
+_DROPPED = re.compile(r"keeping the sparsest ([\d.]+)% of the features")
+
+
+def _report_dropping(stderr: str) -> None:
+    """Say how hard the tiles were thinned.
+
+    --drop-densest-as-needed silently sheds features to keep a tile under the size
+    limit. That is the right behaviour, but a build that kept a quarter of the
+    network at low zoom should say so rather than look like full coverage.
+    """
+    kept = [float(m) for m in _DROPPED.findall(stderr)]
+    if not kept:
+        log.info("no features dropped; every zoom holds the full network")
+        return
+    log.info(
+        "thinned %d tiles to fit; sparsest kept %.1f%% of its features "
+        "(low zooms only -- max zoom %d is complete)",
+        len(kept),
+        min(kept),
+        config.MAX_ZOOM,
+    )
+
+
+def _tail(text: str, lines: int = 20) -> str:
+    return "\n".join(text.strip().splitlines()[-lines:])
 
 
 def build(con: duckdb.DuckDBPyConnection) -> Path:
