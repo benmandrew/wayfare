@@ -55,7 +55,20 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status", help="show progress and coverage")
 
     p = sub.add_parser("art", help="render an area")
-    p.add_argument("area", help="preset name or 'minlon,minlat,maxlon,maxlat'")
+    p.add_argument(
+        "area",
+        nargs="?",
+        help="preset name, or a window as minlon,minlat,maxlon,maxlat",
+    )
+    # A window that starts west of Greenwich begins with a minus, which argparse
+    # reads as an option flag. `--bbox=...` sidesteps that, because the value is
+    # attached rather than a separate token.
+    p.add_argument(
+        "--bbox",
+        default=None,
+        metavar="minlon,minlat,maxlon,maxlat",
+        help="explicit window; use --bbox=-3.3,51.4,-3.0,51.6 for negative longitudes",
+    )
     p.add_argument("--style", default="density", help="density | spectrum | strands")
     p.add_argument("--out", type=Path, default=None, help=".png or .svg")
     p.add_argument("--width", type=int, default=4000)
@@ -150,10 +163,20 @@ def _dispatch(args: argparse.Namespace) -> int:
     if args.cmd == "art":
         from . import art
 
+        area = args.bbox or args.area
+        if not area:
+            log.error(
+                "give an area: a preset (%s) or --bbox=minlon,minlat,maxlon,maxlat",
+                ", ".join(sorted(art.PRESETS)),
+            )
+            return 1
+        if args.bbox and args.area:
+            log.error("give either an area or --bbox, not both")
+            return 1
         _require_db()
 
         out = art.render(
-            args.area,
+            area,
             style=args.style,
             out_path=args.out,
             opts=art.RenderOpts(

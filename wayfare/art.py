@@ -97,15 +97,67 @@ PRESETS: dict[str, Bounds] = {
     "uk": Bounds(-8.75, 49.85, 1.95, 60.90),
 }
 
+# Everything the dataset could ever cover. Used only to warn when a hand-written
+# window falls somewhere there will never be buses.
+ISLES = Bounds(-11.5, 49.4, 2.6, 61.3)
+
 
 def resolve(bounds_or_name: Bounds | str) -> Bounds:
+    """A Bounds, a preset name, or a raw ``minlon,minlat,maxlon,maxlat`` window."""
     if isinstance(bounds_or_name, Bounds):
         return bounds_or_name
+    if "," in bounds_or_name:
+        return parse_bbox(bounds_or_name)
     try:
         return PRESETS[bounds_or_name]
     except KeyError:
         known = ", ".join(sorted(PRESETS))
-        raise KeyError(f"unknown area {bounds_or_name!r}; known areas: {known}") from None
+        raise KeyError(
+            f"unknown area {bounds_or_name!r}; known areas: {known}"
+            " -- or give a window as minlon,minlat,maxlon,maxlat"
+        ) from None
+
+
+def parse_bbox(text: str) -> Bounds:
+    """Parse ``minlon,minlat,maxlon,maxlat``.
+
+    Ordering is west,south,east,north to match GeoJSON and the OGC convention,
+    which is also the order Overpass and Geofabrik use. It is the opposite of the
+    lat,lon order a map UI usually shows, so the error messages say which is which
+    rather than just reporting a bad number.
+    """
+    parts = [p.strip() for p in text.split(",")]
+    if len(parts) != 4:
+        raise ValueError(
+            f"expected 4 comma-separated numbers as minlon,minlat,maxlon,maxlat, "
+            f"got {len(parts)} in {text!r}"
+        )
+    try:
+        min_lon, min_lat, max_lon, max_lat = (float(p) for p in parts)
+    except ValueError as exc:
+        raise ValueError(f"not a number in {text!r}: {exc}") from None
+
+    for name, lon in (("minlon", min_lon), ("maxlon", max_lon)):
+        if not -180.0 <= lon <= 180.0:
+            raise ValueError(f"{name}={lon} is out of range; longitudes run -180 to 180")
+    for name, lat in (("minlat", min_lat), ("maxlat", max_lat)):
+        if not -90.0 <= lat <= 90.0:
+            raise ValueError(f"{name}={lat} is out of range; latitudes run -90 to 90")
+
+    b = Bounds(min_lon, min_lat, max_lon, max_lat)
+    # Range checks cannot catch a swapped pair here: a UK latitude near 51 is a
+    # perfectly valid longitude, and a UK longitude near -3 is a valid latitude, so
+    # lat,lon order parses cleanly and silently puts the window off West Africa.
+    # What does catch it is that the data only covers these islands.
+    if not b.hits(
+        [ISLES.min_lon, ISLES.max_lon], [ISLES.min_lat, ISLES.max_lat]
+    ):
+        log.warning(
+            "%s lies outside the British Isles, so the render will be empty. "
+            "The order is minlon,minlat,maxlon,maxlat -- lon first, not lat.",
+            text,
+        )
+    return b
 
 
 # --- Projection -------------------------------------------------------------

@@ -147,3 +147,53 @@ def test_unknown_output_format_fails_before_querying(tmp_path):
     """Rejecting the suffix must not cost a full window query first."""
     with pytest.raises(ValueError):
         art.render("cardiff", style="density", out_path=tmp_path / "x.tiff", edges=[])
+
+
+# --- Raw windows ------------------------------------------------------------
+
+
+def test_resolve_accepts_a_raw_window():
+    b = art.resolve("-3.32,51.42,-3.08,51.57")
+    assert (b.min_lon, b.min_lat, b.max_lon, b.max_lat) == (-3.32, 51.42, -3.08, 51.57)
+
+
+def test_swapped_lat_lon_warns_because_it_cannot_raise(caplog):
+    """A UK latitude near 51 is a valid longitude and a UK longitude near -3 is a
+    valid latitude, so lat,lon order parses cleanly. Range checks cannot catch it;
+    only noticing that the window is nowhere near the data can."""
+    with caplog.at_level("WARNING"):
+        b = art.parse_bbox("51.42,-3.32,51.57,-3.08")
+    assert b.min_lon == 51.42  # parsed, not rejected
+    assert "outside the British Isles" in caplog.text
+    assert "lon first" in caplog.text
+
+
+def test_a_real_uk_window_warns_about_nothing(caplog):
+    with caplog.at_level("WARNING"):
+        art.parse_bbox("-3.32,51.42,-3.08,51.57")
+    assert caplog.text == ""
+
+
+@pytest.mark.parametrize(
+    ("text", "match"),
+    [
+        ("-3.3,51.4,-3.0", "got 3"),
+        ("-3.3,51.4,-3.0,51.6,7", "got 5"),
+        ("-3.3,51.4,-3.0,north", "not a number"),
+        ("-200,51.4,-3.0,51.6", "longitudes run"),
+        ("-3.3,100,-3.0,101", "latitudes run"),
+        ("-3.3,51.4,-3.0,51.4", "degenerate"),
+    ],
+)
+def test_bad_windows_say_why(text, match):
+    with pytest.raises(ValueError, match=match):
+        art.parse_bbox(text)
+
+
+def test_preset_names_still_win():
+    assert art.resolve("cardiff") is art.PRESETS["cardiff"]
+
+
+def test_unknown_name_mentions_the_window_form():
+    with pytest.raises(KeyError, match="minlon"):
+        art.resolve("swansea")
