@@ -353,6 +353,34 @@ function offerRegions(current) {
   });
 }
 
+/* ---------- how far you may roam ---------- */
+
+// West of the Blaskets to east of Lowestoft, Scilly up to Unst, with enough
+// margin that coastal places do not sit jammed against the edge. The data is
+// British Isles only, so there is nothing to find outside this.
+const ISLES = [[-11.5, 49.4], [2.6, 61.3]];
+
+// maxBounds constrains the whole viewport, not just the centre: MapLibre zooms
+// *in* until the visible area fits inside the box, taking whichever of width and
+// height binds harder. In Web Mercator the isles are taller than they are wide --
+// 0.059 of the world against 0.039 -- so on any landscape window it was the width
+// that bound, and full zoom out showed a slice of the middle of the country
+// rather than the whole of it.
+//
+// So widen the box, and only the box, until it is at least as wide as the
+// viewport. Height then governs, and zooming out fits the country end to end. A
+// portrait phone already has room and gets no widening at all.
+function roamingBounds(el) {
+  const merc = (lat) =>
+    0.5 - Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360)) / (2 * Math.PI);
+  const [[w, s], [e, n]] = ISLES;
+  const tall = merc(s) - merc(n); // north is the smaller y
+  const wide = (e - w) / 360;
+  const aspect = el.clientWidth / Math.max(el.clientHeight, 1);
+  const grow = (Math.max(0, aspect * tall - wide) * 360) / 2;
+  return [[w - grow, s], [e + grow, n]];
+}
+
 function start(header) {
   $("boot").remove();
   offerRegions(TILES);
@@ -372,12 +400,9 @@ function start(header) {
     hash: true, // shareable #zoom/lat/lon
     center: [-2.4, 54.2],
     zoom: 5.6,
-    // The data is British Isles only, so there is nothing to find outside it.
-    // West of the Blaskets to east of Lowestoft, Scilly up to Unst, with enough
-    // margin that coastal places do not sit jammed against the edge.
-    maxBounds: [[-11.5, 49.4], [2.6, 61.3]],
-    // Below this the islands no longer fill the frame, and the tiles stop at
-    // MIN_ZOOM anyway -- zooming further out only adds empty ocean.
+    maxBounds: roamingBounds($("map")),
+    // Below this the tiles run out -- the overview build starts at z5 -- so
+    // zooming further would drop the network rather than show more of it.
     minZoom: 4.6,
     maxZoom: 18,
     attributionControl: { compact: true },
@@ -436,6 +461,10 @@ function start(header) {
       ],
     },
   });
+
+  // A resize changes the aspect, and with it how wide the box has to be for the
+  // country to still fit top to bottom.
+  map.on("resize", () => map.setMaxBounds(roamingBounds(map.getContainer())));
 
   // A #hash in the URL is someone sharing a place, so it outranks the framing.
   if (framed && !location.hash) {
