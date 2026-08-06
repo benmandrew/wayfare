@@ -19,7 +19,7 @@ import re
 import shutil
 import subprocess
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -34,12 +34,26 @@ LAYER = "bus"
 Point = tuple[int, int]  # (lon_e6, lat_e6)
 
 
+# How many rows to pull from DuckDB at a time. Only ever this many rows plus one
+# way's worth are resident; the previous fetchall() held the entire edge table as
+# Python objects, which at national scale is several million rows of tuples and
+# integer lists.
+FETCH_ROWS = 50_000
+
+
 def export_geojsonl(con: duckdb.DuckDBPyConnection, path: Path | None = None) -> Path:
-    """Write one GeoJSON feature per line, which is what tippecanoe wants."""
+    """Write one GeoJSON feature per line, which is what tippecanoe wants.
+
+    Streamed rather than materialised. The query is ordered by way_id and coalescing
+    never merges across ways, so a way's edges can be collapsed and released as soon
+    as the next way starts -- the result is identical to collapsing the whole table
+    at once, at a fraction of the resident memory. DuckDB does the sort out of core,
+    which is exactly the part it is better at than the Python heap.
+    """
     path = path or (config.WORK / "edges.geojsonl")
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    rows = con.execute(
+    cur = con.execute(
         """
         SELECT e.edge_id, e.way_id, e.road_name, e.lon_e6, e.lat_e6,
                s.n, s.refs, s.trips
@@ -47,21 +61,26 @@ def export_geojsonl(con: duckdb.DuckDBPyConnection, path: Path | None = None) ->
         JOIN (
             SELECT edge_id,
                    count(*)          AS n,
-                   list(short_name ORDER BY n_trips DESC) AS refs,
+                   -- short_name breaks the tie. Without it, two services running
+                   -- the same number of trips come back in whatever order the
+                   -- aggregate happened to build, which made the export
+                   -- non-deterministic and split segments that should merge.
+                   list(short_name ORDER BY n_trips DESC, short_name) AS refs,
                    sum(n_trips)      AS trips
             FROM edge_services GROUP BY edge_id
         ) s USING (edge_id)
         WHERE e.lon_e6 IS NOT NULL
+        ORDER BY e.way_id
         """
-    ).fetchall()
+    )
 
     n_written = 0
     n_capped = 0
+    stats = {"edges": 0}
 
     with path.open("w") as fh:
-        for props, coords in coalesce(rows):
-            n = props["n"]
-            n_capped += n > config.MAX_REFS_IN_TILE
+        for props, coords in _coalesce_by_way(cur, stats):
+            n_capped += props["n"] > config.MAX_REFS_IN_TILE
             fh.write(
                 json.dumps(
                     {
@@ -77,13 +96,42 @@ def export_geojsonl(con: duckdb.DuckDBPyConnection, path: Path | None = None) ->
 
     log.info(
         "%d edges coalesced to %d features in %s (%d over the %d-service cap)",
-        len(rows),
+        stats["edges"],
         n_written,
         path,
         n_capped,
         config.MAX_REFS_IN_TILE,
     )
     return path
+
+
+def _coalesce_by_way(
+    cur: duckdb.DuckDBPyConnection, stats: dict[str, int]
+) -> Iterator[tuple[dict[str, Any], list[list[float]]]]:
+    """Coalesce a way at a time from an ordered cursor.
+
+    Relies on the query's ORDER BY way_id and on way_id being part of the coalescing
+    key: no segment can ever span two ways, so a way is complete the moment the next
+    one appears and its rows can be dropped.
+    """
+    buf: list[Any] = []
+    current: Any = _NO_WAY
+    while chunk := cur.fetchmany(FETCH_ROWS):
+        for row in chunk:
+            stats["edges"] += 1
+            if row[1] != current:
+                if buf:
+                    yield from coalesce(buf)
+                buf = []
+                current = row[1]
+            buf.append(row)
+    if buf:
+        yield from coalesce(buf)
+
+
+# A sentinel, because way_id could in principle be NULL and None is a real value to
+# compare against.
+_NO_WAY = object()
 
 
 # --- Coalescing -------------------------------------------------------------
@@ -118,18 +166,28 @@ def export_geojsonl(con: duckdb.DuckDBPyConnection, path: Path | None = None) ->
 def coalesce(rows: list[Any]) -> list[tuple[dict[str, Any], list[list[float]]]]:
     """Group edges by their tile attributes, then chain each group end to end."""
     groups: dict[tuple[Any, ...], list[Member]] = defaultdict(list)
+    display: dict[tuple[Any, ...], tuple[int, tuple[str, ...]]] = {}
     for edge_id, way_id, name, lon_e6, lat_e6, n, refs, trips in rows:
         pts = list(zip(lon_e6, lat_e6, strict=True))
         if len(pts) < 2:
             continue
         capped = tuple(refs[: config.MAX_REFS_IN_TILE])
-        # refs is ordered by frequency, so the same set can arrive in two orders.
-        # Group on the sorted form and carry the frequency-ordered one through.
-        key = (way_id, name, int(n), int(trips or 0), tuple(sorted(capped)), capped)
+        # Identity is the service *set*, not the order it happens to be listed in.
+        # Two edges carrying the same buses are the same road to a reader even when
+        # the busiest-first ordering differs between them, and splitting the geometry
+        # over that would be splitting it over nothing.
+        key = (way_id, name, int(n), int(trips or 0), tuple(sorted(capped)))
         groups[key].append((edge_id, pts))
+        # Keep the busiest-first list from the lowest edge id, so which of several
+        # equivalent orderings gets displayed does not depend on row order.
+        held = display.get(key)
+        if held is None or edge_id < held[0]:
+            display[key] = (edge_id, capped)
 
     out = []
-    for (way_id, name, n, trips, _sorted_refs, capped), members in groups.items():
+    for key, members in groups.items():
+        way_id, name, n, trips, _set = key
+        capped = display[key][1]
         for edge_id, pts in _chain(_dedupe_reversed(members)):
             props: dict[str, Any] = {
                 # Consumed by --use-attribute-for-id and then excluded, so it costs
@@ -175,7 +233,14 @@ def _chain(members: list[Member]) -> list[Member]:
     Only merges through a point where exactly two of the group's edges meet. At a
     junction of three the continuation is ambiguous, and picking one would draw a
     line that doubles back on itself.
+
+    Sorted first, and each finished run is pointed a consistent way afterwards, so
+    the output does not depend on the order DuckDB's parallel scan returned rows in.
+    Without both, a closed loop starts wherever the scan happened to put its first
+    edge and an open run comes out forwards or backwards at random -- which changes
+    nothing on screen but makes every rebuild produce different bytes.
     """
+    members = sorted(members)
     at: dict[Point, list[int]] = defaultdict(list)
     for i, (_, pts) in enumerate(members):
         at[pts[0]].append(i)
@@ -220,6 +285,8 @@ def _chain(members: list[Member]) -> list[Member]:
                 chain = chain + tail[1:] if forward else list(reversed(tail[1:])) + chain
                 here = nxt
 
+        if chain[0] > chain[-1]:
+            chain.reverse()
         out.append((min(ids), chain))
     return out
 

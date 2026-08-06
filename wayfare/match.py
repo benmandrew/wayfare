@@ -21,9 +21,16 @@ HTTP, and DuckDB takes a single writer. Workers do HTTP, the main thread writes.
 
 from __future__ import annotations
 
+import csv
+import json
+import os
+import tempfile
 import time
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import duckdb
@@ -369,12 +376,80 @@ def _commit(con: duckdb.DuckDBPyConnection, batch: list[Outcome]) -> None:
         seen: dict[int, tuple[Any, ...]] = {}
         for row in edge_rows:
             seen.setdefault(row[0], row)
-        con.executemany(
-            "INSERT INTO edges VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT (edge_id) DO NOTHING",
-            list(seen.values()),
+        _insert_edges(con, list(seen.values()))
+        _insert_links(con, link_rows)
+
+
+# -- bulk insert ------------------------------------------------------------
+#
+# These two tables are why the match stage looked like it was waiting on Valhalla
+# when it was not. Written a row at a time through executemany, DuckDB manages
+# about 2,700 rows/s -- it is a columnar engine and every bound-parameter insert
+# pays the full per-statement machinery. Wales writes 1,033,886 pattern_edges rows
+# and 169,857 edges, so roughly 450 of the run's 983 seconds went on inserting
+# rather than matching, with Valhalla sitting at under 1% CPU throughout.
+#
+# Staging the batch to a file and letting DuckDB read it back columnar is the same
+# work at 1.6M rows/s for the flat table and 186k rows/s for the one with list
+# columns. Measured: 400k link rows in 0.25s against 150s.
+#
+# pattern_edges is flat, so CSV. edges carries INTEGER[] geometry and a road_name
+# that can hold quotes, commas and newlines, so newline-delimited JSON, with the
+# column types stated rather than sniffed -- a batch whose geometry is entirely
+# NULL would otherwise infer the wrong type and fail the insert.
+
+_EDGE_COLS: tuple[str, ...] = (
+    "edge_id", "way_id", "road_name", "road_class", "length_m",
+    "lon_e6", "lat_e6", "min_lon_e6", "min_lat_e6", "max_lon_e6", "max_lat_e6",
+)
+_EDGE_TYPES = (
+    "'edge_id':'BIGINT','way_id':'BIGINT','road_name':'VARCHAR',"
+    "'road_class':'VARCHAR','length_m':'DOUBLE',"
+    "'lon_e6':'INTEGER[]','lat_e6':'INTEGER[]',"
+    "'min_lon_e6':'INTEGER','min_lat_e6':'INTEGER',"
+    "'max_lon_e6':'INTEGER','max_lat_e6':'INTEGER'"
+)
+
+
+@contextmanager
+def _staged(suffix: str) -> Iterator[Path]:
+    """A scratch file beside the database, removed however the block exits.
+
+    Under WORK rather than the system temp directory: a server run points
+    WAYFARE_DATA at a volume with room, and /tmp is frequently a small tmpfs.
+    """
+    d = config.WORK / "stage"
+    d.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(suffix=suffix, dir=d)
+    os.close(fd)
+    path = Path(name)
+    try:
+        yield path
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def _insert_edges(con: duckdb.DuckDBPyConnection, rows: list[tuple[Any, ...]]) -> None:
+    with _staged(".ndjson") as p:
+        with p.open("w") as fh:
+            for r in rows:
+                fh.write(json.dumps(dict(zip(_EDGE_COLS, r, strict=True))))
+                fh.write("\n")
+        con.execute(
+            f"INSERT INTO edges SELECT {', '.join(_EDGE_COLS)} "
+            f"FROM read_json('{p}', format='newline_delimited', columns={{{_EDGE_TYPES}}}) "
+            "ON CONFLICT (edge_id) DO NOTHING"
         )
-        con.executemany("INSERT INTO pattern_edges VALUES (?, ?, ?)", link_rows)
+
+
+def _insert_links(con: duckdb.DuckDBPyConnection, rows: list[tuple[int, int, int]]) -> None:
+    with _staged(".csv") as p:
+        with p.open("w", newline="") as fh:
+            csv.writer(fh).writerows(rows)
+        con.execute(
+            f"INSERT INTO pattern_edges SELECT * FROM read_csv('{p}', header=false, "
+            "columns={'pattern_id':'BIGINT','seq':'INTEGER','edge_id':'BIGINT'})"
+        )
 
 
 # lon_e6, lat_e6, then the bounding box. Empty for an edge with too few points, so

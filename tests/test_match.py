@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import duckdb
 import pytest
 
 from wayfare import aggregate, config, gtfs, match, valhalla
@@ -139,6 +140,45 @@ def test_coverage_reports_service_weighted_share(loaded):
     assert cov["patterns_matched"] == 2
     assert cov["trips_pct"] == 100.0
     assert cov["services"] == 1
+
+
+def test_bulk_insert_survives_awkward_text_and_missing_geometry(con, tmp_path, monkeypatch):
+    """Rows are staged through a file, so anything the file format could mangle has
+    to survive the round trip: quotes, commas and newlines in a road name, and an
+    edge with no geometry at all."""
+    monkeypatch.setattr(config, "WORK", tmp_path)
+    nasty = 'A "B", C\nD\treal name'
+    rows = [
+        (1, 10, nasty, "secondary", 100.0, [1, 2], [3, 4], 1, 3, 2, 4),
+        (2, 20, None, None, 0.0, None, None, None, None, None, None),
+    ]
+    match._insert_edges(con, rows)
+
+    got = con.execute(
+        "SELECT edge_id, road_name, lon_e6 FROM edges ORDER BY edge_id"
+    ).fetchall()
+    assert got == [(1, nasty, [1, 2]), (2, None, None)]
+    # Nothing is left behind in the staging directory.
+    assert list((tmp_path / "stage").iterdir()) == []
+
+
+def test_bulk_insert_ignores_an_edge_another_batch_wrote(con, tmp_path, monkeypatch):
+    """edges is shared across patterns, so the same edge arrives in many batches."""
+    monkeypatch.setattr(config, "WORK", tmp_path)
+    first = (1, 10, "Oxford Road", "secondary", 100.0, [1, 2], [3, 4], 1, 3, 2, 4)
+    match._insert_edges(con, [first])
+    match._insert_edges(con, [(1, 10, "Renamed", "primary", 999.0, [9], [9], 9, 9, 9, 9)])
+
+    assert con.execute("SELECT count(*) FROM edges").fetchone()[0] == 1
+    assert con.execute("SELECT road_name FROM edges").fetchone()[0] == "Oxford Road"
+
+
+def test_staging_file_is_removed_even_when_the_insert_fails(con, tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "WORK", tmp_path)
+    bad = [("not a number", 10, "x", "y", 1.0, [1], [1], 1, 1, 1, 1)]
+    with pytest.raises(duckdb.Error):
+        match._insert_edges(con, bad)  # read_json refuses text where a BIGINT belongs
+    assert list((tmp_path / "stage").iterdir()) == []
 
 
 def test_geometry_needs_two_points():

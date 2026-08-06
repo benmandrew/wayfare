@@ -35,6 +35,24 @@ def test_edges_meeting_end_to_end_become_one_feature():
     assert props["refs"] == "42"
 
 
+def test_the_same_service_set_merges_whatever_order_it_is_listed_in():
+    """Identity is the service set, not the busiest-first order it happens to be
+    listed in. Two services running the same number of trips can come out of the
+    aggregate either way round, and splitting the geometry over that splits it over
+    nothing -- it also made the export differ from one run to the next."""
+    out = publish.coalesce([_row(1, [A, B], ["42", "43"]), _row(2, [B, C], ["43", "42"])])
+    assert len(out) == 1
+    assert len(out[0][1]) == 3
+    # The list shown comes from the lowest edge id, so it does not depend on order.
+    assert out[0][0]["refs"] == "42,43"
+    assert (
+        publish.coalesce([_row(2, [B, C], ["43", "42"]), _row(1, [A, B], ["42", "43"])])[0][
+            0
+        ]["refs"]
+        == "42,43"
+    )
+
+
 def test_a_different_service_set_breaks_the_run():
     out = publish.coalesce([_row(1, [A, B], ["42"]), _row(2, [B, C], ["42", "43"])])
     assert len(out) == 2
@@ -110,6 +128,32 @@ def _edge(con, edge_id: int, refs: list[str]) -> None:
         con.execute(
             "INSERT INTO edge_services VALUES (?, ?, 'OP1', 1, ?)", [edge_id, ref, 100 - i]
         )
+
+
+def test_streaming_gives_the_same_result_as_collapsing_everything_at_once(
+    con, tmp_path, monkeypatch
+):
+    """The export coalesces one way at a time so the whole table is never resident.
+    That is only sound because a segment can never span two ways."""
+    monkeypatch.setattr(config, "OUT", tmp_path)
+    # Two ways, interleaved edge ids, and a fetch small enough to split a way across
+    # two chunks -- the buffer must survive the chunk boundary.
+    monkeypatch.setattr(publish, "FETCH_ROWS", 2)
+    for eid, way, x in [(1, 10, 0), (2, 10, 10), (3, 20, 0), (4, 10, 20), (5, 20, 10)]:
+        con.execute(
+            "INSERT INTO edges VALUES (?, ?, 'R', 'secondary', 100.0, [?, ?], "
+            "[0, 0], ?, 0, ?, 0)",
+            [eid, way, x, x + 10, x, x + 10],
+        )
+        con.execute("INSERT INTO edge_services VALUES (?, '42', 'OP1', 1, 100)", [eid])
+
+    path = publish.export_geojsonl(con, tmp_path / "edges.geojsonl")
+    feats = [json.loads(line) for line in path.read_text().splitlines()]
+
+    # Way 10 chains into one 4-point line, way 20 into one 3-point line. Never one
+    # feature spanning both, however the rows were chunked.
+    assert sorted(len(f["geometry"]["coordinates"]) for f in feats) == [3, 4]
+    assert sorted(f["properties"]["way"] for f in feats) == [10, 20]
 
 
 def test_export_writes_one_feature_per_line(con, tmp_path, monkeypatch):
