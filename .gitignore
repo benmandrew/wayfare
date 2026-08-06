@@ -18,5 +18,8 @@ __pycache__/
 .coverage
 htmlcov/
 
+# Claude Code's session state, and the git worktrees it creates under here.
+.claude/
+
 .env
 .DS_Store
