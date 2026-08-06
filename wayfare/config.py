@@ -94,6 +94,16 @@ MIN_MATCH_CONFIDENCE = 0.30
 MAX_DETOUR_RATIO = 3.0
 DETOUR_SLACK_M = 1_000.0
 
+# --- Patterns --------------------------------------------------------------
+
+# How many passes the stop_times group-by is split into. An ordered list aggregate
+# pins its per-group sort state, so DuckDB cannot spill it and a big feed fails
+# regardless of memory_limit -- see gtfs._collapse_to_sequences. Partitioning by a
+# hash of trip_id bounds the state at 1/N of the groups. More partitions means less
+# memory and more scans of a small projected table; 16 clears London on a 17 GB
+# machine with room to spare.
+SEQ_PARTITIONS = int(os.environ.get("WAYFARE_SEQ_PARTITIONS", "16"))
+
 # --- Matching batch --------------------------------------------------------
 
 # Results are committed this often. Smaller means less lost work when the server is

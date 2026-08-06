@@ -17,7 +17,7 @@ from pathlib import Path
 
 import duckdb
 
-from . import db, logs
+from . import config, db, logs
 
 log = logs.get("gtfs")
 
@@ -91,15 +91,7 @@ def build_patterns(
     n_trips = db.scalar(con, "SELECT count(*) FROM trip")
     log.info("%d trips", n_trips)
 
-    # The expensive pass: one group-by over every stop_time row.
-    log.info("collapsing trips to stop sequences (one pass over stop_times.txt)")
-    con.execute(f"""
-        CREATE OR REPLACE TEMP TABLE trip_seq AS
-        SELECT trip_id,
-               list(stop_id ORDER BY TRY_CAST(stop_sequence AS INTEGER)) AS stop_seq
-        FROM {_csv(gtfs_dir, "stop_times.txt")}
-        GROUP BY trip_id
-    """)
+    _collapse_to_sequences(gtfs_dir, con)
 
     log.info("deduplicating to patterns")
     con.execute("""
@@ -156,6 +148,53 @@ def build_patterns(
         100.0 * (n_with_shape or 0) / max(n_patterns, 1),
         n_refs or 0,
     )
+
+
+def _collapse_to_sequences(gtfs_dir: Path, con: duckdb.DuckDBPyConnection) -> None:
+    """Reduce stop_times to one ordered stop list per trip.
+
+    This is the expensive pass, and the one place the stage runs out of memory.
+
+    ``list(stop_id ORDER BY stop_sequence)`` is the natural way to write it, but an
+    ordered aggregate holds its per-group sort state pinned, so DuckDB cannot spill
+    it and the buffer manager fails however high the limit is set. Measured on
+    London: 480,412 trips over a 1.5 GB stop_times.txt died identically at a 7.4 GB
+    limit and at 10.2 GB. Raising the limit is not a fix, it just moves the wall.
+
+    So bound the state instead. Project the three columns that matter into a table
+    once -- a streaming scan that spills cleanly -- then aggregate it in partitions
+    of trip_id, so at most 1/N of the groups are in flight at a time. The partition
+    key is a hash of trip_id, which keeps every row of a trip in the same pass.
+    """
+    log.info("projecting stop_times (one pass over the CSV)")
+    con.execute(f"""
+        CREATE OR REPLACE TABLE stop_time_raw AS
+        SELECT trip_id, stop_id, TRY_CAST(stop_sequence AS INTEGER) AS seq
+        FROM {_csv(gtfs_dir, "stop_times.txt")}
+    """)
+    n_rows = db.scalar(con, "SELECT count(*) FROM stop_time_raw")
+
+    con.execute("""
+        CREATE OR REPLACE TEMP TABLE trip_seq (trip_id VARCHAR, stop_seq VARCHAR[])
+    """)
+    log.info(
+        "collapsing %d stop times to sequences in %d partitions",
+        n_rows,
+        config.SEQ_PARTITIONS,
+    )
+    for k in range(config.SEQ_PARTITIONS):
+        con.execute(
+            f"""
+            INSERT INTO trip_seq
+            SELECT trip_id, list(stop_id ORDER BY seq)
+            FROM stop_time_raw
+            WHERE hash(trip_id) % {config.SEQ_PARTITIONS} = ?
+            GROUP BY trip_id
+            """,
+            [k],
+        )
+
+    con.execute("DROP TABLE stop_time_raw")
 
 
 def _fill_span(con: duckdb.DuckDBPyConnection) -> None:
