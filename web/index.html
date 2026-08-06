@@ -305,7 +305,13 @@ function start(header) {
     hash: true, // shareable #zoom/lat/lon
     center: [-2.4, 54.2],
     zoom: 5.6,
-    minZoom: 4,
+    // The data is British Isles only, so there is nothing to find outside it.
+    // West of the Blaskets to east of Lowestoft, Scilly up to Unst, with enough
+    // margin that coastal places do not sit jammed against the edge.
+    maxBounds: [[-11.5, 49.4], [2.6, 61.3]],
+    // Below this the islands no longer fill the frame, and the tiles stop at
+    // MIN_ZOOM anyway -- zooming further out only adds empty ocean.
+    minZoom: 4.6,
     maxZoom: 18,
     attributionControl: { compact: true },
     style: {
