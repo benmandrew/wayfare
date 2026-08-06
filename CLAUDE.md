@@ -4,9 +4,6 @@ UK-wide dataset of bus routes snapped to the road network, from DfT BODS open
 data. Two consumers: an interactive web map (hover a road, see which buses use it)
 and artistic renderings of areas.
 
-The directory is still called `coda`; that was a placeholder. The package, the CLI
-and the docs are all `wayfare`. Rename the directory when convenient.
-
 ## Hard-won facts — do not rediscover these
 
 Measured against the live feeds on 2026-08-06, feed version `20260806_022608`.
