@@ -116,6 +116,17 @@ docker compose up -d web          # viewer on :8099
 `pipeline` is safe to interrupt and re-run: every stage skips work already done, and
 `match` resumes from its last committed batch.
 
+The compose file names a published image, `benmandrew/wayfare:latest`, rather than
+building one, so a server never compiles tippecanoe itself. `docker compose pull`
+picks up a newer build. Running a local change means building the image and
+overriding the tag through `WAYFARE_IMAGE`, which `.env.example` also uses to pin a
+release rather than track `latest`:
+
+```
+docker build -t benmandrew/wayfare:dev .
+WAYFARE_IMAGE=benmandrew/wayfare:dev docker compose run --rm wayfare status
+```
+
 To redo a single stage rather than the lot:
 
 ```
@@ -136,6 +147,19 @@ after a reboot. It is designed to be interrupted: work is selected by the absenc
 `match_status` row, and each batch of 200 is committed before the next is loaded, so
 an unclean restart costs at most one batch. Failures are recorded rather than retried
 forever, because a pattern whose stops cannot be connected by road will never succeed.
+
+### Publishing the image
+
+`.github/workflows/image.yml` builds the image on pushes to `main`, on `v*` tags and
+on pull requests, but a pull request build is never pushed, so a broken Dockerfile
+fails the check without publishing anything. Publishing from a fork needs two
+repository secrets: `DOCKERHUB_USERNAME`, and `DOCKERHUB_TOKEN`, which is a Docker Hub
+personal access token with Read & Write scope rather than the account password. The
+build targets linux/amd64 only, because tippecanoe compiles from source and an
+emulated arm64 build costs 30 to 60 minutes of continuous integration (CI) time.
+Layer caching is buildx `type=gha` with `mode=max`: the tippecanoe and dependency
+stages are intermediate and discarded from the final image, and the default `min`
+caches only the final image's layers, so tippecanoe would recompile on every run.
 
 ## Requirements
 
@@ -168,6 +192,7 @@ wayfare/
 web/index.html   MapLibre GL JS viewer, one self-contained page
 tests/           pytest; markers `slow` and `valhalla` gate the ones needing real data
 docker-compose.yml
+.github/workflows/image.yml  builds and pushes benmandrew/wayfare to Docker Hub
 ```
 
 ## Known gaps
