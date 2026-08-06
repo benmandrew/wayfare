@@ -155,7 +155,7 @@ edges meet: at a fork, picking a continuation draws a line that doubles back.
 Directed pairs collapse only where the service sets agree, so a one-way pair
 carrying different buses each way still renders as two lines, while an ordinary
 two-way street no longer renders one line invisibly under another. Wales: 169,857
-directed edges -> 102,925 after collapsing pairs -> 59,358 after chaining. This is
+directed edges -> 102,925 after collapsing pairs -> 53,013 after chaining. This is
 a publish-stage concern only; `art` reads raw directed edges and is unaffected.
 
 **The `refs` cap is 64 and there is no overflow sidecar.** Only 1,405 of Wales's
@@ -190,18 +190,36 @@ from `wales-latest.osm.pbf`.
 | | ok 3,400 (94.9%) · skipped 148 · error 23 · low_confidence 13 |
 | | **95.6% of timetabled trips** represented |
 | aggregate | 169,857 edges, 413,915 edge-service pairs, 478 distinct services |
-| publish | 169,857 edges -> 59,358 features -> **11.1 MB PMTiles**, no features dropped |
+| publish | 169,857 edges -> 53,013 features -> **9.5 MB PMTiles**, no features dropped |
 | art | 0.5s per 2400px render |
 
 3.6/s is the honest throughput. An earlier 15.3/s was measured while the
 confidence bug was rejecting most patterns instantly, and meant nothing.
 
 **Archive size, same data throughout.** 23.8 MB baseline -> 20.9 MB with the edge
-id moved into the MVT feature id field (`--use-attribute-for-id`, 12%) -> 13.7 MB
-with coalescing (34%) -> 11.1 MB with card-only attributes confined to z11+ (19%).
-53% in total. Tippecanoe now reports no features dropped and every zoom holds the
-full network; the first build was thinning the densest tiles to 27% of their
-features, so Wales renders complete at every zoom for the first time.
+id moved into the MVT feature id field (`--use-attribute-for-id`) -> 13.7 MB with
+coalescing -> 11.1 MB with card-only attributes confined to z11+ -> 9.5 MB once
+the refs-ordering bug stopped splitting segments. 60% in total. Tippecanoe now
+reports no features dropped and every zoom holds the full network; the first build
+was thinning the densest tiles to 27% of their features, so Wales renders complete
+at every zoom for the first time.
+
+**The export is deterministic, and must stay that way.** Two things made it not
+be: `list(short_name ORDER BY n_trips DESC)` with no tiebreak, so equally busy
+services came back in arbitrary order and that order was part of the coalescing
+key; and `_chain` starting a closed loop wherever the scan happened to begin. A
+rebuild now produces byte-identical output, which is what makes tiles cacheable
+and two runs comparable.
+
+**DuckDB inserts about 2,700 rows/s through executemany, and 1.6M/s from a file.**
+It is columnar; every bound-parameter insert pays the full per-statement
+machinery. This is not a small constant -- roughly 450 of the Wales match run's
+983 seconds went on inserting rather than matching, with Valhalla under 1% CPU
+throughout. `match` stages each batch to a file and reads it back: CSV for
+`pattern_edges`, newline-delimited JSON for `edges` because it carries INTEGER[]
+geometry and road names holding quotes and commas. Multi-row VALUES and unnest of
+parallel arrays are no better than executemany. Never add a row-at-a-time insert
+loop on a table that grows with the network.
 
 **Extrapolating to GB is not a straight multiply.** Wales is 2.4% of national
 trips, which suggests roughly 12 hours -- but Wales is 85% `shape` and the nation

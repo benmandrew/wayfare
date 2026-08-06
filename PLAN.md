@@ -27,8 +27,8 @@ Ran 2026-08-06. Numbers in CLAUDE.md.
 
 - **Tile coalescing.** Runs of edges with identical tile attributes that meet end
   to end merge into one feature: 169,857 directed edges -> 102,925 after
-  collapsing directed pairs -> 59,358 after chaining along the way. Lossless.
-- **Archive 23.8 MB -> 11.1 MB (53%)**, and tippecanoe now drops no features at
+  collapsing directed pairs -> 53,013 after chaining along the way. Lossless.
+- **Archive 23.8 MB -> 9.5 MB (60%)**, and tippecanoe now drops no features at
   any zoom. The first build was thinning the densest tiles to 27%.
 - **`refs` cap 12 -> 64, overflow sidecar deleted.** Wales's longest list is 53.
 - **Geometry as micro-degree integer lists** plus bbox columns, replacing WKT.
