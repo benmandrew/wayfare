@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -179,6 +180,32 @@ def test_missing_tippecanoe_says_which_fork(monkeypatch, tmp_path):
     monkeypatch.setattr(publish.shutil, "which", lambda _: None)
     with pytest.raises(RuntimeError, match="felt/tippecanoe"):
         publish.build_tiles(tmp_path / "edges.geojsonl")
+
+
+def test_the_overview_band_drops_the_card_only_attributes(monkeypatch, tmp_path):
+    """Attributes are stored per feature per zoom, and nothing reads a road name
+    when the whole country is a few hundred pixels across."""
+    import subprocess
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
+    monkeypatch.setattr(publish.subprocess, "run", fake_run)
+
+    publish.build_tiles(tmp_path / "edges.geojsonl", tmp_path / "bus.pmtiles")
+
+    overview, detail, join = calls
+    assert overview[overview.index("-z") + 1] == str(config.DETAIL_ZOOM - 1)
+    assert detail[detail.index("-Z") + 1] == str(config.DETAIL_ZOOM)
+    for name in publish._DETAIL_ONLY:
+        assert name in overview
+        assert name not in detail
+    assert join[0] == "tile-join"
 
 
 def test_dropping_is_reported_not_silent(caplog):

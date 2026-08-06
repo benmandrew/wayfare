@@ -114,6 +114,14 @@ CHECKPOINT_EVERY = 200
 
 MIN_ZOOM = 5
 MAX_ZOOM = 14
+# Below this zoom the archive carries geometry and `n` and nothing else.
+#
+# Attributes are stored per feature per zoom, so `name`, `refs`, `way` and `trips`
+# are paid for at every zoom a feature survives to -- and at z5-z10 nothing reads
+# them. The whole country is a few hundred pixels across, the info card only
+# appears on hover, and hovering a road is not a thing anyone does at that scale.
+# `n` stays everywhere because it drives the colour and width ramps.
+DETAIL_ZOOM = 11
 # A backstop against one pathological city-centre edge, not a routine truncation.
 #
 # The original 12 assumed a long service list would dominate tile size. It does not:

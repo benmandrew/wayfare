@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 from collections import defaultdict
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -223,26 +224,58 @@ def _chain(members: list[Member]) -> list[Member]:
     return out
 
 
+# Only `n` survives below DETAIL_ZOOM; it is what the colour and width ramps read.
+_DETAIL_ONLY = ("way", "refs", "trips", "name")
+
+
 def build_tiles(geojsonl: Path, out: Path | None = None) -> Path:
-    """Run tippecanoe. Requires felt/tippecanoe >= 2.17 for native PMTiles output."""
+    """Build the archive in two zoom bands and join them.
+
+    tippecanoe stores attributes per feature per zoom, and -x is global to a run --
+    there is no way to say "keep the road name only where someone might read it" in
+    a single pass. So the overview band is built without the four attributes that
+    exist purely for the info card, the detail band is built with everything, and
+    tile-join concatenates the two into one PMTiles file. The join is cheap; the
+    second tippecanoe pass is the real cost, and it only touches z5-z10.
+    """
     out = out or (config.OUT / "bus.pmtiles")
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    if not shutil.which("tippecanoe"):
-        raise RuntimeError(
-            "tippecanoe is not on PATH. Install felt/tippecanoe "
-            "(`brew install tippecanoe`, or use the Docker service in "
-            "docker-compose.yml). The mapbox/tippecanoe fork is unmaintained and "
-            "cannot write PMTiles."
-        )
+    for tool in ("tippecanoe", "tile-join"):
+        if not shutil.which(tool):
+            raise RuntimeError(
+                f"{tool} is not on PATH. Install felt/tippecanoe "
+                "(`brew install tippecanoe`, or use the Docker service in "
+                "docker-compose.yml). The mapbox/tippecanoe fork is unmaintained and "
+                "cannot write PMTiles."
+            )
 
+    overview = out.with_name(out.stem + ".overview.pmtiles")
+    detail = out.with_name(out.stem + ".detail.pmtiles")
+    try:
+        _tippecanoe(
+            geojsonl, overview, config.MIN_ZOOM, config.DETAIL_ZOOM - 1, _DETAIL_ONLY
+        )
+        _tippecanoe(geojsonl, detail, config.DETAIL_ZOOM, config.MAX_ZOOM, ())
+        _tile_join(out, [overview, detail])
+    finally:
+        for p in (overview, detail):
+            p.unlink(missing_ok=True)
+
+    log.info("tiles built: %.1f MB", out.stat().st_size / 1e6)
+    return out
+
+
+def _tippecanoe(
+    geojsonl: Path, out: Path, min_zoom: int, max_zoom: int, exclude: Sequence[str]
+) -> None:
     cmd = [
         "tippecanoe",
         "-o", str(out),
         "--force",
         "-l", LAYER,
-        "-Z", str(config.MIN_ZOOM),
-        "-z", str(config.MAX_ZOOM),
+        "-Z", str(min_zoom),
+        "-z", str(max_zoom),
         # The edge id belongs in the MVT feature id field, not in the attributes.
         # It is two varints and a pool entry per feature cheaper there, and it is
         # where setFeatureState looks -- so the viewer needs no promoteId either.
@@ -260,9 +293,12 @@ def build_tiles(geojsonl: Path, out: Path | None = None) -> Path:
         # zoom the geometry should be the real road.
         "--simplification=4",
         "--no-simplification-of-shared-nodes",
-        str(geojsonl),
     ]
-    log.info("tippecanoe -> %s", out)
+    for name in exclude:
+        cmd += ["-x", name]
+    cmd.append(str(geojsonl))
+
+    log.info("tippecanoe z%d-z%d -> %s", min_zoom, max_zoom, out.name)
     # tippecanoe writes a per-tile progress bar to stderr -- hundreds of kilobytes
     # of it for a national build. On a server run that buries everything else in
     # the log, so it is captured and reduced to what actually matters.
@@ -270,10 +306,15 @@ def build_tiles(geojsonl: Path, out: Path | None = None) -> Path:
     if proc.returncode != 0:
         log.error("tippecanoe failed:\n%s", _tail(proc.stderr))
         raise subprocess.CalledProcessError(proc.returncode, cmd, proc.stdout, proc.stderr)
-
     _report_dropping(proc.stderr)
-    log.info("tiles built: %.1f MB", out.stat().st_size / 1e6)
-    return out
+
+
+def _tile_join(out: Path, parts: list[Path]) -> None:
+    cmd = ["tile-join", "-o", str(out), "--force", "-pk", *[str(p) for p in parts]]
+    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    if proc.returncode != 0:
+        log.error("tile-join failed:\n%s", _tail(proc.stderr))
+        raise subprocess.CalledProcessError(proc.returncode, cmd, proc.stdout, proc.stderr)
 
 
 # tippecanoe announces each thinning decision as it fills a tile.

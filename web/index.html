@@ -472,16 +472,23 @@ function start(header) {
     const n = Number(p.n) || 0;
     $("road").textContent = p.name || "Unnamed road";
     $("road").classList.remove("empty");
-    $("meta").innerHTML =
-      `<b>${n}</b> service${n === 1 ? "" : "s"} · ` +
-      `<b>${Number(p.trips || 0).toLocaleString()}</b> trips/week · ` +
-      `way <b>${escapeHtml(p.way)}</b>`;
+    // Below DETAIL_ZOOM the archive carries geometry and `n` only: the service
+    // list, road name, way id and trip count are stripped, because nothing reads
+    // them when the country is a few hundred pixels across.
+    const detailed = p.refs !== undefined;
+    $("meta").innerHTML = detailed
+      ? `<b>${n}</b> service${n === 1 ? "" : "s"} · ` +
+        `<b>${Number(p.trips || 0).toLocaleString()}</b> trips/week · ` +
+        `way <b>${escapeHtml(p.way)}</b>`
+      : `<b>${n}</b> service${n === 1 ? "" : "s"}`;
     // The pipeline caps `refs` generously and always carries the true count in
     // `n`, so the shortfall is read off the data rather than from a constant here
     // that has to be kept in step with config.MAX_REFS_IN_TILE.
     const shown = String(p.refs || "").split(",").filter(Boolean).length;
-    $("note").hidden = shown >= n;
-    $("note").textContent = `Showing ${shown} of ${n} services.`;
+    $("note").hidden = detailed && shown >= n;
+    $("note").textContent = detailed
+      ? `Showing ${shown} of ${n} services.`
+      : "Zoom in to see which services run here.";
     redrawChips();
   }
 
