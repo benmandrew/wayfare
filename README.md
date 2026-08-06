@@ -151,8 +151,10 @@ forever, because a pattern whose stops cannot be connected by road will never su
 ### Publishing the image
 
 `.github/workflows/image.yml` builds the image on pushes to `main`, on `v*` tags and
-on pull requests, but a pull request build is never pushed, so a broken Dockerfile
-fails the check without publishing anything. Publishing from a fork needs two
+on pull requests, but only `main` and the tags cut from it publish, so a broken
+Dockerfile fails the check without putting anything on Docker Hub. The gate is on the
+push step rather than the trigger, because a manual run can be aimed at any branch and
+would otherwise overwrite `latest` with unreviewed code. Publishing from a fork needs two
 repository secrets: `DOCKERHUB_USERNAME`, and `DOCKERHUB_TOKEN`, which is a Docker Hub
 personal access token with Read & Write scope rather than the account password. The
 build targets linux/amd64 only, because tippecanoe compiles from source and an
