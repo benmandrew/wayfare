@@ -23,7 +23,9 @@ services:
       # Geofabrik rebuilds daily. Once the graph is built, edge ids are only
       # meaningful against this exact extract -- so after the first successful
       # build, set force_rebuild=False and leave it alone for the whole run.
-      tile_urls: https://download.geofabrik.de/europe/great-britain-latest.osm.pbf
+      # Override for a regional dev run, e.g.
+      #   WAYFARE_OSM_URL=https://download.geofabrik.de/europe/united-kingdom/wales-latest.osm.pbf
+      tile_urls: ${WAYFARE_OSM_URL:-https://download.geofabrik.de/europe/great-britain-latest.osm.pbf}
       server_threads: 8
       force_rebuild: "False"
       force_rebuild_elevation: "False"

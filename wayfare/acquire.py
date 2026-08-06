@@ -11,6 +11,7 @@ from __future__ import annotations
 import shutil
 import time
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,26 +22,53 @@ from . import config, logs
 log = logs.get("acquire")
 
 
+# The GTFS members the pipeline actually reads. shapes.txt is deliberately absent:
+# roughly half of operators supply no geometry, and a feed without it is degraded
+# rather than broken.
+REQUIRED_GTFS = ("stop_times.txt", "trips.txt", "routes.txt", "stops.txt")
+
+
 @dataclass(frozen=True)
 class Source:
     name: str
     url: str
     filename: str
     min_bytes: int = 0
+    check: Callable[[Path], None] | None = None
 
 
-def sources(region: str | None = None) -> list[Source]:
+def check_gtfs(path: Path) -> None:
+    """Reject a truncated or bogus GTFS bundle.
+
+    A zip stores its central directory at the *end*, so a download cut short
+    cannot be opened at all -- which makes this a reliable completeness test in
+    the absence of a Content-Length, and one that works at any feed size.
+    """
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = {Path(n).name for n in zf.namelist()}
+    except zipfile.BadZipFile as exc:
+        raise OSError(f"not a readable zip ({exc}); download was truncated") from exc
+    if missing := [n for n in REQUIRED_GTFS if n not in names]:
+        raise OSError(f"GTFS bundle is missing {', '.join(missing)}")
+
+
+def sources(region: str | None = None, with_osm: bool = False) -> list[Source]:
     region = region or config.BODS_REGION
-    return [
+    out = [
         Source(
             "gtfs",
             config.BODS_GTFS_URL.format(region=region),
             f"bods_gtfs_{region}.zip",
             config.MIN_GTFS_BYTES,
+            check=check_gtfs,
         ),
-        Source("osm_gb", config.OSM_GB_URL, "great-britain.osm.pbf", 1 << 30),
         Source("naptan", config.NAPTAN_URL, "naptan.csv", 10 << 20),
     ]
+    if with_osm:
+        url = config.osm_url(region)
+        out.append(Source("osm", url, url.rsplit("/", 1)[-1], 50 << 20))
+    return out
 
 
 def download(src: Source, dest_dir: Path | None = None, force: bool = False) -> Path:
@@ -63,6 +91,8 @@ def download(src: Source, dest_dir: Path | None = None, force: bool = False) -> 
                 raise OSError(
                     f"{src.name}: got {size} bytes, expected at least {src.min_bytes}"
                 )
+            if src.check:
+                src.check(part)
             part.replace(dest)
             log.info("%s: fetched %s (%.2f GB)", src.name, dest.name, _gb(dest))
             return dest
@@ -149,10 +179,12 @@ def _gb(p: Path) -> float:
     return p.stat().st_size / 1e9
 
 
-def acquire_all(region: str | None = None, force: bool = False) -> dict[str, Path]:
+def acquire_all(
+    region: str | None = None, force: bool = False, with_osm: bool = False
+) -> dict[str, Path]:
     config.ensure_dirs()
     out: dict[str, Path] = {}
-    for src in sources(region):
+    for src in sources(region, with_osm=with_osm):
         out[src.name] = download(src, force=force)
     out["gtfs_dir"] = unpack_gtfs(out["gtfs"], force=force)
     return out

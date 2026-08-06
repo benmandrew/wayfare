@@ -24,13 +24,32 @@ DB_PATH = WORK / "wayfare.duckdb"
 BODS_GTFS_URL = "https://data.bus-data.dft.gov.uk/timetable/download/gtfs-file/{region}/"
 BODS_REGION = os.environ.get("WAYFARE_REGION", "all")
 
-# Geofabrik rebuilds these daily. The Valhalla graph is built from this exact file,
-# and Valhalla edge ids are only stable within one graph build -- so the extract is
-# pinned by copying it into RAW and never re-downloading unless asked.
-OSM_GB_URL = "https://download.geofabrik.de/europe/great-britain-latest.osm.pbf"
-OSM_IE_NI_URL = (
-    "https://download.geofabrik.de/europe/ireland-and-northern-ireland-latest.osm.pbf"
-)
+# Geofabrik rebuilds these daily. Valhalla downloads its own copy at graph-build
+# time (see `tile_urls` in docker-compose.yml), so the pipeline does not need the
+# pbf at all -- nothing in Python reads it. Fetching it here is purely archival: a
+# record of which extract a set of edge ids belongs to. Hence `acquire --with-osm`
+# rather than doing it by default and spending 2 GB to no purpose.
+GEOFABRIK = "https://download.geofabrik.de/europe/"
+OSM_EXTRACTS = {
+    "all": "great-britain-latest.osm.pbf",
+    "england": "united-kingdom/england-latest.osm.pbf",
+    "scotland": "united-kingdom/scotland-latest.osm.pbf",
+    "wales": "united-kingdom/wales-latest.osm.pbf",
+    # There is no standalone Northern Ireland extract.
+    "northern_ireland": "ireland-and-northern-ireland-latest.osm.pbf",
+}
+
+
+def osm_url(region: str | None = None) -> str:
+    """The extract matching a BODS region, so a dev run need not fetch all of GB.
+
+    BODS splits England far more finely than Geofabrik does, so anything without
+    its own extract falls back to Great Britain.
+    """
+    if override := os.environ.get("WAYFARE_OSM_URL"):
+        return override
+    region = region or BODS_REGION
+    return GEOFABRIK + OSM_EXTRACTS.get(region, OSM_EXTRACTS["all"])
 
 NAPTAN_URL = "https://naptan.api.dft.gov.uk/v1/access-nodes?dataFormat=csv"
 
@@ -45,8 +64,12 @@ DOWNLOAD_CHUNK = 1 << 20
 DOWNLOAD_RETRIES = 5
 DOWNLOAD_BACKOFF = 30.0  # seconds, multiplied by attempt number
 # BODS streams its bulk files with no Content-Length, so a truncated download looks
-# like a complete one. Anything smaller than this is treated as a failed fetch.
-MIN_GTFS_BYTES = 100 << 20
+# like a complete one. Size alone cannot catch that -- regional bundles run from
+# 37 MB to 1.28 GB, so any floor high enough to detect a truncated national feed
+# would reject a complete Welsh one. The real check is structural: acquire opens
+# the zip and requires the members the pipeline needs. This floor only exists to
+# reject an empty body or an HTML error page cheaply, before that.
+MIN_GTFS_BYTES = 1 << 20
 
 # --- Valhalla --------------------------------------------------------------
 

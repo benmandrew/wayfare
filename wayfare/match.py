@@ -77,6 +77,32 @@ def pending_count(con: duckdb.DuckDBPyConnection) -> int:
     )
 
 
+def retry(con: duckdb.DuckDBPyConnection, statuses: list[str]) -> int:
+    """Forget outcomes with these statuses so the next run redoes them.
+
+    Failures are deliberately never retried automatically -- a pattern that cannot
+    be routed will never route, and retrying it every restart means never
+    finishing. But when the matcher itself was wrong, the recorded failures are
+    wrong too, and this is how they get cleared.
+    """
+    ids = [
+        r[0]
+        for r in con.execute(
+            "SELECT pattern_id FROM match_status WHERE status IN (SELECT unnest(?))",
+            [statuses],
+        ).fetchall()
+    ]
+    if not ids:
+        return 0
+    con.execute("DELETE FROM pattern_edges WHERE pattern_id IN (SELECT unnest(?))", [ids])
+    con.execute("DELETE FROM match_status WHERE pattern_id IN (SELECT unnest(?))", [ids])
+    # `edges` is left alone: it is shared across patterns and re-inserted by
+    # ON CONFLICT DO NOTHING, so a stale row costs nothing and deleting one that
+    # another pattern still references would lose that pattern's geometry.
+    log.info("cleared %d outcomes with status in %s", len(ids), statuses)
+    return len(ids)
+
+
 def load_batch(con: duckdb.DuckDBPyConnection, limit: int) -> list[Pattern]:
     """Fetch the next unmatched patterns, busiest first.
 

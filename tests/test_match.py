@@ -146,3 +146,28 @@ def test_wkt_needs_two_points():
     assert match._wkt([(53.0, -2.0), (53.1, -2.1)]) == (
         "LINESTRING(-2.000000 53.000000, -2.100000 53.100000)"
     )
+
+
+def test_retry_clears_only_the_named_statuses(loaded):
+    match.run(loaded, client_=FakeClient(road_m=100_000))  # all low_confidence
+    assert match.pending_count(loaded) == 0
+
+    assert match.retry(loaded, ["error"]) == 0  # nothing of that status
+    assert match.pending_count(loaded) == 0
+
+    assert match.retry(loaded, ["low_confidence"]) == 2
+    assert match.pending_count(loaded) == 2
+
+    # And a re-run with a working client now succeeds.
+    match.run(loaded, client_=FakeClient())
+    statuses = {r[0] for r in loaded.execute("SELECT status FROM match_status").fetchall()}
+    assert statuses == {"ok"}
+
+
+def test_retry_leaves_shared_edges_alone(loaded):
+    """`edges` is shared across patterns and re-inserted idempotently, so clearing
+    one pattern's outcome must not delete geometry another still points at."""
+    match.run(loaded, client_=FakeClient())
+    match.retry(loaded, ["ok"])
+    assert loaded.execute("SELECT count(*) FROM edges").fetchone()[0] == 2
+    assert loaded.execute("SELECT count(*) FROM pattern_edges").fetchone()[0] == 0

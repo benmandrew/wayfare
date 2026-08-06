@@ -27,6 +27,12 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("acquire", help="download BODS GTFS, OSM extract and NaPTAN")
     p.add_argument("--region", default=None, help="BODS region slug (default: all)")
     p.add_argument("--force", action="store_true", help="re-download even if present")
+    p.add_argument(
+        "--with-osm",
+        action="store_true",
+        help="also archive the OSM extract; Valhalla fetches its own copy, so "
+        "this is only for recording which extract a set of edge ids belongs to",
+    )
 
     p = sub.add_parser("patterns", help="reduce the timetable to distinct route patterns")
     p.add_argument("--memory", default=None, help="DuckDB memory limit, e.g. 8GB")
@@ -37,6 +43,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--workers", type=int, default=None)
     p.add_argument("--limit", type=int, default=None, help="stop after N patterns")
     p.add_argument("--valhalla", default=None, help="Valhalla base URL")
+    p.add_argument(
+        "--retry",
+        default=None,
+        help="comma-separated statuses to forget and redo, e.g. "
+        "low_confidence,error -- use after fixing the matcher itself",
+    )
 
     sub.add_parser("aggregate", help="invert to edge -> services")
     sub.add_parser("publish", help="export GeoJSON and build PMTiles")
@@ -85,7 +97,9 @@ def _require_db() -> Path:
 
 def _dispatch(args: argparse.Namespace) -> int:
     if args.cmd == "acquire":
-        acquire.acquire_all(region=args.region, force=args.force)
+        acquire.acquire_all(
+            region=args.region, force=args.force, with_osm=args.with_osm
+        )
         return 0
 
     if args.cmd == "patterns":
@@ -104,6 +118,8 @@ def _dispatch(args: argparse.Namespace) -> int:
 
         con = db.connect()
         client = valhalla.Client(args.valhalla)
+        if args.retry:
+            match.retry(con, [s.strip() for s in args.retry.split(",") if s.strip()])
         match.run(con, client_=client, workers=args.workers, limit=args.limit)
         for row in match.summary(con):
             log.info("  %-16s %-6s n=%-7d edges=%-6s detour=%s", *row)

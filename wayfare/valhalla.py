@@ -35,8 +35,14 @@ from . import config, logs, polyline
 
 log = logs.get("valhalla")
 
-# The edge fields we need, and nothing else. Valhalla returns a large object per
-# edge by default; at national scale the unwanted fields dominate transfer time.
+# The fields we need, and nothing else. Valhalla returns a large object per edge by
+# default; at national scale the unwanted fields dominate transfer time.
+#
+# `filters.action=include` is a strict allowlist: anything not named here is absent
+# from the response entirely, not null. `confidence_score` is top-level rather than
+# per-edge and is easy to forget for that reason -- leaving it out made every
+# map_snap match score 0.0 and be rejected as low confidence, which looked like bad
+# matching rather than a bad request. Hence the assertion in _to_match.
 EDGE_ATTRS = [
     "edge.way_id",
     "edge.id",
@@ -47,6 +53,7 @@ EDGE_ATTRS = [
     "edge.end_shape_index",
     "shape",
     "matched.point",
+    "confidence_score",
 ]
 
 # Valhalla caps locations per route request (bus costing defaults to 50). Long
@@ -186,6 +193,15 @@ class Client:
 
 
 def _to_match(data: dict[str, Any], source: str) -> Match:
+    # A map_snap response without a score means the attribute filter dropped it, not
+    # that the match was poor. Defaulting to 0.0 there silently rejects every good
+    # match, so fail loudly instead. edge_walk scores nothing, hence shape-only.
+    if source == "shape" and "confidence_score" not in data:
+        raise ValhallaError(
+            "trace_attributes returned no confidence_score; "
+            "'confidence_score' must be listed in filters.attributes"
+        )
+
     shape = polyline.decode(data["shape"], 6) if data.get("shape") else []
     edges: list[Edge] = []
     total = 0.0

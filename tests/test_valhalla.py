@@ -86,3 +86,22 @@ def test_thinning_preserves_the_endpoints():
 def test_short_shapes_are_not_thinned():
     shape = [(53.0, -2.0), (53.1, -2.0)]
     assert valhalla._thin(shape, 2000) is shape
+
+
+def test_confidence_score_is_requested():
+    """filters.action=include is a strict allowlist. Omitting confidence_score
+    makes every map_snap match score 0.0 and get rejected as low confidence --
+    a bad request that looks exactly like bad matching."""
+    assert "confidence_score" in valhalla.EDGE_ATTRS
+
+
+def test_missing_confidence_score_raises_rather_than_defaulting():
+    stripped = {k: v for k, v in RESPONSE.items() if k != "confidence_score"}
+    with pytest.raises(valhalla.ValhallaError, match="confidence_score"):
+        valhalla._to_match(stripped, source="shape")
+
+
+def test_edge_walk_needs_no_confidence_score():
+    """The stops path scores nothing by construction, so its absence is normal."""
+    stripped = {k: v for k, v in RESPONSE.items() if k != "confidence_score"}
+    assert valhalla._to_match(stripped, source="stops").confidence == 0.0
