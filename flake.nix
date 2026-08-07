@@ -15,7 +15,7 @@
     in
     {
       # `nix fmt` formats this file.
-      formatter = forAllSystems (pkgs: pkgs.nixfmt-rfc-style);
+      formatter = forAllSystems (pkgs: pkgs.nixfmt);
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
@@ -32,7 +32,7 @@
             # Not used by the pipeline; for reading work/wayfare.duckdb by hand.
             pkgs.duckdb
             # ruff formats the Python, nixfmt formats this file. CI checks both.
-            pkgs.nixfmt-rfc-style
+            pkgs.nixfmt
           ];
 
           # buildInputs rather than nativeBuildInputs so the linker wrapper adds
