@@ -38,9 +38,15 @@ Each stage reads what the last one wrote, and each re-runs on its own.
 Use a small region rather than the national bundle. Wales is 41 MB zipped and exercises
 every stage.
 
+The development environment is a *Nix flake*. `direnv allow` on first entry is the whole
+of the setup, or `nix develop` for those without direnv. The hook creates `.venv` with
+uv, installs `-e '.[dev,art]'` and re-syncs it as `pyproject.toml` or the nixpkgs Python
+moves. `.venv/bin` is on `PATH`, so `pytest -q`, `ruff check .` and `mypy` run bare.
+`.envrc` also loads `.env` if present, the file Compose reads, so a local run and a
+containerised one share `WAYFARE_REGION` and `WAYFARE_OSM_URL`.
+
 ```
-uv venv && source .venv/bin/activate
-pip install -e '.[dev]'
+direnv allow                      # or: nix develop
 
 wayfare acquire --region wales
 wayfare patterns && wayfare match && wayfare aggregate && wayfare publish
@@ -66,10 +72,12 @@ and a mismatch fails every pattern rather than erroring.
 
 ## Requirements
 
-Python 3.12 or newer, roughly 40 GB of free disk, and felt/tippecanoe 2.17 or newer on
-`PATH` for native PMTiles output. A Valhalla server must be reachable at
-`WAYFARE_VALHALLA`, which defaults to `http://localhost:8002`. All pipeline state lives
-in a single DuckDB file under `WAYFARE_DATA`.
+The flake supplies the toolchain: Python 3.12, uv, cairo and pkg-config (pycairo ships
+no wheel and compiles), felt/tippecanoe 2.79.0 — the fork and version the Dockerfile
+builds from source — and the duckdb command-line interface (CLI) for reading the
+database by hand. Budget roughly 40 GB of free disk. A Valhalla server must be reachable
+at `WAYFARE_VALHALLA`, which defaults to `http://localhost:8002`. All pipeline state
+lives in a single DuckDB file under `WAYFARE_DATA`.
 
 ## Layout
 

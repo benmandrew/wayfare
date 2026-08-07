@@ -23,3 +23,6 @@ htmlcov/
 
 .env
 .DS_Store
+
+# direnv/nix-direnv: the devShell it builds, and the gc root that keeps it.
+.direnv/

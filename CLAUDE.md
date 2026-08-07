@@ -248,7 +248,19 @@ info card.
 ## Standards
 
 - Python 3.12, ruff at line-length 92, mypy strict on `wayfare`.
-- `.venv` via uv. `.venv/bin/python -m pytest -q`, `-m ruff check .`, `-m mypy`.
+- The dev environment is the nix flake and nothing else. direnv enters it (`.envrc` is
+  `use flake` plus `dotenv_if_exists .env`, the same file Compose reads); `nix develop`
+  is the same shell without direnv. It supplies Python 3.12, uv, cairo, pkg-config,
+  felt/tippecanoe and the duckdb CLI, and its hook builds `.venv` with uv, re-syncing
+  when `pyproject.toml` or the nixpkgs Python moves. Dependencies stay in
+  `pyproject.toml`, never in the flake.
+- `.venv/bin` is on `PATH` in the shell, so the commands are bare: `pytest -q`,
+  `ruff check .`, `mypy`. Outside the shell they are not on `PATH` at all — get into it
+  rather than reaching for a system Python or a hand-made venv.
+- Tools that must be found by hand outside the shell: `tippecanoe` for `publish`, cairo
+  for `art`. That is what the flake exists to stop.
+- `LD_LIBRARY_PATH` in the flake is load-bearing: duckdb's manylinux wheel wants a distro
+  `libstdc++`, and the nix interpreter has none. It fails at `import duckdb`, not install.
 - Tests must not need the real datasets. `tests/conftest.py` holds a mini GTFS
   feed; mark anything needing real data `slow` or `valhalla`.
 - Comment the non-obvious and leave the obvious alone.
