@@ -80,5 +80,15 @@ jobs:
           # every run would rebuild tippecanoe from scratch -- several minutes
           # each time. max keeps the intermediate stages too, and their cache
           # keys move only when the Dockerfile or pyproject.toml does.
+          #
+          # Only the publishing runs write. A cache entry written from a pull
+          # request lands in that request's own ref scope, where neither main nor
+          # any other request can read it -- but it still counts against the
+          # repository's 10 GB quota and evicts by least-recent use. Two
+          # `build-essential` toolchains under mode=max make each entry large
+          # enough that a few open requests would push out main's entry, which is
+          # the one the release build depends on. Reading stays unconditional:
+          # a pull request can read the default branch, so it gets tippecanoe for
+          # free either way.
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: ${{ env.PUBLISH == 'true' && 'type=gha,mode=max' || '' }}

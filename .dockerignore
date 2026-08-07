@@ -1,22 +1,32 @@
 # The build context is sent to the daemon in full. data/ holds the downloads and
 # the graph -- tens of gigabytes after a national run -- and none of it belongs in
-# an image.
+# an image. The glob as well as the bare name: each region gets its own data root,
+# so data-gb/ and data-london/ were being sent when only `data/` was listed.
 data/
+data-*/
 *.pmtiles
 *.duckdb
 *.duckdb.wal
 *.osm.pbf
 *.part
 
-.venv/
+# Patterns match the whole path and do not recurse on their own, so a bare
+# `__pycache__/` excludes the root one and leaves wayfare/__pycache__/ in the
+# context -- where `COPY wayfare` puts it in the image and invalidates that layer.
+# Hence the `**/` on everything that can appear at depth.
+**/.venv/
+**/__pycache__/
+**/*.egg-info/
 .git/
-__pycache__/
-*.egg-info/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
 .coverage
 htmlcov/
+
+# Claude Code's session state, and the git worktrees it creates under here --
+# each one a repository copy carrying its own .venv.
+.claude/
 
 .env
 .DS_Store

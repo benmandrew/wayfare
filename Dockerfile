@@ -31,9 +31,10 @@ RUN python -m venv "$VIRTUAL_ENV"
 
 WORKDIR /app
 # Dependencies resolve from pyproject alone, so this layer survives every change
-# to wayfare/ and only rebuilds when the dependency list moves. README is copied
-# because the project metadata references it.
-COPY pyproject.toml README.md ./
+# to wayfare/ and only rebuilds when the dependency list moves. README stays out
+# on purpose: pyproject carries no `readme` field, so copying it here would buy
+# nothing and make every docs edit recompile pycairo.
+COPY pyproject.toml ./
 RUN mkdir -p wayfare && touch wayfare/__init__.py \
     && pip install --no-cache-dir '.[art]' \
     && pip uninstall -y wayfare
