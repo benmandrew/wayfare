@@ -470,8 +470,17 @@ def _commit(con: duckdb.DuckDBPyConnection, batch: list[Outcome]) -> None:
 # NULL would otherwise infer the wrong type and fail the insert.
 
 _EDGE_COLS: tuple[str, ...] = (
-    "edge_id", "way_id", "road_name", "road_class", "length_m",
-    "lon_e6", "lat_e6", "min_lon_e6", "min_lat_e6", "max_lon_e6", "max_lat_e6",
+    "edge_id",
+    "way_id",
+    "road_name",
+    "road_class",
+    "length_m",
+    "lon_e6",
+    "lat_e6",
+    "min_lon_e6",
+    "min_lat_e6",
+    "max_lon_e6",
+    "max_lat_e6",
 )
 _EDGE_TYPES = (
     "'edge_id':'BIGINT','way_id':'BIGINT','road_name':'VARCHAR',"

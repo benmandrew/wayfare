@@ -35,10 +35,22 @@ class FakeClient:
         if self.fail:
             raise self.fail
         edges = [
-            valhalla.Edge(1001, 44556677, self.road_m / 2, "Oxford Road", "secondary",
-                          [(53.48, -2.245), (53.48, -2.240)]),
-            valhalla.Edge(1002, 44556678, self.road_m / 2, "Oxford Road", "secondary",
-                          [(53.48, -2.240), (53.48, -2.235)]),
+            valhalla.Edge(
+                1001,
+                44556677,
+                self.road_m / 2,
+                "Oxford Road",
+                "secondary",
+                [(53.48, -2.245), (53.48, -2.240)],
+            ),
+            valhalla.Edge(
+                1002,
+                44556678,
+                self.road_m / 2,
+                "Oxford Road",
+                "secondary",
+                [(53.48, -2.240), (53.48, -2.235)],
+            ),
         ]
         return valhalla.Match(edges, confidence=0.9, road_m=self.road_m, source=source)
 
@@ -47,6 +59,7 @@ class FakeClient:
 
     def match_stops(self, stops):
         return self._match("stops")
+
 
 # A four-stop line running east along a single street, with two trips sharing one
 # pattern and a third trip that turns short. Enough to exercise the collapse from

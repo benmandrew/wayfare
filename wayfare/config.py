@@ -56,6 +56,7 @@ def osm_url(region: str | None = None) -> str:
     region = region or BODS_REGION
     return GEOFABRIK + OSM_EXTRACTS.get(region, OSM_EXTRACTS["all"])
 
+
 NAPTAN_URL = "https://naptan.api.dft.gov.uk/v1/access-nodes?dataFormat=csv"
 
 # BODS blocks requests that look like generic scrapers.

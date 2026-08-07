@@ -128,9 +128,7 @@ def download(src: Source, dest_dir: Path | None = None, force: bool = False) -> 
             # continue from where it stopped. Otherwise it is dead weight that
             # would be mistaken for progress.
             if src.resumable:
-                log.warning(
-                    "%s: keeping %.2f GB already fetched", src.name, _gb(part)
-                )
+                log.warning("%s: keeping %.2f GB already fetched", src.name, _gb(part))
             else:
                 part.unlink(missing_ok=True)
             if attempt < config.DOWNLOAD_RETRIES:

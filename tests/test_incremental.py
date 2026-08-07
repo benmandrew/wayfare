@@ -57,8 +57,7 @@ def _ids_by_stop_count(con: duckdb.DuckDBPyConnection) -> dict[int, int]:
     return {
         n: pid
         for n, pid in con.execute(
-            "SELECT n_stops, pattern_id FROM patterns p "
-            f"WHERE {db.current_feed()}"
+            f"SELECT n_stops, pattern_id FROM patterns p WHERE {db.current_feed()}"
         ).fetchall()
     }
 
@@ -188,9 +187,7 @@ def test_departed_patterns_keep_their_edges_but_leave_the_map(gtfs_dir: Path, co
         gtfs_dir,
         FEED_2,
         "R2,WK,T7,0,\n",
-        "T7,09:00:00,09:00:00,S1,1\n"
-        "T7,09:05:00,09:05:00,S2,2\n"
-        "T7,09:10:00,09:10:00,S3,3\n",
+        "T7,09:00:00,09:00:00,S1,1\nT7,09:05:00,09:05:00,S2,2\nT7,09:10:00,09:10:00,S3,3\n",
     )
     _build(gtfs_dir, con)
     match.run(con, client_=FakeClient())
@@ -364,7 +361,7 @@ def test_migration_is_not_repeated(tmp_path: Path):
     con.close()
 
     con = db.connect(path)
-    assert con.execute(
-        "SELECT pattern_id FROM patterns ORDER BY n_stops"
-    ).fetchall() == first
+    assert (
+        con.execute("SELECT pattern_id FROM patterns ORDER BY n_stops").fetchall() == first
+    )
     con.close()

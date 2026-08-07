@@ -132,9 +132,7 @@ def _require_db() -> Path:
 
 def _dispatch(args: argparse.Namespace) -> int:
     if args.cmd == "acquire":
-        acquire.acquire_all(
-            region=args.region, force=args.force, with_osm=args.with_osm
-        )
+        acquire.acquire_all(region=args.region, force=args.force, with_osm=args.with_osm)
         return 0
 
     if args.cmd == "patterns":

@@ -96,7 +96,6 @@ def test_hits_is_a_bbox_overlap_not_containment():
     assert not b.hits([-2.25], [53.60])
 
 
-
 # --- Styles -----------------------------------------------------------------
 
 

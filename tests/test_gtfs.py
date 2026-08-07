@@ -36,9 +36,12 @@ def test_pattern_stops_are_ordered(gtfs_dir: Path, con):
     ).fetchall()
     assert [s[0] for s in stops] == ["S1", "S2", "S3", "S4"]
     # seq is zero-based, so it indexes the stop list directly.
-    assert con.execute(
-        "SELECT min(seq) FROM pattern_stops WHERE pattern_id = ?", [pid]
-    ).fetchone()[0] == 0
+    assert (
+        con.execute(
+            "SELECT min(seq) FROM pattern_stops WHERE pattern_id = ?", [pid]
+        ).fetchone()[0]
+        == 0
+    )
 
 
 def test_span_is_measured_in_metres(gtfs_dir: Path, con):

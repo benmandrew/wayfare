@@ -338,16 +338,21 @@ def _tippecanoe(
 ) -> None:
     cmd = [
         "tippecanoe",
-        "-o", str(out),
+        "-o",
+        str(out),
         "--force",
-        "-l", LAYER,
-        "-Z", str(min_zoom),
-        "-z", str(max_zoom),
+        "-l",
+        LAYER,
+        "-Z",
+        str(min_zoom),
+        "-z",
+        str(max_zoom),
         # The edge id belongs in the MVT feature id field, not in the attributes.
         # It is two varints and a pool entry per feature cheaper there, and it is
         # where setFeatureState looks -- so the viewer needs no promoteId either.
         "--use-attribute-for-id=id",
-        "-x", "id",
+        "-x",
+        "id",
         # The national GeoJSONL is around 1.6 GB. Reading it single-threaded is
         # minutes of wall clock for nothing.
         "-P",
@@ -423,5 +428,3 @@ def _tail(text: str, lines: int = 20) -> str:
 def build(con: duckdb.DuckDBPyConnection) -> Path:
     config.ensure_dirs()
     return build_tiles(export_geojsonl(con))
-
-

@@ -141,9 +141,7 @@ def parse_bbox(text: str) -> Bounds:
     # perfectly valid longitude, and a UK longitude near -3 is a valid latitude, so
     # lat,lon order parses cleanly and silently puts the window off West Africa.
     # What does catch it is that the data only covers these islands.
-    if not b.hits(
-        [ISLES.min_lon, ISLES.max_lon], [ISLES.min_lat, ISLES.max_lat]
-    ):
+    if not b.hits([ISLES.min_lon, ISLES.max_lon], [ISLES.min_lat, ISLES.max_lat]):
         log.warning(
             "%s lies outside the British Isles, so the render will be empty. "
             "The order is minlon,minlat,maxlon,maxlat -- lon first, not lat.",
@@ -218,6 +216,7 @@ class Projection:
 
 
 # --- Data -------------------------------------------------------------------
+
 
 @dataclass(frozen=True, slots=True)
 class Edge:
@@ -562,9 +561,7 @@ class RenderOpts:
     alpha_scale: float = 1.0
 
 
-StyleFn = Callable[
-    ["cairo.Context[cairo.Surface]", "Window", Projection, RenderOpts], None
-]
+StyleFn = Callable[["cairo.Context[cairo.Surface]", "Window", Projection, RenderOpts], None]
 
 
 @dataclass(frozen=True, slots=True)
