@@ -1,0 +1,63 @@
+# Formatting, linting, types and tests, run in the same nix devShell a
+# contributor gets from direnv. One environment definition, checked here rather
+# than described here -- a CI-only Python setup would drift from flake.nix and
+# the drift would surface as a green check on a broken shell.
+#
+# The suite needs no datasets and no Valhalla: tests/conftest.py holds a mini
+# GTFS feed, and anything wanting the real thing is marked `slow` or `valhalla`.
+
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A second push to the same branch makes the first one's result irrelevant.
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+
+      # The devShell installs into .venv with uv on first entry, and pycairo
+      # has no wheel -- it compiles every time this cache misses. Keyed on
+      # flake.lock as well as pyproject.toml because the interpreter moving
+      # invalidates the built extension too.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'flake.lock') }}
+          restore-keys: uv-${{ runner.os }}-
+
+      # Separate steps so a failure names itself in the run summary, and
+      # `!cancelled()` so one failing check does not hide the other three --
+      # a formatting slip should not conceal a broken test. The first entry
+      # builds the shell and .venv; the rest find both already there.
+      - name: format (python)
+        run: nix develop --command ruff format --check .
+
+      - if: ${{ !cancelled() }}
+        name: format (nix)
+        run: nix develop --command nixfmt --check flake.nix
+
+      - if: ${{ !cancelled() }}
+        name: lint
+        run: nix develop --command ruff check .
+
+      - if: ${{ !cancelled() }}
+        name: types
+        run: nix develop --command mypy
+
+      - if: ${{ !cancelled() }}
+        name: tests
+        run: nix develop --command pytest -q

@@ -11,10 +11,12 @@
         "aarch64-linux"
         "aarch64-darwin"
       ];
-      forAllSystems =
-        f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
     in
     {
+      # `nix fmt` formats this file.
+      formatter = forAllSystems (pkgs: pkgs.nixfmt-rfc-style);
+
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           # uv still owns the Python dependencies, exactly as the README and
@@ -29,6 +31,8 @@
             pkgs.tippecanoe
             # Not used by the pipeline; for reading work/wayfare.duckdb by hand.
             pkgs.duckdb
+            # ruff formats the Python, nixfmt formats this file. CI checks both.
+            pkgs.nixfmt-rfc-style
           ];
 
           # buildInputs rather than nativeBuildInputs so the linker wrapper adds

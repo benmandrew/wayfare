@@ -247,7 +247,10 @@ info card.
 
 ## Standards
 
-- Python 3.12, ruff at line-length 92, mypy strict on `wayfare`.
+- Python 3.12, ruff at line-length 92, mypy strict on `wayfare`. `ruff format` owns the
+  layout and `nixfmt` owns `flake.nix`; both are enforced, so do not hand-tune spacing
+  back. `.github/workflows/check.yml` runs format, lint, types and tests in this same
+  devShell on every push and pull request.
 - The dev environment is the nix flake and nothing else. direnv enters it (`.envrc` is
   `use flake` plus `dotenv_if_exists .env`, the same file Compose reads); `nix develop`
   is the same shell without direnv. It supplies Python 3.12, uv, cairo, pkg-config,
