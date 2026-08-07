@@ -48,7 +48,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libsqlite3-0 zlib1g libcairo2 curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=tippecanoe /usr/local/bin/tippecanoe* /usr/local/bin/
+
+# The whole directory rather than a tippecanoe* glob. `make install` lays down
+# six binaries and `tile-join` is the only one not carrying the prefix, so the
+# glob dropped exactly one -- silently, since nothing in the build or the image
+# looks for it. publish.py runs tippecanoe twice over different zoom ranges and
+# uses tile-join to concatenate the passes into a single PMTiles file, so a
+# national run spent its hours matching, exported the GeoJSONL, and only then
+# died on a missing executable. This stage's base image ships an empty
+# /usr/local/bin, so copying the directory carries tippecanoe's install output
+# and nothing else.
+COPY --from=tippecanoe /usr/local/bin/ /usr/local/bin/
 COPY --from=deps /opt/venv /opt/venv
 ENV VIRTUAL_ENV=/opt/venv PATH=/opt/venv/bin:$PATH
 
