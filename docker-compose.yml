@@ -22,8 +22,15 @@
 # about Yorkshire stops. See .env.example.
 
 x-wayfare: &wayfare
-  build: .
-  image: wayfare:latest
+  # Published by .github/workflows/image.yml on every push to main. There is no
+  # `build:` here on purpose: a server should pull a tagged, already-built image
+  # rather than compile tippecanoe and pycairo itself. `docker compose pull`
+  # picks up a newer one. To run a local change instead, build and point
+  # WAYFARE_IMAGE at the result:
+  #
+  #   docker build -t benmandrew/wayfare:dev .
+  #   WAYFARE_IMAGE=benmandrew/wayfare:dev docker compose run --rm wayfare status
+  image: ${WAYFARE_IMAGE:-benmandrew/wayfare:latest}
   volumes:
     - data:/data
   environment:
