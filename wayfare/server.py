@@ -25,9 +25,12 @@ one parameter a caller can raise without limit.
 
 from __future__ import annotations
 
+import contextlib
 import functools
+import gzip
 import hashlib
 import http.server
+import io
 import json
 import os
 import re
@@ -51,6 +54,52 @@ RANGE = re.compile(r"bytes=(\d*)-(\d*)")
 # several regions can offer all of them -- `wales.pmtiles` beside
 # `london.pmtiles` -- and the viewer picks between them with ?tiles=.
 ARTEFACT_SUFFIXES = (".pmtiles",)
+
+# Worth compressing, and small enough that doing it per request costs nothing.
+# Both spellings of JavaScript: Python reports .js as text/javascript from 3.12
+# and application/javascript before it, and the vendored maplibre build is the
+# largest thing the page loads -- listing only one spelling shipped it, and only
+# it, uncompressed. An archive is excluded by both tests below: it is three orders
+# of magnitude past the cap, and gzipping a body the client means to read in
+# ranges would defeat PMTiles entirely.
+COMPRESSIBLE = frozenset(
+    {
+        "text/html",
+        "text/css",
+        "text/plain",
+        "text/javascript",
+        "application/javascript",
+        "application/json",
+    }
+)
+COMPRESS_MAX = 1 << 20
+
+# How long a browser may reuse an archive without asking. A day by default.
+#
+# The archive is the one static thing here worth caching outright: it is ~130 MB
+# read as hundreds of separate ranges, and republishing it is a monthly event
+# with little change in between. Revalidating instead costs a round trip per
+# range, and a round trip is most of what a range request costs -- measured
+# against the deployed instance, a 16 KB range takes ~90 ms of which only ~15 ms
+# is transfer, because the tailnet path is relayed rather than direct.
+#
+# A day rather than something nearer the publish interval, because the whole
+# benefit is already collected well inside one: a session lasts minutes and
+# revisits are usually same-day, so a longer window buys almost nothing further
+# while widening how far behind a returning visitor can be. Past the day it is
+# one 304 against the ETag, not 130 MB.
+#
+# The trade is still real: for up to a day after a publish, a returning visitor
+# can be looking at the previous map. A reload revalidates, so there is always a
+# way out. --max-age moves it; 0 goes back to revalidating every time.
+ARCHIVE_MAX_AGE = 24 * 60 * 60
+
+# Everything else -- the page and the vendored libraries -- keeps revalidating.
+# Those change whenever the image is rebuilt rather than on the pipeline's
+# schedule, they are served from one HTTP/2 connection so the checks multiplex
+# into roughly a single round trip, and a stale index.html is a bug that outlives
+# its own fix.
+REVALIDATE = "no-cache"
 
 # Render limits. Width alone is not the thing to cap: the window's aspect ratio
 # decides the height, and `scale` multiplies both, so a modest-looking
@@ -470,6 +519,13 @@ def art_meta(enabled: bool) -> dict[str, Any]:
 class Handler(http.server.SimpleHTTPRequestHandler):
     out_dir: Path = Path("data/out")
     renderer: Renderer | None = None  # None disables /art
+    max_age: int = ARCHIVE_MAX_AGE
+    # Set per request by send_head and read by end_headers, which is the one hook
+    # both the 200 and 206 paths pass through. Reset on every request: the
+    # connection is kept alive, so a leftover value would tag the next response
+    # with the previous file's validator.
+    _pending_etag: str | None = None
+    _pending_cc: str = REVALIDATE
 
     def translate_path(self, path: str) -> str:
         """Resolve the pipeline's own outputs out of the artefact directory.
@@ -487,6 +543,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         return super().translate_path(path)
 
     def do_GET(self) -> None:
+        self._pending_etag = None
+        self._pending_cc = REVALIDATE
         url = urlparse(self.path)
         if url.path == "/archives.json":
             self._json(archives(self.out_dir))
@@ -585,13 +643,115 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def send_head(self):  # type: ignore[no-untyped-def]
-        header = self.headers.get("Range")
-        if not header:
-            return super().send_head()
+        path = self._resolve(self.translate_path(self.path))
+        gz = path is not None and self._gzip_wanted(path)
+        self._pending_etag = self._file_etag(path, gz) if path else None
+        self._pending_cc = self._cache_control(path) if path else REVALIDATE
 
-        path = self.translate_path(self.path)
-        if os.path.isdir(path):
+        # A conditional hit costs one round trip and sends no body. This is what
+        # makes coming back cheap: an archive is read as hundreds of separate
+        # ranges, and a browser will only reuse cached *partial* content when it
+        # has a strong validator to check it against. Last-Modified is not one,
+        # so without this every visit re-fetched ranges it already held.
+        if self._pending_etag and _matches(
+            self.headers.get("If-None-Match"), self._pending_etag
+        ):
+            self.send_response(304)
+            self.end_headers()
+            return None
+
+        if path is None:
             return super().send_head()
+        if gz:
+            compressed = self._send_compressed(path)
+            if compressed is not None:
+                return compressed
+        if not self.headers.get("Range"):
+            return super().send_head()
+        return self._send_range(path)
+
+    def _resolve(self, path: str) -> str | None:
+        """The file a request actually maps to, or None to let the base class deal.
+
+        `GET /` lands on a directory and the base class then picks index.html out
+        of it. Repeating that here is what lets the page itself carry a validator:
+        resolving only as far as the directory left every request for `/` looking
+        unfileable, so the page went out with neither an ETag nor compression
+        while the archive beside it got both.
+        """
+        if not os.path.isdir(path):
+            return path
+        if not urlparse(self.path).path.endswith("/"):
+            return None  # base class issues the redirect to the trailing-slash form
+        for index in ("index.html", "index.htm"):
+            candidate = os.path.join(path, index)
+            if os.path.isfile(candidate):
+                return candidate
+        return None  # no index: base class lists the directory
+
+    def _file_etag(self, path: str, gzipped: bool = False) -> str | None:
+        """A strong validator for a static file, from its mtime and size.
+
+        Not a content hash, unlike the render ETags above: an archive is ~130 MB
+        and hashing it on every range request would cost far more than the
+        transfer it saves. mtime_ns and size together change whenever
+        `wayfare publish` rewrites it, which is the only way its contents move.
+        """
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        suffix = "-gzip" if gzipped else ""
+        return f'"{st.st_mtime_ns:x}-{st.st_size:x}{suffix}"'
+
+    def _cache_control(self, path: str) -> str:
+        """How long this particular file may be reused without asking.
+
+        Split by what republishes the file rather than by content type. An archive
+        comes from the pipeline on a monthly cadence and is the expensive thing to
+        re-fetch, so it gets a real freshness lifetime. The page and its libraries
+        come from an image rebuild and are cheap, so they keep revalidating --
+        caching those would mean shipping a fix that returning visitors could not
+        see.
+        """
+        if path.endswith(ARTEFACT_SUFFIXES) and self.max_age > 0:
+            return f"public, max-age={self.max_age}"
+        return REVALIDATE
+
+    def _gzip_wanted(self, path: str) -> bool:
+        if "gzip" not in self.headers.get("Accept-Encoding", ""):
+            return False
+        if self.headers.get("Range"):
+            return False
+        if self.guess_type(path).split(";")[0] not in COMPRESSIBLE:
+            return False
+        try:
+            return 0 < os.stat(path).st_size <= COMPRESS_MAX
+        except OSError:
+            return False
+
+    def _send_compressed(self, path: str):  # type: ignore[no-untyped-def]
+        """Serve a small text file gzipped, from memory.
+
+        The viewer is ~24 KB of HTML fetched before anything else can start, and
+        it compresses to about a third of that. `Vary` is not decoration here: the
+        encoding is baked into the ETag above, so a shared cache must key on it or
+        it will hand a gzipped body to a client that asked for identity.
+        """
+        try:
+            body = gzip.compress(Path(path).read_bytes(), 6)
+        except OSError:
+            return None
+        self.send_response(200)
+        self.send_header("Content-Type", self.guess_type(path))
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Encoding", "gzip")
+        self.send_header("Vary", "Accept-Encoding")
+        self.end_headers()
+        return io.BytesIO(body)
+
+    def _send_range(self, path: str):  # type: ignore[no-untyped-def]
+        header = self.headers.get("Range", "")
         try:
             f = open(path, "rb")  # noqa: SIM115 - closed by the caller, as in the base class
         except OSError:
@@ -634,8 +794,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         return _Slice(f, end - start + 1)
 
     def end_headers(self) -> None:
-        if self.command == "OPTIONS" or "Content-Range" not in self._headers_buffer_str():
+        sent = self._headers_buffer_str()
+        if self.command == "OPTIONS" or "Content-Range" not in sent:
             self._cors()
+        if self._pending_etag and "ETag:" not in sent:
+            self.send_header("ETag", self._pending_etag)
+            self.send_header("Cache-Control", self._pending_cc)
         super().end_headers()
 
     def _cors(self) -> None:
@@ -647,6 +811,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def _headers_buffer_str(self) -> str:
         return b"".join(getattr(self, "_headers_buffer", [])).decode("latin-1")
+
+    def copyfile(self, source: Any, outputfile: Any) -> None:
+        """Panning the map cancels every tile still in flight, so a client hanging
+        up mid-body is ordinary traffic here rather than a fault. The base class
+        lets the write raise, and socketserver prints a full traceback per abort --
+        which buries anything that actually matters.
+        """
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            super().copyfile(source, outputfile)
 
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002
         pass  # one line per tile is unreadable
@@ -679,10 +852,12 @@ def serve(
     out_dir: Path = Path("data/out"),
     art_enabled: bool = True,
     host: str = "",
+    max_age: int | None = None,
 ) -> None:
     """Serve `web_dir`, the archives in `out_dir`, and /art, until interrupted."""
     Handler.out_dir = out_dir.resolve()
     Handler.renderer = Renderer() if art_enabled else None
+    Handler.max_age = ARCHIVE_MAX_AGE if max_age is None else max_age
 
     found = archives(Handler.out_dir)
     for name in found:

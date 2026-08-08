@@ -110,6 +110,18 @@ def main(argv: list[str] | None = None) -> int:
         help="switch off /art; a render is the one request here that costs real CPU. "
         "WAYFARE_ART=off does the same for a deployment that cannot change the command",
     )
+    # Defaulted in server.serve rather than here, because `server` is imported
+    # lazily further down -- it pulls in cairo and duckdb, which is a lot to load
+    # to print a usage message for some other subcommand.
+    p.add_argument(
+        "--max-age",
+        type=int,
+        default=None,
+        metavar="SECONDS",
+        help="how long a browser may reuse a cached .pmtiles archive without "
+        "revalidating (default one day; 0 revalidates every time). "
+        "The page itself always revalidates",
+    )
 
     p = sub.add_parser("all", help="acquire, patterns, match, aggregate, publish")
     p.add_argument("--region", default=None)
@@ -253,6 +265,7 @@ def _dispatch(args: argparse.Namespace) -> int:
             web_dir=args.dir,
             out_dir=args.out or config.OUT,
             art_enabled=config.ART_ENABLED and not args.no_art,
+            max_age=args.max_age,
         )
         return 0
 
