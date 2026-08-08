@@ -343,39 +343,6 @@ def build_source(con: duckdb.DuckDBPyConnection, n_edges: int) -> None:
 # --- Layouts ----------------------------------------------------------------
 
 
-# The classic bit spread: four rounds of shift-and-mask turn 16 packed bits into 16
-# bits with a zero between each.
-_SPREAD = ((8, 0x00FF00FF), (4, 0x0F0F0F0F), (2, 0x33333333), (1, 0x55555555))
-
-
-def _morton_sql() -> str:
-    """Z-order code over the bbox centre, 16 bits an axis interleaved into 32.
-
-    Written against a column name rather than an expression because each round names
-    its input twice, so inlining the quantisation would double the expression's length
-    on every one of the four.
-    """
-
-    def spread(col: str) -> str:
-        e = col
-        for shift, mask in _SPREAD:
-            e = f"(({e} | ({e} << {shift})) & {mask})"
-        return e
-
-    return f"({spread('qx')} | ({spread('qy')} << 1))"
-
-
-def _quantise(expr_lon: str, expr_lat: str) -> str:
-    lon_span = GB.max_lon - GB.min_lon
-    lat_span = GB.max_lat - GB.min_lat
-    return (
-        f"least(65535, greatest(0, floor((({expr_lon}) - {GB.min_lon})"
-        f" * 65535.0 / {lon_span})))::BIGINT AS qx, "
-        f"least(65535, greatest(0, floor((({expr_lat}) - {GB.min_lat})"
-        f" * 65535.0 / {lat_span})))::BIGINT AS qy"
-    )
-
-
 # Centre of the stored bbox, in degrees. Both curves order on this: it is the one
 # point an edge has that a window query is asking about, and it is already columnar.
 _CX = "(min_lon_e6 + max_lon_e6) / 2e6"
@@ -395,7 +362,9 @@ def order_sql(layout: str) -> str:
         # geography at all -- a hash of the id models it exactly.
         return salted("batch")
     if layout == "morton":
-        return f"(SELECT {_morton_sql()} FROM (SELECT {_quantise(_CX, _CY)}))"
+        # The package's own, so what this measures and what `wayfare cluster` does
+        # cannot drift apart. `db.CLUSTER_BOX` is this file's `GB` by construction.
+        return db.morton_sql(_CX, _CY)
     if layout == "hilbert":
         return f"ST_Hilbert({_CX}, {_CY}, {_BOX})"
     raise ValueError(layout)

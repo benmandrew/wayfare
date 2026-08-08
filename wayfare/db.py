@@ -375,6 +375,183 @@ def _migrate_pattern_ids(con: duckdb.DuckDBPyConnection) -> None:
     )
 
 
+# --- Spatial clustering ------------------------------------------------------
+
+# The box the Z-order grid is quantised over: Great Britain with room to spare,
+# matching `art.PRESETS["uk"]`. Deliberately wider than the data and written here
+# rather than imported, because `art` imports this module and the constant is four
+# numbers.
+#
+# It is a fixed grid rather than the data's own extent so that a region's layout
+# does not depend on which region it is. Changing these numbers is harmless -- the
+# code is a physical row order, never an identity -- but it does mean re-running
+# `wayfare cluster` to get the benefit back.
+CLUSTER_BOX = (-8.75, 49.85, 1.95, 60.90)
+CLUSTER_BITS = 16  # per axis, so a cell is about 165 m across at this latitude
+
+# The classic bit spread: four rounds of shift-and-mask turn 16 packed bits into 16
+# bits with a zero between each, which is what interleaving two axes needs.
+_SPREAD = ((8, 0x00FF00FF), (4, 0x0F0F0F0F), (2, 0x33333333), (1, 0x55555555))
+
+
+def morton_sql(lon: str, lat: str) -> str:
+    """SQL for a Z-order code over a lon/lat expression pair, in degrees.
+
+    Two 16-bit axes interleaved into 32 bits, which fits a signed BIGINT with room
+    to spare. Z-order rather than Hilbert because Hilbert needs the `spatial`
+    extension and only beat Morton on the smallest window measured -- see
+    `scripts/bench_window.py`, which is where the numbers behind this come from.
+
+    The quantisation is a subquery so that each spreading round can name its input
+    twice without the expression doubling in length four times over.
+    """
+    span_lon = CLUSTER_BOX[2] - CLUSTER_BOX[0]
+    span_lat = CLUSTER_BOX[3] - CLUSTER_BOX[1]
+    top = (1 << CLUSTER_BITS) - 1
+
+    def spread(col: str) -> str:
+        e = col
+        for shift, mask in _SPREAD:
+            e = f"(({e} | ({e} << {shift})) & {mask})"
+        return e
+
+    qx = (
+        f"least({top}, greatest(0, floor((({lon}) - {CLUSTER_BOX[0]})"
+        f" * {top}.0 / {span_lon})))::BIGINT AS qx"
+    )
+    qy = (
+        f"least({top}, greatest(0, floor((({lat}) - {CLUSTER_BOX[1]})"
+        f" * {top}.0 / {span_lat})))::BIGINT AS qy"
+    )
+    code = f"({spread('qx')} | ({spread('qy')} << 1))"
+    return f"(SELECT {code} FROM (SELECT {qx}, {qy}))"
+
+
+# The centre of the stored bbox. Both the window query and the curve are asking
+# about where an edge *is*, and this is the one point an edge has that is already
+# four plain integer columns.
+_EDGE_CX = "(min_lon_e6 + max_lon_e6) / 2e6"
+_EDGE_CY = "(min_lat_e6 + max_lat_e6) / 2e6"
+
+
+def cluster_edges(con: duckdb.DuckDBPyConnection) -> int:
+    """Rewrite `edges` in Z-order so its row-group zonemaps can prune a window.
+
+    DuckDB keeps a min/max zonemap per row group of 122,880 rows and skips a group
+    whose zonemap cannot satisfy a filter. `match` inserts edges as their patterns
+    complete, and a batch of patterns is a national sample, so insertion order
+    carries no geography at all: every group's bbox spans most of the country and
+    none can ever be skipped. A city window reads 100% of the table.
+
+    Ordering the rows by a Z-order code over the bbox centre fixes that. Measured on
+    a synthetic 4.2M-edge database, Cardiff went from reading 100% of `edges` to
+    11.7%, 22 ms to 4.4 ms, and London to 26.3%.
+
+    Two things to keep in proportion. The scan is about a quarter of a render, so
+    this is a large improvement to a small share; and `edge_services` carries no
+    bbox column, so the weights pass reads all of it under any layout. Wales, at
+    barely two row groups, cannot show the effect at all.
+
+    This leaves the file *larger*: the old table's blocks are not reclaimed. Callers
+    want :func:`cluster`, which follows it with the compaction that gets the size
+    win too. This half is separate only so it can be tested against a connection.
+    """
+    n = int(scalar(con, "SELECT count(*) FROM edges"))
+    if not n:
+        return 0
+
+    # CTAS preserves the order it was handed, which is what puts the rows on disk in
+    # curve order; the PRIMARY KEY does not survive it, so it is reinstated as the
+    # unique index the WKT migration above already established as this file's idiom.
+    con.execute(f"""
+        CREATE OR REPLACE TABLE edges_clustered AS
+        SELECT * FROM edges
+        ORDER BY {morton_sql(_EDGE_CX, _EDGE_CY)}, edge_id
+    """)
+    con.execute("DROP TABLE edges")
+    con.execute("ALTER TABLE edges_clustered RENAME TO edges")
+    con.execute("CREATE UNIQUE INDEX edges_pk ON edges (edge_id)")
+    # The row count at the time of clustering, so `wayfare status` can say whether
+    # a later `match` has appended unsorted rows on the end.
+    set_meta(con, "edges_clustered", n)
+    con.execute("CHECKPOINT")
+    return n
+
+
+def cluster(path: Path | None = None) -> tuple[int, int, int]:
+    """Cluster `edges` and compact the file. Returns (edges, bytes before, after).
+
+    Two steps, because neither alone is the thing wanted. The reorder is what makes
+    the zonemaps prune; the compaction is what collects the *other* half of the win,
+    which is that sorted neighbours compress better -- 528 MB to 453 MB on the
+    benchmark's 4.2M edges.
+
+    The compaction has to write a new file. DuckDB never returns space below a
+    file's high-water mark: dropping the old table leaves its blocks allocated, and
+    neither CHECKPOINT nor VACUUM gives them back, so reordering in place ends up
+    *bigger* than it started -- measured at 505 MB going to 730. `COPY FROM
+    DATABASE` into a fresh file is what actually reclaims them, and it preserves row
+    order, so the curve survives the copy.
+
+    The original is replaced only after the copy has been reopened and checked, and
+    the replace itself is atomic, so an interruption leaves the database that cost a
+    day of matching exactly as it was. It does need room for a second copy while it
+    runs.
+    """
+    path = path or config.DB_PATH
+    before = path.stat().st_size
+
+    con = connect(path)
+    try:
+        n = cluster_edges(con)
+    finally:
+        con.close()
+    if not n:
+        return 0, before, before
+
+    # Alongside the original rather than in a temp directory, so the rename at the
+    # end is within one filesystem and therefore atomic.
+    tmp = path.with_suffix(path.suffix + ".compacting")
+    tmp.unlink(missing_ok=True)
+    con = connect(path)
+    try:
+        # ATTACH takes a literal, not a bound parameter. The path comes from config
+        # rather than a request, but doubling the quote costs nothing and means a
+        # data directory with an apostrophe in it is not a broken command.
+        con.execute(f"ATTACH '{str(tmp).replace(chr(39), chr(39) * 2)}' AS compacted")
+        source = scalar(con, "SELECT current_database()")
+        con.execute(f'COPY FROM DATABASE "{source}" TO compacted')
+        con.execute("DETACH compacted")
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    finally:
+        con.close()
+
+    # Reopen the copy and count it before trusting it with the original's place.
+    # `COPY FROM DATABASE` carries data, not necessarily every index, so the
+    # pipeline's own are re-asserted here -- all of them `IF NOT EXISTS`.
+    check = connect(tmp)
+    try:
+        copied = int(scalar(check, "SELECT count(*) FROM edges"))
+        if copied != n:
+            raise RuntimeError(
+                f"compacted copy has {copied} edges, expected {n}; leaving {path} alone"
+            )
+        check.execute("CREATE UNIQUE INDEX IF NOT EXISTS edges_pk ON edges (edge_id)")
+        index(check)
+        check.execute("CHECKPOINT")
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    finally:
+        check.close()
+
+    after = tmp.stat().st_size
+    tmp.replace(path)
+    return n, before, after
+
+
 def prune_shapes(con: duckdb.DuckDBPyConnection) -> int:
     """Drop the operator geometry once every pattern has been matched.
 
