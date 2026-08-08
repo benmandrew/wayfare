@@ -5,19 +5,23 @@
 #
 # The suite needs no datasets and no Valhalla: tests/conftest.py holds a mini
 # GTFS feed, and anything wanting the real thing is marked `slow` or `valhalla`.
+#
+# `image.yml` calls this workflow as the gate on its build, so this file no
+# longer answers `push` or `pull_request` itself. It would otherwise run twice
+# on every event that reaches both -- a second full nix build and test suite for
+# a result already known. The status check is therefore named `image / check`.
 
 name: check
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_call:
   workflow_dispatch:
 
-# A second push to the same branch makes the first one's result irrelevant.
-concurrency:
-  group: check-${{ github.ref }}
-  cancel-in-progress: true
+# Cancelling a superseded run is the caller's business now. A called workflow's
+# `concurrency` is evaluated in the caller's context, so a group of its own here
+# would be a second lever on the same runs: a manual dispatch of this file would
+# cancel the check inside an in-flight `image` run on the same ref, and taking
+# the check down takes the whole run with it.
 
 jobs:
   check:

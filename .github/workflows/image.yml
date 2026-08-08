@@ -7,6 +7,12 @@
 # check rather than surfacing on the next release, without ever putting
 # unreviewed code on Docker Hub.
 #
+# Nothing is built or published until `check.yml` is green. Format, lint, types
+# and tests run first, as a called workflow rather than a parallel one, so there
+# is no window in which an image on Docker Hub is newer than the last passing
+# check. The cost is that a red check hides the Dockerfile result for that run;
+# the build is one `needs` away once the check is fixed.
+#
 # Two repository secrets are required:
 #   DOCKERHUB_USERNAME  the Docker Hub account
 #   DOCKERHUB_TOKEN     an access token from Docker Hub -> Account Settings ->
@@ -38,7 +44,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The gate. Its own file, so `check.yml` stays the one description of what
+  # passing means and can still be dispatched on its own.
+  check:
+    uses: ./.github/workflows/check.yml
+
   build:
+    needs: check
     runs-on: ubuntu-latest
     permissions:
       contents: read
