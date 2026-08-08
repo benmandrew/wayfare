@@ -837,7 +837,7 @@ const styleSpec = () => META.styles.find((st) => st.name === S.style) || META.st
 
 // One builder for the preview and both downloads, so what the page shows is
 // what it exports apart from the size.
-function query({ width, scale, format, download }) {
+function query({ width, scale, format, download, sample }) {
   const p = new URLSearchParams();
   if (S.area) p.set("area", S.area); else p.set("bbox", S.bbox);
   p.set("style", S.style);
@@ -858,6 +858,7 @@ function query({ width, scale, format, download }) {
   p.set("hue", trim(S.hue));
   p.set("line_scale", trim(S.line_scale));
   p.set("alpha_scale", trim(S.alpha_scale));
+  if (sample && sample > 1) p.set("sample", String(sample));
   if (S.caption) p.set("caption", S.caption);
   if (S.background) p.set("background", S.background);
   let q = p.toString();
@@ -865,6 +866,12 @@ function query({ width, scale, format, download }) {
   return "/art?" + q;
 }
 
+// A render costs time per *edge* and hardly anything per pixel, so a smaller
+// preview is not a cheaper one -- the only lever that scales is drawing fewer
+// edges. So a change draws twice: once at `preview_sample`, which lands in about
+// an eighth of the time and is enough to judge a hue or a line weight by, and
+// then again at full detail. Moving another control supersedes both, so a drag
+// never waits on a picture already out of date.
 async function render(force) {
   clearTimeout(timer);
   if (!META || !META.enabled) return;
@@ -875,27 +882,35 @@ async function render(force) {
   const mine = new AbortController();
   controller = mine;
 
-  const url = query({
-    width: S.previewWidth,
-    scale: 1, // see KNOBS: scale is resolution only, so the preview never pays for it
-    format: S.format,
-    download: false,
-  });
+  const preview = Math.max(1, META.defaults.preview_sample || 1);
+  const stages = preview > 1 ? [preview, 1] : [1];
 
   $("busy").hidden = false;
   $("frame").classList.add("pending");
   try {
-    const res = await fetch(url, {
-      signal: mine.signal,
-      cache: force ? "reload" : "default",
-    });
-    if (!res.ok) {
-      showError(await reason(res), res);
-      return;
+    for (const sample of stages) {
+      const url = query({
+        width: S.previewWidth,
+        scale: 1, // see KNOBS: scale is resolution only, so the preview never pays for it
+        format: S.format,
+        download: false,
+        sample,
+      });
+      const res = await fetch(url, {
+        signal: mine.signal,
+        cache: force ? "reload" : "default",
+      });
+      if (!res.ok) {
+        showError(await reason(res), res);
+        return;
+      }
+      const blob = await res.blob();
+      if (mine.signal.aborted) return;
+      show(blob, res, sample);
+      // The sampled pass stays on screen while the full one draws, so the frame
+      // is never empty and the two only differ in how much of the network is in
+      // them.
     }
-    const blob = await res.blob();
-    if (mine.signal.aborted) return;
-    show(blob, res);
   } catch (err) {
     if (err.name === "AbortError") return; // a newer render took over
     showError(`cannot reach the server: ${err.message || err}`);
@@ -922,7 +937,7 @@ async function reason(res) {
   return detail + (retry ? ` Try again in ${retry}s.` : "");
 }
 
-function show(blob, res) {
+function show(blob, res, sample) {
   const next = URL.createObjectURL(blob);
   const img = $("shot");
   // The previous URL is revoked only once the new image has decoded; revoking
@@ -930,9 +945,15 @@ function show(blob, res) {
   img.onload = () => {
     if (objectURL) URL.revokeObjectURL(objectURL);
     objectURL = next;
+    // Say so when the picture is a sampled one: it is dimmer and sparser than
+    // the export will be, and an unlabelled approximation is a design decision
+    // made against the wrong image.
+    const partial = sample > 1
+      ? ` · <span style="color:var(--accent)">1 edge in ${sample}</span>, refining`
+      : "";
     $("stat").innerHTML =
       `<b>${img.naturalWidth}</b> × <b>${img.naturalHeight}</b> px · ` +
-      `<b>${bytes(blob.size)}</b> · drawn in <b>${serverMs(res)}</b>`;
+      `<b>${bytes(blob.size)}</b> · drawn in <b>${serverMs(res)}</b>${partial}`;
   };
   img.src = next;
   img.hidden = false;

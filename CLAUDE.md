@@ -297,6 +297,57 @@ re-rendering on every slider move would otherwise queue renders nobody will look
 **There is still no spatial index on `edges`.** A national window therefore reads
 the whole table, over HTTP as much as on the command line. The pixel cap does
 nothing about that; the serialisation and the queue limit are the only protection.
+See the clustering measurements further down for what would actually prune, and the
+paragraph after that for why it is not where the time goes.
+
+**A render costs per edge and per vertex, never per pixel.** The section below
+measures the cairo half at 75% and asks for "fewer strokes: dropping sub-pixel
+edges, or coalescing runs". This is that, carried out. Over a synthetic 1M edges,
+`density` took 52.7s at 900px and 59.0s at 4,000px — a 20x cut in pixels bought
+11%, because the cost is cairo tessellating round joins and caps once per *vertex*.
+A smaller preview is therefore not a cheaper one, which is the whole reason
+`sample` exists. Batching cairo state changes was tried and rejected: 128 weight
+buckets delivered in bucket order by SQL, one path and one state change each, moved
+50.2s to 45.6s — per-stroke setup was never the cost either.
+
+The three things that did work, in order of how much they buy and how little they
+cost: `RenderOpts.simplify_px` drops vertices within half a pixel of the last one
+kept (36% of vertices survive at preview width, 30% off the clock, 0.05% of output
+bytes changed); `density` draws its halo and core in one walk instead of two, which
+is byte-identical because cairo's ADD is saturating and therefore commutative;
+and `Projection.batch` projects a whole 20,000-row fetch with numpy at once. Per
+edge numpy would lose — 4.14 vertices is far too few to pay for array setup — so
+the batching is the point, not the library. Together, 53.2s to 25.8s.
+
+**`spectrum` must never simplify its geometry.** Every other style would draw the
+same line through fewer points. This one takes the *hue* from the angle between
+consecutive points, so dropping a vertex merges two bearings into their average and
+repaints that stretch a different colour. Half a pixel of tolerance moved 74% of the
+output bytes, against 0.05% for `density`. `draw_spectrum` therefore passes `tol=0.0`
+explicitly rather than reading `opts.simplify_px`. Any future style that derives
+colour, width or order from geometry inherits this problem — check before enabling
+simplification for it.
+
+**Sampling is the only preview lever, and the weight scales must not see it.**
+`QuerySpec.sample=n` adds `hash(edge_id) % n = 0` to the window CTE and is linear:
+1/8 takes `density` from 50.5s to 6.6s. `hash` rather than `random` so a preview is
+reproducible and does not flicker as it redraws. It lives on the spec rather than
+in `RenderOpts` because it decides *which edges there are* — but it is deliberately
+absent from `QuerySpec.selective`, since it narrows nothing semantically and must
+not flip the `LEFT JOIN` that keeps serviceless edges in the picture.
+
+`_Sql.window(sampled=True)` is asked for only by `edges_query`; `weights_query` and
+`group_query` take the whole window, and `grouped_query` puts the thinning on its
+final SELECT rather than in the shared CTE, because `gstat` is built from that CTE
+and decides every ribbon's width and draw order. Sampling upstream of it would make
+a preview weight its ribbons differently from the render it stands in for. This is
+the trap to watch: anything statistical must read the unsampled window, and only
+drawn geometry may be thinned. Alpha is compensated linearly (`alpha_scale * sample`, since
+ADD is linear), but the core pass already runs at alpha up to 0.90, so 8x pins it at
+1.0 and the preview still comes back at about 62% brightness. Widening the lines
+would close that gap and destroy the point, since line weight is one of the knobs
+being judged. Hence the studio page labels the sampled pass and follows it with the
+real one.
 
 **A render is 75% cairo, and the scan is not the problem.** Measured on a synthetic
 4.2M-edge / 10.25M-service database (`scripts/bench_window.py`), `density` at 800px:
@@ -436,5 +487,12 @@ this number.
 ## Current state
 
 Wales complete end to end. Greater London matching in progress in its own data
-root against its own Valhalla instance. 123 tests pass, ruff and mypy clean. GB
+root against its own Valhalla instance. 348 tests pass, ruff and mypy clean. GB
 not yet attempted. See PLAN.md.
+
+The render speed-ups above were measured against a synthetic 1M-edge database, not
+real data, because the timings that prompted them came from a window far larger
+than Wales. The ratios are structural and should hold, but two numbers are worth
+re-taking on the real thing: the 62% preview brightness, which depends on how much
+the network actually overlaps, and `strands`, whose cost is dominated by the
+(service, edge) fan-out rather than by vertices.

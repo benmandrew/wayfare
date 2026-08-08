@@ -21,7 +21,7 @@ import math
 import time
 from array import array
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO
 
@@ -69,6 +69,21 @@ class Bounds:
             and max(lons) >= self.min_lon
             and min(lats) <= self.max_lat
             and max(lats) >= self.min_lat
+        )
+
+    def as_e6(self) -> tuple[int, int, int, int]:
+        """This window in micro-degrees, west/south/east/north.
+
+        Geometry comes out of the database as the integers it is stored as, so the
+        drawing path tests it against these rather than dividing every vertex by a
+        million first. Scaling the window up once is four operations; scaling the
+        vertices down is one per point, on the hottest loop there is.
+        """
+        return (
+            round(self.min_lon * 1e6),
+            round(self.min_lat * 1e6),
+            round(self.max_lon * 1e6),
+            round(self.max_lat * 1e6),
         )
 
 
@@ -216,6 +231,78 @@ class Projection:
         x_max, y_min = self(b.max_lon, b.max_lat)
         return x_min, y_min, x_max - x_min, y_max - y_min
 
+    def batch(
+        self, lon_e6: Sequence[Sequence[int]], lat_e6: Sequence[Sequence[int]]
+    ) -> list[list[tuple[float, float]]]:
+        """Project many edges' micro-degree geometry to canvas pixels at once.
+
+        Vectorised because the arithmetic is per *vertex*, and a whole fetch of
+        20,000 edges is around 100,000 of them. numpy over one edge's four or five
+        vertices would lose to the list comprehension it replaces -- array setup
+        costs more than the trig it saves -- so the batching is the point, not the
+        library. Measured over a million edges: 4.78s scalar, 2.94s here.
+
+        The lists come back in the order given, one per edge, so a caller can zip
+        them straight back against the rows it fetched.
+        """
+        np = _require_numpy()
+
+        lens = [len(v) for v in lon_e6]
+        total = sum(lens)
+        if not total:
+            return [[] for _ in lens]
+        flat_lon = np.fromiter(
+            (v for edge in lon_e6 for v in edge), dtype=np.int64, count=total
+        )
+        flat_lat = np.fromiter(
+            (v for edge in lat_e6 for v in edge), dtype=np.int64, count=total
+        )
+
+        lon = flat_lon / 1e6
+        lat = np.clip(flat_lat / 1e6, -_MERC_MAX_LAT, _MERC_MAX_LAT)
+        # The same forward Mercator as `_merc`, one array at a time.
+        mx = np.radians(lon)
+        my = np.log(np.tan(np.pi / 4 + np.radians(lat) / 2))
+        xs = ((mx - self.x0) * self.k + self.ox).tolist()
+        ys = ((self.y1 - my) * self.k + self.oy).tolist()
+
+        out: list[list[tuple[float, float]]] = []
+        at = 0
+        for n in lens:
+            out.append(list(zip(xs[at : at + n], ys[at : at + n], strict=True)))
+            at += n
+        return out
+
+
+def simplify(pts: list[tuple[float, float]], tol: float) -> list[tuple[float, float]]:
+    """Drop vertices that land within `tol` pixels of the last one kept.
+
+    A Valhalla directed edge averages 4.14 coordinates over tens of metres, so at a
+    preview width most of an edge is smaller than a pixel and collapses to its two
+    endpoints. That matters because the cost of a render turned out to be cairo
+    tessellating joins and caps once per vertex -- not per pixel, and not per stroke.
+    Over a million edges this drops 64% of the vertices and 30% of the draw time,
+    for a difference in 0.05% of the output bytes.
+
+    The comparison is against the last *kept* vertex rather than the previous one,
+    so a gently curving road accumulates its small steps and survives; comparing
+    against the previous vertex would straighten it out entirely. Endpoints are
+    always kept, so edges still meet where they met.
+
+    Not every style may use this -- see `draw_spectrum`, which takes colour from the
+    angle between points and so cannot afford to lose any.
+    """
+    if tol <= 0.0 or len(pts) <= 2:
+        return pts
+    out = [pts[0]]
+    kx, ky = pts[0]
+    for x, y in pts[1:-1]:
+        if abs(x - kx) >= tol or abs(y - ky) >= tol:
+            out.append((x, y))
+            kx, ky = x, y
+    out.append(pts[-1])
+    return out
+
 
 # --- Data -------------------------------------------------------------------
 
@@ -310,6 +397,15 @@ class QuerySpec:
     service: tuple[str, ...] = ()
     road_class: tuple[str, ...] = ()
     min_trips: int = 0
+    # Draw one edge in `sample`, chosen by a hash of the edge id. Not a filter and
+    # not a picture anyone wants: it exists because a render costs per edge and
+    # hardly anything per pixel, so thinning the edges is the only way to make a
+    # preview cheap. It belongs here rather than in RenderOpts because it decides
+    # *which edges there are*, which is what this spec is for -- but unlike the
+    # filters it is deliberately absent from `selective`, since it narrows nothing
+    # semantically and an edge with no services should still drop out at the same
+    # rate as any other.
+    sample: int = 1
 
     def __post_init__(self) -> None:
         # Named, because this message is what an HTTP caller sees: "unknown 'busiest'"
@@ -324,6 +420,8 @@ class QuerySpec:
             if value not in table:
                 known = ", ".join(sorted(table))
                 raise ValueError(f"unknown {name}={value!r}; known {name}s: {known}")
+        if self.sample < 1:
+            raise ValueError(f"sample={self.sample} must be 1 or more")
 
     @property
     def selective(self) -> bool:
@@ -355,6 +453,7 @@ class QuerySpec:
                 list(self.service),
                 list(self.road_class),
                 self.min_trips,
+                self.sample,
             ],
             separators=(",", ":"),
         )
@@ -407,7 +506,7 @@ class _Sql:
         self.group = f"coalesce(CAST({GROUPS[spec.group]} AS VARCHAR), 'unknown')"
 
     # -- fragments ---------------------------------------------------------
-    def window(self) -> tuple[str, list[Any]]:
+    def window(self, *, sampled: bool = False) -> tuple[str, list[Any]]:
         """The bbox filter, plus any edge-plane filter.
 
         `edges` stores each geometry's bounding box as four micro-degree integers, so
@@ -420,6 +519,12 @@ class _Sql:
         There is no spatial index, so a window over `uk` reads the whole table. Four
         integer comparisons a row is a cheap way to pay that, and an edge-plane
         filter here is the one kind of customisation that makes a render *faster*.
+
+        `sampled` adds the preview thinning, and only the queries that produce drawn
+        geometry ask for it. The weight scale and the group statistics are taken over
+        the whole window whatever the sample rate, because they decide colour, line
+        width and draw order -- a preview whose palette differs from the render it
+        previews is worse than no preview at all.
         """
         sql = f"""
     SELECT edge_id, way_id, road_name, road_class, length_m, lon_e6, lat_e6
@@ -434,6 +539,11 @@ class _Sql:
         if self.spec.road_class:
             sql += f"      AND road_class IN ({_holes(self.spec.road_class)})\n"
             params += list(self.spec.road_class)
+        if sampled and self.spec.sample > 1:
+            # `hash` rather than `random`, so the same window always drops the same
+            # edges: a preview that redrew a different eighth on every keystroke
+            # would flicker, and two runs would not be comparable.
+            sql += f"      AND hash(edge_id) % {int(self.spec.sample)} = 0\n"
         return sql, params
 
     def services(self) -> tuple[str, list[Any]]:
@@ -473,7 +583,10 @@ class _Sql:
 
     # -- whole queries -----------------------------------------------------
     def edges_query(self, *, with_groups: bool, by_weight: bool) -> tuple[str, list[Any]]:
-        win, win_p = self.window()
+        # Sampled: this is the geometry that gets drawn. Each surviving edge still
+        # carries its own true weight, because a weight is computed from that edge's
+        # own service rows -- only how many edges there are changes.
+        win, win_p = self.window(sampled=True)
         svc, svc_p = self.services()
         groups = f", list(DISTINCT {self.group}) AS groups" if with_groups else ""
         groups_col = ", svc.groups" if with_groups else ""
@@ -582,10 +695,20 @@ WITH win AS ({win}
         """
         base, params = self._grouped_base()
         order = _order_sql(self.spec.order, grouped=True)
+        # The thinning goes here rather than into the shared `win` CTE, because
+        # `gstat` is built from that same CTE and decides every ribbon's width and
+        # the order they are drawn in. Sampling upstream of it would make a preview
+        # weight its ribbons differently from the render it stands in for; sampling
+        # here drops only geometry, which is the whole intent.
+        thin = (
+            f"WHERE hash(win.edge_id) % {int(self.spec.sample)} = 0\n"
+            if self.spec.sample > 1
+            else ""
+        )
         return (
             f"{base}\nSELECT p.grp, win.lon_e6, win.lat_e6\n"
             "FROM pair p JOIN win USING (edge_id) JOIN gstat USING (grp)\n"
-            f"ORDER BY {order}\n",
+            f"{thin}ORDER BY {order}\n",
             params,
         )
 
@@ -691,11 +814,60 @@ class Window:
                 ):
                     yield edge
 
+    def paths(
+        self, proj: Projection, *, tol: float = 0.0, by_weight: bool = False
+    ) -> Iterator[tuple[float, list[tuple[float, float]]]]:
+        """(this edge's weight, its geometry in canvas pixels), one edge at a time.
+
+        The projection runs once per *fetch* rather than once per edge, so numpy sees
+        a hundred thousand vertices instead of five and the vectorising pays. Nothing
+        is held across chunks, so the streaming property the class exists for
+        survives: peak memory is one fetch, not one window.
+
+        Degrees never reach the caller, which is deliberate -- building the float
+        lon/lat tuples was itself a measurable share of a render, and a style that
+        only strokes lines has no use for them. `edges()` remains for callers that
+        do want them.
+        """
+        query, params = self.sql.edges_query(with_groups=False, by_weight=by_weight)
+        cur = self.con.execute(query, params)
+        # The window test stays in micro-degrees, against the same integers the
+        # database holds -- see `Bounds.as_e6`.
+        w, s, e, n = self.bounds.as_e6()
+        while chunk := cur.fetchmany(FETCH_ROWS):
+            keep = [r for r in chunk if r[3] and len(r[3]) >= 2]
+            for row, pts in zip(
+                keep,
+                proj.batch([r[3] for r in keep], [r[4] for r in keep]),
+                strict=True,
+            ):
+                lons, lats = row[3], row[4]
+                if min(lons) <= e and max(lons) >= w and min(lats) <= n and max(lats) >= s:
+                    yield float(row[6]), simplify(pts, tol)
+
     def groups(self) -> Iterator[tuple[str, float, list[tuple[float, float]]]]:
         """(group, its weight, one edge's coordinates), grouped.
 
         Consecutive tuples sharing a group belong to the same ribbon, widest first by
         default. The caller strokes a group's geometry as one path and moves on.
+        """
+        for name, weight, _, coords in self._group_rows(None, 0.0):
+            yield name, weight, coords
+
+    def group_paths(
+        self, proj: Projection, *, tol: float = 0.0
+    ) -> Iterator[tuple[str, float, list[tuple[float, float]]]]:
+        """:meth:`groups`, already projected and simplified. Same grouping."""
+        for name, weight, pts, _ in self._group_rows(proj, tol):
+            yield name, weight, pts
+
+    def _group_rows(
+        self, proj: Projection | None, tol: float
+    ) -> Iterator[tuple[str, float, list[tuple[float, float]], list[tuple[float, float]]]]:
+        """The shared body of `groups` and `group_paths`.
+
+        One generator so the ordering, the weighting and the window test cannot drift
+        apart between the projected and unprojected views of the same data.
 
         The group listing is materialised because it is small -- hundreds of services
         for a city, thousands nationally. That assumption is the spec's to break:
@@ -717,14 +889,31 @@ class Window:
         weight_of = {r[0]: weights.of(float(r[2] or 0.0)) for r in rows}
 
         query, params = self.sql.grouped_query()
+        w, s, e, n = self.bounds.as_e6()
         cur = self.con.execute(query, params)
         while chunk := cur.fetchmany(FETCH_ROWS):
-            for name, lon_e6, lat_e6 in chunk:
-                if not lon_e6 or len(lon_e6) < 2:
-                    continue
-                coords = [(x / 1e6, y / 1e6) for x, y in zip(lon_e6, lat_e6, strict=True)]
-                if self.bounds.hits([c[0] for c in coords], [c[1] for c in coords]):
-                    yield name, weight_of[name], coords
+            keep = [
+                r
+                for r in chunk
+                if r[1]
+                and len(r[1]) >= 2
+                and min(r[1]) <= e
+                and max(r[1]) >= w
+                and min(r[2]) <= n
+                and max(r[2]) >= s
+            ]
+            projected: list[list[tuple[float, float]]] = (
+                proj.batch([r[1] for r in keep], [r[2] for r in keep])
+                if proj is not None
+                else [[] for _ in keep]
+            )
+            for (name, lon_e6, lat_e6), pts in zip(keep, projected, strict=True):
+                coords = (
+                    []
+                    if proj is not None
+                    else [(x / 1e6, y / 1e6) for x, y in zip(lon_e6, lat_e6, strict=True)]
+                )
+                yield name, weight_of[name], simplify(pts, tol), coords
 
 
 class Held(Window):
@@ -748,6 +937,20 @@ class Held(Window):
         if by_weight:
             return iter(sorted(self._edges, key=lambda e: (e.weight, e.edge_id)))
         return iter(self._edges)
+
+    def paths(
+        self, proj: Projection, *, tol: float = 0.0, by_weight: bool = False
+    ) -> Iterator[tuple[float, list[tuple[float, float]]]]:
+        # Already in degrees and already in memory, so this projects per edge. The
+        # batching that `Window` needs would buy nothing against a list.
+        for e in self.edges(by_weight=by_weight):
+            yield e.weight, simplify([proj(lon, lat) for lon, lat in e.coords], tol)
+
+    def group_paths(
+        self, proj: Projection, *, tol: float = 0.0
+    ) -> Iterator[tuple[str, float, list[tuple[float, float]]]]:
+        for name, weight, coords in self.groups():
+            yield name, weight, simplify([proj(x, y) for x, y in coords], tol)
 
     def groups(self) -> Iterator[tuple[str, float, list[tuple[float, float]]]]:
         by_group: dict[str, list[Edge]] = {}
@@ -885,6 +1088,15 @@ class RenderOpts:
     hue: float = 0.56  # base hue for density, palette rotation elsewhere
     line_scale: float = 1.0
     alpha_scale: float = 1.0
+    # Vertices closer than this to the last one kept are dropped. In canvas pixels,
+    # so the detail retained follows the output size: the same window keeps four
+    # times the vertices at 4,000px that it does at 1,000. Half a pixel is below
+    # what antialiasing can show. Set to 0 to keep every vertex as stored.
+    #
+    # A drawing concern rather than a query one, which is why it lives here and
+    # `QuerySpec.sample` does not: this changes how a line is stroked, not which
+    # lines there are.
+    simplify_px: float = 0.5
 
 
 StyleFn = Callable[["cairo.Context[cairo.Surface]", "Window", Projection, RenderOpts], None]
@@ -917,12 +1129,15 @@ def draw_density(
 ) -> None:
     """One hue on a dark ground; busy corridors bloom.
 
-    Two additive passes -- a wide, almost invisible halo under a narrow bright
+    Two additive strokes -- a wide, almost invisible halo under a narrow bright
     core. ADD is commutative, so overlapping routes accumulate light exactly the
     way a long exposure does and draw order does not matter.
 
-    The two passes are two walks of the window rather than two walks of a list, so
-    the geometry is read twice and held never.
+    Both strokes are laid down in *one* walk of the window rather than two. The
+    commutativity above is exactly what licenses that: cairo's ADD saturates at
+    full brightness, and saturating addition is commutative and associative, so
+    halo-then-core per edge and every-halo-then-every-core give the same buffer to
+    the byte. It halves the scanning, decoding and projecting a render does.
     """
     import cairo
 
@@ -938,14 +1153,27 @@ def draw_density(
             lambda t: 0.90 - 0.75 * t,
         ),
     )
-    for width_of, alpha_of, sat_of in passes:
-        for e in window.edges():
-            t = window.weights.of(e.weight)
+    # A sampled preview draws a fraction of the edges, so each survivor carries the
+    # light of the ones that were dropped. Linear in the sample rate because ADD is
+    # linear: n times the alpha over 1/n of the edges sums to the same brightness.
+    #
+    # Only until it clips. The core pass already runs at alpha 0.10 to 0.90, so
+    # multiplying by 8 pins most of it at 1.0 and the light that would have gone
+    # above cannot be recovered -- measured at 62% of the full render's brightness
+    # rather than 100%. Widening the lines instead would close the gap and ruin the
+    # thing a preview is for, since line weight is one of the knobs being judged. So
+    # the preview stays a little dark, says so on the page, and is followed by the
+    # real render.
+    alpha_scale = opts.alpha_scale * max(1, window.spec.sample)
+
+    for weight, pts in window.paths(proj, tol=opts.simplify_px):
+        t = window.weights.of(weight)
+        for width_of, alpha_of, sat_of in passes:
             r, g, b = colorsys.hsv_to_rgb(opts.hue, sat_of(t), 1.0)
-            ctx.set_source_rgba(r, g, b, min(1.0, alpha_of(t) * opts.alpha_scale))
+            ctx.set_source_rgba(r, g, b, min(1.0, alpha_of(t) * alpha_scale))
             ctx.set_line_width(width_of(t) * opts.line_scale)
             ctx.new_path()
-            _stroke_path(ctx, [proj(lon, lat) for lon, lat in e.coords])
+            _stroke_path(ctx, pts)
             ctx.stroke()
 
 
@@ -965,6 +1193,14 @@ def draw_spectrum(
 
     The angle is measured in screen space, which is legitimate here only because
     Mercator is conformal: the projected angle equals the true bearing.
+
+    This style alone never simplifies its geometry, and the reason is that here a
+    vertex is not only shape. Every other style would draw the same line through
+    fewer points; this one derives the *colour* from the angle between them, so
+    dropping a vertex merges two bearings into their average and repaints that
+    stretch of road a different hue. Measured over a million edges, half a pixel of
+    tolerance moved 74% of the output bytes -- against 0.05% for `density`. Any
+    future style taking colour, width or order from geometry inherits this.
     """
     import cairo
 
@@ -973,9 +1209,8 @@ def draw_spectrum(
     # Quietest first so the busy roads finish on top and stay legible. The ordering
     # is done in SQL rather than by sorting the window in memory -- the weight is
     # monotonic in the trip count, so ordering by one orders by the other.
-    for e in window.edges(by_weight=True):
-        t = window.weights.of(e.weight)
-        pts = [proj(lon, lat) for lon, lat in e.coords]
+    for weight, pts in window.paths(proj, tol=0.0, by_weight=True):
+        t = window.weights.of(weight)
         sat = 0.30 + 0.62 * t
         val = 0.52 + 0.48 * t
         alpha = min(1.0, (0.30 + 0.62 * t) * opts.alpha_scale)
@@ -1024,7 +1259,7 @@ def draw_strands(
             ctx.stroke()
 
     # Widest first, so the long trunk routes lie underneath the local fiddly ones.
-    for name, weight, coords in window.groups():
+    for name, weight, pts in window.group_paths(proj, tol=opts.simplify_px):
         if name != current:
             finish()
             current = name
@@ -1044,7 +1279,7 @@ def draw_strands(
             )
             ctx.set_line_width((0.9 + 3.0 * weight) * opts.line_scale)
             ctx.new_path()
-        _stroke_path(ctx, [proj(lon, lat) for lon, lat in coords])
+        _stroke_path(ctx, pts)
     finish()
 
     if not drew:
@@ -1088,6 +1323,21 @@ def _require_cairo() -> Any:
             "rendering needs pycairo. Install the extra with: pip install -e '.[art]'"
         ) from exc
     return cairo
+
+
+def _require_numpy() -> Any:
+    """Also lazy, and for the same reason as :func:`_require_cairo`.
+
+    Only :meth:`Projection.batch` needs it, so a caller reading coordinates out of
+    the database never pays for the import.
+    """
+    try:
+        import numpy
+    except ImportError as exc:  # pragma: no cover - depends on the environment
+        raise ImportError(
+            "rendering needs numpy. Install the extra with: pip install -e '.[art]'"
+        ) from exc
+    return numpy
 
 
 def _caption(ctx: cairo.Context[cairo.Surface], text: str, proj: Projection) -> None:
@@ -1208,6 +1458,11 @@ def _render(
     proj = Projection.fit(bounds, width, height)
 
     surface, draw_scale = _surface(fmt, sink, width, height, opts.scale)
+    # Styles draw in logical units and the context is scaled up for print, so a
+    # tolerance of half a logical pixel is half a *device* pixel only at 1x. Divide
+    # it here, where `draw_scale` is known -- and where SVG's fixed 1.0 keeps a
+    # vector output at full detail whatever `scale` was asked for.
+    opts = replace(opts, simplify_px=opts.simplify_px / draw_scale)
     ctx = cairo.Context(surface)
     ctx.scale(draw_scale, draw_scale)
     ctx.set_antialias(cairo.Antialias.BEST)
