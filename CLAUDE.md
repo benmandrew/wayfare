@@ -69,6 +69,44 @@ columns into a table in one streaming scan (which does spill), then aggregate in
 times in 6 seconds inside an 8 GB limit. `stop_times.txt` is 5.09 GB nationally,
 so this would have hit there too.
 
+**A DuckDB connection holds one result at a time, and a second query abandons the
+first silently.** Not an error, not a short read anything notices — a 200,000-row
+stream interrupted after its first batch simply ends at 20,000 and looks complete.
+This is why `Window.paths` resolves `self.weights` *before* it opens its stream:
+making that scale lazy put its query inside the draw loop, where it truncated
+every `density` and `spectrum` render to its first fetch. The renders were stable,
+plausible, and wrong. Anything else that becomes lazy on this connection inherits
+the same trap.
+
+**Geometry comes out of DuckDB as Arrow, not as rows.** The scan was never the
+problem and still is not — the London window scans in 4.4ms — but *materialising*
+it was: 303ms to turn the same rows into Python lists of ints, because an
+`INTEGER[]` column arrives over the row protocol as a list object per edge holding
+an int object per vertex. In Arrow that column is a flat child buffer plus
+offsets, which numpy adopts without copying. Over London at 3000px (197,276 edges,
+585,287 vertices) the whole data path went 852ms → 358ms by fetching Arrow, and
+→ 198ms by keeping it flat all the way to cairo — hence `Polyline`, which holds
+indices into a fetch's shared coordinate buffers rather than a list of tuples per
+edge. Whole renders: `strands` over London 5,449ms → 3,622ms, `density` 4,985ms →
+4,423ms. The remainder really is cairo, as recorded below.
+
+**The percentile pass belongs in SQL, and has to match `Weights.over` exactly.**
+Pulling every weight into Python to take two order statistics cost 1,918ms of a
+2,150ms pass at 4.2M edges. `bounds_query` reproduces the rank convention rather
+than using `quantile_disc`, which interpolates differently and would shift a
+render's contrast invisibly: `row_number()` and an explicit `floor(q * n)`,
+because `CAST(x AS BIGINT)` rounds where Python's `int()` truncates. Verified
+identical on 72 real database/window/spec combinations.
+
+**`density` to SVG is not reproducible, and this predates the Arrow work.**
+`edges_query(by_weight=False)` has no `ORDER BY`, so DuckDB's parallel scan
+returns rows in a different order every run, and SVG records strokes in the order
+they were issued — four distinct hashes in four runs, on `main` as much as on any
+branch. The PNG is byte-identical regardless, because ADD saturating-composites
+commutatively. It is the same bug `_order_sql` fixed for `strands` and the same
+fix would work, but the tiebreak would put a full sort on the hottest query in the
+render path, so it is knowingly left open.
+
 **OSM `route=bus` relations are not viable as a source.** 12,968 nationally, only
 818 `route_master` relations, and Greater London alone is 13% of the total. BODS
 is the authority for what services exist; OSM is only the geometry substrate.
@@ -358,6 +396,13 @@ percentile pass under 2%. Optimise the drawing, not the query. What would actual
 help is fewer strokes: dropping sub-pixel edges, or coalescing runs the way
 `publish` already does for tiles.
 
+That conclusion held and the reasoning behind it did not, which is worth keeping
+both halves of. "The scan is not the problem" is true — but the quarter that is not
+cairo was almost none of it *scanning*. It was DuckDB rows becoming Python objects,
+which is a different thing with a different fix, and the reason a "query
+optimisation" like clustering `edges` moved 14ms while changing how the rows are
+fetched moved 650ms. See the Arrow entry above. What remains is genuinely cairo.
+
 **Clustering `edges` on a space-filling curve does prune, and it is `wayfare
 cluster`.** DuckDB keeps min/max zonemaps per 122,880-row group, and `match` inserts
 edges in batch order, which is spatially random, so unclustered they prune nothing.
@@ -397,11 +442,17 @@ command rather than a step in `aggregate` for the same reason `prune` is: it
 rewrites the whole table, needs room for a second copy of `edges` while it does, and
 is worth doing once after a match run rather than on every re-aggregation.
 
-**`edge_services` cannot prune and never will, as things stand.** It carries no bbox
-column and DuckDB pushes no min/max filter through the join, so the weights pass
-reads all 10.25M rows under every layout. That caps what clustering can do. Giving
-it a bbox column, or clustering it by `edge_id` alongside a clustered `edges`, is
-the only way through — unmeasured.
+**`edge_services` cannot prune, and giving it a bbox column is not worth it.** It
+carries no bbox column and DuckDB pushes no min/max filter through the join, so the
+weights pass reads all 10.25M rows under every layout. That caps what clustering can
+do. The bbox column was the obvious way through and has now been measured: it prunes
+almost exactly as hoped — cardiff 10,250,638 rows → 614,400, London → 2,457,600 —
+and buys 40.9ms → 31.1ms on cardiff, 356.1ms → 357.6ms on London, and nothing
+nationally. Four `INTEGER` columns on the largest table in the database for 10ms on
+the smallest window. The reason the pruning does not convert into time is the same
+one as everywhere else here: the scan was never what cost anything. The weights pass
+is now two order statistics computed in SQL rather than 4.2M floats crossing into
+Python, which is where its 1,918ms actually went.
 
 **Extracting a window to Parquet was tried and rejected.** The idea was that
 iterating on a design should cost the window rather than the national table. It does
@@ -514,8 +565,23 @@ this number.
 ## Current state
 
 Wales complete end to end. Greater London matching in progress in its own data
-root against its own Valhalla instance. 358 tests pass, ruff and mypy clean. GB
+root against its own Valhalla instance. 375 tests pass, ruff and mypy clean. GB
 not yet attempted. See PLAN.md.
+
+`pyarrow` joined the `art` extra alongside `pycairo` and `numpy`, and only that
+extra — the pipeline and the tile server do not import it. It is what makes the
+geometry fetch above possible; there is no row-protocol way to get at an
+`INTEGER[]` column's buffer.
+
+Two read-path changes were measured and **rejected**, so they do not get tried
+again. Materialising the shared `_grouped_base` CTEs into temp tables so the two
+grouped queries stop recomputing them: 1.20x on London and 1.04x on `uk`, worth
+about 48ms of a 3.6s render, against three temp tables and a second copy of SQL
+whose parameter ordering is already the fragile part of the builder. And giving
+`edge_services` a bounding box so the weights pass can prune: it prunes exactly as
+hoped — 94% of rows on cardiff, 76% on London — and buys 10ms on cardiff and
+nothing at all on London, on the largest table there is. That last one answers the
+open question this file used to record as unmeasured.
 
 The render speed-ups above were measured against a synthetic 1M-edge database, not
 real data, because the timings that prompted them came from a window far larger
