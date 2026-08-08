@@ -38,7 +38,7 @@ Each stage reads what the last one wrote, and each re-runs on its own.
 - **art** (`art.py`). A bounding box or named preset to PNG or SVG, in one of three
   styles: `density`, `spectrum` or `strands`.
 
-`cli.py` fronts all six, plus `serve`, `status`, `prune` and `all`. `serve`
+`cli.py` fronts all six, plus `serve`, `status`, `prune`, `cluster` and `all`. `serve`
 (`server.py`) answers the viewer, the archives and `GET /art`, which renders a window on
 demand instead of only to a file. Two self-contained pages sit in `web/`: the viewer
 `index.html`, and `art.html`, a studio for iterating on a render's design.

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 from . import acquire, aggregate, config, db, gtfs, logs, match, publish
@@ -74,6 +75,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status", help="show progress and coverage")
     sub.add_parser(
         "prune", help="drop operator geometry once matching is complete (reclaims space)"
+    )
+    sub.add_parser(
+        "cluster", help="reorder edges spatially so window queries can skip row groups"
     )
 
     p = sub.add_parser("art", help="render an area")
@@ -221,6 +225,28 @@ def _dispatch(args: argparse.Namespace) -> int:
         finally:
             con.close()
         log.info("dropped %d shapes", n)
+        return 0
+
+    if args.cmd == "cluster":
+        _require_db()
+        t0 = time.monotonic()
+        try:
+            n, before, after = db.cluster()
+        except RuntimeError as exc:
+            log.error("%s", exc)
+            return 1
+        if not n:
+            log.info("no edges to cluster")
+            return 0
+        # The size is worth reporting because it is half the reason to run this: the
+        # rows compress better sorted, whatever the window queries then do.
+        log.info(
+            "clustered %d edges in %.1fs; %.0f MB -> %.0f MB",
+            n,
+            time.monotonic() - t0,
+            before / 1e6,
+            after / 1e6,
+        )
         return 0
 
     if args.cmd == "status":

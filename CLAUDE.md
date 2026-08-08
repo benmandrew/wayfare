@@ -358,17 +358,44 @@ percentile pass under 2%. Optimise the drawing, not the query. What would actual
 help is fewer strokes: dropping sub-pixel edges, or coalescing runs the way
 `publish` already does for tiles.
 
-**Clustering `edges` on a space-filling curve does prune, and it is worth doing for
-its own sake.** DuckDB keeps min/max zonemaps per 122,880-row group, and `match`
-inserts edges in batch order, which is spatially random, so today they prune
-nothing. Ordering the table by a Morton or Hilbert code over the bbox centre makes a
-city window touch a handful of groups: Cardiff read 100% -> 11.7% (Morton) or 5.9%
-(Hilbert) of `edges`, 22 ms -> 4.4 ms; London 100% -> 26.3%, 30 ms -> 16 ms. It also
-shrinks the file, 528 -> 453 -> 443 MB. Verified from DuckDB's own
-`operator_rows_scanned`, not inferred from wall time. Hilbert only beats Morton on
-the smallest window, so it is not worth the `spatial` extension on its own. **But
-read the previous paragraph before spending the effort:** this is a 5x improvement to
-a quarter of the cost, and Wales at ~2 row groups cannot show it at all.
+**Clustering `edges` on a space-filling curve does prune, and it is `wayfare
+cluster`.** DuckDB keeps min/max zonemaps per 122,880-row group, and `match` inserts
+edges in batch order, which is spatially random, so unclustered they prune nothing.
+Ordering the table by a Morton code over the bbox centre makes a city window touch a
+handful of groups: Cardiff read 100% -> 11.7% of `edges`, 22 ms -> 4.4 ms; London
+100% -> 26.3%, 30 ms -> 16 ms. It also shrinks the file, 528 -> 453 MB. Verified from
+DuckDB's own `operator_rows_scanned`, not inferred from wall time. Hilbert reaches
+5.9% on Cardiff but only beats Morton on the smallest window, so it is not worth the
+`spatial` extension on its own and is benchmark-only. **But this is a 5x improvement
+to a quarter of the cost**, and Wales at ~2 row groups cannot show it at all.
+
+`db.morton_sql` is the one implementation; `scripts/bench_window.py` calls it rather
+than keeping its own, so what the benchmark measures and what the command does
+cannot drift. `db.CLUSTER_BOX` is a fixed grid over Great Britain rather than the
+data's extent, so a region's layout does not depend on which region it is; the code
+is a physical row order and never an identity, so changing the box is harmless
+beyond needing a re-run.
+
+**DuckDB never gives space back below a file's high-water mark, so `cluster` has to
+write a new file.** Reordering in place is the obvious implementation and it makes
+the database *bigger*: the dropped table's blocks stay allocated, and neither
+`CHECKPOINT` nor `VACUUM` reclaims them — measured at 505 MB going to 730. `COPY
+FROM DATABASE` into a freshly attached file is what actually reclaims them, and it
+preserves row order, so the curve survives the copy. `db.cluster` therefore reorders
+in place, copies to `<db>.compacting`, reopens and counts it, re-asserts the indexes
+(the copy carries data, not necessarily every index), and only then does an atomic
+rename. 529 MB -> 471 MB on the benchmark's 4.2M edges, with Cardiff at 11.7% and
+London at 26.3% of rows scanned — the bench's own figures, reproduced through the
+shipped command. It needs room for a second copy while it runs, and an interruption
+at any point leaves the original untouched.
+
+**Clustering goes stale rather than off, and `wayfare status` says so.**
+`cluster_edges` records the row count it sorted in `meta.edges_clustered`. Rows
+`match` adds afterwards land unsorted on the end, where no zonemap can help, so
+`status` reports `yes`, `no`, or `stale (N of M edges sorted)`. It is a separate
+command rather than a step in `aggregate` for the same reason `prune` is: it
+rewrites the whole table, needs room for a second copy of `edges` while it does, and
+is worth doing once after a match run rather than on every re-aggregation.
 
 **`edge_services` cannot prune and never will, as things stand.** It carries no bbox
 column and DuckDB pushes no min/max filter through the join, so the weights pass
@@ -487,7 +514,7 @@ this number.
 ## Current state
 
 Wales complete end to end. Greater London matching in progress in its own data
-root against its own Valhalla instance. 348 tests pass, ruff and mypy clean. GB
+root against its own Valhalla instance. 358 tests pass, ruff and mypy clean. GB
 not yet attempted. See PLAN.md.
 
 The render speed-ups above were measured against a synthetic 1M-edge database, not

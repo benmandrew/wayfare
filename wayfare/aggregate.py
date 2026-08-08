@@ -55,6 +55,22 @@ def build(con: duckdb.DuckDBPyConnection) -> None:
     log.info("%d edges carry %d edge-service pairs", n_edges, n_rows)
 
 
+def _clustered(con: duckdb.DuckDBPyConnection) -> str:
+    """Whether `edges` is still in the Z-order `wayfare cluster` left it in.
+
+    A count rather than a flag, because clustering goes stale rather than off: the
+    rows that were sorted stay sorted, and anything `match` adds afterwards sits
+    unsorted on the end where no zonemap can help.
+    """
+    at = db.get_meta(con, "edges_clustered")
+    if at is None:
+        return "no"
+    now = int(db.scalar(con, "SELECT count(*) FROM edges"))
+    if int(at) == now:
+        return "yes"
+    return f"stale ({at} of {now} edges sorted; re-run `wayfare cluster`)"
+
+
 def coverage(con: duckdb.DuckDBPyConnection) -> dict[str, object]:
     """How much of the network came out, and how much was lost on the way.
 
@@ -105,6 +121,10 @@ def coverage(con: duckdb.DuckDBPyConnection) -> dict[str, object]:
         # The number that actually matters: share of timetabled service represented.
         "trips_pct": round(100.0 * trips_ok / max(trips_all, 1), 1),
         "edges": db.scalar(con, "SELECT count(*) FROM edges"),
+        # Not just whether `wayfare cluster` has ever run, but whether it still
+        # holds: it records the row count it sorted, so edges appended by a later
+        # `match` land on the end out of order and show up here as a shortfall.
+        "edges_clustered": _clustered(con),
         "services": db.scalar(con, "SELECT count(DISTINCT short_name) FROM edge_services"),
         "by_status": {
             row[0]: row[1]
