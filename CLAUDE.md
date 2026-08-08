@@ -98,15 +98,6 @@ render's contrast invisibly: `row_number()` and an explicit `floor(q * n)`,
 because `CAST(x AS BIGINT)` rounds where Python's `int()` truncates. Verified
 identical on 72 real database/window/spec combinations.
 
-**`density` to SVG is not reproducible, and this predates the Arrow work.**
-`edges_query(by_weight=False)` has no `ORDER BY`, so DuckDB's parallel scan
-returns rows in a different order every run, and SVG records strokes in the order
-they were issued — four distinct hashes in four runs, on `main` as much as on any
-branch. The PNG is byte-identical regardless, because ADD saturating-composites
-commutatively. It is the same bug `_order_sql` fixed for `strands` and the same
-fix would work, but the tiebreak would put a full sort on the hottest query in the
-render path, so it is knowingly left open.
-
 **OSM `route=bus` relations are not viable as a source.** 12,968 nationally, only
 818 `route_master` relations, and Greater London alone is 13% of the total. BODS
 is the authority for what services exist; OSM is only the geometry substrate.
@@ -387,6 +378,23 @@ would close that gap and destroy the point, since line weight is one of the knob
 being judged. Hence the studio page labels the sampled pass and follows it with the
 real one.
 
+**Every query the render path streams needs an ORDER BY, including the ones whose
+order looks irrelevant.** `edges_query` had none when not ordering by weight, and
+DuckDB's parallel hash join returns rows in an order that varies between runs of
+the same query against the same file — so `density` to SVG produced four distinct
+outputs in four runs, on real data. PNG hid it completely, because cairo's ADD is
+saturating and therefore commutative, so the buffer is identical whatever order the
+strokes arrive in; SVG records the strokes in the order they were issued and shows
+it. That is the same failure `_order_sql` was written to fix for `strands`, and the
+existing "byte-identical across two calls" test could not catch this one: three
+edges never reach a second thread, so an undefined order is a stable one. Test the
+order is *defined* rather than that two runs agree. The sort is close to free —
++1.2 ms over cardiff, +10.1 ms over `uk`, +9.1 ms over London, against renders of
+0.4 s to 4.4 s — which is worth knowing, because it was left alone once on the
+assumption that ordering the hottest query in the render path would be expensive.
+It is about 0.2%, measured after the Arrow fetch above, so against the faster
+numerator rather than the one it was originally waved away with.
+
 **A render is 75% cairo, and the scan is not the problem.** Measured on a synthetic
 4.2M-edge / 10.25M-service database (`scripts/bench_window.py`), `density` at 800px:
 Cardiff 56,251 edges takes 2,363 ms — weights pass 55 ms, two window walks 532 ms,
@@ -565,7 +573,7 @@ this number.
 ## Current state
 
 Wales complete end to end. Greater London matching in progress in its own data
-root against its own Valhalla instance. 375 tests pass, ruff and mypy clean. GB
+root against its own Valhalla instance. 376 tests pass, ruff and mypy clean. GB
 not yet attempted. See PLAN.md.
 
 `pyarrow` joined the `art` extra alongside `pycairo` and `numpy`, and only that
