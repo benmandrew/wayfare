@@ -16,6 +16,7 @@ from __future__ import annotations
 import colorsys
 import hashlib
 import io
+import json
 import math
 import time
 from array import array
@@ -228,102 +229,402 @@ class Edge:
     length_m: float
     coords: list[tuple[float, float]]  # (lon, lat)
     n_services: int
-    n_trips: int  # timetabled trips per week, summed over services
-    services: tuple[str, ...] = ()  # only populated when the style needs it
+    # Whatever `QuerySpec.weight` asked for -- trips per week by default, but possibly
+    # a service count or traffic per metre. Named for its role rather than its usual
+    # contents, because a field called n_trips holding a count of operators is a lie.
+    weight: float
+    groups: tuple[str, ...] = ()  # only populated when the style draws grouped paths
 
 
-# The bbox filter.
+# --- The query spec ---------------------------------------------------------
 #
-# `edges` stores each geometry's bounding box as four micro-degree integers, so the
-# window test is an exact integer overlap in SQL and nothing has to look inside the
-# geometry. That is worth stating because it used not to be: when geom was WKT text
-# there was no numeric column to compare against, and the filter matched the *first*
-# vertex only, over-selected a collar of edges padded by the longest edge in the
-# table, and re-tested each one in Python. This does the same job in one pass, with
-# no collar and no false positives.
+# What a style paints is one half of a render; the other half is which edges are in
+# frame, what scalar drives the ramps, and what a "group" means. That second half
+# used to be hard-coded -- traffic, and groups are services -- and it is the half
+# that reaches pictures no paint knob can: the same three styles grouped by operator
+# or filtered to one road class are genuinely different maps.
 #
-# There is still no spatial index, so a window over `uk` reads the whole table. That
-# is the honest price, and four integer comparisons per row is a cheap way to pay it.
+# It is exposed as a closed vocabulary rather than a query language. Substituted text
+# is only ever a value looked up in one of the dicts below; anything the caller
+# supplies is a bound parameter. That matters more than it looks: DuckDB's read_only
+# applies to the database file and not to the filesystem, so `read_csv` and `ATTACH`
+# still work and user SQL would be an arbitrary file read on the server.
 
-_WINDOW = """
-    SELECT edge_id, road_class, length_m, lon_e6, lat_e6
-    FROM edges
+# The scalar the ramps see, per edge. Aggregated over `edge_services`, so it may
+# reference `s.*`; `win.*` is joined alongside, so edge columns are available too.
+WEIGHTS: dict[str, str] = {
+    "trips": "sum(s.n_trips)",
+    "services": "count(DISTINCT s.short_name)",
+    "operators": "count(DISTINCT s.agency_id)",
+    "patterns": "sum(s.n_patterns)",
+    "busiest": "max(s.n_trips)",
+    # Traffic per metre rather than per edge. An edge is tens of metres, so a long
+    # rural link and a short city block carrying the same buses currently weigh the
+    # same; this asks the other question. greatest() guards a zero length.
+    "density": "sum(s.n_trips) / greatest(min(win.length_m), 1.0)",
+}
+
+# What one ribbon is, for styles that draw grouped paths. A service key puts an edge
+# in as many groups as it has services; an edge-level key puts it in exactly one.
+# Both work through the same query, which is what makes this cheap.
+GROUPS: dict[str, str] = {
+    "service": "s.short_name",
+    "operator": "s.agency_id",
+    "road_class": "win.road_class",
+    "way": "win.way_id",
+    "road_name": "win.road_name",
+}
+
+# Which group is drawn first, and so ends up underneath. `widest` is the original and
+# the default: long trunk routes lie under the local fiddly ones. Held as (column,
+# direction) rather than a SQL string because the same ordering has to be written
+# against two different sets of table aliases; see _order_sql.
+ORDERS: dict[str, tuple[str, str]] = {
+    "widest": ("n_edges", "DESC"),
+    "narrowest": ("n_edges", "ASC"),
+    "busiest": ("trips", "DESC"),
+    "quietest": ("trips", "ASC"),
+    "name": ("grp", "ASC"),
+}
+
+# Above this many groups, `strands` is not drawing ribbons any more -- it is drawing
+# one stroke per edge with the compositing cost of a ribbon, and _SERVICE_QUERY
+# materialises a row per group. `way` over a city is the way to trip it.
+MAX_GROUPS = 20_000
+
+
+@dataclass(frozen=True, slots=True)
+class QuerySpec:
+    """Which edges, weighted how, grouped by what.
+
+    Defaults reproduce the original hard-coded query exactly, so a render that does
+    not ask for anything is byte-identical to one from before this existed.
+    """
+
+    weight: str = "trips"
+    group: str = "service"
+    order: str = "widest"
+    # Filters. The service-plane ones (operator, service) and min_trips change which
+    # services contribute; the edge-plane ones (road_class) shrink the scan itself.
+    operator: tuple[str, ...] = ()
+    service: tuple[str, ...] = ()
+    road_class: tuple[str, ...] = ()
+    min_trips: int = 0
+
+    def __post_init__(self) -> None:
+        # Named, because this message is what an HTTP caller sees: "unknown 'busiest'"
+        # is ambiguous when `busiest` is a valid weight *and* a valid order, and a
+        # request carrying two mistakes should not make the reader guess which one
+        # this is about.
+        for name, value, table in (
+            ("weight", self.weight, WEIGHTS),
+            ("group", self.group, GROUPS),
+            ("order", self.order, ORDERS),
+        ):
+            if value not in table:
+                known = ", ".join(sorted(table))
+                raise ValueError(f"unknown {name}={value!r}; known {name}s: {known}")
+
+    @property
+    def selective(self) -> bool:
+        """Whether any filter narrows what is drawn.
+
+        This decides join semantics, and it is the one place the spec is not a free
+        substitution. Unfiltered, an edge with no services still draws -- black, at
+        weight zero -- which is the original behaviour and worth keeping. Filtered to
+        one operator, an edge that operator does not use must vanish rather than
+        render as a black line through the middle of the picture.
+        """
+        return bool(self.operator or self.service or self.road_class or self.min_trips)
+
+    @property
+    def key(self) -> str:
+        """Stable identity, for a cache key or an ETag.
+
+        JSON rather than a delimiter join, because a join is not injective: with
+        commas inside pipe-separated fields, `service=("A", "B")` and
+        `service=("A,B",)` produce the same string. They are different specs, and two
+        specs sharing a key means one's picture is served for the other.
+        """
+        return json.dumps(
+            [
+                self.weight,
+                self.group,
+                self.order,
+                list(self.operator),
+                list(self.service),
+                list(self.road_class),
+                self.min_trips,
+            ],
+            separators=(",", ":"),
+        )
+
+
+DEFAULT_SPEC = QuerySpec()
+
+
+@dataclass(frozen=True, slots=True)
+class Source:
+    """Where the two tables are read from.
+
+    Normally the database. The point of naming them is that a materialised or
+    extracted window can be substituted underneath a render without touching the
+    query builder, and the bbox predicate is applied either way, so correctness never
+    depends on the substitute being exactly right -- only speed.
+
+    A Parquet extract of the window was the substitution this was built for, and it
+    was measured and dropped: against 4.2M edges it moved a Cardiff render from
+    2347ms to 2320ms, because the scan is not where the time goes. A density render
+    is 75% cairo, and the whole database scan is a quarter of the rest. Anything
+    plugged in here can only ever address that quarter.
+    """
+
+    edges: str = "edges"
+    services: str = "edge_services"
+
+
+DEFAULT_SOURCE = Source()
+
+
+class _Sql:
+    """The query skeleton, with its holes filled from the spec.
+
+    One builder rather than module-level f-strings, because the holes are no longer
+    independent: a filter decides a join type, and the group key decides which table
+    the strand queries group on.
+    """
+
+    def __init__(self, spec: QuerySpec, source: Source, bbox: Sequence[int]) -> None:
+        self.spec = spec
+        self.source = source
+        self.bbox = list(bbox)
+        self.weight = WEIGHTS[spec.weight]
+        # Every group key is coerced to a non-null string here rather than in GROUPS,
+        # so the dict stays readable and the guarantee lives in one place. It has to
+        # hold: `strands` hashes the key to pick a hue, and `way_id` is a BIGINT while
+        # `road_name` is frequently null. Casting is identity for the string columns,
+        # so the default grouping produces exactly the values it always did.
+        self.group = f"coalesce(CAST({GROUPS[spec.group]} AS VARCHAR), 'unknown')"
+
+    # -- fragments ---------------------------------------------------------
+    def window(self) -> tuple[str, list[Any]]:
+        """The bbox filter, plus any edge-plane filter.
+
+        `edges` stores each geometry's bounding box as four micro-degree integers, so
+        the window test is an exact integer overlap in SQL and nothing has to look
+        inside the geometry. That is worth stating because it used not to be: when
+        geom was WKT text there was no numeric column to compare against, and the
+        filter matched the *first* vertex only, over-selected a collar of edges
+        padded by the longest edge in the table, and re-tested each one in Python.
+
+        There is no spatial index, so a window over `uk` reads the whole table. Four
+        integer comparisons a row is a cheap way to pay that, and an edge-plane
+        filter here is the one kind of customisation that makes a render *faster*.
+        """
+        sql = f"""
+    SELECT edge_id, way_id, road_name, road_class, length_m, lon_e6, lat_e6
+    FROM {self.source.edges}
     WHERE min_lon_e6 <= ? AND max_lon_e6 >= ?
       AND min_lat_e6 <= ? AND max_lat_e6 >= ?
 """
+        # The bounds belong to this fragment, so it carries them. Every query puts the
+        # window first, but a fragment that owns its own parameters can be moved
+        # without a caller having to know where its holes went.
+        params: list[Any] = list(self.bbox)
+        if self.spec.road_class:
+            sql += f"      AND road_class IN ({_holes(self.spec.road_class)})\n"
+            params += list(self.spec.road_class)
+        return sql, params
 
-_QUERY = f"""
-WITH win AS ({_WINDOW}
+    def services(self) -> tuple[str, list[Any]]:
+        """The `edge_services` scan, aliased `s`, plus any service-plane filter.
+
+        A filter becomes a subquery rather than an extra WHERE on the outer join, so
+        the same fragment drops into all four queries unchanged. Its predicates are
+        unqualified because inside the subquery the alias does not exist yet.
+        """
+        params: list[Any] = []
+        clauses = []
+        if self.spec.operator:
+            clauses.append(f"agency_id IN ({_holes(self.spec.operator)})")
+            params += list(self.spec.operator)
+        if self.spec.service:
+            clauses.append(f"short_name IN ({_holes(self.spec.service)})")
+            params += list(self.spec.service)
+        if not clauses:
+            return f"{self.source.services} s", params
+        where = " AND ".join(clauses)
+        return f"(SELECT * FROM {self.source.services} WHERE {where}) s", params
+
+    def _having(self) -> str:
+        """A floor on traffic, deliberately on trips and not on the chosen weight.
+
+        `min_trips=50` means "roads carrying at least 50 buses a week" whatever the
+        picture is coloured by; thresholding the weight instead would make the same
+        number mean a different thing under every `weight=`.
+        """
+        if not self.spec.min_trips:
+            return ""
+        return f"HAVING sum(s.n_trips) >= {int(self.spec.min_trips)}"
+
+    def _join(self) -> str:
+        # An inner join drops edges no surviving service uses; see QuerySpec.selective.
+        return "JOIN" if self.spec.selective else "LEFT JOIN"
+
+    # -- whole queries -----------------------------------------------------
+    def edges_query(self, *, with_groups: bool, by_weight: bool) -> tuple[str, list[Any]]:
+        win, win_p = self.window()
+        svc, svc_p = self.services()
+        groups = f", list(DISTINCT {self.group}) AS groups" if with_groups else ""
+        groups_col = ", svc.groups" if with_groups else ""
+        # edge_id breaks the tie, so equally busy roads draw in a fixed order rather
+        # than whichever way the scan happened to return them.
+        order = "ORDER BY coalesce(svc.weight, 0), win.edge_id" if by_weight else ""
+        sql = f"""
+WITH win AS ({win}
 ), svc AS (
     SELECT s.edge_id,
            count(DISTINCT s.short_name) AS n_services,
-           sum(s.n_trips)               AS n_trips
-           {{services}}
-    FROM edge_services s JOIN win USING (edge_id)
+           {self.weight} AS weight
+           {groups}
+    FROM {svc} JOIN win USING (edge_id)
     GROUP BY s.edge_id
+    {self._having()}
 )
 SELECT win.edge_id, win.road_class, win.length_m, win.lon_e6, win.lat_e6,
-       coalesce(svc.n_services, 0), coalesce(svc.n_trips, 0){{services_col}}
-FROM win LEFT JOIN svc USING (edge_id)
-{{order}}
+       coalesce(svc.n_services, 0), coalesce(svc.weight, 0){groups_col}
+FROM win {self._join()} svc USING (edge_id)
+{order}
 """
+        return sql, win_p + svc_p
 
-# Just the trip counts, for the percentile pass. Eight bytes an edge against the
-# hundreds its geometry costs, which is what lets the bounds be known before a
-# single coordinate is read.
-_WEIGHTS_QUERY = f"""
-WITH win AS ({_WINDOW})
-SELECT coalesce(sum(s.n_trips), 0)
-FROM win LEFT JOIN edge_services s USING (edge_id)
-GROUP BY win.edge_id
-"""
+    def weights_query(self) -> tuple[str, list[Any]]:
+        """Just the weight per edge, for the percentile pass.
 
-# The shared part of the two strand queries.
-#
-# `pair` is DISTINCT because a service registered by two operators has two rows per
-# edge in edge_services, and a ribbon must cover each edge once.
-#
-# `trips` deliberately sums each edge's total traffic across every service, not the
-# service's own -- so a minor route along a busy corridor gets a wide ribbon. That
-# is what the list version measured and what the existing renders look like; it is
-# a property of the picture rather than an accident worth silently changing here.
-_STRAND_BASE = f"""
-WITH win AS ({_WINDOW}
-), edge_trips AS (
-    SELECT s.edge_id, sum(s.n_trips) AS n_trips
-    FROM edge_services s JOIN win USING (edge_id)
-    GROUP BY s.edge_id
-), pair AS (
-    SELECT DISTINCT s.short_name, s.edge_id
-    FROM edge_services s JOIN win USING (edge_id)
+        Eight bytes an edge against the hundreds its geometry costs, which is what
+        lets the bounds be known before a single coordinate is read.
+        """
+        win, win_p = self.window()
+        svc, svc_p = self.services()
+        sql = f"""
+WITH win AS ({win}
 ), svc AS (
-    SELECT p.short_name, count(*) AS n_edges, sum(t.n_trips) AS trips
-    FROM pair p JOIN edge_trips t USING (edge_id)
-    GROUP BY p.short_name
+    SELECT s.edge_id, {self.weight} AS weight
+    FROM {svc} JOIN win USING (edge_id)
+    GROUP BY s.edge_id
+    {self._having()}
+)
+SELECT coalesce(svc.weight, 0) FROM win {self._join()} svc USING (edge_id)
+"""
+        return sql, win_p + svc_p
+
+    def _grouped_base(self) -> tuple[str, list[Any]]:
+        """The shared part of the two grouped queries.
+
+        `pair` is DISTINCT because a service registered by two operators has two rows
+        per edge in edge_services, and a ribbon must cover each edge once.
+
+        `trips` deliberately sums each edge's total weight across every service, not
+        the group's own -- so a minor route along a busy corridor gets a wide ribbon.
+        That is what the existing renders look like; it is a property of the picture
+        rather than an accident worth silently changing here.
+
+        `pair` joins `edge_w` rather than only `win`, and that join is load-bearing.
+        `edge_w` is where `min_trips` is applied, so without it a below-floor edge
+        still drew as long as one of its groups survived -- `Window.edges()` and
+        `Window.groups()` would then disagree about which network they were drawing,
+        from an identical spec, and only the grouped styles would be wrong. It also
+        skewed ribbon widths, because `gstat` summed the surviving edges and then the
+        whole unfiltered set got stroked. Unfiltered the join is a no-op: `edge_w`
+        already holds exactly the edges with a service row in the window.
+
+        The stats CTE is `gstat`, not `grp`: `grp` is the group *column*, and a CTE
+        sharing the name makes `JOIN ... USING (grp)` read as a self-reference.
+        """
+        win, win_p = self.window()
+        svc, svc_p = self.services()
+        sql = f"""
+WITH win AS ({win}
+), edge_w AS (
+    SELECT s.edge_id, {self.weight} AS weight
+    FROM {svc} JOIN win USING (edge_id)
+    GROUP BY s.edge_id
+    {self._having()}
+), pair AS (
+    SELECT DISTINCT {self.group} AS grp, s.edge_id
+    FROM {svc} JOIN win USING (edge_id) JOIN edge_w USING (edge_id)
+), gstat AS (
+    SELECT p.grp, count(*) AS n_edges, sum(w.weight) AS trips
+    FROM pair p JOIN edge_w w USING (edge_id)
+    GROUP BY p.grp
 )
 """
+        # The window CTE is declared once; the services fragment appears twice, in
+        # edge_w and again in pair. Bound parameters follow textual order, so this
+        # list has to match that exactly -- one win, then two svc.
+        return sql, win_p + svc_p + svc_p
 
-# One row per service in the window. Small -- hundreds for a city, thousands
-# nationally -- so it is materialised, and it both orders the draw and scales the
-# ribbon widths.
-_SERVICE_QUERY = f"""
-{_STRAND_BASE}
-SELECT short_name, n_edges, trips FROM svc
-ORDER BY n_edges DESC, short_name
-"""
+    def group_query(self) -> tuple[str, list[Any]]:
+        base, params = self._grouped_base()
+        order = _order_sql(self.spec.order, grouped=False)
+        return f"{base}\nSELECT grp, n_edges, trips FROM gstat\nORDER BY {order}\n", params
 
-# Every (service, edge) pair in the window, ordered so a service's edges arrive
-# together and the widest service comes first. An edge carrying five services
-# appears five times, which is the point: the geometry streams past rather than
-# being held in a dict of service to edge list.
-_STRAND_QUERY = f"""
-{_STRAND_BASE}
-SELECT p.short_name, win.lon_e6, win.lat_e6
-FROM pair p
-JOIN win USING (edge_id)
-JOIN svc USING (short_name)
-ORDER BY svc.n_edges DESC, p.short_name
-"""
+    def grouped_query(self) -> tuple[str, list[Any]]:
+        """Every (group, edge) pair, ordered so a group's edges arrive together.
+
+        An edge carrying five services appears five times, which is the point: the
+        geometry streams past rather than being held in a dict of group to edge list.
+
+        Never `list(geom ORDER BY ...)`. DuckDB cannot spill an ordered list
+        aggregate -- it pins the per-group sort state, which is what killed the
+        patterns stage on the London feed -- so the grouping is done by the caller in
+        one pass over rows SQL has already ordered.
+        """
+        base, params = self._grouped_base()
+        order = _order_sql(self.spec.order, grouped=True)
+        return (
+            f"{base}\nSELECT p.grp, win.lon_e6, win.lat_e6\n"
+            "FROM pair p JOIN win USING (edge_id) JOIN gstat USING (grp)\n"
+            f"ORDER BY {order}\n",
+            params,
+        )
+
+    def cardinality_query(self) -> tuple[str, list[Any]]:
+        """How many groups this spec would produce, before anything is drawn."""
+        win, win_p = self.window()
+        svc, svc_p = self.services()
+        return (
+            f"WITH win AS ({win})\n"
+            f"SELECT count(DISTINCT {self.group}) FROM {svc} JOIN win USING (edge_id)",
+            win_p + svc_p,
+        )
+
+
+def _order_sql(order: str, *, grouped: bool) -> str:
+    """The ORDER BY for a group listing, qualified for whichever query wants it.
+
+    Both grouped queries sort on the same two columns, but one selects them bare out
+    of `gstat` and the other reaches them across a join. The group key always breaks
+    the tie, so two equally broad groups draw in a fixed order rather than whichever
+    way the scan returned them -- the determinism the export already depends on.
+
+    `edge_id` is the second tiebreak, and it fixes a real bug rather than guarding
+    against one. Ordering by group alone leaves the edges *within* a ribbon in
+    whatever order the scan produced, which a PNG hides -- SCREEN compositing is
+    commutative, so the image is identical either way -- and an SVG does not, because
+    it records the strokes in the order they were issued. Two runs of `strands` to
+    SVG differed in 180,365 of 293,842 bytes while the PNG was byte-identical.
+    """
+    col, direction = ORDERS[order]
+    key = "p.grp" if grouped else "grp"
+    qualified = key if col == "grp" else f"{'gstat.' if grouped else ''}{col}"
+    tiebreak = f"{key}, p.edge_id" if grouped else key
+    return f"{qualified} {direction}, {tiebreak}"
+
+
+def _holes(values: Sequence[Any]) -> str:
+    return ", ".join("?" for _ in values)
+
 
 FETCH_ROWS = 20_000
 
@@ -346,19 +647,29 @@ class Window:
         bounds: Bounds,
         con: duckdb.DuckDBPyConnection,
         *,
-        with_services: bool = False,
+        with_groups: bool = False,
+        spec: QuerySpec = DEFAULT_SPEC,
+        source: Source = DEFAULT_SOURCE,
     ) -> None:
         self.bounds = bounds
         self.con = con
-        self.with_services = with_services
-        self._params = [
-            round(bounds.max_lon * 1e6),
-            round(bounds.min_lon * 1e6),
-            round(bounds.max_lat * 1e6),
-            round(bounds.min_lat * 1e6),
-        ]
+        self.with_groups = with_groups
+        self.spec = spec
+        self.sql = _Sql(
+            spec,
+            source,
+            [
+                round(bounds.max_lon * 1e6),
+                round(bounds.min_lon * 1e6),
+                round(bounds.max_lat * 1e6),
+                round(bounds.min_lat * 1e6),
+            ],
+        )
+        query, params = self.sql.weights_query()
+        # "d" rather than "q": a weight is not necessarily an integer any more --
+        # `density` divides by length. Still eight bytes an edge either way.
         self.weights = Weights.over(
-            array("q", (r[0] for r in con.execute(_WEIGHTS_QUERY, self._params).fetchall()))
+            array("d", (r[0] for r in con.execute(query, params).fetchall()))
         )
 
     def edges(self, *, by_weight: bool = False) -> Iterator[Edge]:
@@ -368,37 +679,45 @@ class Window:
         get by sorting the whole list in memory. The weight is monotonic in the trip
         count, so ordering by one orders by the other.
         """
-        sql = _QUERY.format(
-            services=", list(DISTINCT s.short_name) AS services"
-            if self.with_services
-            else "",
-            services_col=", svc.services" if self.with_services else "",
-            # edge_id breaks the tie, so equally busy roads draw in a fixed order
-            # rather than whichever way the scan happened to return them.
-            order="ORDER BY coalesce(svc.n_trips, 0), win.edge_id" if by_weight else "",
+        query, params = self.sql.edges_query(
+            with_groups=self.with_groups, by_weight=by_weight
         )
-        cur = self.con.execute(sql, self._params)
+        cur = self.con.execute(query, params)
         while chunk := cur.fetchmany(FETCH_ROWS):
             for row in chunk:
-                edge = _to_edge(row, with_services=self.with_services)
+                edge = _to_edge(row, with_groups=self.with_groups)
                 if edge is not None and self.bounds.hits(
                     [c[0] for c in edge.coords], [c[1] for c in edge.coords]
                 ):
                     yield edge
 
-    def strands(self) -> Iterator[tuple[str, float, list[tuple[float, float]]]]:
-        """(service, its weight, one edge's coordinates), grouped by service.
+    def groups(self) -> Iterator[tuple[str, float, list[tuple[float, float]]]]:
+        """(group, its weight, one edge's coordinates), grouped.
 
-        Consecutive tuples sharing a service name belong to the same ribbon, widest
-        service first. The caller strokes a name's geometry as one path and moves on.
+        Consecutive tuples sharing a group belong to the same ribbon, widest first by
+        default. The caller strokes a group's geometry as one path and moves on.
+
+        The group listing is materialised because it is small -- hundreds of services
+        for a city, thousands nationally. That assumption is the spec's to break:
+        `group=way` over a city is one group per OSM way, so the count is checked
+        against MAX_GROUPS here rather than discovered as a render that never ends.
         """
-        rows = self.con.execute(_SERVICE_QUERY, self._params).fetchall()
+        query, params = self.sql.group_query()
+        rows = self.con.execute(query, params).fetchall()
         if not rows:
             return
-        weights = Weights.over(array("q", (r[2] for r in rows)))
-        weight_of = {r[0]: weights.of(r[2]) for r in rows}
+        if len(rows) > MAX_GROUPS:
+            raise ValueError(
+                f"group={self.spec.group!r} gives {len(rows)} groups in this window, "
+                f"over the {MAX_GROUPS} limit. Each group is a separate composited "
+                "stroke, so this would draw slowly and read as noise. Narrow the "
+                "window, or group by something coarser."
+            )
+        weights = Weights.over(array("d", (float(r[2] or 0.0) for r in rows)))
+        weight_of = {r[0]: weights.of(float(r[2] or 0.0)) for r in rows}
 
-        cur = self.con.execute(_STRAND_QUERY, self._params)
+        query, params = self.sql.grouped_query()
+        cur = self.con.execute(query, params)
         while chunk := cur.fetchmany(FETCH_ROWS):
             for name, lon_e6, lat_e6 in chunk:
                 if not lon_e6 or len(lon_e6) < 2:
@@ -414,32 +733,37 @@ class Held(Window):
     `render(edges=...)` exists so a caller can re-render a window it already has,
     which is worth keeping for anyone tuning options against one area. It is the
     only path that still holds everything, and it is the caller's choice to.
+
+    It cannot honour a spec: the edges it was handed were already weighted, grouped
+    and filtered by whatever produced them. `spec` is recorded so a caller can see
+    which one that was, and ignored otherwise.
     """
 
-    def __init__(self, edges: Sequence[Edge]) -> None:
+    def __init__(self, edges: Sequence[Edge], *, spec: QuerySpec = DEFAULT_SPEC) -> None:
         self._edges = list(edges)
-        self.weights = Weights.over([e.n_trips for e in self._edges])
+        self.spec = spec
+        self.weights = Weights.over([e.weight for e in self._edges])
 
     def edges(self, *, by_weight: bool = False) -> Iterator[Edge]:
         if by_weight:
-            return iter(sorted(self._edges, key=lambda e: e.n_trips))
+            return iter(sorted(self._edges, key=lambda e: (e.weight, e.edge_id)))
         return iter(self._edges)
 
-    def strands(self) -> Iterator[tuple[str, float, list[tuple[float, float]]]]:
-        by_service: dict[str, list[Edge]] = {}
+    def groups(self) -> Iterator[tuple[str, float, list[tuple[float, float]]]]:
+        by_group: dict[str, list[Edge]] = {}
         for e in self._edges:
-            for name in e.services:
-                by_service.setdefault(name, []).append(e)
-        if not by_service:
+            for name in e.groups:
+                by_group.setdefault(name, []).append(e)
+        if not by_group:
             return
-        trips = {n: sum(e.n_trips for e in es) for n, es in by_service.items()}
+        trips = {n: sum(e.weight for e in es) for n, es in by_group.items()}
         weights = Weights.over(list(trips.values()))
-        for name in sorted(by_service, key=lambda n: (-len(by_service[n]), n)):
-            for e in by_service[name]:
+        for name in sorted(by_group, key=lambda n: (-len(by_group[n]), n)):
+            for e in by_group[name]:
                 yield name, weights.of(trips[name]), e.coords
 
 
-def _to_edge(row: tuple[Any, ...], *, with_services: bool) -> Edge | None:
+def _to_edge(row: tuple[Any, ...], *, with_groups: bool) -> Edge | None:
     lon_e6, lat_e6 = row[3], row[4]
     if not lon_e6 or len(lon_e6) < 2:
         return None
@@ -449,15 +773,16 @@ def _to_edge(row: tuple[Any, ...], *, with_services: bool) -> Edge | None:
         length_m=float(row[2] or 0.0),
         coords=[(x / 1e6, y / 1e6) for x, y in zip(lon_e6, lat_e6, strict=True)],
         n_services=int(row[5]),
-        n_trips=int(row[6]),
-        services=tuple(sorted(row[7])) if with_services and row[7] else (),
+        weight=float(row[6]),
+        groups=tuple(sorted(row[7])) if with_groups and row[7] else (),
     )
 
 
 def load_edges(
     bounds: Bounds,
     *,
-    with_services: bool = False,
+    with_groups: bool = False,
+    spec: QuerySpec = DEFAULT_SPEC,
     con: duckdb.DuckDBPyConnection | None = None,
 ) -> list[Edge]:
     """Every edge whose geometry's bbox overlaps `bounds`, all at once.
@@ -469,7 +794,7 @@ def load_edges(
     con = con or db.connect(read_only=True)
     t0 = time.monotonic()
     try:
-        edges = list(Window(bounds, con, with_services=with_services).edges())
+        edges = list(Window(bounds, con, with_groups=with_groups, spec=spec).edges())
     finally:
         if own:
             con.close()
@@ -569,7 +894,7 @@ StyleFn = Callable[["cairo.Context[cairo.Surface]", "Window", Projection, Render
 class Style:
     draw: StyleFn
     background: RGB = (0.02, 0.02, 0.035)
-    needs_services: bool = False
+    needs_groups: bool = False
     blurb: str = ""
 
 
@@ -615,7 +940,7 @@ def draw_density(
     )
     for width_of, alpha_of, sat_of in passes:
         for e in window.edges():
-            t = window.weights.of(e.n_trips)
+            t = window.weights.of(e.weight)
             r, g, b = colorsys.hsv_to_rgb(opts.hue, sat_of(t), 1.0)
             ctx.set_source_rgba(r, g, b, min(1.0, alpha_of(t) * opts.alpha_scale))
             ctx.set_line_width(width_of(t) * opts.line_scale)
@@ -649,7 +974,7 @@ def draw_spectrum(
     # is done in SQL rather than by sorting the window in memory -- the weight is
     # monotonic in the trip count, so ordering by one orders by the other.
     for e in window.edges(by_weight=True):
-        t = window.weights.of(e.n_trips)
+        t = window.weights.of(e.weight)
         pts = [proj(lon, lat) for lon, lat in e.coords]
         sat = 0.30 + 0.62 * t
         val = 0.52 + 0.48 * t
@@ -699,7 +1024,7 @@ def draw_strands(
             ctx.stroke()
 
     # Widest first, so the long trunk routes lie underneath the local fiddly ones.
-    for name, weight, coords in window.strands():
+    for name, weight, coords in window.groups():
         if name != current:
             finish()
             current = name
@@ -740,7 +1065,7 @@ STYLES: dict[str, Style] = {
     "strands": Style(
         draw=draw_strands,
         background=(0.04, 0.035, 0.045),
-        needs_services=True,
+        needs_groups=True,
         blurb="one ribbon per service",
     ),
 }
@@ -837,6 +1162,8 @@ def _render(
     label: str,
     *,
     opts: RenderOpts | None = None,
+    query: QuerySpec = DEFAULT_SPEC,
+    source: Source = DEFAULT_SOURCE,
     con: duckdb.DuckDBPyConnection | None = None,
     edges: Sequence[Edge] | None = None,
 ) -> None:
@@ -845,12 +1172,17 @@ def _render(
     `label` names the destination in the log line only. Everything else about the
     drawing is identical either way -- there is no separate in-memory code path to
     diverge from the one that writes files.
+
+    `style` and `query` are the two halves: the style decides how an edge is painted,
+    the query decides which edges there are, what their weight means, and what a
+    group is. Neither knows about the other, which is what lets three styles cover
+    the whole product of the two.
     """
     # Argument checks come first, and before requiring cairo: a mistyped style
     # should say which styles exist, not tell the caller to install a dependency
     # they would then discover was not the problem.
     try:
-        spec = STYLES[style]
+        sty = STYLES[style]
     except KeyError:
         known = ", ".join(sorted(STYLES))
         raise KeyError(f"unknown style {style!r}; known styles: {known}") from None
@@ -864,10 +1196,12 @@ def _render(
     # holds; either way the styles see the same interface.
     own_con = con is None and edges is None
     if edges is not None:
-        window: Window = Held(edges)
+        window: Window = Held(edges, spec=query)
     else:
         con = con or db.connect(read_only=True)
-        window = Window(bounds, con, with_services=spec.needs_services)
+        window = Window(
+            bounds, con, with_groups=sty.needs_groups, spec=query, source=source
+        )
 
     width = opts.width_px
     height = opts.height_px or Projection.canvas_height(bounds, width)
@@ -880,7 +1214,7 @@ def _render(
     ctx.set_line_cap(cairo.LineCap.ROUND)
     ctx.set_line_join(cairo.LineJoin.ROUND)
 
-    r, g, b = opts.background or spec.background
+    r, g, b = opts.background or sty.background
     ctx.set_source_rgb(r, g, b)
     ctx.paint()
 
@@ -891,7 +1225,7 @@ def _render(
     ctx.clip()
     t0 = time.monotonic()
     try:
-        spec.draw(ctx, window, proj, opts)
+        sty.draw(ctx, window, proj, opts)
     finally:
         if own_con and con is not None:
             con.close()
@@ -922,6 +1256,8 @@ def render(
     out_path: str | Path | None = None,
     *,
     opts: RenderOpts | None = None,
+    query: QuerySpec = DEFAULT_SPEC,
+    source: Source = DEFAULT_SOURCE,
     con: duckdb.DuckDBPyConnection | None = None,
     edges: Sequence[Edge] | None = None,
 ) -> Path:
@@ -935,7 +1271,18 @@ def render(
     fmt = _fmt(path)  # before the query, so a typo'd suffix fails in milliseconds
     config.ensure_dirs()
     path.parent.mkdir(parents=True, exist_ok=True)
-    _render(bounds_or_name, style, fmt, path, str(path), opts=opts, con=con, edges=edges)
+    _render(
+        bounds_or_name,
+        style,
+        fmt,
+        path,
+        str(path),
+        opts=opts,
+        query=query,
+        source=source,
+        con=con,
+        edges=edges,
+    )
     return path
 
 
@@ -945,6 +1292,8 @@ def render_bytes(
     *,
     fmt: str = ".png",
     opts: RenderOpts | None = None,
+    query: QuerySpec = DEFAULT_SPEC,
+    source: Source = DEFAULT_SOURCE,
     con: duckdb.DuckDBPyConnection | None = None,
     edges: Sequence[Edge] | None = None,
 ) -> bytes:
@@ -956,5 +1305,16 @@ def render_bytes(
     """
     fmt = _fmt(fmt)
     buf = io.BytesIO()
-    _render(bounds_or_name, style, fmt, buf, "memory", opts=opts, con=con, edges=edges)
+    _render(
+        bounds_or_name,
+        style,
+        fmt,
+        buf,
+        "memory",
+        opts=opts,
+        query=query,
+        source=source,
+        con=con,
+        edges=edges,
+    )
     return buf.getvalue()

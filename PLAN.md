@@ -88,6 +88,40 @@ the data on the machine doing the iterating.
 Not done: `edges` still has no spatial index, so a national window reads the whole
 table however it is asked for. Measured only against Wales-scale data.
 
+## Done — data-side customisation (prototype)
+
+Added 2026-08-08. Numbers in CLAUDE.md. A style now says how an edge is painted and
+`QuerySpec` says which edges there are, so three styles cover the product of the two.
+
+- **`art.QuerySpec`** — `weight` (6), `group` (5), `order` (5), and filters on
+  operator, service, road class and a trips floor. A closed vocabulary of SQL
+  fragments with bound parameters, never a query language.
+- **Exposed on `/art`** and in the studio page, which builds the controls from
+  `/art/meta` — including the operators and road classes actually in the database.
+- **Defaults reproduce the previous output byte for byte**, checked by rendering the
+  pre-refactor and post-refactor modules against one database with the same cairo.
+- **`MAX_GROUPS`** refuses a spec that would draw one composited stroke per OSM way.
+- 188 -> 334 tests.
+
+Two bugs found on the way, both fixed: `min_trips` reached the flat query but not the
+grouped one, so `density` and `strands` drew different networks from one spec; and
+`strands` to SVG was never deterministic, because the edges within a ribbon had no
+tiebreak and SCREEN compositing hid it from every PNG comparison.
+
+## Next — make the drawing cheaper, not the query
+
+The prototype's measurements point somewhere other than where I expected. A render
+is **75% cairo**; the whole database side is a quarter, and the percentile pass under
+2%. London's 752,561-edge window is 28.6s, of which 21.5s is stroking.
+
+- Clustering `edges` on a Morton/Hilbert code prunes real work (Cardiff reads 5.9% of
+  the table, 22ms -> 4.4ms) and shrinks the file 528 -> 443 MB. Worth doing, but it
+  is a 5x win on a quarter of the cost, and Wales is too small to show it.
+- `edge_services` cannot prune at all — no bbox column, no pushdown through the join.
+- Extracting the window to Parquet was tried and **rejected**: 2,347 -> 2,320 ms.
+- The real lever is fewer strokes: drop sub-pixel edges, or coalesce runs the way
+  `publish` already does for tiles. Unmeasured.
+
 ## In progress — Greater London
 
 Running in a separate data root (`data-london`) against its own Valhalla instance

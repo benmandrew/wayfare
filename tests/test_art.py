@@ -170,7 +170,7 @@ def test_unknown_name_mentions_the_window_form():
 # --- Streaming ---------------------------------------------------------------
 
 
-def _art_edge(con, edge_id, lon, trips, services=("42",)):
+def _art_edge(con, edge_id, lon, trips, services=("42",), agency="OP1"):
     con.execute(
         "INSERT INTO edges VALUES (?, 1, 'R', 'secondary', 100.0, [?, ?], "
         "[51480000, 51480000], ?, 51480000, ?, 51480000)",
@@ -178,7 +178,8 @@ def _art_edge(con, edge_id, lon, trips, services=("42",)):
     )
     for s in services:
         con.execute(
-            "INSERT INTO edge_services VALUES (?, ?, 'OP1', 1, ?)", [edge_id, s, trips]
+            "INSERT INTO edge_services VALUES (?, ?, ?, 1, ?)",
+            [edge_id, s, agency, trips],
         )
 
 
@@ -229,9 +230,9 @@ def test_strands_arrive_grouped_by_service_widest_first(con):
     _art_edge(con, 1, -3200000, trips=100, services=("42", "9A"))
     _art_edge(con, 2, -3190000, trips=100, services=("42",))
     _art_edge(con, 3, -3180000, trips=100, services=("42",))
-    w = art.Window(art.Bounds(-3.30, 51.40, -3.10, 51.60), con, with_services=True)
+    w = art.Window(art.Bounds(-3.30, 51.40, -3.10, 51.60), con, with_groups=True)
 
-    names = [name for name, _weight, _coords in w.strands()]
+    names = [name for name, _weight, _coords in w.groups()]
     assert names == ["42", "42", "42", "9A"]  # widest service first, then grouped
     # Once a name is left behind it never comes back, which is what lets the caller
     # stroke and forget.
@@ -251,13 +252,111 @@ def test_held_window_matches_the_streaming_one(con):
     _art_edge(con, 2, -3190000, trips=10, services=("42",))
     bounds = art.Bounds(-3.30, 51.40, -3.10, 51.60)
 
-    streamed = art.Window(bounds, con, with_services=True)
-    held = art.Held(art.load_edges(bounds, with_services=True, con=con))
+    streamed = art.Window(bounds, con, with_groups=True)
+    held = art.Held(art.load_edges(bounds, with_groups=True, con=con))
 
     assert held.weights == streamed.weights
     assert [e.edge_id for e in held.edges(by_weight=True)] == [
         e.edge_id for e in streamed.edges(by_weight=True)
     ]
-    assert [(n, round(w, 9)) for n, w, _ in held.strands()] == [
-        (n, round(w, 9)) for n, w, _ in streamed.strands()
+    assert [(n, round(w, 9)) for n, w, _ in held.groups()] == [
+        (n, round(w, 9)) for n, w, _ in streamed.groups()
     ]
+
+
+def test_held_window_carries_the_groups_the_query_asked_for(con):
+    """`with_groups=` populates Edge.groups, and `Held` draws from that field alone --
+    so a rename that left one of the two behind would show up as an empty ribbon."""
+    _art_edge(con, 1, -3200000, trips=900, services=("42", "9A"))
+    bounds = art.Bounds(-3.30, 51.40, -3.10, 51.60)
+    assert [e.groups for e in art.load_edges(bounds, with_groups=True, con=con)] == [
+        ("42", "9A")
+    ]
+    assert art.load_edges(bounds, con=con)[0].groups == ()
+
+
+def test_a_spec_is_recorded_on_a_held_window_even_though_it_cannot_honour_it(con):
+    """`Held` was handed edges somebody else already weighted and grouped. It keeps
+    the spec so a caller can see which one that was, and ignores it otherwise."""
+    spec = art.QuerySpec(weight="services", group="operator")
+    assert art.Held([], spec=spec).spec is spec
+
+
+# --- Rendering the spec -------------------------------------------------------
+
+RENDER_BOUNDS = art.Bounds(-3.30, 51.40, -3.10, 51.60)
+RENDER_OPTS = art.RenderOpts(width_px=300)
+
+
+@pytest.fixture
+def drawable(con):
+    """Enough overlap that every style has something to composite."""
+    _art_edge(con, 1, -3200000, trips=900, services=("42", "9A"))
+    _art_edge(con, 2, -3190000, trips=40, services=("42",), agency="FIRST")
+    _art_edge(con, 3, -3180000, trips=300, services=("9A", "7"))
+    return con
+
+
+@pytest.mark.parametrize("style", sorted(art.STYLES))
+@pytest.mark.parametrize("fmt", [".png", ".svg"])
+def test_a_render_is_byte_identical_across_two_calls(drawable, style, fmt):
+    """SVG is the format that can tell: it records the strokes in the order they were
+    issued, where a PNG of `strands` hides an arbitrary order because SCREEN
+    compositing is commutative. Two runs once differed in 180,365 of 293,842 bytes."""
+    first = art.render_bytes(RENDER_BOUNDS, style, fmt=fmt, opts=RENDER_OPTS, con=drawable)
+    second = art.render_bytes(RENDER_BOUNDS, style, fmt=fmt, opts=RENDER_OPTS, con=drawable)
+    assert first == second
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        art.QuerySpec(weight="services"),
+        art.QuerySpec(group="operator", order="busiest"),
+        art.QuerySpec(operator=("FIRST",)),
+    ],
+    ids=lambda q: q.key,
+)
+def test_a_spec_renders_deterministically_too(drawable, query):
+    kwargs = {"fmt": ".svg", "opts": RENDER_OPTS, "con": drawable, "query": query}
+    assert art.render_bytes(RENDER_BOUNDS, "strands", **kwargs) == art.render_bytes(
+        RENDER_BOUNDS, "strands", **kwargs
+    )
+
+
+def test_two_specs_do_not_draw_the_same_picture(drawable):
+    """If they did, `QuerySpec.key` would be pointless and the cache could not tell
+    them apart in the first place."""
+    kwargs = {"fmt": ".svg", "opts": RENDER_OPTS, "con": drawable}
+    plain = art.render_bytes(RENDER_BOUNDS, "strands", **kwargs)
+    filtered = art.render_bytes(
+        RENDER_BOUNDS, "strands", query=art.QuerySpec(operator=("FIRST",)), **kwargs
+    )
+    assert plain != filtered
+
+
+# --- Cached windows -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        art.DEFAULT_SPEC,
+        art.QuerySpec(weight="density", group="way"),
+        art.QuerySpec(min_trips=100),
+    ],
+    ids=lambda q: q.key,
+)
+@pytest.mark.parametrize("style", sorted(art.STYLES))
+def test_substituting_the_source_never_changes_the_picture(drawable, style, query):
+    """`Source` names where the two tables are read from, so that a materialised or
+    extracted window can be swapped in underneath a render. Whatever is swapped in,
+    the picture has to be the same one -- a source that changed the output would make
+    every design iterated against it a picture of something other than the database.
+    """
+    kwargs = {"fmt": ".svg", "opts": RENDER_OPTS, "con": drawable, "query": query}
+    direct = art.render_bytes(RENDER_BOUNDS, style, **kwargs)
+    wrapped = art.Source(
+        edges="(SELECT * FROM edges)", services="(SELECT * FROM edge_services)"
+    )
+    assert art.render_bytes(RENDER_BOUNDS, style, source=wrapped, **kwargs) == direct

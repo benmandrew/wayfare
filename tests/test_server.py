@@ -76,6 +76,13 @@ def test_no_area_names_the_presets():
         ("area=cardiff&format=tiff", "use png or svg"),
         ("area=swansea", "cardiff"),
         ("bbox=-3.3,51.4,-3.0", "minlon,minlat,maxlon,maxlat"),
+        # The spec's own vocabularies, and each mistake reports the table it belongs
+        # to rather than all three.
+        # The field is named as well as the alternatives listed: `busiest` is both a
+        # valid weight and a valid order, so "unknown 'busiest'" would be ambiguous.
+        ("area=cardiff&weight=popularity", "unknown weight=.*known weights: busiest"),
+        ("area=cardiff&group=depot", "unknown group=.*known groups: operator"),
+        ("area=cardiff&order=alphabetical", "unknown order=.*known orders: busiest"),
     ],
 )
 def test_bad_choices_list_the_alternatives(query, match):
@@ -170,6 +177,61 @@ def test_a_lat_lon_window_warns_rather_than_failing():
     assert server.parse_art(f"bbox={WINDOW}").warning is None
 
 
+def test_a_bare_request_asks_for_the_original_query():
+    """Everything about the spec is optional, and asking for none of it must draw what
+    the endpoint drew before the spec existed."""
+    assert server.parse_art(BASE).query == art.DEFAULT_SPEC
+
+
+def test_the_spec_reaches_the_request():
+    request = server.parse_art(
+        f"{BASE}&weight=density&group=operator&order=name&min_trips=20"
+    )
+    assert request.query.weight == "density"
+    assert request.query.group == "operator"
+    assert request.query.order == "name"
+    assert request.query.min_trips == 20
+
+
+def test_a_filter_takes_repeats_and_commas_alike():
+    """A multi-select sends one comma-joined value; a shell loop appends a parameter
+    per value. Both spellings mean the same filter."""
+    commas = server.parse_art(f"{BASE}&operator=FIRST,STAGE").query
+    repeats = server.parse_art(f"{BASE}&operator=FIRST&operator=STAGE").query
+    assert commas.operator == ("FIRST", "STAGE") == repeats.operator
+    both = server.parse_art(f"{BASE}&operator=STAGE&operator=FIRST,+STAGE+").query
+    assert both.operator == ("FIRST", "STAGE")
+
+
+def test_class_is_the_url_spelling_of_road_class():
+    query = server.parse_art(f"{BASE}&class=motorway,trunk&service=X1").query
+    assert query.road_class == ("motorway", "trunk")
+    assert query.service == ("X1",)
+
+
+def test_a_reordered_filter_is_the_same_render():
+    """Order cannot matter to an IN list, so two spellings of one filter must not each
+    pay for a draw."""
+    one = server.parse_art(f"{BASE}&operator=STAGE,FIRST&class=trunk,motorway")
+    other = server.parse_art(f"{BASE}&operator=FIRST,STAGE&class=motorway,trunk")
+    assert one.key == other.key
+
+
+@pytest.mark.parametrize(
+    ("query", "match"),
+    [
+        (f"operator={','.join(str(i) for i in range(65))}", "over the 64 limit"),
+        ("min_trips=-1", "min_trips=-1 is out of range; it runs 0 to"),
+        ("min_trips=9999999999", "is out of range"),
+        ("min_trips=1.5", "is not a whole number"),
+        ("min_trips=lots", "is not a whole number"),
+    ],
+)
+def test_the_filters_are_bounded(query, match):
+    with pytest.raises(server.BadRequest, match=match):
+        server.parse_art(f"{BASE}&{query}")
+
+
 def test_an_overlong_caption_is_rejected():
     with pytest.raises(server.BadRequest, match="longer than 120"):
         server.parse_art(f"area=cardiff&caption={'x' * (server.MAX_CAPTION + 1)}")
@@ -190,6 +252,15 @@ def test_an_overlong_caption_is_rejected():
         "area=cardiff&width=200&alpha_scale=2",
         "area=cardiff&width=200&caption=hello",
         "area=cardiff&width=200&background=ff0000",
+        # The query spec draws as different a picture as the style does, so every part
+        # of it has to reach the key as well.
+        "area=cardiff&width=200&weight=services",
+        "area=cardiff&width=200&group=operator",
+        "area=cardiff&width=200&order=quietest",
+        "area=cardiff&width=200&operator=OP1",
+        "area=cardiff&width=200&service=42",
+        "area=cardiff&width=200&class=secondary",
+        "area=cardiff&width=200&min_trips=50",
     ],
 )
 def test_every_drawn_parameter_reaches_the_cache_key(query):
@@ -222,6 +293,33 @@ def test_a_render_returns_an_image_of_the_format_asked_for(art_db):
     assert etag == renderer.etag(server.parse_art(BASE))
     svg, _ = renderer.render(server.parse_art(f"{BASE}&format=svg"))
     assert b"<svg" in svg
+
+
+def test_two_specs_draw_two_pictures(art_db):
+    """The point of the whole parameter set. `min_trips=250` drops two of the three
+    fixture edges, so a shared cache entry would be visible as the same image."""
+    renderer = server.Renderer()
+    everything, etag = renderer.render(server.parse_art(BASE))
+    filtered, filtered_etag = renderer.render(server.parse_art(f"{BASE}&min_trips=250"))
+    assert filtered != everything
+    assert filtered_etag != etag
+
+
+def test_a_filter_the_data_cannot_satisfy_still_draws(art_db):
+    """An operator this database has never heard of is an empty picture, not an error:
+    there is nothing for the caller to fix, and the ground colour says as much."""
+    png, _ = server.Renderer().render(server.parse_art(f"{BASE}&operator=NOSUCHCO"))
+    assert png.startswith(b"\x89PNG")
+
+
+def test_too_many_groups_is_the_callers_fault_not_a_server_error(art_db, monkeypatch):
+    """`group=way` over a city is one ribbon per OSM way. art.Window.groups refuses
+    rather than drawing it, and that refusal has to reach the caller as a 400 with the
+    reason -- a 500 would read as a bug in the server."""
+    monkeypatch.setattr(art, "MAX_GROUPS", 1)
+    with pytest.raises(ValueError, match="over the 1 limit") as exc:
+        server.Renderer().render(server.parse_art(f"{BASE}&style=strands&group=service"))
+    assert not isinstance(exc.value, server.BadRequest)  # raised by art, not by parsing
 
 
 def test_the_second_identical_request_is_not_redrawn(art_db, monkeypatch):
@@ -360,6 +458,36 @@ def test_meta_reports_the_feed_version(art_db):
     assert "error" not in database
 
 
+def test_meta_publishes_the_query_vocabularies_in_a_stable_order(art_db):
+    """The page builds three dropdowns from these, so adding a weight in art.py has to
+    show up in the UI without touching any HTML. Declaration order, not sorted: the
+    default belongs at the top of the menu."""
+    meta = server.art_meta(True)
+    assert meta["query"]["weights"] == list(art.WEIGHTS)
+    assert meta["query"]["groups"] == list(art.GROUPS)
+    assert meta["query"]["orders"] == list(art.ORDERS)
+    assert meta["query"]["weights"][0] == meta["defaults"]["weight"] == "trips"
+    assert meta["limits"]["max_groups"] == art.MAX_GROUPS
+    assert meta["limits"]["max_filter_values"] == server.MAX_FILTER_VALUES
+    assert meta["limits"]["max_min_trips"] == server.MAX_MIN_TRIPS
+
+
+def test_meta_reports_the_operators_and_road_classes_the_database_holds(art_db):
+    """A dropdown of the values that exist beats a free-text box whose typos answer
+    with an empty picture."""
+    database = server.art_meta(True)["database"]
+    assert database["operators"] == ["OP1"]
+    assert database["road_classes"] == ["secondary"]
+
+
+def test_the_facet_lists_are_bounded(art_db, monkeypatch):
+    monkeypatch.setattr(server, "MAX_FACET_VALUES", 1)
+    con = db.connect(art_db)
+    con.execute("INSERT INTO edge_services VALUES (1, '7', 'OP2', 1, 5)")
+    con.close()
+    assert len(server.art_meta(True)["database"]["operators"]) == 1
+
+
 def test_meta_survives_a_database_with_no_feed_version(tmp_path, monkeypatch):
     """A bare select raises on an empty result, and a viewer that cannot name the feed
     is still a working viewer."""
@@ -483,6 +611,30 @@ def test_a_bad_parameter_is_json_not_an_html_page(art_db, serve_at):
     assert exc.value.code == 400
     assert exc.value.headers["Content-Type"] == "application/json"
     assert "hue=7 is out of range" in json.loads(exc.value.read())["error"]
+
+
+def test_a_spec_over_http_answers_with_its_own_image_and_etag(art_db, serve_at):
+    base = serve_at()
+    seen = {}
+    for query in (BASE, f"{BASE}&weight=services&group=operator&min_trips=150"):
+        with _get(f"{base}/art?{query}") as response:
+            assert response.status == 200
+            seen[response.headers["ETag"]] = response.read()
+    assert len(seen) == 2  # two ETags
+    assert len(set(seen.values())) == 2  # and two pictures
+
+
+def test_too_many_groups_reads_as_a_400_over_http(art_db, serve_at, monkeypatch):
+    """The one error a caller will actually hit. It has to arrive as the message
+    art.Window.groups wrote, so the studio page can show it verbatim."""
+    monkeypatch.setattr(art, "MAX_GROUPS", 1)
+    base = serve_at()
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(f"{base}/art?{BASE}&style=strands&group=service")
+    assert exc.value.code == 400
+    detail = json.loads(exc.value.read())["error"]
+    assert "group='service' gives 2 groups" in detail
+    assert "group by something coarser" in detail
 
 
 def test_meta_over_http(art_db, serve_at):

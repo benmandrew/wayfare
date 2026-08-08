@@ -125,6 +125,27 @@ endpoint — serving bytes off disk is fine unchecked, taking parameters from a 
 and running cairo is not, and pyproject puts only `wayfare` under mypy and ruff.
 `scripts/serve.py` is a deprecated shim so a deployed compose file keeps working.
 
+**A render is a style and a query spec, and they know nothing about each other.**
+The style decides how an edge is painted; `art.QuerySpec` decides which edges exist,
+what their weight means, and what a group is. Three styles then cover the product of
+the two rather than three fixed pictures — `strands` grouped by operator or by road
+class is a genuinely different map with no new drawing code. `Style.needs_groups`
+(was `needs_services`) is the only thing crossing the line: it says which *shape* of
+data a style consumes, flat edges or grouped paths, never what the groups are.
+
+**The spec is a closed vocabulary, not a query language.** `WEIGHTS`, `GROUPS` and
+`ORDERS` are dicts of SQL fragments; substituted text is only ever a value looked up
+in one of them, and anything a caller supplies is a bound parameter. This is not
+fussiness: DuckDB's `read_only` applies to the database file and not the filesystem,
+so `read_csv` and `ATTACH` still work and user SQL would be an arbitrary file read on
+the server. There is a lockdown path (`enable_external_access=false`,
+`disabled_filesystems`) but no statement timeout, so a runaway query would need
+interrupting from another thread. Not worth it for four knobs.
+
+**`Edge.weight`, not `Edge.n_trips`.** The field holds whatever `QuerySpec.weight`
+asked for, which may be a count of operators or traffic per metre. A field named for
+trips holding a count of operators is a lie, and the rename cost four lines.
+
 **`/art` exists because the data is on the server and the design work is not.**
 Every expensive stage runs where the disk is, so iterating on a style used to mean
 copying tens of gigabytes to a laptop or editing a style and watching a deploy.
@@ -277,6 +298,41 @@ re-rendering on every slider move would otherwise queue renders nobody will look
 the whole table, over HTTP as much as on the command line. The pixel cap does
 nothing about that; the serialisation and the queue limit are the only protection.
 
+**A render is 75% cairo, and the scan is not the problem.** Measured on a synthetic
+4.2M-edge / 10.25M-service database (`scripts/bench_window.py`), `density` at 800px:
+Cardiff 56,251 edges takes 2,363 ms — weights pass 55 ms, two window walks 532 ms,
+cairo 1,776 ms. London 752,561 edges takes 28,589 ms, split 516 / 6,558 / 21,515 the
+same way. So the whole database side is about a quarter of a render and the
+percentile pass under 2%. Optimise the drawing, not the query. What would actually
+help is fewer strokes: dropping sub-pixel edges, or coalescing runs the way
+`publish` already does for tiles.
+
+**Clustering `edges` on a space-filling curve does prune, and it is worth doing for
+its own sake.** DuckDB keeps min/max zonemaps per 122,880-row group, and `match`
+inserts edges in batch order, which is spatially random, so today they prune
+nothing. Ordering the table by a Morton or Hilbert code over the bbox centre makes a
+city window touch a handful of groups: Cardiff read 100% -> 11.7% (Morton) or 5.9%
+(Hilbert) of `edges`, 22 ms -> 4.4 ms; London 100% -> 26.3%, 30 ms -> 16 ms. It also
+shrinks the file, 528 -> 453 -> 443 MB. Verified from DuckDB's own
+`operator_rows_scanned`, not inferred from wall time. Hilbert only beats Morton on
+the smallest window, so it is not worth the `spatial` extension on its own. **But
+read the previous paragraph before spending the effort:** this is a 5x improvement to
+a quarter of the cost, and Wales at ~2 row groups cannot show it at all.
+
+**`edge_services` cannot prune and never will, as things stand.** It carries no bbox
+column and DuckDB pushes no min/max filter through the join, so the weights pass
+reads all 10.25M rows under every layout. That caps what clustering can do. Giving
+it a bbox column, or clustering it by `edge_id` alongside a clustered `edges`, is
+the only way through — unmeasured.
+
+**Extracting a window to Parquet was tried and rejected.** The idea was that
+iterating on a design should cost the window rather than the national table. It does
+not pay, for the reason above: Cardiff went 2,347 ms -> 2,320 ms and London 28,978
+-> 28,619, and a filtered spec got *slower* (37 -> 101 ms) because the extract cost
+more than the scan it saved. `art.Source` survives as the substitution seam, with
+the numbers recorded on it; do not reintroduce the extract without first making the
+drawing cheaper.
+
 **Every `/art` error is JSON, and the message is the interface.** `send_error`
 writes an HTML page, which an `<img>` renders as a broken-image icon with the reason
 nowhere anyone can see it. A lat,lon-swapped window is the case that cannot raise —
@@ -349,6 +405,17 @@ the old `spectrum` differed by 426 bytes. Verified by rendering Cardiff before a
 after the streaming rewrite: `density` byte-identical, `strands` differing by 7
 bytes out of 5.8M at delta 1, `spectrum` differing more because its ties now
 resolve differently.
+
+**That claim was PNG-only, and `strands` to SVG was never deterministic.** The group
+query ordered by group with no tiebreak *within* a group, so the edges of one ribbon
+arrived in scan order. A PNG cannot show it — `strands` composites with SCREEN, which
+is commutative, so the image is identical either way — and an SVG records strokes in
+the order they were issued. Three runs gave three different files at a constant
+293,842 bytes, differing in 180,365 of them. Fixed by an `edge_id` tiebreak in
+`art._order_sql`. The general lesson is the one this codebase keeps relearning, after
+the refs ordering and `_chain`'s starting point: **every ORDER BY needs a unique
+tiebreak**, and a commutative compositing operator will hide a missing one from every
+check that looks at pixels.
 
 **DuckDB inserts about 2,700 rows/s through executemany, and 1.6M/s from a file.**
 It is columnar; every bound-parameter insert pays the full per-statement

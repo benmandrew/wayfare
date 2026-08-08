@@ -13,7 +13,8 @@ aggregate -- happens on a server, and until now ``wayfare art`` could only draw
 against a database on the same machine. Iterating on a design therefore meant
 copying tens of gigabytes to a laptop, or editing a style, rebuilding an image and
 watching a log. Rendering where the data already is turns that into a query string:
-the endpoint takes a window, a style and the style's knobs, and answers with a PNG.
+the endpoint takes a window, a style, the style's knobs and the query spec -- what
+drives the ramps, what a group is, which services count -- and answers with a PNG.
 
 Renders are serialised and bounded. One at a time, because a render is CPU-bound
 cairo over a full scan of ``edges`` and the same box is usually also matching --
@@ -42,6 +43,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+
+import duckdb
 
 from . import art, config, db, logs
 
@@ -111,6 +114,19 @@ MAX_PIXELS = 64_000_000
 MAX_SCALE = 4.0
 MAX_CAPTION = 120
 
+# Query-spec limits. A filter becomes an `IN (...)` list of bound parameters, so a
+# URL repeating `operator=` a few thousand times would have the server build the
+# query rather than draw the picture. Sixty-four is well past any real choice: the
+# whole country has a few hundred operators and five road classes.
+MAX_FILTER_VALUES = 64
+# A floor on weekly trips. The busiest edge in the country carries tens of
+# thousands, so anything above this filters everything out and is a typo.
+MAX_MIN_TRIPS = 1_000_000
+# How many distinct operators and road classes /art/meta will list for the page's
+# dropdowns. Enough for every real value, bounded so that a database with dirty
+# agency ids cannot turn the metadata into the largest response the server sends.
+MAX_FACET_VALUES = 500
+
 # How long a request will wait for the render slot before giving up, and how many
 # are allowed to be waiting. A studio page that re-renders on every slider move
 # would otherwise build an unbounded backlog of renders nobody is looking at any
@@ -149,6 +165,10 @@ class ArtRequest:
     style: str
     fmt: str
     opts: art.RenderOpts
+    # The other half of the render: which edges, weighted how, grouped by what. It
+    # changes the picture as much as the style does, which is why its identity has to
+    # reach `key` below.
+    query: art.QuerySpec = art.DEFAULT_SPEC
     # Something the render will not fail on but the caller probably meant
     # differently. `art.parse_bbox` logs this to a terminal, which is no help at all
     # to an <img> tag: over HTTP the same mistake arrives as a black rectangle.
@@ -163,6 +183,7 @@ class ArtRequest:
                 self.area,
                 self.style,
                 self.fmt,
+                self.query.key,
                 o.width_px,
                 o.height_px,
                 o.scale,
@@ -202,6 +223,79 @@ def _number(
     if not lo <= value <= hi:
         raise BadRequest(f"{name}={value:g} is out of range; it runs {lo:g} to {hi:g}")
     return value
+
+
+def _count(q: dict[str, list[str]], name: str, hi: int) -> int:
+    """A whole number from zero up, or zero when the parameter is absent.
+
+    Separate from `_number` rather than an int() of it: truncating `min_trips=5.9` to
+    5 would answer a question nobody asked, and a threshold is the parameter where
+    quietly rounding is least welcome.
+    """
+    raw = _one(q, name)
+    if raw is None:
+        return 0
+    try:
+        value = int(raw)
+    except ValueError:
+        raise BadRequest(f"{name}={raw!r} is not a whole number") from None
+    if not 0 <= value <= hi:
+        raise BadRequest(f"{name}={value} is out of range; it runs 0 to {hi}")
+    return value
+
+
+def _many(q: dict[str, list[str]], name: str) -> tuple[str, ...]:
+    """A filter's values, from repeats, commas, or both.
+
+    Repeatable *and* comma-separated because the two callers want different things:
+    a multi-select serialises as one comma-joined value and stays short, while a
+    hand-written URL or a shell loop appends `&operator=` per value. Accepting both
+    costs one split.
+
+    Sorted and deduplicated, which is what makes `operator=A,B` and `operator=B,A`
+    one cache entry rather than two. Order cannot matter to an `IN` list, so two
+    spellings of the same filter must not draw twice.
+    """
+    values = {
+        part.strip() for raw in q.get(name, []) for part in raw.split(",") if part.strip()
+    }
+    if len(values) > MAX_FILTER_VALUES:
+        raise BadRequest(
+            f"{name}= lists {len(values)} values, over the {MAX_FILTER_VALUES} limit. "
+            "Filter to a handful and let the picture show the rest."
+        )
+    return tuple(sorted(values))
+
+
+def _spec(q: dict[str, list[str]]) -> art.QuerySpec:
+    """The data half of the request, validated by the spec itself.
+
+    `weight`, `group` and `order` are checked by `QuerySpec.__post_init__`, whose
+    message already names the alternatives -- and names them from the right table, so
+    the reply to a mistyped `weight=` lists weights and not orders. Converting that
+    one ValueError is better than restating three vocabularies here, where they would
+    drift from `art.py` the first time one gained an entry.
+    """
+    # The filters are read outside the try so that their own BadRequest -- which is a
+    # ValueError -- reaches the caller with its own message rather than this one.
+    operator = _many(q, "operator")
+    service = _many(q, "service")
+    # `class` in a URL, `road_class` in the spec: the query string is written by hand
+    # often enough that the shorter name is worth the mapping.
+    road_class = _many(q, "class")
+    min_trips = _count(q, "min_trips", MAX_MIN_TRIPS)
+    try:
+        return art.QuerySpec(
+            weight=_one(q, "weight") or art.DEFAULT_SPEC.weight,
+            group=_one(q, "group") or art.DEFAULT_SPEC.group,
+            order=_one(q, "order") or art.DEFAULT_SPEC.order,
+            operator=operator,
+            service=service,
+            road_class=road_class,
+            min_trips=min_trips,
+        )
+    except ValueError as exc:
+        raise BadRequest(str(exc)) from None
 
 
 def _hex(colour: art.RGB) -> str:
@@ -305,6 +399,7 @@ def parse_art(query: str) -> ArtRequest:
         area=area,
         style=style,
         fmt=fmt,
+        query=_spec(q),
         warning=warning,
         opts=art.RenderOpts(
             width_px=width,
@@ -434,7 +529,12 @@ class Renderer:
             ) from None
         try:
             return art.render_bytes(
-                request.area, request.style, fmt=request.fmt, opts=request.opts, con=con
+                request.area,
+                request.style,
+                fmt=request.fmt,
+                opts=request.opts,
+                query=request.query,
+                con=con,
             )
         finally:
             con.close()
@@ -470,13 +570,21 @@ def art_meta(enabled: bool) -> dict[str, Any]:
                 "name": name,
                 "blurb": spec.blurb,
                 "background": _hex(spec.background),
-                "needs_services": spec.needs_services,
+                "needs_groups": spec.needs_groups,
             }
             for name, spec in art.STYLES.items()
         ],
         "presets": {
             name: [b.min_lon, b.min_lat, b.max_lon, b.max_lat]
             for name, b in art.PRESETS.items()
+        },
+        # The closed vocabularies of the query spec, in the order art.py declares them
+        # rather than sorted: `trips` first is the useful default to land on, and
+        # alphabetical would open the weight menu on `busiest`.
+        "query": {
+            "weights": list(art.WEIGHTS),
+            "groups": list(art.GROUPS),
+            "orders": list(art.ORDERS),
         },
         "defaults": {
             "style": "density",
@@ -485,12 +593,19 @@ def art_meta(enabled: bool) -> dict[str, Any]:
             "hue": DEFAULTS.hue,
             "line_scale": DEFAULTS.line_scale,
             "alpha_scale": DEFAULTS.alpha_scale,
+            "weight": art.DEFAULT_SPEC.weight,
+            "group": art.DEFAULT_SPEC.group,
+            "order": art.DEFAULT_SPEC.order,
+            "min_trips": art.DEFAULT_SPEC.min_trips,
         },
         "limits": {
             "max_width": MAX_WIDTH,
             "max_pixels": MAX_PIXELS,
             "max_scale": MAX_SCALE,
             "formats": list(art.FORMATS),
+            "max_groups": art.MAX_GROUPS,
+            "max_filter_values": MAX_FILTER_VALUES,
+            "max_min_trips": MAX_MIN_TRIPS,
         },
         "database": {"present": config.DB_PATH.exists()},
     }
@@ -506,11 +621,34 @@ def art_meta(enabled: bool) -> dict[str, Any]:
                     con, "SELECT max(value) FROM meta WHERE key = 'feed_version'"
                 )
                 meta["database"]["edges"] = db.scalar(con, "SELECT count(*) FROM edges")
+                # What the filters can usefully be set to. A dropdown of the operators
+                # this database actually holds beats a free-text box that answers a
+                # typo with an empty picture -- and there is no other way for a caller
+                # to learn that this region is `FIRST` and `STAGE` rather than the
+                # national list.
+                meta["database"]["operators"] = _facet(
+                    con, "SELECT DISTINCT agency_id FROM edge_services"
+                )
+                meta["database"]["road_classes"] = _facet(
+                    con, "SELECT DISTINCT road_class FROM edges"
+                )
             finally:
                 con.close()
         except Exception as exc:
             meta["database"]["error"] = str(exc)
     return meta
+
+
+def _facet(con: duckdb.DuckDBPyConnection, sql: str) -> list[str]:
+    """Distinct values of one column, bounded and sorted.
+
+    LIMIT inside the query rather than a slice afterwards, so a column with a million
+    distinct values costs a bounded result set rather than a list this process mostly
+    discards. Sorting happens here for the same reason: an ORDER BY would have the
+    database sort every distinct value before the limit could discard any.
+    """
+    rows = con.execute(f"{sql} LIMIT {MAX_FACET_VALUES}").fetchall()
+    return sorted(str(r[0]) for r in rows if r[0] is not None)
 
 
 # --- The server -------------------------------------------------------------
