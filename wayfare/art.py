@@ -231,6 +231,36 @@ class Projection:
         x_max, y_min = self(b.max_lon, b.max_lat)
         return x_min, y_min, x_max - x_min, y_max - y_min
 
+    def flat(self, lon_e6: Any, lat_e6: Any) -> tuple[list[float], list[float]]:
+        """Project one flat run of micro-degree vertices to canvas pixels.
+
+        Takes and returns the coordinates unsplit -- no per-edge structure at all --
+        because that is the shape the arithmetic wants and, since the geometry
+        arrives from DuckDB as Arrow list columns, it is also the shape it comes in.
+        An Arrow list column *is* a flat child buffer plus a vector of offsets, so
+        the child buffer goes straight into numpy with no copy and no Python object
+        per vertex. Splitting it into per-edge lists first was the single largest
+        cost in a render's database half: 852ms against 198ms over the London window
+        at 3000px, 197,276 edges and 585,287 vertices.
+
+        Lists rather than numpy arrays come back because every consumer is a Python
+        loop feeding cairo one vertex at a time, and indexing a list of floats beats
+        indexing an ndarray -- the latter boxes a fresh scalar on every access. The
+        one bulk `.tolist()` is C-level and pays for itself immediately.
+        """
+        np = _require_numpy()
+
+        lon = np.asarray(lon_e6, dtype=np.int64) / 1e6
+        lat = np.clip(
+            np.asarray(lat_e6, dtype=np.int64) / 1e6, -_MERC_MAX_LAT, _MERC_MAX_LAT
+        )
+        # The same forward Mercator as `_merc`, one array at a time.
+        mx = np.radians(lon)
+        my = np.log(np.tan(np.pi / 4 + np.radians(lat) / 2))
+        xs: list[float] = ((mx - self.x0) * self.k + self.ox).tolist()
+        ys: list[float] = ((self.y1 - my) * self.k + self.oy).tolist()
+        return xs, ys
+
     def batch(
         self, lon_e6: Sequence[Sequence[int]], lat_e6: Sequence[Sequence[int]]
     ) -> list[list[tuple[float, float]]]:
@@ -244,28 +274,19 @@ class Projection:
 
         The lists come back in the order given, one per edge, so a caller can zip
         them straight back against the rows it fetched.
+
+        Nothing on the rendering path calls this any more -- :meth:`flat` does the
+        work and :class:`Path` keeps the per-edge view without materialising it.
+        This stays because it is the form the projection is *tested* in, against a
+        scalar `__call__` per vertex, and because :class:`Held` has per-edge lists
+        already and no flat buffer to hand.
         """
-        np = _require_numpy()
-
         lens = [len(v) for v in lon_e6]
-        total = sum(lens)
-        if not total:
+        if not sum(lens):
             return [[] for _ in lens]
-        flat_lon = np.fromiter(
-            (v for edge in lon_e6 for v in edge), dtype=np.int64, count=total
+        xs, ys = self.flat(
+            [v for edge in lon_e6 for v in edge], [v for edge in lat_e6 for v in edge]
         )
-        flat_lat = np.fromiter(
-            (v for edge in lat_e6 for v in edge), dtype=np.int64, count=total
-        )
-
-        lon = flat_lon / 1e6
-        lat = np.clip(flat_lat / 1e6, -_MERC_MAX_LAT, _MERC_MAX_LAT)
-        # The same forward Mercator as `_merc`, one array at a time.
-        mx = np.radians(lon)
-        my = np.log(np.tan(np.pi / 4 + np.radians(lat) / 2))
-        xs = ((mx - self.x0) * self.k + self.ox).tolist()
-        ys = ((self.y1 - my) * self.k + self.oy).tolist()
-
         out: list[list[tuple[float, float]]] = []
         at = 0
         for n in lens:
@@ -302,6 +323,92 @@ def simplify(pts: list[tuple[float, float]], tol: float) -> list[tuple[float, fl
             kx, ky = x, y
     out.append(pts[-1])
     return out
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class Polyline:
+    """One edge's projected geometry, as indices into a batch's flat coordinates.
+
+    The point is what it does *not* hold. `xs` and `ys` belong to the whole fetch of
+    20,000 edges and are shared by every path in it; this carries only which of
+    those vertices are its own. So a path costs one small object rather than a list
+    of tuples, and simplification is a narrowing of `idx` rather than a second list
+    of tuples built from the first.
+
+    `idx` is a `range` for an unsimplified path, which allocates nothing at all --
+    the overwhelmingly common case, since `spectrum` never simplifies and a preview
+    at low tolerance drops nothing. It becomes a list only once vertices are
+    actually dropped.
+
+    Equality is over the *points*, not the representation, because the two ways of
+    producing a path do not agree on the representation: :class:`Window` hands out
+    slices of a shared buffer and :class:`Held` builds a two-element buffer per
+    edge. Only the polyline is meant to be the same, and a test comparing the two
+    implementations is testing exactly that.
+    """
+
+    xs: Sequence[float]
+    ys: Sequence[float]
+    idx: Sequence[int]
+
+    def __len__(self) -> int:
+        return len(self.idx)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Polyline):
+            return NotImplemented
+        return self.points() == other.points()
+
+    def points(self) -> list[tuple[float, float]]:
+        """The polyline as (x, y) tuples. Materialises; the draw path avoids it."""
+        xs, ys = self.xs, self.ys
+        return [(xs[i], ys[i]) for i in self.idx]
+
+    def segments(self) -> Iterator[tuple[float, float, float, float]]:
+        """Consecutive vertex pairs as bare floats, for a style that colours by one.
+
+        Four floats rather than two points because `spectrum` immediately unpacks
+        them into a subtraction; building the tuples to take them apart again is
+        the allocation this class exists to avoid, and that style is the one that
+        never simplifies, so it sees every vertex there is.
+        """
+        xs, ys = self.xs, self.ys
+        it = iter(self.idx)
+        i = next(it, None)
+        if i is None:
+            return
+        x0, y0 = xs[i], ys[i]
+        for j in it:
+            x1, y1 = xs[j], ys[j]
+            yield x0, y0, x1, y1
+            x0, y0 = x1, y1
+
+    def simplified(self, tol: float) -> Polyline:
+        """This path with sub-`tol` vertices dropped -- see :func:`simplify`.
+
+        Same rule and same result as that function, kept separate rather than shared
+        because the two work on different things: one filters a list of tuples it
+        was given, this one filters indices into a buffer it does not own.
+        """
+        idx = self.idx
+        if tol <= 0.0 or len(idx) <= 2:
+            return self
+        xs, ys = self.xs, self.ys
+        first, last = idx[0], idx[-1]
+        keep = [first]
+        kx, ky = xs[first], ys[first]
+        for i in idx[1:-1]:
+            x, y = xs[i], ys[i]
+            if abs(x - kx) >= tol or abs(y - ky) >= tol:
+                keep.append(i)
+                kx, ky = x, y
+        keep.append(last)
+        return Polyline(xs, ys, keep)
+
+    @classmethod
+    def of(cls, pts: Sequence[tuple[float, float]]) -> Polyline:
+        """A path over its own buffer, for a caller that already has the tuples."""
+        return cls([p[0] for p in pts], [p[1] for p in pts], range(len(pts)))
 
 
 # --- Data -------------------------------------------------------------------
@@ -631,6 +738,51 @@ SELECT coalesce(svc.weight, 0) FROM win {self._join()} svc USING (edge_id)
 """
         return sql, win_p + svc_p
 
+    def bounds_query(self, lo_q: float, hi_q: float) -> tuple[str, list[Any]]:
+        """The two order statistics :class:`Weights` needs, without shipping the rest.
+
+        :meth:`weights_query` is eight bytes an edge in SQL and then a Python float
+        object an edge out of it, which is where the cost actually lands: over the
+        `uk` window at 4.2M edges the query itself is 232ms and `.fetchall()` on it
+        is 1,918ms. Only two of those numbers are ever used.
+
+        This has to agree with :meth:`Weights.over` exactly, not approximately -- the
+        same window rendered through either path must give the same picture -- so it
+        reproduces that method's rank convention rather than reaching for a quantile
+        aggregate. `quantile_disc` interpolates ranks differently and would shift the
+        bounds slightly, which is invisible in a test and visible in a render's
+        contrast. Hence `row_number()` and an explicit `floor(q * n)`: `CAST(x AS
+        BIGINT)` in DuckDB rounds where Python's `int()` truncates, and on
+        non-negative weights `floor` is the one that matches.
+
+        Ties need no thought: two rows with equal weight can take either rank, and
+        the value read off at a given rank is the same either way.
+        """
+        win, win_p = self.window()
+        svc, svc_p = self.services()
+        sql = f"""
+WITH win AS ({win}
+), svc AS (
+    SELECT s.edge_id, {self.weight} AS weight
+    FROM {svc} JOIN win USING (edge_id)
+    GROUP BY s.edge_id
+    {self._having()}
+), w AS (
+    SELECT coalesce(svc.weight, 0) AS weight
+    FROM win {self._join()} svc USING (edge_id)
+), ranked AS (
+    SELECT weight,
+           row_number() OVER (ORDER BY weight) - 1 AS rn,
+           count(*) OVER () AS n
+    FROM w
+)
+SELECT max(weight) FILTER (WHERE rn = least(n - 1, floor(? * n)::BIGINT)),
+       max(weight) FILTER (WHERE rn = least(n - 1, floor(? * n)::BIGINT))
+FROM ranked
+"""
+        # Textual order again -- the two CTEs first, then the quantiles in the SELECT.
+        return sql, win_p + svc_p + [lo_q, hi_q]
+
     def _grouped_base(self) -> tuple[str, list[Any]]:
         """The shared part of the two grouped queries.
 
@@ -752,6 +904,67 @@ def _holes(values: Sequence[Any]) -> str:
 FETCH_ROWS = 20_000
 
 
+def _batches(cur: duckdb.DuckDBPyConnection) -> Iterator[Any]:
+    """The result as Arrow record batches, FETCH_ROWS at a time.
+
+    Arrow rather than `fetchmany` because of one column type. A DuckDB `INTEGER[]`
+    arrives over the Python row protocol as a list object per edge holding an int
+    object per vertex, and building those is most of what a render's database half
+    costs -- the scan for the whole London window is 4.4ms and materialising its
+    rows is 303ms. In Arrow the same column *is* a flat 32-bit child buffer plus a
+    vector of offsets, which numpy adopts without copying and
+    :meth:`Projection.flat` consumes directly.
+
+    Batched rather than one table, because streaming is the property
+    :class:`Window` exists for: peak memory stays one fetch, not one window.
+
+    DuckDB renamed this method in 1.3 and kept the old spelling working, so both
+    are tried rather than raising the floor in pyproject for a rename.
+    """
+    reader = getattr(cur, "to_arrow_reader", None) or cur.fetch_record_batch
+    return iter(reader(FETCH_ROWS))
+
+
+def _lists(column: Any) -> tuple[Any, Any, Any]:
+    """An Arrow list column as (flat values, offsets, per-edge lengths), in numpy.
+
+    A record batch's column is a plain array rather than a chunked one, so its
+    child buffer is contiguous and no combine step is needed.
+    """
+    np = _require_numpy()
+    offsets = np.asarray(column.offsets, dtype=np.int64)
+    return np.asarray(column.values, dtype=np.int64), offsets, np.diff(offsets)
+
+
+def _in_window(
+    lon: Any, lat: Any, offsets: Any, lengths: Any, box: tuple[int, int, int, int]
+) -> Any:
+    """Per-edge mask: does this edge's own geometry overlap the window?
+
+    `edges` stores a bounding box per edge and the SQL has already filtered on it,
+    so this repeats that test against the vertices themselves. It is kept because
+    it is what the row path did, and dropping it would silently change which edges
+    draw wherever a stored box and its geometry disagree.
+
+    Vectorised with `reduceat`, which needs every start index to be in bounds even
+    for a group it will not be asked about -- an empty list at the end of a batch
+    would otherwise index off the end -- hence the clip. Lengths below two are
+    masked out afterwards, which is where those groups go.
+    """
+    np = _require_numpy()
+    w, s, e, n = box
+    if not len(lon):
+        return np.zeros(len(lengths), dtype=bool)
+    starts = np.minimum(offsets[:-1], len(lon) - 1)
+    return (
+        (lengths >= 2)
+        & (np.minimum.reduceat(lon, starts) <= e)
+        & (np.maximum.reduceat(lon, starts) >= w)
+        & (np.minimum.reduceat(lat, starts) <= n)
+        & (np.maximum.reduceat(lat, starts) >= s)
+    )
+
+
 class Window:
     """The edges of a view, offered as a stream that can be walked more than once.
 
@@ -788,12 +1001,25 @@ class Window:
                 round(bounds.min_lat * 1e6),
             ],
         )
-        query, params = self.sql.weights_query()
-        # "d" rather than "q": a weight is not necessarily an integer any more --
-        # `density` divides by length. Still eight bytes an edge either way.
-        self.weights = Weights.over(
-            array("d", (r[0] for r in con.execute(query, params).fetchall()))
-        )
+        self._weights: Weights | None = None
+
+    @property
+    def weights(self) -> Weights:
+        """The window's weight scale, computed on first use and then held.
+
+        Lazy because one of the three styles never asks. `strands` takes its widths
+        and alphas from the *group* statistics inside `_group_rows`, so for that
+        style the scale here is a whole extra pass over the window whose result is
+        thrown away -- 94ms over London, and about three seconds over `uk` at 4.2M
+        edges. It was eager because two styles out of three want it before they draw
+        anything, which is a reason to compute it once, not a reason to compute it
+        unasked.
+        """
+        if self._weights is None:
+            query, params = self.sql.bounds_query(_LO_Q, _HI_Q)
+            row = self.con.execute(query, params).fetchone()
+            self._weights = Weights.at(*row) if row else Weights(0.0, 0.0)
+        return self._weights
 
     def edges(self, *, by_weight: bool = False) -> Iterator[Edge]:
         """Every edge whose bbox overlaps the window.
@@ -816,7 +1042,7 @@ class Window:
 
     def paths(
         self, proj: Projection, *, tol: float = 0.0, by_weight: bool = False
-    ) -> Iterator[tuple[float, list[tuple[float, float]]]]:
+    ) -> Iterator[tuple[float, Polyline]]:
         """(this edge's weight, its geometry in canvas pixels), one edge at a time.
 
         The projection runs once per *fetch* rather than once per edge, so numpy sees
@@ -824,26 +1050,40 @@ class Window:
         is held across chunks, so the streaming property the class exists for
         survives: peak memory is one fetch, not one window.
 
+        A :class:`Polyline` rather than a list of points, because building those
+        tuples was the largest single cost left in the database half of a render and
+        every consumer of them is a loop that takes them apart again. See
+        :meth:`Projection.flat` for the measurements.
+
         Degrees never reach the caller, which is deliberate -- building the float
         lon/lat tuples was itself a measurable share of a render, and a style that
         only strokes lines has no use for them. `edges()` remains for callers that
         do want them.
         """
+        # Resolve the scale *before* opening the stream, and never during it. A
+        # DuckDB connection holds one result at a time, so a second `execute` on it
+        # abandons the first -- silently, with no error and no short read to notice:
+        # a 200,000-row stream interrupted after its first batch simply ends at
+        # 20,000. Every caller of this method wants the scale anyway (the two styles
+        # that stream flat edges are exactly the two that weight them), so warming it
+        # here costs nothing and keeps the lazy pass honest for `strands`, which goes
+        # through `group_paths` instead and still never asks.
+        self.weights  # noqa: B018
         query, params = self.sql.edges_query(with_groups=False, by_weight=by_weight)
         cur = self.con.execute(query, params)
         # The window test stays in micro-degrees, against the same integers the
         # database holds -- see `Bounds.as_e6`.
-        w, s, e, n = self.bounds.as_e6()
-        while chunk := cur.fetchmany(FETCH_ROWS):
-            keep = [r for r in chunk if r[3] and len(r[3]) >= 2]
-            for row, pts in zip(
-                keep,
-                proj.batch([r[3] for r in keep], [r[4] for r in keep]),
-                strict=True,
-            ):
-                lons, lats = row[3], row[4]
-                if min(lons) <= e and max(lons) >= w and min(lats) <= n and max(lats) >= s:
-                    yield float(row[6]), simplify(pts, tol)
+        box = self.bounds.as_e6()
+        for batch in _batches(cur):
+            lon, offsets, lengths = _lists(batch.column(3))
+            lat, _, _ = _lists(batch.column(4))
+            keep = _in_window(lon, lat, offsets, lengths, box)
+            xs, ys = proj.flat(lon, lat)
+            weights = batch.column(6).to_pylist()
+            offs = offsets.tolist()
+            for i in keep.nonzero()[0].tolist():
+                line = Polyline(xs, ys, range(offs[i], offs[i + 1]))
+                yield float(weights[i]), line.simplified(tol)
 
     def groups(self) -> Iterator[tuple[str, float, list[tuple[float, float]]]]:
         """(group, its weight, one edge's coordinates), grouped.
@@ -856,14 +1096,14 @@ class Window:
 
     def group_paths(
         self, proj: Projection, *, tol: float = 0.0
-    ) -> Iterator[tuple[str, float, list[tuple[float, float]]]]:
+    ) -> Iterator[tuple[str, float, Polyline]]:
         """:meth:`groups`, already projected and simplified. Same grouping."""
         for name, weight, pts, _ in self._group_rows(proj, tol):
             yield name, weight, pts
 
     def _group_rows(
         self, proj: Projection | None, tol: float
-    ) -> Iterator[tuple[str, float, list[tuple[float, float]], list[tuple[float, float]]]]:
+    ) -> Iterator[tuple[str, float, Polyline, list[tuple[float, float]]]]:
         """The shared body of `groups` and `group_paths`.
 
         One generator so the ordering, the weighting and the window test cannot drift
@@ -889,31 +1129,34 @@ class Window:
         weight_of = {r[0]: weights.of(float(r[2] or 0.0)) for r in rows}
 
         query, params = self.sql.grouped_query()
-        w, s, e, n = self.bounds.as_e6()
+        box = self.bounds.as_e6()
         cur = self.con.execute(query, params)
-        while chunk := cur.fetchmany(FETCH_ROWS):
-            keep = [
-                r
-                for r in chunk
-                if r[1]
-                and len(r[1]) >= 2
-                and min(r[1]) <= e
-                and max(r[1]) >= w
-                and min(r[2]) <= n
-                and max(r[2]) >= s
-            ]
-            projected: list[list[tuple[float, float]]] = (
-                proj.batch([r[1] for r in keep], [r[2] for r in keep])
-                if proj is not None
-                else [[] for _ in keep]
-            )
-            for (name, lon_e6, lat_e6), pts in zip(keep, projected, strict=True):
+        empty = Polyline((), (), ())
+        for batch in _batches(cur):
+            lon, offsets, lengths = _lists(batch.column(1))
+            lat, _, _ = _lists(batch.column(2))
+            keep = _in_window(lon, lat, offsets, lengths, box)
+            names = batch.column(0).to_pylist()
+            offs = offsets.tolist()
+            xs, ys = proj.flat(lon, lat) if proj is not None else ((), ())
+            lons = lon.tolist() if proj is None else ()
+            lats = lat.tolist() if proj is None else ()
+            for i in keep.nonzero()[0].tolist():
+                a, b = offs[i], offs[i + 1]
+                # `groups()` wants degrees and no projection; `group_paths()` wants
+                # the projection and no degrees. Neither ever wants both, so only
+                # the half that was asked for is built.
+                line = (
+                    Polyline(xs, ys, range(a, b)).simplified(tol)
+                    if proj is not None
+                    else empty
+                )
                 coords = (
                     []
                     if proj is not None
-                    else [(x / 1e6, y / 1e6) for x, y in zip(lon_e6, lat_e6, strict=True)]
+                    else [(lons[j] / 1e6, lats[j] / 1e6) for j in range(a, b)]
                 )
-                yield name, weight_of[name], simplify(pts, tol), coords
+                yield names[i], weight_of[names[i]], line, coords
 
 
 class Held(Window):
@@ -931,7 +1174,9 @@ class Held(Window):
     def __init__(self, edges: Sequence[Edge], *, spec: QuerySpec = DEFAULT_SPEC) -> None:
         self._edges = list(edges)
         self.spec = spec
-        self.weights = Weights.over([e.weight for e in self._edges])
+        # The base class computes this lazily off the database; there is no database
+        # here, so it is filled in up front and the property finds it already set.
+        self._weights: Weights | None = Weights.over([e.weight for e in self._edges])
 
     def edges(self, *, by_weight: bool = False) -> Iterator[Edge]:
         if by_weight:
@@ -940,17 +1185,21 @@ class Held(Window):
 
     def paths(
         self, proj: Projection, *, tol: float = 0.0, by_weight: bool = False
-    ) -> Iterator[tuple[float, list[tuple[float, float]]]]:
+    ) -> Iterator[tuple[float, Polyline]]:
         # Already in degrees and already in memory, so this projects per edge. The
-        # batching that `Window` needs would buy nothing against a list.
+        # batching that `Window` needs would buy nothing against a list, and neither
+        # would sharing a flat buffer between paths -- there is nothing to share it
+        # with, so each gets its own two-element one.
         for e in self.edges(by_weight=by_weight):
-            yield e.weight, simplify([proj(lon, lat) for lon, lat in e.coords], tol)
+            pts = [proj(lon, lat) for lon, lat in e.coords]
+            yield e.weight, Polyline.of(pts).simplified(tol)
 
     def group_paths(
         self, proj: Projection, *, tol: float = 0.0
-    ) -> Iterator[tuple[str, float, list[tuple[float, float]]]]:
+    ) -> Iterator[tuple[str, float, Polyline]]:
         for name, weight, coords in self.groups():
-            yield name, weight, simplify([proj(x, y) for x, y in coords], tol)
+            pts = [proj(x, y) for x, y in coords]
+            yield name, weight, Polyline.of(pts).simplified(tol)
 
     def groups(self) -> Iterator[tuple[str, float, list[tuple[float, float]]]]:
         by_group: dict[str, list[Edge]] = {}
@@ -1008,6 +1257,13 @@ def load_edges(
 # --- Weighting --------------------------------------------------------------
 
 
+# The percentile range the scale is clamped to. Named because three places have to
+# agree on them: the Python pass, the SQL that replaced it, and the reference
+# implementation both are checked against.
+_LO_Q = 0.02
+_HI_Q = 0.98
+
+
 @dataclass(frozen=True, slots=True)
 class Weights:
     """A log scale clamped to a percentile range, held as just its two bounds.
@@ -1026,7 +1282,7 @@ class Weights:
 
     @classmethod
     def over(
-        cls, values: Iterable[float], lo_q: float = 0.02, hi_q: float = 0.98
+        cls, values: Iterable[float], lo_q: float = _LO_Q, hi_q: float = _HI_Q
     ) -> Weights:
         # log1p is monotonic, so taking the percentiles of the raw values and
         # logging the two picks is the same as logging everything first -- and it
@@ -1036,6 +1292,19 @@ class Weights:
             return cls(0.0, 0.0)
         lo = ordered[min(len(ordered) - 1, int(lo_q * len(ordered)))]
         hi = ordered[min(len(ordered) - 1, int(hi_q * len(ordered)))]
+        return cls.at(lo, hi)
+
+    @classmethod
+    def at(cls, lo: float | None, hi: float | None) -> Weights:
+        """The scale for two already-chosen bounds, from wherever they were found.
+
+        Split out of :meth:`over` so the database can find them -- see
+        `_Sql.bounds_query` -- without a second copy of the log-and-clamp. `None` is
+        what an aggregate over no rows gives back, and means the same as an empty
+        sequence does above.
+        """
+        if lo is None or hi is None:
+            return cls(0.0, 0.0)
         return cls(math.log1p(max(lo, 0.0)), math.log1p(max(hi, 0.0)))
 
     def of(self, value: float) -> float:
@@ -1046,7 +1315,7 @@ class Weights:
 
 
 def _normalise(
-    values: Sequence[float], lo_q: float = 0.02, hi_q: float = 0.98
+    values: Sequence[float], lo_q: float = _LO_Q, hi_q: float = _HI_Q
 ) -> list[float]:
     """The original list-at-a-time scale, kept as the reference :class:`Weights` is
     tested against.
@@ -1113,12 +1382,21 @@ class Style:
 # --- Styles -----------------------------------------------------------------
 
 
-def _stroke_path(
-    ctx: cairo.Context[cairo.Surface], pts: Sequence[tuple[float, float]]
-) -> None:
-    ctx.move_to(*pts[0])
-    for p in pts[1:]:
-        ctx.line_to(*p)
+def _stroke_path(ctx: cairo.Context[cairo.Surface], line: Polyline) -> None:
+    """Append one polyline to the current path, vertex by vertex.
+
+    Indexing the shared coordinate buffers rather than unpacking a tuple per vertex,
+    which is the whole reason :class:`Polyline` holds indices: cairo wants two floats
+    and everything between the database and here now hands it two floats.
+    """
+    xs, ys = line.xs, line.ys
+    it = iter(line.idx)
+    first = next(it, None)
+    if first is None:
+        return
+    ctx.move_to(xs[first], ys[first])
+    for i in it:
+        ctx.line_to(xs[i], ys[i])
 
 
 def draw_density(
@@ -1166,8 +1444,11 @@ def draw_density(
     # real render.
     alpha_scale = opts.alpha_scale * max(1, window.spec.sample)
 
+    # Bound once: this is a property that may run a query on first touch, and it
+    # is read once per edge.
+    weights = window.weights
     for weight, pts in window.paths(proj, tol=opts.simplify_px):
-        t = window.weights.of(weight)
+        t = weights.of(weight)
         for width_of, alpha_of, sat_of in passes:
             r, g, b = colorsys.hsv_to_rgb(opts.hue, sat_of(t), 1.0)
             ctx.set_source_rgba(r, g, b, min(1.0, alpha_of(t) * alpha_scale))
@@ -1209,13 +1490,14 @@ def draw_spectrum(
     # Quietest first so the busy roads finish on top and stay legible. The ordering
     # is done in SQL rather than by sorting the window in memory -- the weight is
     # monotonic in the trip count, so ordering by one orders by the other.
+    weights = window.weights
     for weight, pts in window.paths(proj, tol=0.0, by_weight=True):
-        t = window.weights.of(weight)
+        t = weights.of(weight)
         sat = 0.30 + 0.62 * t
         val = 0.52 + 0.48 * t
         alpha = min(1.0, (0.30 + 0.62 * t) * opts.alpha_scale)
         ctx.set_line_width((0.6 + 3.4 * t**0.8) * opts.line_scale)
-        for (x0, y0), (x1, y1) in zip(pts, pts[1:], strict=False):
+        for x0, y0, x1, y1 in pts.segments():
             dx, dy = x1 - x0, y1 - y0
             if dx == 0.0 and dy == 0.0:
                 continue

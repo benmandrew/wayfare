@@ -26,7 +26,6 @@ one parameter a caller can raise without limit.
 
 from __future__ import annotations
 
-import contextlib
 import functools
 import gzip
 import hashlib
@@ -76,6 +75,19 @@ COMPRESSIBLE = frozenset(
     }
 )
 COMPRESS_MAX = 1 << 20
+
+# How many compressed bodies to keep. Compressing was being done per request, and
+# it is not cheap: the vendored maplibre build is 784 KB and takes 15.8 ms of CPU
+# to gzip, against 0.04 ms to read off disk and hand to the socket. The page loads
+# the same five or six files every time, so essentially all of that was spent
+# producing bytes gzip had already produced moments earlier.
+#
+# A count rather than a byte budget, because `_gzip_wanted` already refuses
+# anything over COMPRESS_MAX: sixteen entries is a 16 MB ceiling by construction
+# and a few hundred KB in practice. The web directory holds six compressible files
+# today, so the cap exists to bound a directory nobody has served yet rather than
+# to evict anything real.
+GZIP_CACHE_ENTRIES = 16
 
 # How long a browser may reuse an archive without asking. A day by default.
 #
@@ -674,8 +686,83 @@ def _facet(con: duckdb.DuckDBPyConnection, sql: str) -> list[str]:
 
 # --- The server -------------------------------------------------------------
 
+# Keyed on the same (path, mtime_ns, size) identity `_file_etag` builds its
+# validator from, so an edited file recompresses rather than being served stale
+# under an ETag that has already moved.
+_gzip_cache: OrderedDict[tuple[str, int, int], bytes] = OrderedDict()
+_gzip_lock = threading.Lock()
+
+
+def _gzipped(path: str) -> bytes | None:
+    """A small static file's gzip, compressed at most once per revision.
+
+    The lock covers the dictionary and nothing else. Holding it across
+    `gzip.compress` would put every compressible request behind whichever one
+    happened to miss -- the 15.8 ms above, charged to unrelated files, on a server
+    whose whole point is answering hundreds of small requests at once. The cost of
+    letting go is that two threads racing a cold key both compress and one result
+    is overwritten: one duplicated compress per file per server lifetime, against
+    a per-key lock's bookkeeping for a cache with about six live keys.
+
+    `mtime=0` because gzip otherwise stamps the current time into bytes 4-7 of its
+    header, so two compressions of one unchanged file a second apart come back
+    different -- under an ETag that promises they do not. Nothing downstream
+    compared those bytes, but the file now has to be identical across the cache
+    boundary anyway, and a validator that is only nearly true is the kind of thing
+    that gets discovered from a proxy rather than from a test.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (path, st.st_mtime_ns, st.st_size)
+    with _gzip_lock:
+        hit = _gzip_cache.get(key)
+        if hit is not None:
+            _gzip_cache.move_to_end(key)
+            return hit
+    try:
+        body = gzip.compress(Path(path).read_bytes(), 6, mtime=0)
+    except OSError:
+        return None
+    with _gzip_lock:
+        _gzip_cache[key] = body
+        _gzip_cache.move_to_end(key)
+        while len(_gzip_cache) > GZIP_CACHE_ENTRIES:
+            _gzip_cache.popitem(last=False)
+    return body
+
 
 class Handler(http.server.SimpleHTTPRequestHandler):
+    # Keep-alive. The default is HTTP/1.0, so every request cost a fresh TCP
+    # connection and a fresh thread -- and MapLibre issues dozens of PMTiles range
+    # requests per pan. On loopback that setup is 0.20 ms of a 0.56 ms request and
+    # hardly matters; over the deployed tailnet path it is a full round trip each,
+    # which is most of what a range request costs (a 16 KB range takes ~90 ms of
+    # which ~15 ms is transfer, because the path is relayed rather than direct).
+    #
+    # Three things had to be true first, and all three are quiet under HTTP/1.0
+    # because the connection dies after one response either way: an aborted body
+    # must close the connection rather than leave a half-written one for the next
+    # response to be parsed as the tail of (see `copyfile`), every response must
+    # carry accurate framing since there is no read-until-EOF (the 416 below sends
+    # `Content-Length: 0` for that reason), and a malformed Range must not raise
+    # mid-connection (`bytes=-`, also below).
+    protocol_version = "HTTP/1.1"
+
+    # A connection now holds a thread for its whole life rather than for one
+    # request, and ThreadingTCPServer is thread-per-connection and unbounded, so an
+    # idle browser tab would otherwise pin a thread indefinitely. The stdlib applies
+    # this to the socket in `setup()` and turns the resulting timeout into a closed
+    # connection in `handle_one_request`.
+    #
+    # Fifteen seconds: a pan's worth of range requests arrive milliseconds apart, so
+    # anything above a second or two already collects the whole benefit, while the
+    # value is also the ceiling on a single blocked write to a stalled client and
+    # wants headroom over a slow mobile link. Reconnecting after an idle gap costs
+    # the one round trip this change removed from the other dozens.
+    timeout = 15.0
+
     out_dir: Path = Path("data/out")
     renderer: Renderer | None = None  # None disables /art
     max_age: int = ARCHIVE_MAX_AGE
@@ -896,10 +983,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         it compresses to about a third of that. `Vary` is not decoration here: the
         encoding is baked into the ETag above, so a shared cache must key on it or
         it will hand a gzipped body to a client that asked for identity.
+
+        The compression itself is cached by revision; see `_gzipped`.
         """
-        try:
-            body = gzip.compress(Path(path).read_bytes(), 6)
-        except OSError:
+        body = _gzipped(path)
+        if body is None:
             return None
         self.send_response(200)
         self.send_header("Content-Type", self.guess_type(path))
@@ -925,6 +1013,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return None
 
         first, last = m.group(1), m.group(2)
+        # `bytes=-` matches the pattern -- both halves are `\d*` -- and names no
+        # range at all. It used to fall into the suffix branch below and raise
+        # ValueError out of `int("")`, which under HTTP/1.0 cost one aborted
+        # connection and a traceback. On a connection the client means to reuse it
+        # is worth more than that, so it joins the other malformed spellings.
+        if not first and not last:
+            f.close()
+            self.send_error(400, "malformed Range")
+            return None
         if first:
             start = int(first)
             end = int(last) if last else size - 1
@@ -939,6 +1036,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             f.close()
             self.send_response(416)
             self.send_header("Content-Range", f"bytes */{size}")
+            # Explicit, because there is no body and HTTP/1.1 has no
+            # read-until-EOF framing to fall back on: without it a client on a
+            # persistent connection waits for a body that is never coming.
+            self.send_header("Content-Length", "0")
             self.end_headers()
             return None
 
@@ -976,9 +1077,23 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         up mid-body is ordinary traffic here rather than a fault. The base class
         lets the write raise, and socketserver prints a full traceback per abort --
         which buries anything that actually matters.
+
+        Swallowing it is only safe once the connection goes with it. A body that
+        stopped short of its Content-Length has desynchronised the stream, so
+        under keep-alive the next response would be read as the tail of this one
+        -- a truncated tile becoming a corrupt one, on a connection that looks
+        healthy. Under HTTP/1.0 the connection closed anyway and this did not
+        arise.
+
+        TimeoutError is here for the same reason and arrives from the same place:
+        `Handler.timeout` puts a deadline on socket writes as well as reads, so a
+        client that stops reading mid-body now surfaces as a timeout rather than
+        as a block forever.
         """
-        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+        try:
             super().copyfile(source, outputfile)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            self.close_connection = True
 
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002
         pass  # one line per tile is unreadable
@@ -1030,6 +1145,12 @@ def serve(
     handler = functools.partial(Handler, directory=str(web_dir.resolve()))
     socketserver.TCPServer.allow_reuse_address = True
     with socketserver.ThreadingTCPServer((host, port), handler) as httpd:
+        # ThreadingMixIn joins every live thread on close by default, which was
+        # instant while each thread served one request. With keep-alive a thread
+        # lives as long as its connection, so ctrl-c would sit for up to
+        # `Handler.timeout` per idle browser tab before the process exited. There
+        # is nothing to checkpoint in a server, so cutting them is the right end.
+        httpd.daemon_threads = True
         log.info("serving %s at http://localhost:%d/  (ctrl-c to stop)", web_dir, port)
         try:
             httpd.serve_forever()

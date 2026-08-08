@@ -356,7 +356,7 @@ def test_paths_agree_with_projecting_the_edge_stream(con):
     proj = art.Projection.fit(bounds, 800, 600)
     w = art.Window(bounds, con)
 
-    viaPaths = list(w.paths(proj))
+    viaPaths = [(weight, line.points()) for weight, line in w.paths(proj)]
     viaEdges = [(e.weight, [proj(lon, lat) for lon, lat in e.coords]) for e in w.edges()]
     assert viaPaths == viaEdges
 
@@ -490,3 +490,103 @@ def test_substituting_the_source_never_changes_the_picture(drawable, style, quer
         edges="(SELECT * FROM edges)", services="(SELECT * FROM edge_services)"
     )
     assert art.render_bytes(RENDER_BOUNDS, style, source=wrapped, **kwargs) == direct
+
+
+# --- The flat geometry path -------------------------------------------------
+
+
+def test_polyline_simplifies_the_same_way_the_list_form_does():
+    """`Polyline.simplified` and `simplify` are the same rule over two
+    representations. They must agree exactly, or a render would thin its geometry
+    differently depending on which of `Window` and `Held` produced it."""
+    pts = [(0.0, 0.0), (0.1, 0.0), (0.2, 0.0), (9.0, 0.0), (10.0, 0.0)]
+    for tol in (0.0, 0.05, 0.5, 5.0):
+        assert art.Polyline.of(pts).simplified(tol).points() == art.simplify(pts, tol)
+
+
+def test_polyline_keeps_its_indices_when_nothing_is_dropped():
+    """A `range` rather than a list is the point: the unsimplified case is the
+    common one and it should allocate nothing."""
+    line = art.Polyline.of([(0.0, 0.0), (1.0, 1.0), (2.0, 2.0)])
+    assert isinstance(line.simplified(0.0).idx, range)
+
+
+def test_polyline_segments_are_its_consecutive_points():
+    pts = [(0.0, 1.0), (2.0, 3.0), (4.0, 5.0)]
+    line = art.Polyline.of(pts)
+    assert list(line.segments()) == [(0.0, 1.0, 2.0, 3.0), (2.0, 3.0, 4.0, 5.0)]
+    assert list(art.Polyline.of(pts[:1]).segments()) == []
+    assert list(art.Polyline.of([]).segments()) == []
+
+
+def test_polyline_equality_ignores_how_the_points_are_held():
+    """`Window` hands out slices of one buffer shared by a whole fetch and `Held`
+    builds a buffer per edge. Only the polyline is meant to be the same."""
+    shared = art.Polyline([0.0, 1.0, 2.0], [0.0, 1.0, 2.0], range(1, 3))
+    own = art.Polyline.of([(1.0, 1.0), (2.0, 2.0)])
+    assert shared == own
+    assert shared != art.Polyline.of([(1.0, 1.0), (3.0, 3.0)])
+
+
+def test_bounds_in_sql_match_the_python_percentile_pass(con):
+    """The scale is found by SQL now instead of by pulling every weight into
+    Python. The two must pick the *same* two order statistics -- an approximation
+    would shift a render's contrast invisibly. See `_Sql.bounds_query`."""
+    from array import array
+
+    for i in range(50):
+        _art_edge(con, i + 1, -3200000 + i * 200, trips=(i * i) % 97)
+    bounds = art.Bounds(-3.30, 51.40, -3.10, 51.60)
+    for spec in (
+        art.DEFAULT_SPEC,
+        art.QuerySpec(weight="services"),
+        art.QuerySpec(weight="density"),
+        art.QuerySpec(min_trips=10),
+    ):
+        w = art.Window(bounds, con, spec=spec)
+        query, params = w.sql.weights_query()
+        expected = art.Weights.over(
+            array("d", (r[0] for r in con.execute(query, params).fetchall()))
+        )
+        assert w.weights == expected, spec.key
+
+
+def test_an_empty_window_still_has_a_usable_scale_from_sql(con):
+    w = art.Window(art.Bounds(-3.30, 51.40, -3.10, 51.60), con)
+    assert w.weights.of(10) == 0.5
+
+
+def test_the_weight_scale_is_not_computed_until_it_is_asked_for(con):
+    """`strands` never reads it -- it weights ribbons from the group statistics --
+    so computing it eagerly was a whole extra pass over the window per render,
+    thrown away. See `Window.weights`."""
+    _art_edge(con, 1, -3200000, trips=900)
+    w = art.Window(art.Bounds(-3.30, 51.40, -3.10, 51.60), con)
+    assert w._weights is None
+    list(w.group_paths(art.Projection.fit(w.bounds, 800, 600)))
+    assert w._weights is None, "group_paths must not force the window scale"
+    assert w.weights.hi > 0.0
+    assert w._weights is not None
+
+
+def test_streaming_paths_survives_the_scale_being_resolved(con):
+    """A DuckDB connection holds one result at a time, so a query issued while a
+    stream is open abandons it -- silently, ending the stream early with no error.
+    A lazily-computed scale first touched inside the draw loop did exactly that and
+    truncated a render to its first fetch. `paths` resolves it up front."""
+    n = art.FETCH_ROWS + 500  # more than one fetch, so a truncation is visible
+    con.execute(
+        "INSERT INTO edges SELECT i, 1, 'R', 'secondary', 100.0, [-3200000, -3199000], "
+        "[51480000, 51480000], -3200000, 51480000, -3199000, 51480000 "
+        "FROM range(?) t(i)",
+        [n],
+    )
+    con.execute(
+        "INSERT INTO edge_services SELECT i, '42', 'OP1', 1, 1 + i % 7 FROM range(?) t(i)",
+        [n],
+    )
+    w = art.Window(art.Bounds(-3.30, 51.40, -3.10, 51.60), con)
+    proj = art.Projection.fit(w.bounds, 800, 600)
+    assert w._weights is None
+    drawn = [w.weights.of(weight) for weight, _ in w.paths(proj)]
+    assert len(drawn) == art.FETCH_ROWS + 500

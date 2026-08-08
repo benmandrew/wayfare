@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import gzip
+import http.client
+import io
 import json
 import os
 import socketserver
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+from collections import OrderedDict
 from pathlib import Path
 
 import pytest
@@ -546,6 +551,101 @@ def test_render_bytes_is_deterministic(fmt):
     assert once == twice
 
 
+# --- Compression ------------------------------------------------------------
+
+
+@pytest.fixture
+def gzip_cache(monkeypatch) -> OrderedDict:
+    """An empty cache per test, since it is process-wide and outlives a server."""
+    cache: OrderedDict[tuple[str, int, int], bytes] = OrderedDict()
+    monkeypatch.setattr(server, "_gzip_cache", cache)
+    return cache
+
+
+def _count_compressions(monkeypatch) -> list[int]:
+    """[calls to gzip.compress], so a cache hit is visible as work not done."""
+    calls = [0]
+    real = gzip.compress
+
+    def counted(*a, **kw):
+        calls[0] += 1
+        return real(*a, **kw)
+
+    monkeypatch.setattr(server.gzip, "compress", counted)
+    return calls
+
+
+def test_a_file_is_compressed_once_and_again_when_it_changes(
+    tmp_path, monkeypatch, gzip_cache
+):
+    """784 KB of vendored maplibre cost 15.8 ms of CPU to gzip and 0.04 ms to read,
+    and the page asks for the same handful of files every load -- so recompressing
+    per request was nearly all of the cost of serving them. Keyed on the mtime and
+    size the ETag already uses, so an edited file recompresses rather than being
+    served stale under a validator that has moved."""
+    path = tmp_path / "app.js"
+    path.write_text("var x = 1;\n" * 500)
+    calls = _count_compressions(monkeypatch)
+
+    first = server._gzipped(str(path))
+    assert first is not None
+    assert gzip.decompress(first) == path.read_bytes()
+    assert server._gzipped(str(path)) == first
+    assert calls == [1]
+
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    again = server._gzipped(str(path))
+    assert calls == [2]
+    # Byte-identical, because the content did not change and `mtime=0` keeps gzip
+    # from stamping the clock into its header. Without it two compressions of one
+    # file differ, under an ETag that says they do not.
+    assert again == first
+
+    path.write_text("var x = 2;\n" * 500)
+    changed = server._gzipped(str(path))
+    assert calls == [3]
+    assert changed != first
+
+
+def test_the_compression_cache_is_bounded(tmp_path, monkeypatch, gzip_cache):
+    """COMPRESS_MAX caps an entry at 1 MiB, so a count is enough to bound the
+    total. The web directory holds six compressible files; the cap is for a
+    directory nobody has served yet."""
+    monkeypatch.setattr(server, "GZIP_CACHE_ENTRIES", 2)
+    for i in range(3):
+        path = tmp_path / f"f{i}.js"
+        path.write_text(f"var x{i};")
+        server._gzipped(str(path))
+    assert len(gzip_cache) == 2
+    assert not any(key[0].endswith("f0.js") for key in gzip_cache)  # oldest went first
+
+
+def test_an_unreadable_file_compresses_to_nothing_rather_than_raising(tmp_path):
+    assert server._gzipped(str(tmp_path / "absent.js")) is None
+
+
+def test_an_aborted_body_closes_the_connection():
+    """The prerequisite for keep-alive. A body that stopped short of its
+    Content-Length has desynchronised the stream, so the next response would be
+    parsed as the tail of this one -- a truncated tile becoming a corrupt one on a
+    connection that still looks healthy. Under HTTP/1.0 the connection died with
+    the response either way, which is why swallowing the abort was free."""
+
+    class Hangup:
+        def write(self, data: bytes) -> int:
+            raise BrokenPipeError(32, "Broken pipe")
+
+    handler = server.Handler.__new__(server.Handler)
+    handler.close_connection = False
+    handler.copyfile(io.BytesIO(b"x" * 4096), Hangup())
+    assert handler.close_connection is True
+
+    handler.close_connection = False
+    handler.copyfile(io.BytesIO(b"x" * 4096), io.BytesIO())
+    assert handler.close_connection is False
+
+
 # --- Over HTTP --------------------------------------------------------------
 
 
@@ -665,3 +765,95 @@ def test_archives_lists_only_the_tile_archives(serve_at):
     base = serve_at()
     with _get(f"{base}/archives.json") as response:
         assert json.loads(response.read()) == ["wales.pmtiles"]
+
+
+def _connect(base: str) -> http.client.HTTPConnection:
+    """A raw connection, because urllib sends `Connection: close` on every request
+    and so can never show one being reused."""
+    url = urllib.parse.urlparse(base)
+    assert url.hostname and url.port
+    return http.client.HTTPConnection(url.hostname, url.port, timeout=30)
+
+
+def test_two_requests_share_one_connection(serve_at):
+    """MapLibre issues dozens of PMTiles range requests per pan, and under HTTP/1.0
+    each was a fresh TCP connection and a fresh thread. On loopback the setup is a
+    fraction of a millisecond; on the deployed tailnet path it is a full round
+    trip, which is most of what a 16 KB range costs."""
+    conn = _connect(serve_at())
+    try:
+        conn.request("GET", "/archives.json")
+        first = conn.getresponse()
+        assert first.version == 11  # HTTP/1.1, not the stdlib's 1.0 default
+        first.read()
+        socket = conn.sock
+        assert socket is not None  # http.client drops it when the server says close
+
+        conn.request("GET", "/wales.pmtiles")
+        second = conn.getresponse()
+        assert second.status == 200
+        assert second.read() == b"pmtiles"
+        assert conn.sock is socket  # the same connection, not a reconnect
+    finally:
+        conn.close()
+
+
+def test_a_range_naming_neither_end_is_a_400(serve_at):
+    """`bytes=-` matches the Range pattern -- both halves are `\\d*` -- and asks for
+    nothing. It used to reach `int("")` and raise, which on a connection the client
+    means to reuse costs more than the one aborted request it used to."""
+    base = serve_at()
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(f"{base}/wales.pmtiles", Range="bytes=-")
+    assert exc.value.code == 400
+    assert "malformed Range" in exc.value.reason
+
+
+def test_an_unsatisfiable_range_frames_its_empty_body(serve_at):
+    """416 sends no body, and HTTP/1.1 has no read-until-EOF framing to fall back
+    on -- so without an explicit length the client waits for a body that is never
+    coming, on a connection it is entitled to keep."""
+    conn = _connect(serve_at())
+    try:
+        conn.request("GET", "/wales.pmtiles", headers={"Range": "bytes=99-"})
+        response = conn.getresponse()
+        assert response.status == 416
+        assert response.headers["Content-Length"] == "0"
+        assert response.headers["Content-Range"] == "bytes */7"
+        assert response.read() == b""
+        # Framed, so the connection survives it and the next request is answered
+        # rather than being read as the tail of this one.
+        conn.request("GET", "/archives.json")
+        assert json.loads(conn.getresponse().read()) == ["wales.pmtiles"]
+    finally:
+        conn.close()
+
+
+def test_a_satisfiable_suffix_range_still_works(serve_at):
+    """The branch `bytes=-` used to fall into. PMTiles reads its footer this way,
+    without knowing the file length up front."""
+    base = serve_at()
+    with _get(f"{base}/wales.pmtiles", Range="bytes=-5") as response:
+        assert response.status == 206
+        assert response.headers["Content-Range"] == "bytes 2-6/7"
+        assert response.headers["Content-Length"] == "5"
+        assert response.read() == b"tiles"
+
+
+def test_a_compressible_file_goes_out_gzipped_and_stays_identical(
+    tmp_path, serve_at, gzip_cache
+):
+    base = serve_at()
+    (tmp_path / "web" / "app.js").write_text("var x = 1;\n" * 500)
+    bodies = set()
+    for _ in range(2):
+        with _get(f"{base}/app.js", **{"Accept-Encoding": "gzip"}) as response:
+            assert response.headers["Content-Encoding"] == "gzip"
+            assert response.headers["Vary"] == "Accept-Encoding"
+            assert response.headers["ETag"].endswith('-gzip"')
+            body = response.read()
+            assert response.headers["Content-Length"] == str(len(body))
+            bodies.add(body)
+    assert len(bodies) == 1
+    assert gzip.decompress(bodies.pop()) == (tmp_path / "web" / "app.js").read_bytes()
+    assert len(gzip_cache) == 1
