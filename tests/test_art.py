@@ -245,6 +245,136 @@ def test_strands_arrive_grouped_by_service_widest_first(con):
     assert order == ["42", "9A"]
 
 
+# --- Projection, simplification and sampling ---------------------------------
+
+
+def test_batch_projection_matches_the_scalar_one(con):
+    """The batched path is vectorised for speed, not for a different answer. If the
+    two ever disagree the same window draws differently depending on whether it came
+    from the database or from a list."""
+    proj = art.Projection.fit(art.Bounds(-3.3, 51.4, -3.1, 51.6), 800, 600)
+    lons = [[-3200000, -3190000, -3180000], [-3150000, -3140000]]
+    lats = [[51480000, 51490000, 51500000], [51450000, 51460000]]
+
+    batched = proj.batch(lons, lats)
+    scalar = [
+        [proj(x / 1e6, y / 1e6) for x, y in zip(lo, la, strict=True)]
+        for lo, la in zip(lons, lats, strict=True)
+    ]
+    assert batched == scalar
+
+
+def test_simplify_keeps_the_ends_and_drops_the_sub_pixel_middle():
+    pts = [(0.0, 0.0), (0.1, 0.0), (0.2, 0.0), (10.0, 0.0)]
+    assert art.simplify(pts, 0.5) == [(0.0, 0.0), (10.0, 0.0)]
+    # A zero tolerance is the opt-out, and two points are already minimal.
+    assert art.simplify(pts, 0.0) == pts
+    assert art.simplify(pts[:2], 0.5) == pts[:2]
+
+
+def test_simplify_measures_from_the_last_kept_point():
+    """Comparing against the previous point instead would let a gently curving road
+    accumulate unlimited drift in sub-tolerance steps and come out straight."""
+    drift = [(0.0, 0.0), (0.4, 0.0), (0.8, 0.0), (1.2, 0.0), (9.0, 0.0)]
+    # Each step is under the tolerance, but the second and fourth are far enough
+    # from the last point actually kept.
+    assert art.simplify(drift, 0.5) == [(0.0, 0.0), (0.8, 0.0), (9.0, 0.0)]
+
+
+def test_sampling_thins_the_window_but_not_the_weight_scale(con):
+    """A preview must draw fewer edges without changing what a trip count looks
+    like, or its colours and line widths would not be the ones being tuned."""
+    for i in range(64):
+        _art_edge(con, i + 1, -3200000 + i * 1000, trips=10 * (i + 1))
+    bounds = art.Bounds(-3.30, 51.40, -3.10, 51.60)
+
+    full = art.Window(bounds, con)
+    thin = art.Window(bounds, con, spec=art.QuerySpec(sample=8))
+
+    ids = [e.edge_id for e in thin.edges()]
+    assert 0 < len(ids) < 64
+    assert set(ids) <= {e.edge_id for e in full.edges()}
+    # The scale is what turns a weight into a colour, so it is taken over every edge.
+    assert thin.weights == full.weights
+
+
+def test_sampling_is_not_a_filter(con):
+    """`selective` decides LEFT JOIN against JOIN, so a spec that claimed to be
+    selective would silently drop every edge carrying no services -- which sampling
+    has no business doing."""
+    assert not art.QuerySpec(sample=8).selective
+    assert art.QuerySpec(min_trips=1).selective
+
+
+def test_sampling_reaches_the_spec_key():
+    """Two specs sharing a key means one's picture is served for the other, and a
+    preview served as the export is exactly that mistake."""
+    assert art.QuerySpec(sample=8).key != art.QuerySpec().key
+
+
+def test_a_sample_below_one_is_rejected():
+    with pytest.raises(ValueError, match="sample=0 must be 1 or more"):
+        art.QuerySpec(sample=0)
+
+
+def test_sampling_picks_the_same_edges_every_time(con):
+    """A preview that redrew a different eighth on every keystroke would flicker,
+    and two runs of the same render would not be comparable."""
+    for i in range(64):
+        _art_edge(con, i + 1, -3200000 + i * 1000, trips=100)
+    bounds = art.Bounds(-3.30, 51.40, -3.10, 51.60)
+    spec = art.QuerySpec(sample=8)
+    first = [e.edge_id for e in art.Window(bounds, con, spec=spec).edges()]
+    second = [e.edge_id for e in art.Window(bounds, con, spec=spec).edges()]
+    assert first == second
+
+
+def test_sampling_leaves_group_widths_alone(con):
+    """Ribbon width and draw order come from the group listing, which is taken over
+    the whole window. Sampling that too would make a preview weight its ribbons
+    differently from the render it stands in for."""
+    for i in range(64):
+        _art_edge(con, i + 1, -3200000 + i * 1000, trips=100, services=("42",))
+    bounds = art.Bounds(-3.30, 51.40, -3.10, 51.60)
+
+    full = art.Window(bounds, con, with_groups=True)
+    thin = art.Window(bounds, con, with_groups=True, spec=art.QuerySpec(sample=8))
+
+    widths = {(n, round(w, 9)) for n, w, _ in full.groups()}
+    thin_widths = {(n, round(w, 9)) for n, w, _ in thin.groups()}
+    assert thin_widths == widths
+    # ...while the geometry it hands back really is thinner.
+    assert 0 < len(list(thin.groups())) < len(list(full.groups()))
+
+
+def test_paths_agree_with_projecting_the_edge_stream(con):
+    """`paths` exists to skip building degrees at all, so it has its own decode. It
+    must still land on the pixels the unprojected stream would have."""
+    for i in range(3):
+        _art_edge(con, i + 1, -3200000 + i * 5000, trips=100 * (i + 1))
+    bounds = art.Bounds(-3.30, 51.40, -3.10, 51.60)
+    proj = art.Projection.fit(bounds, 800, 600)
+    w = art.Window(bounds, con)
+
+    viaPaths = list(w.paths(proj))
+    viaEdges = [(e.weight, [proj(lon, lat) for lon, lat in e.coords]) for e in w.edges()]
+    assert viaPaths == viaEdges
+
+
+def test_held_paths_match_the_streaming_ones(con):
+    _art_edge(con, 1, -3200000, trips=900, services=("42",))
+    _art_edge(con, 2, -3190000, trips=10, services=("42",))
+    bounds = art.Bounds(-3.30, 51.40, -3.10, 51.60)
+    proj = art.Projection.fit(bounds, 800, 600)
+
+    streamed = art.Window(bounds, con, with_groups=True)
+    held = art.Held(art.load_edges(bounds, with_groups=True, con=con))
+    assert list(held.paths(proj)) == list(streamed.paths(proj))
+    assert [(n, round(w, 9), p) for n, w, p in held.group_paths(proj)] == [
+        (n, round(w, 9), p) for n, w, p in streamed.group_paths(proj)
+    ]
+
+
 def test_held_window_matches_the_streaming_one(con):
     """`render(edges=...)` re-renders a window a caller already has; it must draw
     the same picture as the streaming path."""

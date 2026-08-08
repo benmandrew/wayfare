@@ -100,6 +100,8 @@ def test_bad_choices_list_the_alternatives(query, match):
         ("area=cardiff&line_scale=0", "line_scale=0 is out of range"),
         ("area=cardiff&alpha_scale=99", "alpha_scale=99 is out of range"),
         ("area=cardiff&width=wide", "width='wide' is not a number"),
+        ("area=cardiff&sample=99", "sample=99 is out of range; it runs 1 to 16"),
+        ("area=cardiff&sample=0", "sample=0 is out of range"),
     ],
 )
 def test_out_of_range_numbers_report_the_range(query, match):
@@ -261,6 +263,9 @@ def test_an_overlong_caption_is_rejected():
         "area=cardiff&width=200&service=42",
         "area=cardiff&width=200&class=secondary",
         "area=cardiff&width=200&min_trips=50",
+        # A sampled preview and the full render are different pictures, so serving
+        # one from the other's cache entry would show an approximation as the export.
+        "area=cardiff&width=200&sample=8",
     ],
 )
 def test_every_drawn_parameter_reaches_the_cache_key(query):

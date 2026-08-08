@@ -127,6 +127,14 @@ MAX_MIN_TRIPS = 1_000_000
 # agency ids cannot turn the metadata into the largest response the server sends.
 MAX_FACET_VALUES = 500
 
+# `sample=n` draws one edge in n. The cost of a render is per edge and hardly moves
+# with the canvas, so this -- not `width` -- is what makes a preview cheap: a whole-
+# of-GB window costs about the same at 900 pixels as at 4,000. 8 is what the studio
+# page asks for while a slider is moving. Past about 16 there is too little left of
+# the network to judge a change by, so the cap is low on purpose.
+MAX_SAMPLE = 16
+PREVIEW_SAMPLE = 8
+
 # How long a request will wait for the render slot before giving up, and how many
 # are allowed to be waiting. A studio page that re-renders on every slider move
 # would otherwise build an unbounded backlog of renders nobody is looking at any
@@ -192,6 +200,9 @@ class ArtRequest:
                 o.alpha_scale,
                 o.caption,
                 o.background,
+                o.simplify_px,
+                # `sample` is not listed: it lives in the query spec, so it is
+                # already inside `self.query.key`.
             )
         )
 
@@ -284,6 +295,10 @@ def _spec(q: dict[str, list[str]]) -> art.QuerySpec:
     # often enough that the shorter name is worth the mapping.
     road_class = _many(q, "class")
     min_trips = _count(q, "min_trips", MAX_MIN_TRIPS)
+    # Range-checked here rather than left to the spec, because the spec's own floor
+    # of 1 is a correctness bound and this is a usability one: past about 16 there
+    # is too little of the network left to judge a change by.
+    sample = int(_number(q, "sample", 1, MAX_SAMPLE, art.DEFAULT_SPEC.sample))
     try:
         return art.QuerySpec(
             weight=_one(q, "weight") or art.DEFAULT_SPEC.weight,
@@ -293,6 +308,7 @@ def _spec(q: dict[str, list[str]]) -> art.QuerySpec:
             service=service,
             road_class=road_class,
             min_trips=min_trips,
+            sample=sample,
         )
     except ValueError as exc:
         raise BadRequest(str(exc)) from None
@@ -597,11 +613,16 @@ def art_meta(enabled: bool) -> dict[str, Any]:
             "group": art.DEFAULT_SPEC.group,
             "order": art.DEFAULT_SPEC.order,
             "min_trips": art.DEFAULT_SPEC.min_trips,
+            "sample": art.DEFAULT_SPEC.sample,
+            # What the page should ask for while a control is being dragged. Served
+            # rather than hard-coded so the trade-off is tuned in one place.
+            "preview_sample": PREVIEW_SAMPLE,
         },
         "limits": {
             "max_width": MAX_WIDTH,
             "max_pixels": MAX_PIXELS,
             "max_scale": MAX_SCALE,
+            "max_sample": MAX_SAMPLE,
             "formats": list(art.FORMATS),
             "max_groups": art.MAX_GROUPS,
             "max_filter_values": MAX_FILTER_VALUES,
