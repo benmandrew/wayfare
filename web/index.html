@@ -74,6 +74,7 @@ h1 {
   white-space: nowrap;
 }
 .btn:hover { color: var(--text); border-color: var(--muted); }
+a.btn { text-decoration: none; }
 
 /* --- search --- */
 .search { padding: 0 12px 10px; }
@@ -161,6 +162,7 @@ h1 {
         <div class="sub" id="sub">UK bus services by road segment</div>
       </div>
       <select class="btn" id="region" title="Which region to show" hidden></select>
+      <a class="btn" href="art.html" title="Draw the network as a picture">Art</a>
       <button class="btn" id="theme" title="Toggle light/dark">Dark</button>
       <button class="btn" id="helpBtn" title="What am I looking at?">?</button>
     </div>
@@ -316,8 +318,8 @@ function failed(err) {
       ${offer}
       <p>To build one and serve it:</p>
       <pre>wayfare publish
-python3 scripts/serve.py</pre>
-      <p>Use that script, not <code>python3 -m http.server</code> — the built-in
+wayfare serve</pre>
+      <p>Use that, not <code>python3 -m http.server</code> — the built-in
          server does not answer HTTP range requests, which PMTiles needs.</p>
       <p>Already have tiles elsewhere? Point at them with
          <code>?tiles=https://…/bus.pmtiles</code> — the host must allow CORS and

@@ -97,6 +97,20 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--scale", type=float, default=1.0, help="2.0 is roughly 192 dpi")
     p.add_argument("--caption", default=None)
 
+    p = sub.add_parser("serve", help="serve the viewer, the tiles and /art")
+    p.add_argument("--port", type=int, default=8099)
+    p.add_argument("--host", default="", help="bind address; default all interfaces")
+    p.add_argument("--dir", type=Path, default=Path("web"), help="the viewer bundle")
+    p.add_argument(
+        "--out", type=Path, default=None, help="where the .pmtiles are (default: OUT)"
+    )
+    p.add_argument(
+        "--no-art",
+        action="store_true",
+        help="switch off /art; a render is the one request here that costs real CPU. "
+        "WAYFARE_ART=off does the same for a deployment that cannot change the command",
+    )
+
     p = sub.add_parser("all", help="acquire, patterns, match, aggregate, publish")
     p.add_argument("--region", default=None)
     p.add_argument("--workers", type=int, default=None)
@@ -228,6 +242,18 @@ def _dispatch(args: argparse.Namespace) -> int:
             ),
         )
         log.info("done: %s", out)
+        return 0
+
+    if args.cmd == "serve":
+        from . import server
+
+        server.serve(
+            port=args.port,
+            host=args.host,
+            web_dir=args.dir,
+            out_dir=args.out or config.OUT,
+            art_enabled=config.ART_ENABLED and not args.no_art,
+        )
         return 0
 
     if args.cmd == "all":

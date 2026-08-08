@@ -15,13 +15,14 @@ from __future__ import annotations
 
 import colorsys
 import hashlib
+import io
 import math
 import time
 from array import array
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, BinaryIO
 
 from . import config, db, logs
 
@@ -785,14 +786,25 @@ def _caption(ctx: cairo.Context[cairo.Surface], text: str, proj: Projection) -> 
     ctx.restore()
 
 
-def _fmt(path: Path) -> str:
-    suffix = path.suffix.lower()
-    if suffix not in (".png", ".svg"):
+FORMATS = (".png", ".svg")
+
+
+def _fmt(path: Path | str) -> str:
+    suffix = (Path(path).suffix if isinstance(path, Path) else path).lower()
+    if suffix not in FORMATS:
         raise ValueError(f"unsupported output format {suffix!r}; use .png or .svg")
     return suffix
 
 
-def _surface(path: Path, w: int, h: int, scale: float) -> tuple[cairo.Surface, float]:
+# Where a finished render goes: a filesystem path, or a buffer for a caller that
+# wants the bytes and never the file. cairo takes either interchangeably, which is
+# what lets the HTTP endpoint reuse the whole drawing path unchanged.
+Sink = Path | BinaryIO
+
+
+def _surface(
+    fmt: str, sink: Sink, w: int, h: int, scale: float
+) -> tuple[cairo.Surface, float]:
     """Surface plus the factor drawing should be scaled by.
 
     SVG is resolution independent, so `scale` is ignored there and the surface is
@@ -801,8 +813,9 @@ def _surface(path: Path, w: int, h: int, scale: float) -> tuple[cairo.Surface, f
     """
     import cairo
 
-    if _fmt(path) == ".svg":
-        return cairo.SVGSurface(str(path), w, h), 1.0
+    if fmt == ".svg":
+        # SVG writes as it draws, so the surface owns the sink from the start.
+        return cairo.SVGSurface(str(sink) if isinstance(sink, Path) else sink, w, h), 1.0
     return (
         cairo.ImageSurface(
             cairo.FORMAT_ARGB32, max(1, round(w * scale)), max(1, round(h * scale))
@@ -816,20 +829,22 @@ def _default_path(bounds_or_name: Bounds | str, style: str) -> Path:
     return config.OUT / f"{stem}-{style}.png"
 
 
-def render(
+def _render(
     bounds_or_name: Bounds | str,
-    style: str = "density",
-    out_path: str | Path | None = None,
+    style: str,
+    fmt: str,
+    sink: Sink,
+    label: str,
     *,
     opts: RenderOpts | None = None,
     con: duckdb.DuckDBPyConnection | None = None,
     edges: Sequence[Edge] | None = None,
-) -> Path:
-    """Draw `bounds_or_name` in `style` and return the path written.
+) -> None:
+    """Draw into `sink`, which is a path to write or a buffer to fill.
 
-    `out_path` decides the format by suffix (.png or .svg) and defaults to
-    ``OUT/<area>-<style>.png``. Pass `edges` to re-render a window you already
-    loaded without touching the database again.
+    `label` names the destination in the log line only. Everything else about the
+    drawing is identical either way -- there is no separate in-memory code path to
+    diverge from the one that writes files.
     """
     # Argument checks come first, and before requiring cairo: a mistyped style
     # should say which styles exist, not tell the caller to install a dependency
@@ -842,12 +857,8 @@ def render(
 
     bounds = resolve(bounds_or_name)
     opts = opts or RenderOpts()
-    path = Path(out_path) if out_path else _default_path(bounds_or_name, style)
-    fmt = _fmt(path)  # before the query, so a typo'd suffix fails in milliseconds
 
     cairo = _require_cairo()
-    config.ensure_dirs()
-    path.parent.mkdir(parents=True, exist_ok=True)
 
     # Streamed from the database unless the caller handed over edges it already
     # holds; either way the styles see the same interface.
@@ -862,7 +873,7 @@ def render(
     height = opts.height_px or Projection.canvas_height(bounds, width)
     proj = Projection.fit(bounds, width, height)
 
-    surface, draw_scale = _surface(path, width, height, opts.scale)
+    surface, draw_scale = _surface(fmt, sink, width, height, opts.scale)
     ctx = cairo.Context(surface)
     ctx.scale(draw_scale, draw_scale)
     ctx.set_antialias(cairo.Antialias.BEST)
@@ -890,7 +901,9 @@ def render(
         _caption(ctx, opts.caption, proj)
 
     if fmt == ".png":
-        surface.write_to_png(str(path))
+        surface.write_to_png(str(sink) if isinstance(sink, Path) else sink)
+    # Flushes the SVG writer as well, so a buffer holds a complete document by the
+    # time this returns.
     surface.finish()
     log.info(
         "%s %dx%d %s in %.1fs -> %s",
@@ -899,6 +912,49 @@ def render(
         height,
         f"@{opts.scale:g}x" if opts.scale != 1.0 else "",
         time.monotonic() - t0,
-        path,
+        label,
     )
+
+
+def render(
+    bounds_or_name: Bounds | str,
+    style: str = "density",
+    out_path: str | Path | None = None,
+    *,
+    opts: RenderOpts | None = None,
+    con: duckdb.DuckDBPyConnection | None = None,
+    edges: Sequence[Edge] | None = None,
+) -> Path:
+    """Draw `bounds_or_name` in `style` and return the path written.
+
+    `out_path` decides the format by suffix (.png or .svg) and defaults to
+    ``OUT/<area>-<style>.png``. Pass `edges` to re-render a window you already
+    loaded without touching the database again.
+    """
+    path = Path(out_path) if out_path else _default_path(bounds_or_name, style)
+    fmt = _fmt(path)  # before the query, so a typo'd suffix fails in milliseconds
+    config.ensure_dirs()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _render(bounds_or_name, style, fmt, path, str(path), opts=opts, con=con, edges=edges)
     return path
+
+
+def render_bytes(
+    bounds_or_name: Bounds | str,
+    style: str = "density",
+    *,
+    fmt: str = ".png",
+    opts: RenderOpts | None = None,
+    con: duckdb.DuckDBPyConnection | None = None,
+    edges: Sequence[Edge] | None = None,
+) -> bytes:
+    """The same render, returned rather than written.
+
+    What the HTTP endpoint serves. Nothing on a server that answers requests should
+    have to invent a filename, and an image the size of a print render has no
+    business landing in the output directory on the way to a socket.
+    """
+    fmt = _fmt(fmt)
+    buf = io.BytesIO()
+    _render(bounds_or_name, style, fmt, buf, "memory", opts=opts, con=con, edges=edges)
+    return buf.getvalue()
