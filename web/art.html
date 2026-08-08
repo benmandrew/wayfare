@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Wayfare studio — generative renders</title>
+<link rel="stylesheet" href="vendor/maplibre-gl.css">
 <style>
 :root {
   --bg:        #ffffff;
@@ -152,6 +153,18 @@ input[type=color] {
 .row { display: flex; align-items: center; gap: 6px; }
 .row .inp { flex: 1; }
 
+/* --- the window picker --- */
+/* No fixed aspect and no drawn rectangle: the frame *is* the window, so the
+   only thing this box has to be is a box. */
+.pickmap {
+  height: 200px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+/* A 272px-wide map has no room for the library's default attribution size. */
+.pickmap .maplibregl-ctrl-attrib { font-size: 10px; }
+
 /* --- the picture --- */
 .frame {
   flex: 1;
@@ -234,6 +247,17 @@ input[type=color] {
     <div class="field">
       <div class="label">Area</div>
       <select class="inp" id="preset"></select>
+      <div class="field" id="pickField" hidden>
+        <div id="pickwrap">
+          <div class="pickmap" id="pickmap"></div>
+          <div class="note">Pan and zoom to frame the window. The map's edges are
+            the render's edges — both are Web Mercator, so the shape you see is
+            the shape that is drawn.</div>
+        </div>
+        <div class="row" style="margin-top:7px">
+          <button class="btn" id="pickToggle" aria-expanded="true">Hide the map</button>
+        </div>
+      </div>
       <div class="field">
         <input class="inp mono" id="bbox" spellcheck="false" autocomplete="off"
                placeholder="minlon,minlat,maxlon,maxlat">
@@ -358,6 +382,12 @@ input[type=color] {
 
 </div>
 
+<!-- Vendored rather than pulled from a CDN, for the reason web/vendor/README.md
+     gives: this page is usually served on a private network. Only the window
+     picker needs them, and it stands down if they are missing, so a bundle
+     without web/vendor/ loses the map and keeps the studio. -->
+<script src="vendor/maplibre-gl.js"></script>
+<script src="vendor/pmtiles.js"></script>
 <script>
 "use strict";
 
@@ -425,6 +455,7 @@ $("theme").addEventListener("click", () => {
   localStorage.setItem("wayfare-theme", theme);
   document.documentElement.dataset.theme = theme;
   $("theme").textContent = theme === "dark" ? "Light" : "Dark";
+  repaintPicker();
 });
 
 /* ---------- boot ---------- */
@@ -638,6 +669,9 @@ function build() {
     S.bbox = $("bbox").value.trim();
     S.area = "";
     $("preset").value = "";
+    // Not apply(), which would rewrite the field being typed into -- but the map
+    // is not a field, and a half-typed window simply leaves it where it was.
+    showOnMap(bounds());
     changed();
   });
 
@@ -749,6 +783,8 @@ function build() {
     });
   }
 
+  initPicker();
+
   $("again").addEventListener("click", () => render(true));
   $("copyLink").addEventListener("click", async () => {
     try {
@@ -776,6 +812,7 @@ function apply() {
   }
   $("preset").value = S.area;
   $("bbox").value = S.bbox;
+  showOnMap(bounds());
   applyQuery();
   for (const k of KNOBS) {
     $("k-" + k.key).value = S[k.key];
@@ -1045,6 +1082,194 @@ function bounds() {
   const parts = S.bbox.split(",").map((p) => Number(p.trim()));
   if (parts.length !== 4 || parts.some((n) => !Number.isFinite(n))) return null;
   return parts;
+}
+
+/* ---------- the window picker ---------- */
+
+// MapLibre and the renderer are the same projection -- spherical Web Mercator --
+// and art.Projection.canvas_height takes the image's aspect from the window's
+// Mercator extent. So a north-up viewport and the render frame are the same
+// rectangle, and the map can be the control rather than a picture of one: pan
+// and zoom, and what is on screen is what gets drawn. Nothing is fitted, padded
+// or letterboxed, because there is no second aspect to reconcile.
+//
+// Two things follow, and both are load-bearing. Rotation is switched off
+// everywhere, since getBounds on a turned map returns the enclosing box rather
+// than the frame. And a camera move this page made itself must never be read
+// back into the state that caused it, or a typed window would fight the fit that
+// displays it.
+
+const ISLES = [-11.5, 49.4, 2.6, 61.3];   // art.ISLES, and the viewer's own copy
+const BASEMAP = { light: "light_all", dark: "dark_all" };
+const PICK_LINE = { light: "#3f6d9e", dark: "#79c6c9" };
+
+let pickMap = null;
+let syncing = false;    // a camera move of our own, which must not be read back
+
+function initPicker() {
+  if (typeof maplibregl === "undefined") return; // no vendor bundle; no picker
+  $("pickField").hidden = false;
+
+  const b = bounds() || ISLES;
+  pickMap = new maplibregl.Map({
+    container: "pickmap",
+    // Emphatically not `hash`: this page's fragment is the whole design, and
+    // MapLibre would overwrite it with a position.
+    hash: false,
+    bounds: [[b[0], b[1]], [b[2], b[3]]],
+    fitBoundsOptions: { padding: 0, animate: false },
+    maxBounds: roamingBounds($("pickmap")),
+    minZoom: 3,
+    maxZoom: 17,
+    dragRotate: false,
+    pitchWithRotate: false,
+    // Resizing is ours. MapLibre's own observer is debounced, so its resize --
+    // which fires movestart/move/moveend like any other jump -- would land
+    // outside the guard below and rewrite the window on a browser resize.
+    trackResize: false,
+    attributionControl: { compact: true },
+    style: {
+      version: 8,
+      sources: {
+        basemap: {
+          type: "raster",
+          tiles: basemapTiles(theme),
+          tileSize: 256,
+          attribution:
+            '<a href="https://carto.com/attributions">CARTO</a> · ' +
+            '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+        },
+      },
+      layers: [{ id: "basemap", type: "raster", source: "basemap" }],
+    },
+  });
+  pickMap.touchZoomRotate.disableRotation();
+  pickMap.keyboard.disableRotation();
+  pickMap.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
+
+  pickMap.on("moveend", () => {
+    if (syncing || !S) return;
+    const v = pickMap.getBounds();
+    const next = fmtBbox([v.getWest(), v.getSouth(), v.getEast(), v.getNorth()]);
+    if (next === S.bbox && !S.area) return;
+    // The same rule the bbox field follows: choosing a window by hand takes it
+    // off the preset, and the preset's numbers stay as the starting point.
+    S.bbox = next;
+    S.area = "";
+    $("preset").value = "";
+    $("bbox").value = next;
+    changed();
+  });
+
+  pickMap.on("load", () => addNetwork(pickMap));
+
+  let sizing = null;
+  addEventListener("resize", () => {
+    clearTimeout(sizing);
+    sizing = setTimeout(() => quietly(() => pickMap.resize()), 100);
+  });
+
+  $("pickToggle").addEventListener("click", () => showPicker(!!$("pickwrap").hidden));
+  showPicker(localStorage.getItem("wayfare-pickmap") !== "closed");
+}
+
+// fitBounds({animate:false}) and resize() both jump rather than ease, and a jump
+// fires its move events synchronously -- so the flag can be scoped to the call
+// instead of guessing when the camera has settled.
+function quietly(fn) {
+  syncing = true;
+  try { fn(); } finally { syncing = false; }
+}
+
+function showOnMap(b) {
+  if (!pickMap || !b) return;
+  quietly(() => pickMap.fitBounds([[b[0], b[1]], [b[2], b[3]]],
+                                  { padding: 0, animate: false }));
+}
+
+function showPicker(open) {
+  $("pickwrap").hidden = !open;
+  $("pickToggle").textContent = open ? "Hide the map" : "Pick on a map";
+  $("pickToggle").setAttribute("aria-expanded", String(open));
+  localStorage.setItem("wayfare-pickmap", open ? "open" : "closed");
+  // A map whose container was display:none while the window changed size comes
+  // back with a stale canvas.
+  if (open && pickMap) quietly(() => pickMap.resize());
+}
+
+function repaintPicker() {
+  if (!pickMap) return;
+  pickMap.getSource("basemap").setTiles(basemapTiles(theme));
+  if (pickMap.getLayer("bus")) {
+    pickMap.setPaintProperty("bus", "line-color", PICK_LINE[theme]);
+  }
+}
+
+// The viewer's own archives, drawn faintly, so a window is framed against the
+// network it will contain rather than against an empty basemap. Entirely
+// optional: a server holding a database but no tiles still gets a working
+// picker, which is the ordinary state of things between `match` and `publish`.
+async function addNetwork(map) {
+  if (typeof pmtiles === "undefined") return;
+  let archives = [];
+  try {
+    archives = await (await fetch("archives.json")).json();
+  } catch {
+    archives = [];
+  }
+  const url = new URL(archives[0] || "./bus.pmtiles", location.href).href;
+  const protocol = new pmtiles.Protocol();
+  maplibregl.addProtocol("pmtiles", protocol.tile);
+  const archive = new pmtiles.PMTiles(url);
+  protocol.add(archive);
+  let header;
+  try {
+    header = await archive.getHeader();
+  } catch {
+    return; // no archive here, or an unreadable one: the basemap is enough
+  }
+  map.addSource("bus", {
+    type: "vector",
+    url: "pmtiles://" + url,
+    maxzoom: header.maxZoom,
+  });
+  map.addLayer({
+    id: "bus",
+    type: "line",
+    source: "bus",
+    "source-layer": "bus",
+    layout: { "line-cap": "round", "line-join": "round" },
+    paint: {
+      "line-color": PICK_LINE[theme],
+      "line-opacity": 0.75,
+      "line-width": ["interpolate", ["linear"], ["zoom"], 6, 0.4, 10, 0.9, 14, 1.8],
+    },
+  });
+}
+
+// MapLibre has no {s} or {r} placeholder: expand the subdomains and pick the
+// retina variant up front. The viewer holds the same six lines; they are two
+// self-contained pages by design, and this is the whole of what they share.
+function basemapTiles(t) {
+  const r = devicePixelRatio > 1.4 ? "@2x" : "";
+  return ["a", "b", "c", "d"].map(
+    (s) => `https://${s}.basemaps.cartocdn.com/${BASEMAP[t]}/{z}/{x}/{y}${r}.png`
+  );
+}
+
+// maxBounds constrains the whole viewport, not the centre, so MapLibre zooms in
+// until the visible area fits inside the box -- and on a landscape frame it is
+// the box's width that binds, leaving a slice of the country at full zoom out.
+// Widen the box, and only the box, until it is at least as wide as the frame.
+// The viewer does this too, and for the same reason.
+function roamingBounds(el) {
+  const merc = (lat) => 0.5 - mercY(lat) / (2 * Math.PI);
+  const [w, s, e, n] = ISLES;
+  const tall = merc(s) - merc(n);            // north is the smaller y
+  const wide = (e - w) / 360;
+  const aspect = Math.max(el.clientWidth, 1) / Math.max(el.clientHeight, 1);
+  const grow = (Math.max(0, aspect * tall - wide) * 360) / 2;
+  return [[w - grow, s], [e + grow, n]];
 }
 
 /* ---------- helpers ---------- */
