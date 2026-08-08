@@ -67,6 +67,12 @@ h1 { margin: 0; font-size: 13px; font-weight: 600; letter-spacing: .02em; }
 a.btn { text-decoration: none; }
 .btn[aria-disabled="true"] { opacity: .45; pointer-events: none; }
 
+/* A control the current style ignores. Dimmed rather than hidden, so it is clear
+   the knob exists and which style would use it. */
+.dim { opacity: .45; }
+/* Names one control inside a section, where .label names the section itself. */
+.sublabel { display: block; color: var(--muted); font-size: 11.5px; margin-bottom: 3px; }
+
 .meta { color: var(--muted); font-size: 11.5px; }
 .meta b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
 .note { color: var(--muted); font-size: 11px; margin-top: 8px; font-style: italic; }
@@ -236,6 +242,49 @@ input[type=color] {
     </div>
 
     <div class="field">
+      <div class="label">Weight</div>
+      <label class="sublabel" for="weight">The ramps follow</label>
+      <select class="inp" id="weight"></select>
+      <div class="note" id="weightNote"></div>
+    </div>
+
+    <div class="field" id="grouping">
+      <div class="label">Grouping</div>
+      <label class="sublabel" for="group">One ribbon per</label>
+      <select class="inp" id="group"></select>
+      <div class="field">
+        <label class="sublabel" for="order">Drawn underneath</label>
+        <select class="inp" id="order"></select>
+      </div>
+      <div class="note" id="groupNote"></div>
+    </div>
+
+    <div class="field">
+      <div class="label">Filters</div>
+      <div class="field" id="operatorField">
+        <label class="sublabel" for="operator">Operators</label>
+        <select class="inp" id="operator" multiple size="4"></select>
+      </div>
+      <div class="field" id="classField">
+        <label class="sublabel" for="class">Road classes</label>
+        <select class="inp" id="class" multiple size="4"></select>
+      </div>
+      <div class="field">
+        <div class="slider">
+          <label for="min_trips">Trips a week, at least</label>
+          <output id="minTripsOut"></output>
+        </div>
+        <input class="inp" type="number" id="min_trips" min="0" step="10">
+      </div>
+      <div class="row" style="margin-top:7px">
+        <button class="btn" id="filterReset">Draw everything again</button>
+      </div>
+      <div class="note">Nothing selected means any. A filter drops the roads no
+        surviving service uses rather than drawing them empty, so it is the one
+        customisation that makes a render faster.</div>
+    </div>
+
+    <div class="field">
       <div class="label">Knobs</div>
       <div id="knobs"></div>
     </div>
@@ -327,6 +376,34 @@ const KNOBS = [
   // reaches the exported PNG.
   { key: "scale",       label: "Export scale", min: 0.1, max: 4, step: 0.1, exportOnly: true },
 ];
+
+// What each vocabulary entry means, in a line. The server publishes the names and
+// nothing else -- art.py holds the SQL, which is no use in a dropdown -- so these
+// are written here and are the one thing to add to when a weight or a group is.
+const MEANS = {
+  weight: {
+    trips:     "Timetabled trips a week over each road.",
+    services:  "How many distinct services use it.",
+    operators: "How many operators use it.",
+    patterns:  "How many distinct journeys use it.",
+    busiest:   "The single busiest service on it.",
+    density:   "Trips per metre, so a long rural link stops matching a city block.",
+  },
+  group: {
+    service:    "The original picture: a ribbon is one bus route.",
+    operator:   "A ribbon per company, so the picture reads as territory.",
+    road_class: "A handful of ribbons — coarse, and quick to draw.",
+    way:        "One per OSM way: fine detail, and the way to hit the group cap.",
+    road_name:  "A ribbon per named street; unnamed roads share one.",
+  },
+  order: {
+    widest:    "Widest ribbons underneath.",
+    narrowest: "Narrowest underneath.",
+    busiest:   "Busiest underneath.",
+    quietest:  "Quietest underneath.",
+    name:      "Alphabetical, so a picture is stable as the timetable changes.",
+  },
+};
 
 const DEBOUNCE_MS = 300;
 
@@ -434,6 +511,15 @@ function defaults() {
     style: d.style,
     area: area,                       // "" means the bbox field is in charge
     bbox: fmtBbox(META.presets[area]),
+    // The data half: what the ramps follow, what a ribbon is, and which services
+    // count. Empty filter lists mean any, which is what the server's absent
+    // parameter means too.
+    weight: d.weight,
+    group: d.group,
+    order: d.order,
+    operator: [],
+    roadClass: [],
+    min_trips: d.min_trips,
     hue: d.hue,
     line_scale: d.line_scale,
     alpha_scale: d.alpha_scale,
@@ -455,9 +541,14 @@ function toHash(s) {
   const p = new URLSearchParams();
   if (s.area) p.set("area", s.area); else p.set("bbox", s.bbox);
   for (const k of ["style", "hue", "line_scale", "alpha_scale", "scale",
-                   "width", "previewWidth", "caption", "background", "format"]) {
+                   "width", "previewWidth", "caption", "background", "format",
+                   "weight", "group", "order", "min_trips"]) {
     if (String(s[k]) !== String(d[k])) p.set(k, String(s[k]));
   }
+  // Comma-joined, as the endpoint's own filters are: shorter than a repeated
+  // parameter, and the same spelling the request uses.
+  if (s.operator.length) p.set("operator", s.operator.join(","));
+  if (s.roadClass.length) p.set("class", s.roadClass.join(","));
   return p.toString();
 }
 
@@ -471,16 +562,35 @@ function fromHash(base) {
     // back to a window instead of trusting the hash.
     if (META.presets[name]) { s.area = name; s.bbox = fmtBbox(META.presets[name]); }
   }
-  for (const k of ["style", "caption", "background", "format"]) {
+  for (const k of ["style", "caption", "background", "format",
+                   "weight", "group", "order"]) {
     if (p.has(k)) s[k] = p.get(k);
   }
-  for (const k of ["hue", "line_scale", "alpha_scale", "scale", "width", "previewWidth"]) {
+  for (const k of ["hue", "line_scale", "alpha_scale", "scale", "width", "previewWidth",
+                   "min_trips"]) {
     if (p.has(k) && Number.isFinite(Number(p.get(k)))) s[k] = Number(p.get(k));
   }
+  if (p.has("operator")) s.operator = splitList(p.get("operator"));
+  if (p.has("class")) s.roadClass = splitList(p.get("class"));
   if (!META.styles.some((st) => st.name === s.style)) s.style = base.style;
   if (s.format !== "png" && s.format !== "svg") s.format = base.format;
+  // A vocabulary the server does not know would render as a 400 no control could
+  // undo, exactly as an unknown preset would. Filter values are left alone: they
+  // are not a closed vocabulary, and one this database happens not to hold is an
+  // empty picture rather than an error.
+  for (const [k, vocab] of [["weight", "weights"], ["group", "groups"], ["order", "orders"]]) {
+    if (!vocabulary(vocab).includes(s[k])) s[k] = base[k];
+  }
+  s.min_trips = clamp(Math.round(s.min_trips) || 0, 0, maxTrips());
   return s;
 }
+
+const vocabulary = (name) => (META.query && META.query[name]) || [];
+const maxTrips = () => META.limits.max_min_trips || 1e6;
+// Sorted and deduplicated, which is what the endpoint does to a filter as well, so
+// two spellings of one choice are one URL and one cached render.
+const splitList = (raw) =>
+  [...new Set(raw.split(",").map((v) => v.trim()).filter(Boolean))].sort();
 
 function writeHash() {
   lastHash = toHash(S);
@@ -503,7 +613,7 @@ function build() {
       <input type="radio" name="style" value="${escapeHtml(st.name)}">
       <div class="name">${escapeHtml(st.name)}</div>
       <div class="blurb">${escapeHtml(st.blurb)}${
-        st.needs_services ? " · needs service names" : ""}</div>
+        st.needs_groups ? " · draws one ribbon per group" : ""}</div>
     </label>`).join("");
   $("styles").addEventListener("change", (e) => {
     S.style = e.target.value;
@@ -528,6 +638,52 @@ function build() {
     S.bbox = $("bbox").value.trim();
     S.area = "";
     $("preset").value = "";
+    changed();
+  });
+
+  // The three vocabularies, built from what the server publishes rather than from a
+  // list in this page: a weight added to art.py appears here without an edit.
+  for (const [id, name] of [["weight", "weights"], ["group", "groups"], ["order", "orders"]]) {
+    $(id).innerHTML = vocabulary(name)
+      .map((v) => `<option value="${escapeHtml(v)}">${escapeHtml(label(v))}</option>`)
+      .join("");
+    $(id).addEventListener("change", () => {
+      S[id] = $(id).value;
+      apply();
+      changed();
+    });
+  }
+
+  // The filter menus hold what this database actually holds. A server that could not
+  // read them says nothing rather than guessing, so the menu is hidden instead of
+  // offering an empty list.
+  const d = META.database || {};
+  fillOptions($("operator"), d.operators || []);
+  fillOptions($("class"), d.road_classes || []);
+  for (const [id, key] of [["operator", "operator"], ["class", "roadClass"]]) {
+    $(id).addEventListener("change", () => {
+      S[key] = [...$(id).selectedOptions].map((o) => o.value).sort();
+      apply();
+      changed();
+    });
+  }
+  $("filterReset").addEventListener("click", () => {
+    S.operator = [];
+    S.roadClass = [];
+    S.min_trips = 0;
+    apply();
+    changed();
+  });
+
+  $("min_trips").max = maxTrips();
+  $("min_trips").addEventListener("input", () => {
+    const v = Number($("min_trips").value);
+    if (!Number.isFinite(v) || v < 0) return; // mid-typing, or a minus sign
+    S.min_trips = clamp(Math.round(v), 0, maxTrips());
+    $("minTripsOut").textContent = tripsLabel();
+    // Not apply(), which would write the rounded number back into the field being
+    // typed into. Only the one thing that can change with it.
+    $("filterReset").hidden = !filtersActive();
     changed();
   });
 
@@ -620,6 +776,7 @@ function apply() {
   }
   $("preset").value = S.area;
   $("bbox").value = S.bbox;
+  applyQuery();
   for (const k of KNOBS) {
     $("k-" + k.key).value = S[k.key];
     $("out-" + k.key).textContent = trim(S[k.key]);
@@ -633,6 +790,37 @@ function apply() {
   $("previewWidthOut").textContent = S.previewWidth + " px";
   writeHash();
   exports();
+}
+
+// The data controls. Split out of apply() only because there are now enough of them
+// to read as their own thing; it is called from nowhere else.
+function applyQuery() {
+  $("weight").value = S.weight;
+  $("group").value = S.group;
+  $("order").value = S.order;
+  $("weightNote").textContent = MEANS.weight[S.weight] || "";
+
+  // Grouping is meaningless to a style that paints every road at once. Dimmed and
+  // disabled rather than dropped from the request silently: the knob is real, and
+  // which style would use it is the useful thing to say.
+  const grouped = !!styleSpec().needs_groups;
+  $("grouping").classList.toggle("dim", !grouped);
+  $("group").disabled = $("order").disabled = !grouped;
+  const ribbons = META.styles.filter((st) => st.needs_groups).map((st) => st.name);
+  $("groupNote").textContent = grouped
+    ? [MEANS.group[S.group], MEANS.order[S.order]].filter(Boolean).join(" ")
+    : `${S.style} paints every road at once, so grouping does not reach it. `
+      + `${ribbons.join(" and ") || "No style here"} draws ribbons.`;
+
+  setSelected($("operator"), S.operator);
+  setSelected($("class"), S.roadClass);
+  // Hidden only when there is nothing to offer and nothing chosen -- a value out of
+  // a shared link has to stay visible even if this database does not hold it.
+  $("operatorField").hidden = !$("operator").options.length;
+  $("classField").hidden = !$("class").options.length;
+  $("min_trips").value = S.min_trips;
+  $("minTripsOut").textContent = tripsLabel();
+  $("filterReset").hidden = !filtersActive();
 }
 
 function changed() {
@@ -656,6 +844,17 @@ function query({ width, scale, format, download }) {
   p.set("format", format);
   p.set("width", String(Math.round(width)));
   if (format === "png" && scale !== 1) p.set("scale", trim(scale));
+  p.set("weight", S.weight);
+  // Sent only to a style that groups. They reach the server's cache key whether or
+  // not the render reads them, so a density picture must not carry a grouping it
+  // ignores -- and `group=way` over a city would then be refused for nothing.
+  if (styleSpec().needs_groups) {
+    p.set("group", S.group);
+    p.set("order", S.order);
+  }
+  if (S.operator.length) p.set("operator", S.operator.join(","));
+  if (S.roadClass.length) p.set("class", S.roadClass.join(","));
+  if (S.min_trips) p.set("min_trips", String(S.min_trips));
   p.set("hue", trim(S.hue));
   p.set("line_scale", trim(S.line_scale));
   p.set("alpha_scale", trim(S.alpha_scale));
@@ -830,6 +1029,25 @@ function bounds() {
 /* ---------- helpers ---------- */
 
 const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+const tripsLabel = () => (S.min_trips ? S.min_trips + " a week" : "no floor");
+const filtersActive = () =>
+  !!(S.operator.length || S.roadClass.length || S.min_trips);
+
+function fillOptions(el, values) {
+  el.innerHTML = values
+    .map((v) => `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`)
+    .join("");
+}
+
+// Select `chosen`, adding any value the menu does not hold. A link can carry an
+// operator this database has never seen -- a picture shared from another region --
+// and dropping it silently would show a filter the URL does not ask for.
+function setSelected(el, chosen) {
+  const have = new Set([...el.options].map((o) => o.value));
+  for (const v of chosen) if (!have.has(v)) el.add(new Option(v, v));
+  for (const o of el.options) o.selected = chosen.includes(o.value);
+}
+
 const trim = (v) => String(Number(Number(v).toFixed(4)));
 const fmtBbox = (b) => b.map((n) => trim(n)).join(",");
 const label = (n) => n.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
