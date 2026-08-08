@@ -1,0 +1,856 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wayfare studio — generative renders</title>
+<style>
+:root {
+  --bg:        #ffffff;
+  --panel:     rgba(255,255,255,.94);
+  --border:    #dcdfe4;
+  --text:      #16181d;
+  --muted:     #6b7280;
+  --chip-bg:   #eef1f5;
+  --chip-text: #2b3440;
+  --accent:    #d64512;
+  --shadow:    0 1px 2px rgba(16,24,40,.06), 0 8px 24px rgba(16,24,40,.10);
+  --radius:    8px;
+}
+[data-theme="dark"] {
+  --bg:        #0d1014;
+  --panel:     rgba(20,24,30,.92);
+  --border:    #2b323c;
+  --text:      #e8ecf1;
+  --muted:     #8b949e;
+  --chip-bg:   #232a33;
+  --chip-text: #d7dee7;
+  --accent:    #ffd15c;
+  --shadow:    0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.45);
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* --- panel chrome (as the viewer) --- */
+.panel {
+  background: var(--panel);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+h1 { margin: 0; font-size: 13px; font-weight: 600; letter-spacing: .02em; }
+.sub { color: var(--muted); font-size: 11.5px; margin-top: 2px; }
+.head { padding: 10px 12px; display: flex; align-items: flex-start; gap: 8px; }
+.head > div { flex: 1; min-width: 0; }
+
+.btn {
+  font: inherit;
+  font-size: 11.5px;
+  color: var(--muted);
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 7px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.btn:hover { color: var(--text); border-color: var(--muted); }
+a.btn { text-decoration: none; }
+.btn[aria-disabled="true"] { opacity: .45; pointer-events: none; }
+
+.meta { color: var(--muted); font-size: 11.5px; }
+.meta b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.note { color: var(--muted); font-size: 11px; margin-top: 8px; font-style: italic; }
+[hidden] { display: none !important; }
+
+/* --- studio layout: controls beside a stage --- */
+.studio { display: flex; gap: 12px; height: 100%; padding: 12px; }
+.controls {
+  width: 296px;
+  flex: none;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.stage {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* --- control groups --- */
+.group { padding: 10px 12px; }
+.label {
+  font-size: 11px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 7px;
+}
+.field { margin-top: 9px; }
+.field:first-child { margin-top: 0; }
+
+.inp {
+  width: 100%;
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 7px;
+}
+.inp:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+.inp::placeholder { color: var(--muted); }
+.inp.mono { font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+/* Styles and formats: a radio each, drawn as a stack of pickable rows. */
+.pick { position: relative; display: block; cursor: pointer; border-radius: 6px; padding: 5px 7px; }
+.pick:hover { background: var(--chip-bg); }
+.pick input { position: absolute; opacity: 0; pointer-events: none; }
+.pick .name { font-weight: 600; }
+.blurb { color: var(--muted); font-size: 11.5px; font-weight: 400; }
+.pick.on { background: var(--chip-bg); box-shadow: inset 2px 0 0 var(--accent); }
+.pick.on .name { color: var(--accent); }
+
+.seg { display: flex; gap: 6px; }
+.seg .pick { flex: 1; text-align: center; border: 1px solid var(--border); }
+
+/* --- sliders --- */
+.slider { display: flex; align-items: baseline; gap: 8px; }
+.slider label { flex: 1; min-width: 0; }
+.slider output {
+  font: 500 11.5px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+input[type=range] { width: 100%; accent-color: var(--accent); margin: 3px 0 0; }
+input[type=color] {
+  width: 44px; height: 26px; padding: 1px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.row { display: flex; align-items: center; gap: 6px; }
+.row .inp { flex: 1; }
+
+/* --- the picture --- */
+.frame {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  padding: 12px;
+  overflow: auto;
+}
+.frame img {
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: 4px;
+  /* A render is nearly black; a border keeps it off the dark page background. */
+  box-shadow: 0 0 0 1px var(--border);
+}
+.frame.pending img { opacity: .55; transition: opacity .15s ease-in; }
+.status {
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.status .grow { flex: 1; min-width: 0; }
+
+.dot {
+  display: inline-block; width: 7px; height: 7px;
+  border-radius: 50%; background: var(--accent);
+  margin-right: 5px;
+  animation: pulse 1s ease-in-out infinite;
+}
+@keyframes pulse { 0%,100% { opacity: .25; } 50% { opacity: 1; } }
+
+/* --- banners --- */
+.banner { padding: 9px 12px; font-size: 12px; }
+.banner b { font-weight: 600; }
+.banner.bad { border-color: var(--accent); }
+.banner.bad .what { color: var(--accent); font-weight: 600; }
+.banner pre {
+  font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--chip-bg); color: var(--chip-text);
+  padding: 9px 11px; border-radius: 6px; margin: 8px 0 0; overflow-x: auto;
+}
+.empty { color: var(--muted); text-align: center; max-width: 420px; }
+.empty h2 { font-size: 15px; margin: 0 0 8px; color: var(--text); }
+.empty code {
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--chip-bg); color: var(--chip-text);
+  padding: 1px 5px; border-radius: 4px;
+}
+
+@media (max-width: 860px) {
+  .studio { flex-direction: column; height: auto; min-height: 100%; }
+  .controls { width: auto; overflow: visible; }
+  .stage { min-height: 60vh; }
+}
+</style>
+</head>
+<body>
+
+<div class="studio">
+
+<aside class="controls">
+  <div class="panel">
+    <div class="head">
+      <div>
+        <h1>Wayfare studio</h1>
+        <div class="sub" id="sub">Renders drawn where the data lives</div>
+      </div>
+      <a class="btn" href="index.html" title="Back to the map">Map</a>
+      <button class="btn" id="theme" title="Toggle light/dark">Dark</button>
+    </div>
+  </div>
+
+  <div class="panel group" id="controlPanel">
+    <div class="label">Style</div>
+    <div id="styles"></div>
+
+    <div class="field">
+      <div class="label">Area</div>
+      <select class="inp" id="preset"></select>
+      <div class="field">
+        <input class="inp mono" id="bbox" spellcheck="false" autocomplete="off"
+               placeholder="minlon,minlat,maxlon,maxlat">
+        <div class="note">Longitude first — west, south, east, north.</div>
+      </div>
+    </div>
+
+    <div class="field">
+      <div class="label">Knobs</div>
+      <div id="knobs"></div>
+    </div>
+
+    <div class="field">
+      <div class="label">Ground</div>
+      <div class="row">
+        <input type="color" id="background" title="Background colour">
+        <button class="btn" id="groundReset">Use style colour</button>
+      </div>
+    </div>
+
+    <div class="field">
+      <div class="label">Caption</div>
+      <input class="inp" id="caption" maxlength="120" autocomplete="off"
+             placeholder="Drawn in the corner, if you want one">
+    </div>
+
+    <div class="field">
+      <div class="label">Preview format</div>
+      <div class="seg" id="formats"></div>
+    </div>
+
+    <div class="field">
+      <div class="label">Widths</div>
+      <div class="slider">
+        <label for="previewWidth">Preview width</label>
+        <output id="previewWidthOut"></output>
+      </div>
+      <input class="inp" type="number" id="previewWidth" min="64" step="50">
+      <div class="slider" style="margin-top:9px">
+        <label for="width">Export width</label>
+        <output id="widthOut"></output>
+      </div>
+      <input class="inp" type="number" id="width" min="64" step="100">
+      <div class="note">The preview is deliberately small so each change is cheap.
+        Line weight is in canvas units, so a wider export draws finer lines.</div>
+    </div>
+
+    <div class="field">
+      <div class="label">Download</div>
+      <div class="row">
+        <a class="btn" id="dlPng" href="#">PNG</a>
+        <a class="btn" id="dlSvg" href="#">SVG</a>
+        <button class="btn" id="copyLink" title="Copy this design's address">Copy link</button>
+      </div>
+      <div class="meta" id="exportSize" style="margin-top:7px"></div>
+    </div>
+  </div>
+
+  <div class="panel group" id="about">
+    <div class="meta" id="dbInfo"></div>
+  </div>
+</aside>
+
+<main class="stage">
+  <div class="panel banner bad" id="err" hidden role="alert"></div>
+  <div class="panel banner" id="warn" hidden></div>
+
+  <div class="panel frame" id="frame">
+    <img id="shot" alt="The current render" hidden>
+    <div class="empty" id="empty">Loading…</div>
+  </div>
+
+  <div class="panel status">
+    <div class="grow meta" id="stat"></div>
+    <div class="meta" id="busy" hidden><span class="dot"></span>rendering…</div>
+    <button class="btn" id="again" title="Fetch it again, past the browser cache">Refresh</button>
+  </div>
+</main>
+
+</div>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+
+// The knobs whose bounds the server does not publish. /art/meta carries the
+// defaults and the scale ceiling, but not these ranges, so they are named once
+// here and must stay in step with `_number` calls in server.parse_art.
+const KNOBS = [
+  { key: "hue",         label: "Hue",         min: 0,    max: 1, step: 0.01 },
+  { key: "line_scale",  label: "Line weight", min: 0.05, max: 8, step: 0.05 },
+  { key: "alpha_scale", label: "Opacity",     min: 0.05, max: 8, step: 0.05 },
+  // `scale` is a surface multiplier: drawing happens in canvas units and the
+  // surface is scaled up, so it changes resolution and nothing about the
+  // picture. The preview therefore always renders at 1x and this knob only
+  // reaches the exported PNG.
+  { key: "scale",       label: "Export scale", min: 0.1, max: 4, step: 0.1, exportOnly: true },
+];
+
+const DEBOUNCE_MS = 300;
+
+let META = null;
+let S = null;            // the whole parameter set; the hash is its serialisation
+let controller = null;   // in-flight preview request
+let timer = null;
+let objectURL = null;    // currently displayed blob URL
+let lastHash = null;     // what we wrote, so our own writes are not read back
+
+/* ---------- theme (shared with the viewer through localStorage) ---------- */
+
+let theme = localStorage.getItem("wayfare-theme")
+  || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+document.documentElement.dataset.theme = theme;
+$("theme").textContent = theme === "dark" ? "Light" : "Dark";
+$("theme").addEventListener("click", () => {
+  theme = theme === "dark" ? "light" : "dark";
+  localStorage.setItem("wayfare-theme", theme);
+  document.documentElement.dataset.theme = theme;
+  $("theme").textContent = theme === "dark" ? "Light" : "Dark";
+});
+
+/* ---------- boot ---------- */
+
+boot();
+
+async function boot() {
+  try {
+    const res = await fetch("/art/meta");
+    if (!res.ok) throw new Error(`/art/meta answered ${res.status}`);
+    META = await res.json();
+  } catch (err) {
+    offline(
+      "Cannot reach the render server",
+      `<p>${escapeHtml(String(err.message || err))}</p>
+       <p>This page needs <code>wayfare serve</code>; a plain static host has no
+          <code>/art</code> to call.</p>`
+    );
+    return;
+  }
+
+  describeDatabase();
+  // Checked before the controls are built: there is nothing to iterate on when
+  // the server cannot draw, and half-live knobs would only invite the attempt.
+  if (!renderable()) return;
+
+  S = fromHash(defaults());
+  build();
+  apply();
+  render();
+}
+
+// Why nothing will be drawn, said in the stage rather than as a broken image.
+function renderable() {
+  if (!META.enabled) {
+    offline(
+      "Rendering is switched off",
+      `<p>This server runs with <code>--no-art</code>, so <code>/art</code>
+          answers 501 and draws nothing. Restart it without that flag.</p>`
+    );
+    return false;
+  }
+  if (!META.database || !META.database.present) {
+    offline(
+      "No database on this server",
+      `<p>Renders read <code>edges</code> straight out of the pipeline's DuckDB
+          file, and there is none here yet. Run the pipeline against this data
+          root first:</p>
+       <pre>wayfare acquire &amp;&amp; wayfare patterns
+wayfare match &amp;&amp; wayfare aggregate</pre>`
+    );
+    return false;
+  }
+  return true;
+}
+
+function offline(title, html) {
+  $("empty").hidden = false;
+  $("empty").innerHTML = `<h2>${escapeHtml(title)}</h2>${html}`;
+  $("shot").hidden = true;
+  $("controlPanel").hidden = true;
+  $("again").hidden = true;
+}
+
+function describeDatabase() {
+  const d = META.database || {};
+  const bits = [];
+  if (d.feed_version) bits.push(`feed <b>${escapeHtml(d.feed_version)}</b>`);
+  if (typeof d.edges === "number") {
+    bits.push(`<b>${d.edges.toLocaleString()}</b> road segments`);
+  }
+  if (d.error) bits.push(`could not be read: ${escapeHtml(d.error)}`);
+  $("dbInfo").innerHTML = bits.join(" · ") || "No pipeline database on this server.";
+}
+
+/* ---------- the parameter set ---------- */
+
+function defaults() {
+  const d = META.defaults;
+  // A city opens in a second or so; `uk` is the slowest window there is, and
+  // opening on it would make the page look broken on first load.
+  const area = META.presets.cardiff ? "cardiff" : Object.keys(META.presets)[0];
+  return {
+    style: d.style,
+    area: area,                       // "" means the bbox field is in charge
+    bbox: fmtBbox(META.presets[area]),
+    hue: d.hue,
+    line_scale: d.line_scale,
+    alpha_scale: d.alpha_scale,
+    scale: d.scale,
+    width: d.width,
+    // Big enough to judge a design, small enough to redraw on every slider
+    // move. The stage is what has to hold it, not the export.
+    previewWidth: clamp(Math.round((window.innerWidth - 360) * 0.9), 700, 1400),
+    caption: "",
+    background: "",                   // "" means the style's own ground
+    format: "png",
+  };
+}
+
+// Only what differs from the defaults reaches the hash, so a shared URL says
+// what someone chose rather than restating the whole schema.
+function toHash(s) {
+  const d = defaults();
+  const p = new URLSearchParams();
+  if (s.area) p.set("area", s.area); else p.set("bbox", s.bbox);
+  for (const k of ["style", "hue", "line_scale", "alpha_scale", "scale",
+                   "width", "previewWidth", "caption", "background", "format"]) {
+    if (String(s[k]) !== String(d[k])) p.set(k, String(s[k]));
+  }
+  return p.toString();
+}
+
+function fromHash(base) {
+  const p = new URLSearchParams(location.hash.replace(/^#/, ""));
+  const s = { ...base };
+  if (p.has("bbox")) { s.bbox = p.get("bbox"); s.area = ""; }
+  if (p.has("area")) {
+    const name = p.get("area");
+    // An unknown preset would render as a 400 no control could undo, so fall
+    // back to a window instead of trusting the hash.
+    if (META.presets[name]) { s.area = name; s.bbox = fmtBbox(META.presets[name]); }
+  }
+  for (const k of ["style", "caption", "background", "format"]) {
+    if (p.has(k)) s[k] = p.get(k);
+  }
+  for (const k of ["hue", "line_scale", "alpha_scale", "scale", "width", "previewWidth"]) {
+    if (p.has(k) && Number.isFinite(Number(p.get(k)))) s[k] = Number(p.get(k));
+  }
+  if (!META.styles.some((st) => st.name === s.style)) s.style = base.style;
+  if (s.format !== "png" && s.format !== "svg") s.format = base.format;
+  return s;
+}
+
+function writeHash() {
+  lastHash = toHash(S);
+  history.replaceState(null, "", lastHash ? "#" + lastHash : location.pathname);
+}
+
+// Someone pasting a different design into the address bar, not our own writes.
+addEventListener("hashchange", () => {
+  if (!META || location.hash.replace(/^#/, "") === lastHash) return;
+  S = fromHash(defaults());
+  apply();
+  render();
+});
+
+/* ---------- controls ---------- */
+
+function build() {
+  $("styles").innerHTML = META.styles.map((st) => `
+    <label class="pick" data-style="${escapeHtml(st.name)}">
+      <input type="radio" name="style" value="${escapeHtml(st.name)}">
+      <div class="name">${escapeHtml(st.name)}</div>
+      <div class="blurb">${escapeHtml(st.blurb)}${
+        st.needs_services ? " · needs service names" : ""}</div>
+    </label>`).join("");
+  $("styles").addEventListener("change", (e) => {
+    S.style = e.target.value;
+    apply();
+    changed();
+  });
+
+  const names = Object.keys(META.presets).sort();
+  $("preset").innerHTML =
+    `<option value="">Custom window</option>` +
+    names.map((n) => `<option value="${escapeHtml(n)}">${escapeHtml(label(n))}</option>`).join("");
+  $("preset").addEventListener("change", () => {
+    S.area = $("preset").value;
+    if (S.area) S.bbox = fmtBbox(META.presets[S.area]);
+    apply();
+    changed();
+  });
+
+  // Editing the window by hand takes it off the preset; the preset's own numbers
+  // stay in the field as the starting point.
+  $("bbox").addEventListener("input", () => {
+    S.bbox = $("bbox").value.trim();
+    S.area = "";
+    $("preset").value = "";
+    changed();
+  });
+
+  $("knobs").innerHTML = KNOBS.map((k) => {
+    const max = k.key === "scale" ? META.limits.max_scale : k.max;
+    return `
+      <div class="field">
+        <div class="slider">
+          <label for="k-${k.key}">${escapeHtml(k.label)}${
+            k.exportOnly ? " <span class=\"blurb\">(export only)</span>" : ""}</label>
+          <output id="out-${k.key}"></output>
+        </div>
+        <input type="range" id="k-${k.key}" data-key="${k.key}"
+               min="${k.min}" max="${max}" step="${k.step}">
+      </div>`;
+  }).join("");
+  $("knobs").addEventListener("input", (e) => {
+    const key = e.target.dataset.key;
+    if (!key) return;
+    S[key] = Number(e.target.value);
+    $("out-" + key).textContent = trim(S[key]);
+    // `scale` never changes the preview, so moving it only refreshes the
+    // export figures.
+    if (key === "scale") { writeHash(); exports(); } else changed();
+  });
+
+  $("formats").innerHTML = (META.limits.formats || [".png"]).map((f) => {
+    const name = f.replace(/^\./, "");
+    return `<label class="pick" data-format="${name}">
+      <input type="radio" name="format" value="${name}">
+      <span class="name">${name.toUpperCase()}</span>
+    </label>`;
+  }).join("");
+  $("formats").addEventListener("change", (e) => {
+    S.format = e.target.value;
+    apply();
+    changed();
+  });
+
+  $("background").addEventListener("input", () => {
+    S.background = $("background").value;
+    changed();
+  });
+  $("groundReset").addEventListener("click", () => {
+    S.background = "";
+    apply();
+    changed();
+  });
+
+  $("caption").addEventListener("input", () => {
+    S.caption = $("caption").value;
+    changed();
+  });
+
+  for (const id of ["width", "previewWidth"]) {
+    $(id).max = META.limits.max_width;
+    $(id).addEventListener("input", () => {
+      const v = Number($(id).value);
+      if (!Number.isFinite(v) || v < 64) return; // mid-typing; wait for a usable number
+      S[id] = Math.round(v);
+      $(id + "Out").textContent = S[id] + " px";
+      if (id === "width") { writeHash(); exports(); } else changed();
+    });
+  }
+
+  $("again").addEventListener("click", () => render(true));
+  $("copyLink").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(location.href);
+      flash($("copyLink"), "Copied");
+    } catch {
+      flash($("copyLink"), "Copy the address bar");
+    }
+  });
+}
+
+// Push the whole state into the widgets. Called after anything that can change
+// more than the control the user touched -- a preset filling the bbox field, a
+// style changing the default ground.
+function apply() {
+  for (const el of document.querySelectorAll("#styles .pick")) {
+    const on = el.dataset.style === S.style;
+    el.classList.toggle("on", on);
+    el.querySelector("input").checked = on;
+  }
+  for (const el of document.querySelectorAll("#formats .pick")) {
+    const on = el.dataset.format === S.format;
+    el.classList.toggle("on", on);
+    el.querySelector("input").checked = on;
+  }
+  $("preset").value = S.area;
+  $("bbox").value = S.bbox;
+  for (const k of KNOBS) {
+    $("k-" + k.key).value = S[k.key];
+    $("out-" + k.key).textContent = trim(S[k.key]);
+  }
+  $("background").value = S.background || styleSpec().background;
+  $("groundReset").hidden = !S.background;
+  $("caption").value = S.caption;
+  $("width").value = S.width;
+  $("previewWidth").value = S.previewWidth;
+  $("widthOut").textContent = S.width + " px";
+  $("previewWidthOut").textContent = S.previewWidth + " px";
+  writeHash();
+  exports();
+}
+
+function changed() {
+  writeHash();
+  exports();
+  $("busy").hidden = false;
+  clearTimeout(timer);
+  timer = setTimeout(() => render(), DEBOUNCE_MS);
+}
+
+const styleSpec = () => META.styles.find((st) => st.name === S.style) || META.styles[0];
+
+/* ---------- requests ---------- */
+
+// One builder for the preview and both downloads, so what the page shows is
+// what it exports apart from the size.
+function query({ width, scale, format, download }) {
+  const p = new URLSearchParams();
+  if (S.area) p.set("area", S.area); else p.set("bbox", S.bbox);
+  p.set("style", S.style);
+  p.set("format", format);
+  p.set("width", String(Math.round(width)));
+  if (format === "png" && scale !== 1) p.set("scale", trim(scale));
+  p.set("hue", trim(S.hue));
+  p.set("line_scale", trim(S.line_scale));
+  p.set("alpha_scale", trim(S.alpha_scale));
+  if (S.caption) p.set("caption", S.caption);
+  if (S.background) p.set("background", S.background);
+  let q = p.toString();
+  if (download) q += "&download"; // a valueless flag, which URLSearchParams cannot write
+  return "/art?" + q;
+}
+
+async function render(force) {
+  clearTimeout(timer);
+  if (!META || !META.enabled) return;
+
+  // Supersede rather than queue: the server allows four waiting renders and a
+  // dragged slider would fill that with pictures nobody will look at.
+  if (controller) controller.abort();
+  const mine = new AbortController();
+  controller = mine;
+
+  const url = query({
+    width: S.previewWidth,
+    scale: 1, // see KNOBS: scale is resolution only, so the preview never pays for it
+    format: S.format,
+    download: false,
+  });
+
+  $("busy").hidden = false;
+  $("frame").classList.add("pending");
+  try {
+    const res = await fetch(url, {
+      signal: mine.signal,
+      cache: force ? "reload" : "default",
+    });
+    if (!res.ok) {
+      showError(await reason(res), res);
+      return;
+    }
+    const blob = await res.blob();
+    if (mine.signal.aborted) return;
+    show(blob, res);
+  } catch (err) {
+    if (err.name === "AbortError") return; // a newer render took over
+    showError(`cannot reach the server: ${err.message || err}`);
+  } finally {
+    if (controller === mine) {
+      controller = null;
+      $("busy").hidden = true;
+      $("frame").classList.remove("pending");
+    }
+  }
+}
+
+// Errors from /art are always JSON with a message written to be read, so it is
+// shown verbatim. A broken-image icon with the reason in devtools is the whole
+// failure mode this avoids.
+async function reason(res) {
+  let detail = "";
+  try {
+    detail = (await res.json()).error || "";
+  } catch {
+    detail = res.statusText;
+  }
+  const retry = res.headers.get("Retry-After");
+  return detail + (retry ? ` Try again in ${retry}s.` : "");
+}
+
+function show(blob, res) {
+  const next = URL.createObjectURL(blob);
+  const img = $("shot");
+  // The previous URL is revoked only once the new image has decoded; revoking
+  // it earlier can blank the picture we are trying to keep on screen.
+  img.onload = () => {
+    if (objectURL) URL.revokeObjectURL(objectURL);
+    objectURL = next;
+    $("stat").innerHTML =
+      `<b>${img.naturalWidth}</b> × <b>${img.naturalHeight}</b> px · ` +
+      `<b>${bytes(blob.size)}</b> · drawn in <b>${serverMs(res)}</b>`;
+  };
+  img.src = next;
+  img.hidden = false;
+  $("empty").hidden = true;
+  $("err").hidden = true;
+
+  const warning = res.headers.get("X-Wayfare-Warning");
+  $("warn").hidden = !warning;
+  if (warning) $("warn").innerHTML = `<b>Note.</b> ${escapeHtml(warning)}`;
+}
+
+function showError(detail, res) {
+  const status = res ? `${res.status} — ` : "";
+  $("err").hidden = false;
+  $("err").innerHTML =
+    `<span class="what">${escapeHtml(status)}</span>${escapeHtml(detail)}`;
+  // The last good picture stays up: it is usually the thing being compared
+  // against, and blanking it loses more than the error explains.
+  if ($("shot").hidden) {
+    $("empty").hidden = false;
+    $("empty").textContent = "Nothing drawn yet.";
+  }
+}
+
+function serverMs(res) {
+  const m = /render;dur=([\d.]+)/.exec(res.headers.get("Server-Timing") || "");
+  if (!m) return "—"; // a 304 served from the browser cache never reached cairo
+  const ms = Number(m[1]);
+  if (ms >= 1000) return (ms / 1000).toFixed(1) + " s";
+  // An empty window really does take under a millisecond, and "0 ms" reads as a
+  // missing measurement rather than a fast one.
+  return ms < 1 ? "under 1 ms" : Math.round(ms) + " ms";
+}
+
+/* ---------- exports ---------- */
+
+// The server rejects anything over its pixel budget, and a rejected download is
+// a wasted wait, so the same arithmetic runs here first.
+function exports() {
+  const b = bounds();
+  const png = query({ width: S.width, scale: S.scale, format: "png", download: true });
+  const svg = query({ width: S.width, scale: 1, format: "svg", download: true });
+  $("dlPng").href = png;
+  $("dlSvg").href = svg;
+
+  if (!b) {
+    $("exportSize").textContent = "Window not understood, so the size is unknown.";
+    return;
+  }
+  const h = canvasHeight(b, S.width);
+  const px = S.width * h * S.scale * S.scale;
+  // The server bounds SVG by the same budget, at 1x, because the check runs
+  // before the format decides what a pixel is.
+  const svgPx = S.width * h;
+  const limit = META.limits.max_pixels;
+  $("dlPng").setAttribute("aria-disabled", String(px > limit));
+  $("dlSvg").setAttribute("aria-disabled", String(svgPx > limit));
+  const over = Math.min(px, svgPx) > limit ? "both" : px > limit ? "png" : "";
+  $("exportSize").innerHTML = over
+    ? `<span style="color:var(--accent)">
+         <b>${Math.round(S.width * S.scale)}</b> × <b>${Math.round(h * S.scale)}</b> px is
+         <b>${(px / 1e6).toFixed(0)}</b> MP, over this server's
+         ${(limit / 1e6).toFixed(0)} MP limit. Lower the
+         ${over === "both" ? "export width" : "export width or the scale"}.</span>`
+    : `PNG <b>${Math.round(S.width * S.scale)}</b> × <b>${Math.round(h * S.scale)}</b> px · ` +
+      `<b>${(px / 1e6).toFixed(1)}</b> MP. SVG is vector, at ` +
+      `<b>${S.width}</b> × <b>${h}</b>.`;
+}
+
+/* ---------- geometry ---------- */
+
+const MERC_MAX_LAT = 85.05112878;
+
+function mercY(lat) {
+  const phi = clamp(lat, -MERC_MAX_LAT, MERC_MAX_LAT) * Math.PI / 180;
+  return Math.log(Math.tan(Math.PI / 4 + phi / 2));
+}
+
+// art.Projection.canvas_height, so the megapixel estimate matches the server's.
+function canvasHeight(b, width) {
+  const dx = (b[2] - b[0]) * Math.PI / 180;
+  const dy = mercY(b[3]) - mercY(b[1]);
+  if (!(dx > 0) || !(dy > 0)) return 1;
+  return Math.max(1, Math.round(width * dy / dx));
+}
+
+function bounds() {
+  if (S.area) return META.presets[S.area] || null;
+  const parts = S.bbox.split(",").map((p) => Number(p.trim()));
+  if (parts.length !== 4 || parts.some((n) => !Number.isFinite(n))) return null;
+  return parts;
+}
+
+/* ---------- helpers ---------- */
+
+const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+const trim = (v) => String(Number(Number(v).toFixed(4)));
+const fmtBbox = (b) => b.map((n) => trim(n)).join(",");
+const label = (n) => n.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+
+function bytes(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(0) + " KB";
+  return (n / 1024 / 1024).toFixed(1) + " MB";
+}
+
+function flash(el, text) {
+  const was = el.textContent;
+  el.textContent = text;
+  setTimeout(() => { el.textContent = was; }, 1200);
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
+  );
+}
+</script>
+</body>
+</html>

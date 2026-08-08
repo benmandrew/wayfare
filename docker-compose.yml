@@ -39,6 +39,7 @@ x-wayfare: &wayfare
     WAYFARE_REGION: ${WAYFARE_REGION:-all}
     WAYFARE_MEM: ${WAYFARE_MEM:-8GB}
     WAYFARE_WORKERS: ${WAYFARE_WORKERS:-6}
+    WAYFARE_ART: ${WAYFARE_ART:-on}
   entrypoint: ["wayfare"]
 
 services:
@@ -105,13 +106,19 @@ services:
     # that restarts on success would relaunch it forever against an empty queue.
     restart: on-failure
 
-  # Serves the viewer. PMTiles needs HTTP range requests, which this handles and
-  # `python -m http.server` does not.
+  # Serves the viewer, the tile archives and /art. PMTiles needs HTTP range
+  # requests, which this handles and `python -m http.server` does not.
+  #
+  # /art renders against the database in the data volume, which is the point of
+  # running it here: the server has already done the expensive half, so iterating on
+  # a design is a query string rather than a 40 GB copy to a laptop. It opens the
+  # database read-only for the length of one render and closes it again, so it never
+  # holds the lock a pipeline stage needs. Set WAYFARE_ART=off to switch the endpoint
+  # off -- worth doing if this port is exposed beyond a tailnet, since a render is the
+  # one request here that costs real CPU.
   web:
     <<: *wayfare
-    entrypoint:
-      ["python3", "scripts/serve.py", "--dir", "web", "--out", "/data/out", "--port", "8099"]
-    command: []
+    command: ["serve", "--dir", "web", "--out", "/data/out", "--port", "8099"]
     ports:
       - "${WEB_PORT:-8099}:8099"
     depends_on: []

@@ -136,6 +136,17 @@ DETAIL_ZOOM = 11
 # count in `n`, so the viewer says so rather than quietly showing a short list.
 MAX_REFS_IN_TILE = 64
 
+# --- Serving ---------------------------------------------------------------
+
+# Whether `wayfare serve` answers /art. On by default: rendering where the data
+# already is the reason the endpoint exists. Set WAYFARE_ART=off on a deployment
+# whose port is reachable by people you would not hand a CPU to -- serving tiles is
+# reading bytes off disk, and a render is not.
+#
+# An environment variable as well as the `--no-art` flag because Compose cannot
+# conditionally omit an argument, and an empty string is an argument.
+ART_ENABLED = os.environ.get("WAYFARE_ART", "on").lower() not in ("off", "0", "false")
+
 
 def ensure_dirs() -> None:
     for d in (RAW, WORK, OUT):

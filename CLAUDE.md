@@ -118,6 +118,19 @@ compacted. Migration runs on connect and rewrites in place, because a national
 match run costs a day or two and a schema change it cannot survive is one nobody
 applies.
 
+**Serving is `wayfare serve`, in the package, not a script.** `server.py` answers
+three things on one port: the static viewer, the PMTiles archives with byte ranges,
+and `GET /art`. It moved out of `scripts/serve.py` when it gained the render
+endpoint — serving bytes off disk is fine unchecked, taking parameters from a URL
+and running cairo is not, and pyproject puts only `wayfare` under mypy and ruff.
+`scripts/serve.py` is a deprecated shim so a deployed compose file keeps working.
+
+**`/art` exists because the data is on the server and the design work is not.**
+Every expensive stage runs where the disk is, so iterating on a style used to mean
+copying tens of gigabytes to a laptop or editing a style and watching a deploy.
+`art.render_bytes` is the same `_render` as the file path with a `BytesIO` for a
+sink, deliberately — there is no second drawing path to diverge.
+
 ## Constraints
 
 **The match stage must survive interruption.** It runs for days on a server that
@@ -244,6 +257,31 @@ makes the list cheap. Card-only attributes are confined to z11+. Bucketing `trip
 to a log scale was tried and rejected: it saves a further 2.1%, because MVT
 already pools the 1,759 distinct values, and costs an approximate figure in the
 info card.
+
+**The render server never holds the database open.** DuckDB gives a writer an
+exclusive lock on the file, so one read-only handle kept alive by a viewer nobody is
+looking at would stop the next `match` or `aggregate` from starting. `/art` opens
+read-only for the length of one render and closes it, and reports a held lock as 503
+with the reason rather than a traceback. Never cache the connection to save the
+open — the open is metadata, the lock is the pipeline.
+
+**Renders are serialised, and the cap is pixels, not width.** One at a time because
+a render is CPU-bound cairo over a full scan of `edges` and the same box is usually
+also matching; two would not finish either sooner. The bound is `width` x derived
+height x `scale`², because the window's aspect ratio sets the height and `scale`
+multiplies both — `width=4000&scale=4` over a tall window is 200 megapixels and
+looks modest. Past `QUEUE_LIMIT` waiters the answer is 503, since a studio page
+re-rendering on every slider move would otherwise queue renders nobody will look at.
+
+**There is still no spatial index on `edges`.** A national window therefore reads
+the whole table, over HTTP as much as on the command line. The pixel cap does
+nothing about that; the serialisation and the queue limit are the only protection.
+
+**Every `/art` error is JSON, and the message is the interface.** `send_error`
+writes an HTML page, which an `<img>` renders as a broken-image icon with the reason
+nowhere anyone can see it. A lat,lon-swapped window is the case that cannot raise —
+it is a legal window that draws nothing — so it comes back 200 with
+`X-Wayfare-Warning`, which is the CLI's log line put somewhere a browser can read.
 
 ## Standards
 

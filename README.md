@@ -8,7 +8,8 @@ result: every road segment carries the list of services that use it.
 
 Two artefacts come out. The first is a *PMTiles* archive — a single-file archive of map
 tiles — behind an interactive map, where hovering a road lists the service numbers on
-it. The second is print-resolution art of a chosen area with its routes overlaid.
+it. The second is print-resolution art of a chosen area with its routes overlaid, drawn
+to a file from the command line or served on demand over HTTP.
 
 ## Why matching is the primary path
 
@@ -37,8 +38,10 @@ Each stage reads what the last one wrote, and each re-runs on its own.
 - **art** (`art.py`). A bounding box or named preset to PNG or SVG, in one of three
   styles: `density`, `spectrum` or `strands`.
 
-`cli.py` fronts all six, plus `status`, `prune` and `all`. The viewer is `web/index.html`,
-one self-contained page.
+`cli.py` fronts all six, plus `serve`, `status`, `prune` and `all`. `serve`
+(`server.py`) answers the viewer, the archives and `GET /art`, which renders a window on
+demand instead of only to a file. Two self-contained pages sit in `web/`: the viewer
+`index.html`, and `art.html`, a studio for iterating on a render's design.
 
 ## Quick start
 
@@ -65,7 +68,7 @@ On a server, through Docker Compose:
 ```console
 $ docker compose up -d valhalla     # first run builds the graph
 $ docker compose run --rm pipeline  # acquire -> patterns -> match -> aggregate -> publish
-$ docker compose up -d web          # viewer on :8099
+$ docker compose up -d web          # viewer and renderer on :8099
 ```
 
 That pulls the published `benmandrew/wayfare:latest` rather than building, so a server
@@ -90,4 +93,4 @@ lives in a single DuckDB file under `WAYFARE_DATA`.
 
 - `CLAUDE.md` — architecture, measured results, and the facts worth not rediscovering.
 - `PLAN.md` — roadmap, regions in progress, known gaps.
-- `web/README.md` — serving the viewer and hosting the archive.
+- `web/README.md` — serving the viewer, hosting the archive, and rendering over HTTP.

@@ -67,6 +67,27 @@ that are new.
   a collision rather than merging two patterns.
 - `tests/test_incremental.py` is new; 109 -> 123 tests.
 
+## Done — rendering on the server
+
+Added 2026-08-08. Detail in CLAUDE.md. Iterating on a style no longer means having
+the data on the machine doing the iterating.
+
+- **`GET /art`** renders a window in a style with its knobs as query parameters, and
+  answers PNG or SVG. `GET /art/meta` reports the styles, presets, defaults and
+  limits, so the UI is built from the server rather than compiled against it.
+- **`web/art.html`** is a studio page: sliders, live preview at a cheap width,
+  separate export width, and the whole parameter set in the URL hash.
+- **Serving moved into the package** as `wayfare serve`, so the endpoint is under
+  mypy and the test suite. `scripts/serve.py` is a shim.
+- **`art.render_bytes`** shares `_render` with the file path; a `BytesIO` for a sink
+  is the only difference.
+- Bounded: one render at a time, 64 megapixels, a queue limit, and the database
+  opened read-only for one render so the pipeline's write lock is never blocked.
+  `WAYFARE_ART=off` switches the endpoint off entirely.
+
+Not done: `edges` still has no spatial index, so a national window reads the whole
+table however it is asked for. Measured only against Wales-scale data.
+
 ## In progress — Greater London
 
 Running in a separate data root (`data-london`) against its own Valhalla instance
