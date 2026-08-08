@@ -4,8 +4,19 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Wayfare — UK bus routes on the road network</title>
-<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+<link rel="stylesheet" href="vendor/maplibre-gl.css">
 <style>
+/* Visible to a screen reader, not on screen. The search input is identified only
+   by its placeholder otherwise, and a placeholder is not an accessible name. */
+.sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
 :root {
   --bg:        #ffffff;
   --panel:     rgba(255,255,255,.94);
@@ -152,7 +163,7 @@ a.btn { text-decoration: none; }
 </head>
 <body>
 
-<div id="map"></div>
+<div id="map" role="application" aria-label="Map of UK bus services by road segment"></div>
 
 <div class="stack stack--tl">
   <div class="panel">
@@ -161,18 +172,24 @@ a.btn { text-decoration: none; }
         <h1>Wayfare</h1>
         <div class="sub" id="sub">UK bus services by road segment</div>
       </div>
-      <select class="btn" id="region" title="Which region to show" hidden></select>
+      <select class="btn" id="region" title="Which region to show" aria-label="Which region to show" hidden></select>
       <a class="btn" href="art.html" title="Draw the network as a picture">Art</a>
-      <button class="btn" id="theme" title="Toggle light/dark">Dark</button>
-      <button class="btn" id="helpBtn" title="What am I looking at?">?</button>
+      <button class="btn" id="theme" title="Toggle light/dark" aria-label="Toggle light or dark theme">Dark</button>
+      <button class="btn" id="helpBtn" title="What am I looking at?" aria-label="What am I looking at?" aria-expanded="false" aria-controls="help">?</button>
     </div>
     <div class="search">
-      <input id="q" type="search" placeholder="Filter by bus number, e.g. 42, X57" autocomplete="off" spellcheck="false">
-      <div class="hint" id="hint">Press <b>/</b> to search.</div>
+      <label class="sr-only" for="q">Filter by bus number</label>
+      <input id="q" type="search" placeholder="Filter by bus number, e.g. 42, X57" autocomplete="off" spellcheck="false" aria-describedby="hint">
+      <!-- The match count is written here as you type, so it has to be announced
+           rather than merely updated. Polite: it should not interrupt a keystroke. -->
+      <div class="hint" id="hint" role="status" aria-live="polite">Press <b>/</b> to search.</div>
     </div>
     <div class="help" id="help" hidden>
       <p>Each line is a road segment — a stretch of road between two junctions. Colour and thickness both show <b>how many distinct bus services</b> use it, so trunk corridors stand out from the tail.</p>
       <p>Hover a segment for its service list. Filtering matches whole bus numbers, so <code>4</code> will not match <code>42</code>.</p>
+      <p>Zoomed out, the map thins the densest areas to keep tiles small, so a
+         quiet-looking city is not necessarily a city without buses. Zoom in for
+         the complete picture.</p>
     </div>
   </div>
 
@@ -198,8 +215,12 @@ a.btn { text-decoration: none; }
   </div>
 </div>
 
-<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
-<script src="https://unpkg.com/pmtiles@4.4.1/dist/pmtiles.js"></script>
+<!-- Vendored rather than pulled from a CDN: this page is usually served on a
+     private network, where a public CDN is both a hard dependency the rest of
+     the deployment does not have and the one thing that would take the map down
+     while every byte it actually renders sat on disk. See web/vendor/README.md. -->
+<script src="vendor/maplibre-gl.js"></script>
+<script src="vendor/pmtiles.js"></script>
 <script>
 "use strict";
 
@@ -534,7 +555,19 @@ function start(header) {
       : `${label} — nothing in view. Try zooming out.`;
   }
 
-  input.addEventListener("input", applyFilter);
+  // setFilter re-evaluates the expression across everything rendered and
+  // countMatches then walks the whole viewport again, so running both per
+  // keystroke made typing "X26" three full passes over central London. Collapsing
+  // a burst into one pass is invisible to a person at this delay and much
+  // cheaper. Escape still calls applyFilter directly, so clearing stays instant.
+  const debounce = (fn, ms) => {
+    let timer;
+    return (...args) => {
+      clearTimeout(timer);
+      timer = setTimeout(() => fn(...args), ms);
+    };
+  };
+  input.addEventListener("input", debounce(applyFilter, 120));
   map.on("idle", countMatches);
   addEventListener("keydown", (e) => {
     if (e.key === "/" && document.activeElement !== input) {
@@ -608,7 +641,9 @@ function start(header) {
   }
 
   $("helpBtn").addEventListener("click", () => {
-    $("help").hidden = !$("help").hidden;
+    const open = $("help").hidden;
+    $("help").hidden = !open;
+    $("helpBtn").setAttribute("aria-expanded", String(open));
   });
 }
 
