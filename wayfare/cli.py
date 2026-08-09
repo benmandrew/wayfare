@@ -71,8 +71,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--retry",
         default=None,
-        help="comma-separated statuses to forget and redo, e.g. "
-        "low_confidence,error -- use after fixing the matcher itself",
+        help="comma-separated statuses to forget and redo. `transient` is the "
+        "alias for the ones that are safe unattended (transport_error: the "
+        "request never reached Valhalla). A literal status such as "
+        "low_confidence or error is for after fixing the matcher itself",
+    )
+    p.add_argument(
+        "--reclassify-transport",
+        action="store_true",
+        help="one-off repair for a database matched before transport faults had "
+        "their own status: move the `error` rows that were connection failures to "
+        "transport_error. Combine with --retry transient to redo them",
     )
 
     sub.add_parser("aggregate", help="invert to edge -> services")
@@ -202,6 +211,11 @@ def _dispatch(args: argparse.Namespace) -> int:
 
         con = db.connect()
         client = valhalla.Client(args.valhalla)
+        # Both of these rewrite match_status, and both must land before the first
+        # batch is loaded: work is selected by the absence of a row, so a row
+        # deleted while its pattern is in flight is handed out twice.
+        if args.reclassify_transport:
+            match.reclassify_transport_faults(con)
         if args.retry:
             match.retry(con, [s.strip() for s in args.retry.split(",") if s.strip()])
         match.run(

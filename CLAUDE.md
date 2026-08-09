@@ -64,7 +64,10 @@ cache misses.
 
 **`match_status` is a permanent cache, and failures are recorded rather than
 retried.** Every outcome gets a row, including `no_route`, `error` and `skipped`. A
-matcher that retries the impossible never finishes.
+matcher that retries the impossible never finishes — which needs "failed" to mean
+"impossible": a refused connection is `transport_error`, the one retryable status,
+and Valhalla's `error_code` rather than its English is what tells a no-path apart
+from a fault.
 
 **A batch is both the unit of concurrency and the unit of checkpointing.** Work is
 selected by the *absence* of a `match_status` row, so a batch still in flight is still
@@ -130,7 +133,7 @@ are never retried, but their edges are dropped.
 
 **Great Britain is complete end to end**, on the server, feed `20260807_022616`: 52,554
 patterns, 95.9% matched, 2,746,261 edges, 130 MB PMTiles. Wales and Greater London were
-the two rehearsals for it and both stand. 511 tests pass, ruff and mypy clean.
+the two rehearsals for it and both stand. 536 tests pass, ruff and mypy clean.
 
 **The Republic of Ireland runs as far as `patterns` and no further.** Feed
 `20260808_b375dfac`, 2,853 patterns, 100% operator geometry; figures in

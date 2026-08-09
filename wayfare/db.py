@@ -91,7 +91,10 @@ CREATE TABLE IF NOT EXISTS shapes (
 -- patterns with no row here, so killing the process loses at most one batch.
 CREATE TABLE IF NOT EXISTS match_status (
     pattern_id  BIGINT PRIMARY KEY,
-    status      VARCHAR,   -- ok | low_confidence | no_route | error | skipped
+    -- ok | low_confidence | no_route | error | skipped | transport_error.
+    -- All permanent but the last: transport_error means the request never got an
+    -- answer, so nothing was learned about the pattern and it is safe to redo.
+    status      VARCHAR,
     source      VARCHAR,   -- shape | stops
     confidence  DOUBLE,
     road_m      DOUBLE,
