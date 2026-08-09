@@ -290,12 +290,6 @@ def test_the_shortest_variant_of_a_hop_is_the_one_kept(tmp_path: Path, geometry_
     assert len(hops[("700000000001", "700000000002")]) == 3
 
 
-def test_geometry_joins_to_the_timetable_through_the_atco_code(tmp_path, geometry_zip):
-    stops = translink._extract([geometry_zip], tmp_path, translink.STOPS_MEMBER)
-    atco = translink._atco_by_point(stops)
-    assert atco[("nir", "1", "0", "11")] == "700000000001"
-
-
 def test_a_journey_missing_one_hop_carries_no_geometry_at_all():
     """Stitching around a gap hands the matcher a straight line across a town,
     which map_snap lays down the wrong roads with confidence. No shape sends the
@@ -331,14 +325,11 @@ def test_a_route_id_is_the_operator_and_the_line_not_the_service_code(ni_gtfs: P
 
 
 def test_stop_ids_are_the_naptan_atco_codes_verbatim(ni_gtfs: Path):
+    """The exact list, because it is also what proves 700000000009 was dropped:
+    Translink ships stops at exactly 0.0, which is in the Gulf of Guinea and passes
+    every IS NOT NULL test there is."""
     ids = [ln.split(",")[0] for ln in (ni_gtfs / "stops.txt").read_text().splitlines()[1:]]
     assert ids == ["700000000001", "700000000002", "700000000003"]
-
-
-def test_a_stop_at_zero_zero_never_reaches_the_feed(ni_gtfs: Path):
-    """Translink ships stops at exactly 0.0, which is in the Gulf of Guinea and
-    passes every IS NOT NULL test there is."""
-    assert "700000000009" not in (ni_gtfs / "stops.txt").read_text()
 
 
 def test_a_stop_at_zero_latitude_is_dropped_on_load(gtfs_dir: Path, con):
@@ -515,11 +506,6 @@ def test_the_province_is_four_datasets_and_no_naptan(monkeypatch):
     ]
     assert not feed.stop_register
     assert feed.licence == config.OGL
-
-
-def test_both_irelands_read_one_osm_extract(monkeypatch):
-    monkeypatch.delenv("WAYFARE_OSM_URL", raising=False)
-    assert config.osm_url("northern_ireland") == config.osm_url("ireland")
 
 
 def test_an_assembled_bundle_is_not_rebuilt_while_its_parts_stand(

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import zipfile
 from pathlib import Path
 
 import pytest
@@ -139,15 +138,6 @@ def gtfs_dir(tmp_path: Path) -> Path:
     for name, body in MINI.items():
         (d / name).write_text(body)
     return d
-
-
-@pytest.fixture
-def gtfs_zip(gtfs_dir: Path, tmp_path: Path) -> Path:
-    z = tmp_path / "feed.zip"
-    with zipfile.ZipFile(z, "w") as zf:
-        for f in sorted(gtfs_dir.iterdir()):
-            zf.write(f, f.name)
-    return z
 
 
 @pytest.fixture

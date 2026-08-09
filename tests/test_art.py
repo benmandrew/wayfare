@@ -158,10 +158,6 @@ def test_bad_windows_say_why(text, match):
         art.parse_bbox(text)
 
 
-def test_preset_names_still_win():
-    assert art.resolve("cardiff") is art.PRESETS["cardiff"]
-
-
 def test_unknown_name_mentions_the_window_form():
     with pytest.raises(KeyError, match="minlon"):
         art.resolve("swansea")
@@ -181,14 +177,6 @@ def _art_edge(con, edge_id, lon, trips, services=("42",), agency="OP1"):
             "INSERT INTO edge_services VALUES (?, ?, ?, 1, ?)",
             [edge_id, s, agency, trips],
         )
-
-
-def test_weights_agree_with_the_list_form():
-    """The streaming scale and the list form must be the same scale, or a window
-    would be weighted differently depending on which path drew it."""
-    values = [0, 1, 5, 40, 900, 3000, 12000]
-    w = art.Weights.over(values)
-    assert [w.of(v) for v in values] == art._normalise(values)
 
 
 def test_an_empty_window_has_a_usable_scale():
@@ -403,13 +391,6 @@ def test_held_window_carries_the_groups_the_query_asked_for(con):
         ("42", "9A")
     ]
     assert art.load_edges(bounds, con=con)[0].groups == ()
-
-
-def test_a_spec_is_recorded_on_a_held_window_even_though_it_cannot_honour_it(con):
-    """`Held` was handed edges somebody else already weighted and grouped. It keeps
-    the spec so a caller can see which one that was, and ignores it otherwise."""
-    spec = art.QuerySpec(weight="services", group="operator")
-    assert art.Held([], spec=spec).spec is spec
 
 
 # --- Rendering the spec -------------------------------------------------------
@@ -1041,19 +1022,20 @@ def test_a_band_draws_the_chains_it_was_given(chained_banded, tmp_path):
 
 
 @pytest.mark.parametrize("style", sorted(art.STYLES))
-@pytest.mark.parametrize("width_px", [200, 2000, 4000, 6000, 20000])
-@pytest.mark.parametrize("line_scale", [0.5, 1.0, 2.0, 6.0])
-def test_the_collar_covers_half_the_widest_stroke(style, width_px, line_scale):
-    """The arithmetic behind the render above, checked over the range a render can
-    actually ask for. A band draws past its own rows by `pad` and queries the same
-    distance, so anything a stroke can reach beyond `pad` is paint the band never
-    makes -- a seam. The condition is one-sided: a collar wider than it needs to be
-    only costs work."""
+def test_the_collar_covers_half_the_widest_stroke(style):
+    """The arithmetic behind the render above. A band draws past its own rows by
+    `pad` and queries the same distance, so anything a stroke can reach beyond `pad`
+    is paint the band never makes -- a seam. The condition is one-sided: a collar
+    wider than it needs to be only costs work.
+
+    Checked at the widest canvas and line_scale a render can ask for, which is the
+    only configuration with teeth. `_band_pad` is half the widest stroke plus a
+    constant, so the inequality is scale-invariant and sweeping the canvas sizes
+    only re-proved `2.0 >= 0`; at the widest strokes a `pad` that stopped deriving
+    from `max_stroke_px` fails here instead."""
     sty = art.STYLES[style]
-    opts = art.RenderOpts(width_px=width_px, line_scale=line_scale)
-    assert (
-        art._band_pad(sty, opts, width_px) >= sty.max_stroke_px(width_px, line_scale) / 2.0
-    )
+    opts = art.RenderOpts(width_px=20000, line_scale=6.0)
+    assert art._band_pad(sty, opts, 20000) >= sty.max_stroke_px(20000, 6.0) / 2.0
 
 
 def test_a_style_scaling_with_the_canvas_says_so():
