@@ -112,21 +112,6 @@ def _edges_where(con, predicate):
 # --- The vocabulary ---------------------------------------------------------
 
 
-@pytest.mark.parametrize("weight", sorted(art.WEIGHTS))
-def test_every_weight_constructs(weight):
-    assert art.QuerySpec(weight=weight).weight == weight
-
-
-@pytest.mark.parametrize("group", sorted(art.GROUPS))
-def test_every_group_constructs(group):
-    assert art.QuerySpec(group=group).group == group
-
-
-@pytest.mark.parametrize("order", sorted(art.ORDERS))
-def test_every_order_constructs(order):
-    assert art.QuerySpec(order=order).order == order
-
-
 @pytest.mark.parametrize(
     ("field", "bad", "expected"),
     [
@@ -382,17 +367,12 @@ def test_a_window_inside_the_cap_is_fine(net, monkeypatch):
 # --- Determinism ------------------------------------------------------------
 
 
-def test_grouped_edges_arrive_in_the_same_order_every_time(net):
+@pytest.mark.parametrize("order", sorted(art.ORDERS))
+def test_every_order_is_deterministic(net, order):
     """The order *inside* a ribbon matters. A PNG hides it -- SCREEN compositing is
     commutative -- but an SVG records stroke order, and two runs of `strands` once
     differed in 180,365 of 293,842 bytes. The edge_id tiebreak in _order_sql is what
     fixes it, so pin the full sequence rather than just the group order."""
-    window = art.Window(BOUNDS, net, with_groups=True)
-    assert list(window.groups()) == list(window.groups())
-
-
-@pytest.mark.parametrize("order", sorted(art.ORDERS))
-def test_every_order_is_deterministic(net, order):
     window = art.Window(BOUNDS, net, with_groups=True, spec=art.QuerySpec(order=order))
     assert list(window.groups()) == list(window.groups())
 

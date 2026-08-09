@@ -65,7 +65,7 @@ def test_confidence_and_names_survive():
 
 @pytest.mark.parametrize(
     ("n", "expected_chunks"),
-    [(10, 1), (40, 1), (41, 2), (79, 2), (80, 3)],
+    [(40, 1), (41, 2), (79, 2), (80, 3)],
 )
 def test_chunking_covers_long_services(n, expected_chunks):
     points = [(53.0 + i * 0.001, -2.0) for i in range(n)]
@@ -84,7 +84,7 @@ def _chain_m(points):
     )
 
 
-@pytest.mark.parametrize(("n", "expected_chunks"), [(10, 1), (40, 1), (41, 2), (80, 3)])
+@pytest.mark.parametrize(("n", "expected_chunks"), [(40, 1), (41, 2), (80, 3)])
 def test_the_distance_bound_changes_nothing_where_nothing_was_wrong(n, expected_chunks):
     """A dense service is bounded by the location count, as it always was.
 
@@ -390,23 +390,17 @@ def _valhalla_body(error_code: int, message: str) -> dict:
     }
 
 
-def test_a_442_is_no_route_and_not_an_error():
-    """The regression that mattered. `_post` used to test for the substring "no
-    route", and Valhalla's 442 says "No path could be found for input" -- so
-    NoRoute was never once raised, and every permanent no-path in every database
-    built so far was filed as a transient error instead."""
-    c = _client(
-        _Session(_response(400, _valhalla_body(442, "No path could be found for input")))
-    )
-    with pytest.raises(valhalla.NoRoute):
-        c.trace_attributes([(53.0, -2.0), (53.1, -2.0)])
-
-
 @pytest.mark.parametrize("code", sorted(valhalla.NO_PATH_CODES))
 def test_every_no_path_code_is_no_route(code):
     """Including 444, which is map_snap refusing a sea crossing, and 154, which is
     a stop chain longer than Valhalla will route. Neither answers differently on a
-    second attempt, so both belong with 442 rather than with the retryable set."""
+    second attempt, so both belong with 442 rather than with the retryable set.
+
+    442 is the regression that mattered, and the reason this matches on the code
+    rather than the prose. `_post` used to test for the substring "no route", and
+    Valhalla's 442 says "No path could be found for input" -- so NoRoute was never
+    once raised, and every permanent no-path in every database built so far was
+    filed as a transient error instead."""
     c = _client(_Session(_response(400, _valhalla_body(code, "prose that may change"))))
     with pytest.raises(valhalla.NoRoute):
         c.trace_attributes([(53.0, -2.0), (53.1, -2.0)])

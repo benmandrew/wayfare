@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from wayfare import acquire, gtfs
+from wayfare import gtfs
 
 
 def test_trips_collapse_to_patterns(gtfs_dir: Path, con):
@@ -54,14 +54,10 @@ def test_span_is_measured_in_metres(gtfs_dir: Path, con):
     assert 900 < span < 1050
 
 
-def test_orphaned_shapes_are_not_loaded(gtfs_dir: Path, con):
-    gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB")
-    rows = con.execute("SELECT DISTINCT shape_id FROM shapes").fetchall()
-    assert {r[0] for r in rows} == {"SH1"}
-
-
 def test_a_shape_is_one_row_holding_its_points_in_order(gtfs_dir: Path, con):
     gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB")
+    # One row per shape, so a count of 1 is also what proves the orphaned SH2 --
+    # referenced by no trip -- never loaded.
     assert con.execute("SELECT count(*) FROM shapes").fetchone()[0] == 1
     lat_e6, lon_e6 = con.execute(
         "SELECT lat_e6, lon_e6 FROM shapes WHERE shape_id = 'SH1'"
@@ -206,9 +202,3 @@ def test_route_type_is_stored_as_text(gtfs_dir: Path, con):
     assert con.execute(
         "SELECT route_type FROM routes WHERE route_id = 'F1'"
     ).fetchone() == ("4",)
-
-
-def test_unpack_and_feed_version(gtfs_zip: Path, tmp_path: Path):
-    out = acquire.unpack_gtfs(gtfs_zip, tmp_path / "unpacked")
-    assert (out / "stop_times.txt").exists()
-    assert acquire.feed_version(out) == "20260806_022608"

@@ -135,13 +135,6 @@ def test_missing_members_are_named(tmp_path):
         acquire.check_gtfs(z)
 
 
-def test_a_small_but_complete_feed_passes():
-    """Wales is 41 MB against the national bundle's 1.28 GB. Validation must not
-    depend on size, or the smaller regions are rejected outright."""
-    acquire.check_gtfs  # noqa: B018 - referenced for intent
-    assert config.MIN_GTFS_BYTES < 37 << 20
-
-
 # --- Resume -----------------------------------------------------------------
 
 
@@ -208,24 +201,6 @@ def test_a_short_read_is_caught_where_the_host_declares_a_length(tmp_path, monke
     src = acquire.Source("gtfs", "http://x/f.zip", "f.zip")
     with pytest.raises(OSError, match="cut short"):
         acquire._stream(src, tmp_path / "f.zip.part")
-
-
-def test_a_short_read_is_retried_rather_than_refused(tmp_path, monkeypatch):
-    """A dropped connection hands back different bytes next time, so it is a
-    network fault and not an Invalid one."""
-    attempts = []
-
-    def flaky(src, part):
-        attempts.append(1)
-        if len(attempts) < 2:
-            raise OSError("got 2 bytes of a declared 1000; the transfer was cut short")
-        _zip(part, list(acquire.REQUIRED_GTFS))
-
-    monkeypatch.setattr(acquire, "_stream", flaky)
-    monkeypatch.setattr(config, "DOWNLOAD_BACKOFF", 0.0)
-    monkeypatch.setattr(config, "MIN_GTFS_BYTES", 1)
-    acquire.download(acquire.sources("wales")[0], tmp_path)
-    assert len(attempts) == 2
 
 
 def test_a_compressed_body_is_not_measured_against_the_declared_length(

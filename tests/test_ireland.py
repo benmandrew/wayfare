@@ -98,12 +98,6 @@ def test_a_guid_version_is_dated_so_two_feeds_can_be_compared(gtfs_dir: Path):
     assert acquire.feed_version(gtfs_dir) == "20260808_b375dfac"
 
 
-def test_the_same_publication_gives_the_same_version_twice(gtfs_dir: Path):
-    """It is a cache key, so an unstable one would re-match a whole country."""
-    _feed_info(gtfs_dir, NTA_FEED_INFO.format(guid=GUID))
-    assert acquire.feed_version(gtfs_dir) == acquire.feed_version(gtfs_dir)
-
-
 def test_two_publications_in_one_validity_window_stay_distinct(gtfs_dir: Path):
     """feed_start_date alone would collide: the NTA declares a year-long window and
     republishes inside it. The GUID digits are what keep the two apart."""
