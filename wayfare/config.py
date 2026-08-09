@@ -30,8 +30,46 @@ BODS_REGION = os.environ.get("WAYFARE_REGION", "all")
 # sit beside it as GTFS_<Operator>.zip; the index is transitData/PT_Data.html.
 NTA_GTFS_URL = "https://www.transportforireland.ie/transitData/Data/GTFS_All.zip"
 
+# Translink publishes Northern Ireland on OpenDataNI as four datasets and no GTFS.
+# Resource ids and filenames move on every publication, so the datasets are named
+# by slug and resolved through CKAN at fetch time -- see `translink.resource`.
+OPENDATANI_API = "https://admin.opendatani.gov.uk/api/3/action/package_show"
+
 OGL = "Open Government Licence v3.0"
 CC_BY_4 = "Creative Commons Attribution 4.0"
+
+
+@dataclass(frozen=True)
+class Part:
+    """One dataset of a feed nobody publishes whole.
+
+    `kind` is what the assembler does with it, not what it contains: `timetable`
+    is TransXChange, `geometry` is a MapInfo route bundle.
+    """
+
+    name: str
+    dataset: str
+    kind: str
+
+
+# The dataset slugs are historical names that stopped describing their contents
+# years ago -- the "metro timetable valid from 18 June until 31 August 2016" is the
+# live Metro and Glider feed. They are the identity OpenDataNI keeps stable, so
+# they are what is stored. Do not tidy them.
+NI_PARTS = (
+    Part(
+        "timetable_ulsterbus",
+        "ulsterbus-and-goldline-timetable-data-from-08-11-2023",
+        "timetable",
+    ),
+    Part(
+        "timetable_metro",
+        "metro-timetable-data-valid-from-18-june-until-31-august-2016",
+        "timetable",
+    ),
+    Part("routes_ulsterbus", "translink-ulsterbus-routes", "geometry"),
+    Part("routes_metro", "translink-metro-bus-routes", "geometry"),
+)
 
 
 @dataclass(frozen=True)
@@ -55,11 +93,14 @@ class Feed:
     # transfer resumes. Measured against each host, never assumed -- BODS ignores
     # the header, Geofabrik and the NTA honour it.
     resumable: bool = False
+    # The datasets a feed is assembled from, where no single file is the feed.
+    # `url` is empty in that case and `filename` names the bundle acquire builds.
+    parts: tuple[Part, ...] = ()
 
 
 FEEDS = {
-    # `ireland` is the Republic. Northern Ireland has no GTFS at all (see PLAN.md)
-    # and appears only in OSM_EXTRACTS, which is the same file for both.
+    # `ireland` is the Republic; `northern_ireland` is the province, and the two
+    # read the same OSM extract, so they can share a data root.
     "ireland": Feed(
         url=NTA_GTFS_URL,
         filename="nta_gtfs_ireland.zip",
@@ -70,6 +111,20 @@ FEEDS = {
         attribution="National Transport Authority",
         stop_register=False,
         resumable=True,
+    ),
+    "northern_ireland": Feed(
+        # No URL: there is no Northern Irish GTFS to download. `acquire` fetches
+        # the four Translink datasets below and `translink.build_gtfs` assembles
+        # this file out of them.
+        url="",
+        filename="translink_gtfs_northern_ireland.zip",
+        licence=OGL,
+        attribution="Translink, via OpenDataNI",
+        # NaPTAN is GB-only, and the province needs it least of anywhere: every
+        # Translink stop arrives with its ATCO code and its position attached.
+        stop_register=False,
+        resumable=True,
+        parts=NI_PARTS,
     ),
 }
 
@@ -143,6 +198,11 @@ DOWNLOAD_BACKOFF = 30.0  # seconds, multiplied by attempt number
 # the zip and requires the members the pipeline needs. This floor only exists to
 # reject an empty body or an HTML error page cheaply, before that.
 MIN_GTFS_BYTES = 1 << 20
+# The same cheap check for one dataset of an assembled feed. The Translink parts
+# run from 1.9 MB to 25 MB, so this only ever rejects an empty body or an error
+# page; CKAN declares a size and the host sends a Content-Length, which is the
+# real check.
+MIN_PART_BYTES = 1 << 16
 
 # --- Valhalla --------------------------------------------------------------
 

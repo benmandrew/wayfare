@@ -19,7 +19,7 @@ from pathlib import Path
 
 import requests
 
-from . import config, logs
+from . import config, logs, translink
 
 log = logs.get("acquire")
 
@@ -73,19 +73,41 @@ def check_gtfs(path: Path) -> None:
         raise OSError(f"GTFS bundle is missing {', '.join(missing)}")
 
 
+def _part_sources(feed: config.Feed) -> list[Source]:
+    """The datasets an assembled feed is built from.
+
+    This resolves each one through CKAN, so it makes network calls where the rest
+    of `sources` only builds URLs. That is unavoidable and belongs here rather
+    than in `download`: OpenDataNI moves both the resource id and the filename on
+    every publication, so there is no URL to write down.
+    """
+    out = []
+    for part in feed.parts:
+        res = translink.resource(part.dataset)
+        log.info("%s: %s -> %s", part.name, part.dataset, res.filename)
+        out.append(
+            Source(part.name, res.url, res.filename, config.MIN_PART_BYTES, resumable=True)
+        )
+    return out
+
+
 def sources(region: str | None = None, with_osm: bool = False) -> list[Source]:
     region = region or config.BODS_REGION
     feed = config.feed(region)
-    out = [
-        Source(
-            "gtfs",
-            feed.url,
-            feed.filename,
-            config.MIN_GTFS_BYTES,
-            check=check_gtfs,
-            resumable=feed.resumable,
-        )
-    ]
+    out = (
+        _part_sources(feed)
+        if feed.parts
+        else [
+            Source(
+                "gtfs",
+                feed.url,
+                feed.filename,
+                config.MIN_GTFS_BYTES,
+                check=check_gtfs,
+                resumable=feed.resumable,
+            )
+        ]
+    )
     # NaPTAN is the GB stop register, so a region outside GB skips it rather than
     # downloading 102 MB of stops none of its services call at.
     if feed.stop_register:
@@ -282,6 +304,38 @@ def _gb(p: Path) -> float:
     return p.stat().st_size / 1e9
 
 
+def assemble(feed: config.Feed, parts: dict[str, Path], force: bool = False) -> Path:
+    """Build the GTFS bundle for a feed that is published as several datasets.
+
+    The result lands in WORK rather than RAW: RAW is what was fetched, and this is
+    derived from it. It is rebuilt only when one of the parts has changed, because
+    the alternative is a minute of XML on every `patterns` run -- and the manifest
+    is the parts' sizes and timestamps rather than their contents, since re-reading
+    130 MB to decide whether to re-read it saves nothing.
+    """
+    dest = config.WORK / feed.filename
+    manifest_path = dest.with_suffix(dest.suffix + ".manifest")
+    manifest = translink.parts_manifest(parts)
+    if (
+        dest.exists()
+        and not force
+        and manifest_path.exists()
+        and manifest_path.read_text() == manifest
+    ):
+        log.info("gtfs: already assembled at %s", dest)
+        return dest
+
+    kinds = {p.name: p.kind for p in feed.parts}
+    built = translink.build_gtfs(
+        [v for k, v in sorted(parts.items()) if kinds.get(k) == "timetable"],
+        [v for k, v in sorted(parts.items()) if kinds.get(k) == "geometry"],
+        dest,
+    )
+    check_gtfs(built)
+    manifest_path.write_text(manifest)
+    return built
+
+
 def acquire_all(
     region: str | None = None, force: bool = False, with_osm: bool = False
 ) -> dict[str, Path]:
@@ -290,9 +344,17 @@ def acquire_all(
     # Printed every run, cache hit or not. The Republic's feed is CC BY 4.0 where
     # every other source here is OGL, so attribution is a condition of using it and
     # the run that fetches it is the last point at which nobody has yet forgotten.
-    log.info("gtfs: %s, %s (%s)", feed.url, feed.licence, feed.attribution)
+    log.info(
+        "gtfs: %s, %s (%s)",
+        feed.url or " + ".join(p.dataset for p in feed.parts),
+        feed.licence,
+        feed.attribution,
+    )
     out: dict[str, Path] = {}
     for src in sources(region, with_osm=with_osm):
         out[src.name] = download(src, force=force)
+    if feed.parts:
+        names = {p.name for p in feed.parts}
+        out["gtfs"] = assemble(feed, {k: v for k, v in out.items() if k in names}, force)
     out["gtfs_dir"] = unpack_gtfs(out["gtfs"], force=force)
     return out
