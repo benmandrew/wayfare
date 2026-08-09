@@ -607,6 +607,199 @@ def test_the_edge_stream_has_a_defined_order(con):
     assert [e.edge_id for e in w.edges()] == [1, 3, 7, 9]
 
 
+# --- Coalescing ---------------------------------------------------------------
+#
+# Joining runs of edges that meet end to end into one stroke, so a shared node is
+# capped once instead of twice. The tests below are about the chaining rule rather
+# than the picture: which edges end up in the same run, and whether the vertices
+# survive. What the picture then looks like is a judgement, not an assertion.
+
+COALESCE_BOUNDS = art.Bounds(-3.30, 51.40, -3.10, 51.60)
+
+
+def _link(con, edge_id, pts, trips=100, services=("42",), agency="OP1"):
+    """One edge with explicit geometry, so a test can decide what meets what.
+
+    `pts` is (lon_e6, lat_e6) in micro-degrees and in the edge's own direction --
+    which matters here, because chaining follows direction.
+    """
+    lons = [p[0] for p in pts]
+    lats = [p[1] for p in pts]
+    con.execute(
+        "INSERT INTO edges VALUES (?, 1, 'R', 'secondary', 100.0, ?, ?, ?, ?, ?, ?)",
+        [edge_id, lons, lats, min(lons), min(lats), max(lons), max(lats)],
+    )
+    for s in services:
+        con.execute(
+            "INSERT INTO edge_services VALUES (?, ?, ?, 1, ?)",
+            [edge_id, s, agency, trips],
+        )
+
+
+def _runs(con, spec=art.DEFAULT_SPEC):
+    """The window's geometry, coalesced, as lists of canvas points."""
+    proj = art.Projection.fit(COALESCE_BOUNDS, 400, 400)
+    w = art.Window(COALESCE_BOUNDS, con, spec=spec)
+    return [line.points() for _weight, line in w.paths(proj, coalesce=True)]
+
+
+def _plain(con, spec=art.DEFAULT_SPEC):
+    proj = art.Projection.fit(COALESCE_BOUNDS, 400, 400)
+    w = art.Window(COALESCE_BOUNDS, con, spec=spec)
+    return [line.points() for _weight, line in w.paths(proj)]
+
+
+def test_edges_that_meet_end_to_end_become_one_run(con):
+    _link(con, 1, [(-3_200_000, 51_480_000), (-3_190_000, 51_480_000)])
+    _link(con, 2, [(-3_190_000, 51_480_000), (-3_180_000, 51_480_000)])
+    _link(con, 3, [(-3_180_000, 51_480_000), (-3_170_000, 51_480_000)])
+    runs = _runs(con)
+    assert len(runs) == 1
+    # Four vertices, not six: the two shared nodes appear once each. Every vertex
+    # the flat path would draw is still here, in order.
+    assert len(runs[0]) == 4
+    assert runs[0] == sorted(runs[0])
+
+
+def test_a_run_stops_where_three_edges_meet(con):
+    """The trap `publish._chain` already records. A fork has no single continuation,
+    and picking one would draw a line down a road the run does not take."""
+    _link(con, 1, [(-3_200_000, 51_480_000), (-3_190_000, 51_480_000)])
+    _link(con, 2, [(-3_190_000, 51_480_000), (-3_180_000, 51_480_000)])
+    _link(con, 3, [(-3_190_000, 51_480_000), (-3_190_000, 51_490_000)])
+    runs = _runs(con)
+    assert sorted(len(r) for r in runs) == [2, 2, 2]
+
+
+def test_the_two_directions_of_a_street_chain_separately(con):
+    """The reason this chains head to tail where `publish` chains undirected. A
+    two-way street arrives as two coincident edges pointing opposite ways, so an
+    undirected rule sees four edges at every node and joins nothing at all."""
+    a = [(-3_200_000, 51_480_000), (-3_190_000, 51_480_000)]
+    b = [(-3_190_000, 51_480_000), (-3_180_000, 51_480_000)]
+    _link(con, 1, a)
+    _link(con, 2, b)
+    _link(con, 3, list(reversed(b)))
+    _link(con, 4, list(reversed(a)))
+    runs = _runs(con)
+    assert len(runs) == 2
+    assert sorted(len(r) for r in runs) == [3, 3]
+    # And they really are opposite ways round, not the same run twice.
+    assert {r[0] for r in runs} == {r[-1] for r in runs}
+
+
+def test_edges_that_paint_differently_are_never_joined(con):
+    """Width, alpha and saturation all come from the weight, so two edges meeting
+    end to end at different weights are two different shapes. Joining them would
+    change the picture rather than remove a duplicated cap from it."""
+    _link(con, 1, [(-3_200_000, 51_480_000), (-3_190_000, 51_480_000)], trips=100)
+    _link(con, 2, [(-3_190_000, 51_480_000), (-3_180_000, 51_480_000)], trips=900)
+    assert sorted(len(r) for r in _runs(con)) == [2, 2]
+
+
+def test_coalescing_draws_the_same_vertices_as_the_flat_path(con):
+    """The only thing it removes is the duplicated node. Every point the flat path
+    draws is still drawn, so this is not a simplification in disguise."""
+    _link(con, 1, [(-3_200_000, 51_480_000), (-3_195_000, 51_481_000)])
+    _link(con, 2, [(-3_195_000, 51_481_000), (-3_190_000, 51_480_000)])
+    _link(con, 3, [(-3_190_000, 51_480_000), (-3_185_000, 51_482_000)])
+    flat = sorted({p for line in _plain(con) for p in line})
+    runs = _runs(con)
+    assert len(runs) == 1
+    assert sorted(set(runs[0])) == flat
+    assert len(runs[0]) == len(set(runs[0]))  # no vertex repeated at a join
+
+
+def test_a_closed_loop_is_entered_at_its_lowest_edge_id(con):
+    """A ring has no end to start from, so something has to choose. `publish._chain`
+    started wherever the scan happened to be, which made every rebuild differ."""
+    ring = [
+        (-3_200_000, 51_480_000),
+        (-3_190_000, 51_480_000),
+        (-3_190_000, 51_490_000),
+        (-3_200_000, 51_490_000),
+    ]
+    for i in range(4):
+        _link(con, 9 - i, [ring[i], ring[(i + 1) % 4]])
+    runs = _runs(con)
+    assert len(runs) == 1
+    proj = art.Projection.fit(COALESCE_BOUNDS, 400, 400)
+    # Edge 6 is the lowest id, and it runs from the fourth corner back to the first.
+    assert runs[0][0] == proj(ring[3][0] / 1e6, ring[3][1] / 1e6)
+
+
+def test_a_coalesced_render_is_byte_identical_across_two_calls(drawable):
+    opts = art.RenderOpts(width_px=300, coalesce=True)
+    for fmt in (".png", ".svg"):
+        first = art.render_bytes(RENDER_BOUNDS, fmt=fmt, opts=opts, con=drawable)
+        second = art.render_bytes(RENDER_BOUNDS, fmt=fmt, opts=opts, con=drawable)
+        assert first == second
+
+
+def test_coalescing_changes_the_picture(con):
+    """It is a flag rather than a fix applied silently, so it had better do
+    something -- and only where there is a shared node to stop capping twice."""
+    _link(con, 1, [(-3_200_000, 51_480_000), (-3_190_000, 51_480_000)])
+    _link(con, 2, [(-3_190_000, 51_480_000), (-3_180_000, 51_480_000)])
+    kw = {"con": con, "bounds_or_name": COALESCE_BOUNDS}
+    plain = art.render_bytes(opts=art.RenderOpts(width_px=300), **kw)
+    joined = art.render_bytes(opts=art.RenderOpts(width_px=300, coalesce=True), **kw)
+    assert plain != joined
+
+
+@pytest.mark.parametrize("style", ["spectrum", "strands"])
+def test_a_style_that_ignores_coalescing_says_so(drawable, style, caplog):
+    """`spectrum` strokes each segment separately to colour it, so it has a cap at
+    every vertex and no chaining would remove them; `strands` already puts a whole
+    service into one cairo path, where overlapping caps do not accumulate. Neither
+    should quietly accept a flag it does nothing with."""
+    assert not art.STYLES[style].coalesces
+    with caplog.at_level("WARNING"):
+        art.render_bytes(
+            RENDER_BOUNDS,
+            style,
+            opts=art.RenderOpts(width_px=300, coalesce=True),
+            con=drawable,
+        )
+    assert "coalesce" in caplog.text
+
+
+def test_a_supplied_chain_assignment_is_what_gets_drawn(con):
+    """The seam banding uses. Which edges share a stroke has to be a property of the
+    window rather than of where a band was cut, so the parent works the assignment
+    out once and every band is handed it -- exactly as `Source.groups` already does
+    for a ribbon's width and draw order."""
+    import pyarrow
+
+    _link(con, 1, [(-3_200_000, 51_480_000), (-3_190_000, 51_480_000)])
+    _link(con, 2, [(-3_190_000, 51_480_000), (-3_180_000, 51_480_000)])
+    assert len(_runs(con)) == 1  # left to itself it joins them
+
+    con.register(
+        "wf_fixed",
+        pyarrow.table(
+            {
+                "edge_id": pyarrow.array([1, 2], pyarrow.int64()),
+                "chain_id": pyarrow.array([1, 2], pyarrow.int64()),
+                "seq": pyarrow.array([0, 0], pyarrow.int32()),
+            }
+        ),
+    )
+    proj = art.Projection.fit(COALESCE_BOUNDS, 400, 400)
+    w = art.Window(COALESCE_BOUNDS, con, source=art.Source(chains="wf_fixed"))
+    assert len(list(w.paths(proj, coalesce=True))) == 2
+
+
+def test_held_edges_ignore_coalescing(con):
+    """There is no query to reorder, so `Held` takes the flag and draws flat."""
+    _link(con, 1, [(-3_200_000, 51_480_000), (-3_190_000, 51_480_000)])
+    _link(con, 2, [(-3_190_000, 51_480_000), (-3_180_000, 51_480_000)])
+    edges = art.load_edges(COALESCE_BOUNDS, con=con)
+    proj = art.Projection.fit(COALESCE_BOUNDS, 400, 400)
+    held = art.Held(edges)
+    assert len(list(held.paths(proj, coalesce=True))) == 2
+
+
 # --- Banding ------------------------------------------------------------------
 #
 # The claim banding rests on is that it changes nothing: `workers=8` and `workers=1`
@@ -615,13 +808,22 @@ def test_the_edge_stream_has_a_defined_order(con):
 # pieces that make it true, and the finished render.
 
 
-def _band_edge(con, edge_id, lat_e6, trips=100, services=("42",), agency="OP1"):
+def _band_edge(
+    con,
+    edge_id,
+    lat_e6,
+    trips=100,
+    services=("42",),
+    agency="OP1",
+    lon_span=(-3_200_000, -3_199_000),
+):
     """One edge at a given latitude. Banding cuts north to south, so unlike
     `_art_edge` the geometry has to vary in latitude rather than longitude."""
+    lon0, lon1 = lon_span
     con.execute(
         "INSERT INTO edges VALUES (?, 1, 'R', 'secondary', 100.0, "
-        "[-3200000, -3199000], [?, ?], -3200000, ?, -3199000, ?)",
-        [edge_id, lat_e6, lat_e6, lat_e6, lat_e6],
+        "[?, ?], [?, ?], ?, ?, ?, ?)",
+        [edge_id, lon0, lon1, lat_e6, lat_e6, lon0, lat_e6, lon1, lat_e6],
     )
     for s in services:
         con.execute(
@@ -680,6 +882,194 @@ def test_banding_survives_the_awkward_canvases(banded, opts):
     assert art.render_bytes(BAND_BOUNDS, "density", workers=1, **kw) == art.render_bytes(
         BAND_BOUNDS, "density", workers=4, **kw
     )
+
+
+@pytest.fixture
+def wide_banded(con, tmp_path, monkeypatch):
+    """Edges dense in latitude and alternating between busy and quiet, in a window
+    short enough that a 6,000px canvas is only 3.5 megapixels.
+
+    Both properties are load-bearing. `density`'s stroke width comes from the weight,
+    so only the busiest edges draw at the full width the collar is sized against, and
+    the fixture above puts those at one end of the window -- whether one lands in the
+    couple of pixels either side of a band cut where a collar that is too narrow
+    shows is then luck. Alternating the weight puts a full-width stroke every two
+    rows, so a seam is certain rather than likely."""
+    for i in range(600):
+        _band_edge(
+            con,
+            i + 1,
+            51_500_100 + i * 19,
+            trips=5000 if i % 2 == 0 else 10,
+            lon_span=(-3_290_000, -3_110_000),
+        )
+    con.close()
+    monkeypatch.setattr(art, "MIN_BAND_EDGES", 0)
+    ro = db.connect(tmp_path / "test.duckdb", read_only=True)
+    yield ro
+    ro.close()
+
+
+WIDE_BOUNDS = art.Bounds(-3.30, 51.500, -3.10, 51.512)
+
+
+def test_banding_holds_at_a_canvas_wider_than_the_style_reference(wide_banded):
+    """The regression. `density` quotes its widths against `DENSITY_REF_PX`, so its
+    widest stroke grows with the canvas, and a collar quoted in absolute pixels stops
+    covering half of it once the canvas passes about 4,842px at `line_scale=1`. Below
+    that the collar is merely too generous, which costs a little work and hides the
+    fault -- which is why every band test until this one drew at 200px and passed.
+
+    Bytes rather than a pixel tolerance, for the same reason the serial comparison
+    above is: a seam is a handful of pixels one part in 255 out, and any tolerance
+    loose enough to be robust is loose enough to miss it."""
+    kw = {"opts": art.RenderOpts(width_px=6000), "con": wide_banded}
+    assert art.render_bytes(WIDE_BOUNDS, "density", workers=1, **kw) == art.render_bytes(
+        WIDE_BOUNDS, "density", workers=4, **kw
+    )
+
+
+@pytest.fixture
+def chained_banded(con, tmp_path, monkeypatch):
+    """Two unbroken chains running the whole height of the window, one busy and one
+    quiet, so a run crosses every band cut there is.
+
+    A chain is the thing that can go wrong here: joining edges is a decision about
+    the shape of the graph, and a band sees only part of the graph. Two weights
+    rather than one because `density` takes its stroke width from the weight, so an
+    unvarying window would draw everything at mid width and never test the collar at
+    the size it is sized for.
+    """
+    for lane, (lon, trips) in enumerate(((-3_250_000, 5000), (-3_150_000, 10))):
+        lat, x = 51_500_100, lon
+        for i in range(300):
+            edge_id = lane * 300 + i + 1
+            # A zigzag, so the chain is a road rather than a straight line and its
+            # vertices do not all fall on the same column of pixels. Each edge starts
+            # where the last one ended, which is what makes it a chain at all.
+            nx, nlat = lon + (400 if i % 2 else -400), lat + 38
+            con.execute(
+                "INSERT INTO edges VALUES (?, 1, 'R', 'secondary', 100.0, ?, ?, "
+                "?, ?, ?, ?)",
+                [edge_id, [x, nx], [lat, nlat], min(x, nx), lat, max(x, nx), nlat],
+            )
+            con.execute(
+                "INSERT INTO edge_services VALUES (?, '42', 'OP1', 1, ?)",
+                [edge_id, trips],
+            )
+            x, lat = nx, nlat
+    con.close()
+    monkeypatch.setattr(art, "MIN_BAND_EDGES", 0)
+    ro = db.connect(tmp_path / "test.duckdb", read_only=True)
+    yield ro
+    ro.close()
+
+
+@pytest.mark.parametrize("width_px", [200, 6000])
+def test_a_coalesced_banded_render_is_byte_identical_to_a_serial_one(
+    chained_banded, width_px
+):
+    """The question coalescing raises about banding, and it does not answer itself.
+
+    Whether two edges share a stroke is decided by the graph around the node between
+    them, and a band that worked that out from its own collar would see a fork as a
+    through node wherever the third edge fell outside. Under ADD that is not a local
+    error: two strokes double-count wherever they overlap, which can be a long way
+    from the node that decided it. Measured, before the parent started shipping the
+    assignment: London at 6,000px differed in 356 pixels by up to 89/255, all of them
+    within 40 rows of a cut -- a seam, not a wash, and invisible at 2,000px.
+    """
+    kw = {"opts": art.RenderOpts(width_px=width_px, coalesce=True), "con": chained_banded}
+    assert art.render_bytes(WIDE_BOUNDS, "density", workers=1, **kw) == art.render_bytes(
+        WIDE_BOUNDS, "density", workers=4, **kw
+    )
+
+
+def test_a_band_draws_the_chains_it_was_given(chained_banded, tmp_path):
+    """The worker half of the mechanism, driven directly rather than through a pool.
+
+    A job carrying an assignment must draw *that* assignment. Handing it one that
+    puts every edge in a chain of its own is the same thing as not coalescing, so if
+    the band worked its own out instead the two would come back the same.
+    """
+    import pyarrow
+
+    n = 600
+    alone = pyarrow.table(
+        {
+            "edge_id": pyarrow.array(range(1, n + 1), pyarrow.int64()),
+            "chain_id": pyarrow.array(range(1, n + 1), pyarrow.int64()),
+            "seq": pyarrow.array([0] * n, pyarrow.int32()),
+        }
+    )
+    width = 4000  # wide enough that a stroke is more than a pixel across
+    proj = art.Projection.fit(
+        WIDE_BOUNDS, width, art.Projection.canvas_height(WIDE_BOUNDS, width)
+    )
+    window = art.Window(WIDE_BOUNDS, chained_banded)
+
+    def band(chains):
+        return art._draw_band(
+            art._BandJob(
+                db_path=str(tmp_path / "test.duckdb"),
+                bounds=(
+                    WIDE_BOUNDS.min_lon,
+                    WIDE_BOUNDS.min_lat,
+                    WIDE_BOUNDS.max_lon,
+                    WIDE_BOUNDS.max_lat,
+                ),
+                width=width,
+                height=proj.height,
+                dev_y0=0,
+                dev_y1=proj.height,
+                draw_scale=1.0,
+                style="density",
+                opts=art.RenderOpts(width_px=width, coalesce=True),
+                query=art.DEFAULT_SPEC,
+                source=art.DEFAULT_SOURCE,
+                weights=window.weights,
+                group_stats=None,
+                chains=chains,
+            )
+        )
+
+    real = window.chain_table()
+    assert real.num_rows == n
+    # Two lanes, each an unbroken run: exactly what `alone` is not.
+    assert len(set(real.column("chain_id").to_pylist())) == 2
+    assert band(real)[3] != band(alone)[3]
+
+
+@pytest.mark.parametrize("style", sorted(art.STYLES))
+@pytest.mark.parametrize("width_px", [200, 2000, 4000, 6000, 20000])
+@pytest.mark.parametrize("line_scale", [0.5, 1.0, 2.0, 6.0])
+def test_the_collar_covers_half_the_widest_stroke(style, width_px, line_scale):
+    """The arithmetic behind the render above, checked over the range a render can
+    actually ask for. A band draws past its own rows by `pad` and queries the same
+    distance, so anything a stroke can reach beyond `pad` is paint the band never
+    makes -- a seam. The condition is one-sided: a collar wider than it needs to be
+    only costs work."""
+    sty = art.STYLES[style]
+    opts = art.RenderOpts(width_px=width_px, line_scale=line_scale)
+    assert (
+        art._band_pad(sty, opts, width_px) >= sty.max_stroke_px(width_px, line_scale) / 2.0
+    )
+
+
+def test_a_style_scaling_with_the_canvas_says_so():
+    """The two regimes, stated as a test so a new style has to choose one. `ref_px`
+    left None means `max_line_px` is absolute pixels; set, it means pixels at a
+    canvas that wide, and the collar scales with `width_px`."""
+    absolute = art.Style(draw=lambda *a: None, max_line_px=4.0)
+    assert absolute.max_stroke_px(1000) == absolute.max_stroke_px(8000) == 4.0
+    scaled = art.Style(draw=lambda *a: None, max_line_px=4.0, ref_px=2000.0)
+    assert scaled.max_stroke_px(1000) == 2.0
+    assert scaled.max_stroke_px(8000) == 16.0
+    assert scaled.max_stroke_px(8000, line_scale=2.0) == 32.0
+    # The one style that is in the scaled regime, and the constant it shares with
+    # `draw_density` -- the two must not drift, or the collar is sized for a picture
+    # the style does not draw.
+    assert art.STYLES["density"].ref_px == art.DENSITY_REF_PX
 
 
 def test_bands_hold_roughly_equal_numbers_of_edges(banded):

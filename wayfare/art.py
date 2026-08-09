@@ -499,6 +499,10 @@ MAX_GROUPS = 20_000
 # below it is bounded by the start-up cost and the win above it is not.
 MIN_BAND_EDGES = 150_000
 
+# Where a render's chain assignment is registered while it draws. An identifier this
+# code chose, never anything a request supplied -- the same rule `Source` follows.
+CHAIN_VIEW = "wf_chain"
+
 
 @dataclass(frozen=True, slots=True)
 class QuerySpec:
@@ -611,6 +615,16 @@ class Source:
     # up to 4/255 across the whole image -- diffuse, tiny, and not a seam, which is
     # exactly the kind of difference that gets waved through.
     groups: str | None = None
+    # The same arrangement for a coalesced render's chain assignment, and set by the
+    # same caller for a sharper reason. Which edges share a stroke is decided by the
+    # shape of the graph, and a band sees a truncated graph -- so a node just outside
+    # its collar can look like a through node when it is really a fork, and joining
+    # there puts two edges in one stroke that the serial render draws as two. Under
+    # ADD that is not a local difference: two strokes double-count wherever they
+    # overlap, which may be nowhere near the node that decided it. Handing every band
+    # the parent's assignment makes chain membership a property of the window rather
+    # than of the cut, which is what the collar argument needs to be true.
+    chains: str | None = None
 
 
 DEFAULT_SOURCE = Source()
@@ -938,6 +952,91 @@ WITH win AS ({win}
             params,
         )
 
+    def chain_query(self) -> tuple[str, list[Any]]:
+        """Each edge in the window, and the one edge that continues it, if any.
+
+        The successor relation, not the chains themselves -- following it is a linked
+        list walk and belongs in Python, but deciding whether a node is a through node
+        is a group-by over the whole window and belongs here.
+
+        Directed, unlike `publish._chain`. An ordinary two-way street arrives as two
+        edges pointing opposite ways, so at a node where two roads meet there are four
+        incidences and the undirected "exactly two edges meet here" rule fires on
+        nothing at all. Head to tail, the same node has one edge arriving and one
+        leaving in each direction, and the two directions chain independently -- which
+        is also why the doubling-back trap `publish` records cannot arise here: a
+        directed chain never turns round.
+
+        `weight` is part of the node identity because it is what the paint is a
+        function of. Two edges meeting end to end but stroked at different widths are
+        two different shapes, and joining them would change the picture rather than
+        remove a duplicated cap from it. It is safe to key on: an edge's weight is
+        aggregated over its own service rows and does not depend on the window.
+
+        `o.eid <> e.edge_id` drops a self-loop, which is the one edge that is its own
+        unique predecessor and successor.
+        """
+        win, win_p = self.window(sampled=True)
+        svc, svc_p = self.services()
+        sql = f"""
+WITH win AS ({win}
+), svc AS (
+    SELECT s.edge_id, {self.weight} AS weight
+    FROM {svc} JOIN win USING (edge_id)
+    GROUP BY s.edge_id
+    {self._having()}
+), e AS (
+    SELECT win.edge_id AS edge_id,
+           coalesce(svc.weight, 0) AS weight,
+           win.lon_e6[1] AS sx, win.lat_e6[1] AS sy,
+           win.lon_e6[-1] AS ex, win.lat_e6[-1] AS ey
+    FROM win {self._join()} svc USING (edge_id)
+    WHERE len(win.lon_e6) >= 2
+), ind AS (
+    SELECT ex, ey, weight, count(*) AS n FROM e GROUP BY 1, 2, 3
+), outd AS (
+    SELECT sx, sy, weight, count(*) AS n, min(edge_id) AS eid FROM e GROUP BY 1, 2, 3
+)
+SELECT e.edge_id,
+       coalesce(
+           CASE WHEN i.n = 1 AND o.n = 1 AND o.eid <> e.edge_id THEN o.eid END, -1
+       ) AS next_id
+FROM e
+JOIN ind i ON i.ex = e.ex AND i.ey = e.ey AND i.weight = e.weight
+LEFT JOIN outd o ON o.sx = e.ex AND o.sy = e.ey AND o.weight = e.weight
+ORDER BY e.edge_id
+"""
+        return sql, win_p + svc_p
+
+    def chained_query(self, *, by_weight: bool) -> tuple[str, list[Any]]:
+        """The drawn geometry, ordered so one chain's edges arrive together.
+
+        The same trick `grouped_query` uses for `strands`: SQL puts the rows in the
+        order the caller wants to consume them, so only one run is ever live and the
+        streaming property survives. `chain_id` and `seq` between them are unique, so
+        the order is fully defined without a further tiebreak.
+        """
+        win, win_p = self.window(sampled=True)
+        svc, svc_p = self.services()
+        order = "w.weight, c.chain_id, c.seq" if by_weight else "c.chain_id, c.seq"
+        sql = f"""
+WITH win AS ({win}
+), svc AS (
+    SELECT s.edge_id, {self.weight} AS weight
+    FROM {svc} JOIN win USING (edge_id)
+    GROUP BY s.edge_id
+    {self._having()}
+), w AS (
+    SELECT win.edge_id AS edge_id, win.lon_e6, win.lat_e6,
+           coalesce(svc.weight, 0) AS weight
+    FROM win {self._join()} svc USING (edge_id)
+)
+SELECT c.chain_id, w.lon_e6, w.lat_e6, w.weight
+FROM w JOIN {self.source.chains or CHAIN_VIEW} c USING (edge_id)
+ORDER BY {order}
+"""
+        return sql, win_p + svc_p
+
     def cardinality_query(self) -> tuple[str, list[Any]]:
         """How many groups this spec would produce, before anything is drawn."""
         win, win_p = self.window()
@@ -1114,8 +1213,82 @@ class Window:
                 ):
                     yield edge
 
+    def chain_table(self) -> Any | None:
+        """Every edge in the window mapped to (chain_id, seq), or None if empty.
+
+        Two steps and neither holds geometry. The successor relation comes out of SQL
+        -- see `_Sql.chain_query`, which does the degree counting where the data is --
+        and the walk that turns a linked list into runs is done here over flat lists
+        of ints. About 48 bytes an edge, against the hundreds its geometry costs, and
+        it is released before the drawing stream opens.
+
+        The head of a run names it, so a chain's identity comes from the graph rather
+        than from the order rows arrived in. A run that is a closed loop has no head;
+        it is entered at its lowest edge id, which is the same fix `publish._chain`
+        needed for the same reason.
+        """
+        import pyarrow
+
+        query, params = self.sql.chain_query()
+        cur = self.con.execute(query, params)
+        # Renamed in DuckDB 1.3 with the old spelling kept but deprecated, so both are
+        # tried -- the same accommodation `_batches` makes for the streaming reader.
+        table = (getattr(cur, "to_arrow_table", None) or cur.fetch_arrow_table)()
+        n = table.num_rows
+        if not n:
+            return None
+        np = _require_numpy()
+        ids = table.column(0).to_numpy(zero_copy_only=False)
+        nxt = table.column(1).to_numpy(zero_copy_only=False)
+        # ids arrive sorted, so searchsorted is the edge id -> row index map and no
+        # dict is built. Every next_id is an id, so every lookup lands.
+        succ = np.full(n, -1, dtype=np.int64)
+        has = np.nonzero(nxt >= 0)[0]
+        succ[has] = np.searchsorted(ids, nxt[has])
+        # At most one predecessor each: two edges sharing a successor would mean two
+        # edges ending at that node, which makes it ambiguous and clears both.
+        pred = np.full(n, -1, dtype=np.int64)
+        pred[succ[has]] = has
+
+        succ_l: list[int] = succ.tolist()
+        ids_l: list[int] = ids.tolist()
+        heads: list[int] = np.nonzero(pred < 0)[0].tolist()
+        chain = [0] * n
+        seq = [0] * n
+        seen = [False] * n
+
+        def walk(start: int) -> None:
+            head, k, j = ids_l[start], start, 0
+            while k != -1 and not seen[k]:
+                seen[k] = True
+                chain[k] = head
+                seq[k] = j
+                j += 1
+                k = succ_l[k]
+
+        for i in heads:
+            walk(i)
+        # Whatever is left is a cycle. Ascending order means the first unvisited row
+        # of one is its lowest edge id, so where a loop is broken is a property of the
+        # loop and not of the scan.
+        for i in range(n):
+            if not seen[i]:
+                walk(i)
+        return pyarrow.table(
+            {
+                "edge_id": pyarrow.array(ids_l, pyarrow.int64()),
+                "chain_id": pyarrow.array(chain, pyarrow.int64()),
+                "seq": pyarrow.array(seq, pyarrow.int32()),
+            }
+        )
+
     def paths(
-        self, proj: Projection, *, tol: float = 0.0, by_weight: bool = False
+        self,
+        proj: Projection,
+        *,
+        tol: float = 0.0,
+        by_weight: bool = False,
+        coalesce: bool = False,
     ) -> Iterator[tuple[float, Polyline]]:
         """(this edge's weight, its geometry in canvas pixels), one edge at a time.
 
@@ -1133,6 +1306,10 @@ class Window:
         lon/lat tuples was itself a measurable share of a render, and a style that
         only strokes lines has no use for them. `edges()` remains for callers that
         do want them.
+
+        `coalesce` hands back maximal runs of edges that meet end to end and paint
+        the same, as one polyline each, instead of one polyline per edge -- see the
+        coalescing section below for what that is for and what it costs.
         """
         # Resolve the scale *before* opening the stream, and never during it. A
         # DuckDB connection holds one result at a time, so a second `execute` on it
@@ -1143,6 +1320,9 @@ class Window:
         # here costs nothing and keeps the lazy pass honest for `strands`, which goes
         # through `group_paths` instead and still never asks.
         self.weights  # noqa: B018
+        if coalesce:
+            yield from self._chained_paths(proj, tol, by_weight)
+            return
         query, params = self.sql.edges_query(with_groups=False, by_weight=by_weight)
         cur = self.con.execute(query, params)
         # The window test stays in micro-degrees, against the same integers the
@@ -1158,6 +1338,80 @@ class Window:
             for i in keep.nonzero()[0].tolist():
                 line = Polyline(xs, ys, range(offs[i], offs[i + 1]))
                 yield float(weights[i]), line.simplified(tol)
+
+    def _chained_paths(
+        self, proj: Projection, tol: float, by_weight: bool
+    ) -> Iterator[tuple[float, Polyline]]:
+        """:meth:`paths`, with runs of edges handed back as one polyline each.
+
+        Each edge is simplified *before* it is concatenated, rather than the finished
+        run being simplified as a whole. That is not a detail. :func:`simplify` drops
+        a vertex by comparing it with the last one kept, so which vertices survive
+        depends on where the run started -- and a band's run starts wherever its
+        collar cut the picture, not where the serial render's did. Simplifying per
+        edge keeps the decision a property of the edge, so the vertices a coalesced
+        render draws are exactly the vertices an uncoalesced one draws. The only
+        difference between the two pictures is the duplicated round cap at a shared
+        node, which is the whole point of the exercise.
+
+        One run is live at a time, in two lists that are handed away when it ends.
+        Nothing accumulates across runs.
+        """
+        own = self.sql.source.chains is None
+        if own:
+            table = self.chain_table()
+            if table is None:
+                return
+            self.con.register(CHAIN_VIEW, table)
+        try:
+            query, params = self.sql.chained_query(by_weight=by_weight)
+            cur = self.con.execute(query, params)
+            box = self.bounds.as_e6()
+            ax: list[float] = []
+            ay: list[float] = []
+            live = -1  # chain id of the run being accumulated, -1 for none
+            weight = 0.0
+            for batch in _batches(cur):
+                lon, offsets, lengths = _lists(batch.column(1))
+                lat, _, _ = _lists(batch.column(2))
+                keep = _in_window(lon, lat, offsets, lengths, box).tolist()
+                xs, ys = proj.flat(lon, lat)
+                chains = batch.column(0).to_pylist()
+                weights = batch.column(3).to_pylist()
+                offs = offsets.tolist()
+                for i in range(len(keep)):
+                    # An edge the window test drops leaves a hole, and the edges
+                    # either side of it no longer meet. Breaking the run there is what
+                    # keeps the drawn geometry the same set the flat path draws.
+                    if not keep[i]:
+                        if ax:
+                            yield weight, Polyline(ax, ay, range(len(ax)))
+                        ax, ay, live = [], [], -1
+                        continue
+                    idx = Polyline(xs, ys, range(offs[i], offs[i + 1])).simplified(tol).idx
+                    if chains[i] != live:
+                        if ax:
+                            yield weight, Polyline(ax, ay, range(len(ax)))
+                        ax, ay = [], []
+                        live, weight = chains[i], float(weights[i])
+                        skip = 0
+                    else:
+                        # The junction vertex is already there, from the last edge's
+                        # tail. Appending it again would be a zero-length segment.
+                        skip = 1
+                    if isinstance(idx, range):
+                        # The overwhelmingly common shape, and a C-level slice.
+                        a, b = idx.start + skip, idx.stop
+                        ax.extend(xs[a:b])
+                        ay.extend(ys[a:b])
+                    else:
+                        ax.extend([xs[k] for k in idx[skip:]])
+                        ay.extend([ys[k] for k in idx[skip:]])
+            if ax:
+                yield weight, Polyline(ax, ay, range(len(ax)))
+        finally:
+            if own:
+                self.con.unregister(CHAIN_VIEW)
 
     def group_stats(self) -> list[tuple[str, int, float]]:
         """(group, edges it covers, its total traffic), widest first.
@@ -1280,8 +1534,19 @@ class Held(Window):
         return iter(self._edges)
 
     def paths(
-        self, proj: Projection, *, tol: float = 0.0, by_weight: bool = False
+        self,
+        proj: Projection,
+        *,
+        tol: float = 0.0,
+        by_weight: bool = False,
+        coalesce: bool = False,
     ) -> Iterator[tuple[float, Polyline]]:
+        # `coalesce` is accepted and ignored. Chaining is done by reordering the
+        # stream in SQL, and there is no query here -- the caller handed over edges
+        # that were already selected, weighted and grouped by something else. Held is
+        # a convenience for re-rendering a window one already has, not the path any
+        # measurement is taken on.
+        #
         # Already in degrees and already in memory, so this projects per edge. The
         # batching that `Window` needs would buy nothing against a list, and neither
         # would sharing a flat buffer between paths -- there is nothing to share it
@@ -1462,6 +1727,11 @@ class RenderOpts:
     # `QuerySpec.sample` does not: this changes how a line is stroked, not which
     # lines there are.
     simplify_px: float = 0.5
+    # Join runs of edges that meet end to end and paint the same into one stroke, so
+    # a shared node is capped once instead of twice. Off by default: it is a change
+    # to the picture, and which picture is right is a judgement about what the render
+    # is for. See the coalescing section. Only `density` reads it.
+    coalesce: bool = False
 
 
 StyleFn = Callable[["cairo.Context[cairo.Surface]", "Window", Projection, RenderOpts], None]
@@ -1473,12 +1743,34 @@ class Style:
     background: RGB = (0.02, 0.02, 0.035)
     needs_groups: bool = False
     blurb: str = ""
-    # The widest stroke this style lays down at `line_scale=1`, in logical pixels.
-    # Only banding reads it, and only to work out how far outside a band an edge can
-    # still be and paint into it -- a band whose collar is narrower than half a line
-    # width grows a seam. Declared rather than measured because it is a property of
-    # the ramps in `draw`, and a style that widens its lines has to say so here.
+    # The widest stroke this style lays down at `line_scale=1`. Only banding reads
+    # it, and only to work out how far outside a band an edge can still be and paint
+    # into it -- a band whose collar is narrower than half a line width grows a seam.
+    # Declared rather than measured because it is a property of the ramps in `draw`,
+    # and a style that widens its lines has to say so here.
+    #
+    # There are two regimes, and `ref_px` is which one this style is in. Left None,
+    # `max_line_px` is absolute pixels: the style strokes the same width whatever the
+    # canvas. Set, it is pixels *at a canvas `ref_px` wide*, and the real width scales
+    # with `width_px` -- which is what `density` does, so that the map and the lines
+    # shrink together. A canvas-scaling style that inherited the absolute reading
+    # would get a collar too wide below `ref_px` and, worse, too narrow above it.
     max_line_px: float = 20.0
+    ref_px: float | None = None
+    # Whether this style reads `RenderOpts.coalesce`. Declared rather than inferred so
+    # a request for it against a style that ignores it says so instead of quietly
+    # doing nothing -- and so the reasons the other two decline are written down in
+    # one place. See the coalescing section.
+    coalesces: bool = False
+
+    def max_stroke_px(self, width_px: float, line_scale: float = 1.0) -> float:
+        """The widest stroke this style can lay down on a canvas `width_px` wide."""
+        w = (
+            self.max_line_px
+            if self.ref_px is None
+            else self.max_line_px * width_px / self.ref_px
+        )
+        return w * line_scale
 
 
 # --- Styles -----------------------------------------------------------------
@@ -1518,6 +1810,11 @@ def draw_density(
     full brightness, and saturating addition is commutative and associative, so
     halo-then-core per edge and every-halo-then-every-core give the same buffer to
     the byte. It halves the scanning, decoding and projecting a render does.
+
+    The same commutativity is what makes this the one style with the junction
+    artefact, and the one that `opts.coalesce` addresses. Every stroke gets a round
+    cap at both ends, so where two edges meet the shared node is painted twice and
+    ADD makes that a bright dot -- see the coalescing section.
     """
     import cairo
 
@@ -1562,7 +1859,7 @@ def draw_density(
     # Bound once: this is a property that may run a query on first touch, and it
     # is read once per edge.
     weights = window.weights
-    for weight, pts in window.paths(proj, tol=opts.simplify_px):
+    for weight, pts in window.paths(proj, tol=opts.simplify_px, coalesce=opts.coalesce):
         t = weights.of(weight)
         for width_of, alpha_of, sat_of in passes:
             r, g, b = colorsys.hsv_to_rgb(opts.hue, sat_of(t), 1.0)
@@ -1683,12 +1980,54 @@ def draw_strands(
         log.warning("no service names on these edges; strands has nothing to draw")
 
 
+# --- Coalescing ---------------------------------------------------------------
+#
+# `art` strokes one cairo path per directed edge, and a Valhalla directed edge is
+# 4.14 coordinates over tens of metres -- so a road is dozens of short strokes laid
+# end to end. Every stroke gets a round cap at both ends, and `density` composites
+# with ADD, so a node two edges share is painted twice: a bright dot at every
+# junction, and at every point Valhalla happened to split a road. That is an
+# artefact of how the geometry is stored, not something in the timetable.
+#
+# `RenderOpts.coalesce` joins runs of edges that meet head to tail and paint the same
+# into a single stroke, which caps the run's two ends and joins everything between.
+# `publish` already does this for tiles, and this is deliberately not the same code:
+# there the grouping key is the tile attributes and the chaining is undirected, here
+# it is the drawn weight and the chaining follows direction. See `_Sql.chain_query`
+# for why direction matters and `Window._chained_paths` for why simplification stays
+# per edge.
+#
+# Three things are worth stating outright.
+#
+# **Banding still holds.** A band computes its chains over its own collar window, so
+# it can chain differently from the serial render -- but only at a node outside that
+# window, because any edge incident on a node *inside* it has a bounding box that
+# overlaps it and is therefore selected too. `_band_pad` is half the widest stroke
+# plus slack, so ink from a node outside the collar cannot reach the band's own rows.
+# The two renders agree on every pixel that is kept. This is the same argument the
+# existing collar rests on, applied to chaining decisions rather than to strokes, and
+# it needs no wider collar than the one already there.
+#
+# **Directed pairs are not collapsed.** An ordinary two-way street is two coincident
+# edges and `publish` drops one of them. Doing that here would halve the light on
+# every two-way road, which is a different picture rather than a repaired one.
+#
+# **The two other styles decline, for opposite reasons.** `spectrum` strokes each
+# *segment* separately to colour it by its own bearing, so it has a cap at every
+# vertex rather than only at shared nodes, and nothing short of changing what it
+# means by colour would remove them. `strands` already puts a whole service into one
+# cairo path; cairo fills a stroke's outline once with nonzero winding, so caps that
+# overlap inside a single stroke do not accumulate, and there is nothing to remove.
+
 STYLES: dict[str, Style] = {
     "density": Style(
         draw=draw_density,
         background=(0.015, 0.018, 0.03),
         blurb="weekly trip volume as light",
-        max_line_px=19.0,  # the halo pass, 3.0 + 16.0
+        # The halo pass, 1.5 + 8.0, quoted at DENSITY_REF_PX like the ramps are.
+        max_line_px=9.5,
+        ref_px=DENSITY_REF_PX,
+        coalesces=True,
     ),
     "spectrum": Style(
         draw=draw_spectrum,
@@ -1990,6 +2329,10 @@ class _BandJob:
     source: Source
     weights: Weights
     group_stats: list[tuple[str, int, float]] | None
+    # The parent's chain assignment, as an Arrow table, or None when not coalescing.
+    # About 20 bytes an edge and picklable, which is what lets it cross to a worker;
+    # see `Source.chains` for why a band must not work one out for itself.
+    chains: Any | None
 
 
 def band_source(con: duckdb.DuckDBPyConnection) -> Path | None:
@@ -2036,6 +2379,17 @@ def _stats_table(rows: list[tuple[str, int, float]]) -> Any:
     )
 
 
+def _band_pad(sty: Style, opts: RenderOpts, width_px: float) -> float:
+    """How far outside its own rows a band must draw and query, in logical pixels.
+
+    Half the widest stroke, because a stroke is centred on its path, plus two pixels
+    of slack for the round caps and joins cairo adds past a vertex. The slack is
+    absolute, so it is proportionally thinner the wider the strokes get; it is a
+    margin on the arithmetic, not the arithmetic.
+    """
+    return sty.max_stroke_px(width_px, opts.line_scale) / 2.0 + 2.0
+
+
 def _draw_band(job: _BandJob) -> tuple[int, int, int, bytes]:
     """One band, drawn into its own surface and handed back as raw ARGB rows."""
     import cairo
@@ -2052,7 +2406,13 @@ def _draw_band(job: _BandJob) -> tuple[int, int, int, bytes]:
     # whole shape rasterised to. It showed up as one row of one Cardiff render off by
     # 1/255. Drawing past the cut and pasting only the middle means no shape is ever
     # split, and the clip that remains is exactly the serial path's.
-    pad = sty.max_line_px * job.opts.line_scale / 2.0 + 2.0
+    #
+    # `max_stroke_px` takes the canvas width because a style may quote its widths
+    # against a reference canvas rather than in absolute pixels. A fixed collar was
+    # right for every style until `density` started scaling with `width_px`, at which
+    # point it was twice what a 2,000px render needed and less than a 6,000px one did
+    # -- and only the second of those is a seam, which is why it went unnoticed.
+    pad = _band_pad(sty, job.opts, job.width)
     dev_pad = math.ceil(pad * s)
     origin = job.dev_y0 - dev_pad
     surface = cairo.ImageSurface(
@@ -2097,6 +2457,9 @@ def _draw_band(job: _BandJob) -> tuple[int, int, int, bytes]:
             # `Source.groups` still only ever holds an identifier this code chose.
             con.register("wf_gstat", _stats_table(job.group_stats))
             source = replace(source, groups="wf_gstat")
+        if job.chains is not None:
+            con.register(CHAIN_VIEW, job.chains)
+            source = replace(source, chains=CHAIN_VIEW)
         window = Window(
             _band_window(bounds, proj, top, bottom, pad),
             con,
@@ -2157,6 +2520,10 @@ def _draw_banded(
     )
     if n_edges < MIN_BAND_EDGES or len(cuts) < 3:
         return False
+    # Worked out once over the whole window, exactly like the group statistics below,
+    # and for the reason `Source.chains` records. Doing it per band is both four
+    # times the work and the wrong answer.
+    chains = window.chain_table() if opts.coalesce and sty.coalesces else None
     jobs = [
         _BandJob(
             db_path=str(db_path),
@@ -2173,6 +2540,7 @@ def _draw_banded(
             # Resolved here, on the parent's connection, precisely once.
             weights=window.weights,
             group_stats=window.group_stats() if sty.needs_groups else None,
+            chains=chains,
         )
         for i in range(len(cuts) - 1)
     ]
@@ -2238,6 +2606,10 @@ def _render(
 
     bounds = resolve(bounds_or_name)
     opts = opts or RenderOpts()
+    if opts.coalesce and not sty.coalesces:
+        # Not an error -- it is a request for a different picture that this style does
+        # not have -- but silence would look like it had been honoured.
+        log.warning("%s ignores coalesce; see the coalescing section", style)
 
     cairo = _require_cairo()
 

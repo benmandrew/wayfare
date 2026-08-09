@@ -101,6 +101,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--scale", type=float, default=1.0, help="2.0 is roughly 192 dpi")
     p.add_argument("--caption", default=None)
     p.add_argument(
+        "--coalesce",
+        action="store_true",
+        help="join edges that meet end to end into one stroke, so a shared node is "
+        "capped once rather than twice; density only",
+    )
+    p.add_argument(
         "--workers",
         type=int,
         default=None,
@@ -282,7 +288,10 @@ def _dispatch(args: argparse.Namespace) -> int:
             style=args.style,
             out_path=args.out,
             opts=art.RenderOpts(
-                width_px=args.width, scale=args.scale, caption=args.caption
+                width_px=args.width,
+                scale=args.scale,
+                caption=args.caption,
+                coalesce=args.coalesce,
             ),
             workers=args.workers,
         )
