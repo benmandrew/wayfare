@@ -260,10 +260,13 @@ measurement, since it only matters if matching turns out to be the bottleneck.
 
 **Northern Ireland.** BODS and NaPTAN are both GB-only. Translink publishes
 ATCO.CIF via OpenDataNI (Metro & Glider, Ulsterbus & Goldline datasets, refreshed
-monthly), which carries no geometry at all — so NI would be 100% `stops`-matched.
-It needs a separate parser and the `ireland-and-northern-ireland` OSM extract
-(409 MB; there is no standalone NI extract). Sequenced after GB works, because it
-shares nothing with the GTFS path except the matcher.
+monthly). It does carry geometry, contrary to what this said until 2026-08-09:
+`QB` records hold six-figure Irish Grid (EPSG:29903) stop coordinates, 11,077 of
+11,090 stops, and Translink separately publishes MapInfo MIF/MID `PtLinks` —
+37,913 road-following stop-to-stop polylines covering 97.5% of hops. It needs a
+separate parser and the `ireland-and-northern-ireland` OSM extract (409 MB; there
+is no standalone NI extract). Sequenced after GB works, because it shares nothing
+with the GTFS path except the matcher.
 
 **`calendar_dates` exceptions are ignored** when weighting patterns by trips per
 week. They shift individual days rather than the shape of the week, and the number

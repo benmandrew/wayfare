@@ -102,9 +102,56 @@ identical on 72 real database/window/spec combinations.
 818 `route_master` relations, and Greater London alone is 13% of the total. BODS
 is the authority for what services exist; OSM is only the geometry substrate.
 
-**Northern Ireland has no GTFS.** BODS and NaPTAN are both GB-only. Translink
-publishes ATCO.CIF via OpenDataNI, which carries no geometry at all. Not yet
-covered — see PLAN.md.
+**Ferries are the largest single error class in the GB run, and `route_type` is
+what removes them.** All 52 `error` rows carrying Valhalla code 444 — 11,200 trips
+— are two-stop sea crossings on the `shape` path: CalMac, Orkney, the Shields
+ferry. `map_snap` is refusing to put water on a road, which is correct behaviour
+answering a question that should never have been asked. A further 41
+`low_confidence` rows, 8,867 trips, are the same crossings arriving through the
+`stops` path, and they are 63% of all low-confidence trip weight. `gtfs.py` now
+drops every trip whose route is not road-going before patterns are built.
+
+**The trap is the kept set, not the filter.** GB `routes.txt` carries `3` on
+12,709 routes, `200` on 316, `4` on 119, `1` on 54, `0` on 43, `2` on 3 and `6` on
+1. `200` is the extended-GTFS code for coach, so those 316 are National Express and
+FlixBus — real long-distance road services, and already the bulk of the
+long-distance `skipped` patterns. A filter written as `route_type = '3'` deletes
+them and looks right. `config.ROAD_ROUTE_TYPES` therefore holds ranges rather than
+values: `3`, `11` and `800` for bus and trolleybus, `200`–`209` for coach,
+`700`–`716` for the extended bus codes. Nothing speculative is added beyond that —
+a mode nobody publishes is a line that cannot be checked against a feed.
+
+Everything dropped is logged by type with its route and trip counts, and a type
+this codebase does not name is a warning rather than an info line, because the way
+this goes wrong is a future feed publishing something road-going in a range nobody
+kept. A feed where *every* trip drops raises instead: that means the join to
+`routes.txt` failed, not that the timetable is all water. `routes` gained a
+`route_type` column; the migration adds it empty, since nothing already stored can
+supply it, and the next `patterns` run fills it in. Already-matched ferry patterns
+are not deleted — they stop appearing in the current feed and become departed,
+keeping their `match_status` rows exactly as a withdrawn bus route does. So an
+existing database keeps its ferry edges until the next `aggregate`, which joins on
+`db.current_feed()` and drops them from `edge_services`.
+
+**Northern Ireland has no GTFS, but it does have geometry.** BODS and NaPTAN are
+both GB-only, and Translink publishes ATCO.CIF through OpenDataNI. That file is not
+geometry-free, which is what this section used to claim: its `QB` records carry
+each stop's position as a six-figure Irish Grid reference (EPSG:29903), and only 13
+of 11,090 stops lack one. Round-tripping those against Translink's own lat/lon list
+gives a median error of 3.1 m, which pins the projection rather than assuming it.
+Translink also publishes road-following geometry separately, as MapInfo MIF/MID
+`PtLinks`: 37,913 stop-to-stop polylines covering 97.5% of hops and 83.5% of trips.
+Not yet covered — see PLAN.md.
+
+**The Republic of Ireland inverts the fact at the top of this file.** The National
+Transport Authority's Transport for Ireland feed
+(`https://www.transportforireland.ie/transitData/Data/GTFS_All.zip`) carries a
+`shape_id` on all 129,405 of its trips, across all 108 agencies, with none of the
+per-operator split that holds GB at 48.3%. Median shape is 992 points against GB's
+849. The licence is CC BY 4.0 rather than the Open Government Licence (OGL), so
+attribution is a condition rather than a courtesy. It also carries 2,847 Irish Rail
+and 2,655 LUAS tram trips over 371 patterns, which is the other half of why the
+mode filter above exists.
 
 ## Architecture
 

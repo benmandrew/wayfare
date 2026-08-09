@@ -5,6 +5,10 @@ This is the stage that makes the rest affordable. The national feed holds about
 the day. Grouping trips by their ordered stop sequence collapses that to a far
 smaller set of *patterns*, and a pattern is what we pay the map matcher for.
 
+Only road-going modes get this far. A feed carries ferries, trains and trams as
+well as buses, and a sea crossing handed to a road matcher either fails outright or
+snaps to whatever coast road is nearest -- see ``_drop_non_road_modes``.
+
 The work is done in DuckDB rather than Python because ``stop_times.txt`` is 5.1 GB
 and the central operation is a group-by over every row of it. DuckDB does that out
 of core; a Python dict of 46M stop references does not fit comfortably in RAM.
@@ -43,6 +47,86 @@ def _csv(gtfs_dir: Path, name: str) -> str:
     return f"read_csv('{path}', all_varchar=true, header=true)"
 
 
+def _road_modes_sql(col: str) -> str:
+    """Predicate for a route_type this pipeline is willing to map-match.
+
+    The values are integers looked up in ``config.ROAD_ROUTE_TYPES`` and nothing
+    else reaches the SQL, so the list is a closed vocabulary in the same sense the
+    art query spec is.
+
+    TRY_CAST rather than a string comparison because route_type is an enum, not an
+    id: "03" and "3" mean the same mode, where route "07" and route "7" are two
+    different buses. COALESCE is what makes the *complement* usable -- a trip whose
+    route is missing from routes.txt has no mode at all, and ``NOT (NULL IN (...))``
+    is NULL, so without it the rows this is meant to catch would be kept.
+    """
+    keep = ", ".join(str(t) for t in sorted(config.ROAD_ROUTE_TYPES))
+    return f"COALESCE(TRY_CAST({col} AS INTEGER) IN ({keep}), false)"
+
+
+def _mode_name(route_type: str | None) -> str | None:
+    """What a dropped route_type is called, or None if this file cannot say.
+
+    None is the signal that the log line should be a warning: a mode nobody here
+    has heard of, or a trip whose route has no row in routes.txt at all.
+    """
+    if route_type is None:
+        return None
+    try:
+        return config.ROUTE_TYPE_NAMES.get(int(route_type))
+    except ValueError:
+        return None
+
+
+def _drop_non_road_modes(con: duckdb.DuckDBPyConnection) -> int:
+    """Remove trips that do not run on roads, and say exactly what went.
+
+    Ferries are the reason this exists. Every one of the 52 Valhalla-444 errors in
+    the completed GB run was a two-stop sea crossing on the `shape` path, and the
+    same crossings routed from bare stops were 63% of all low-confidence trip
+    weight -- a matcher being asked to snap water to tarmac. Rail and tram are the
+    same problem waiting: the Irish feed carries 2,847 Irish Rail and 2,655 LUAS
+    trips, which `bus` costing would happily route down the nearest street.
+
+    Nothing here is silent. Every dropped mode is reported with its route and trip
+    counts, and a type this file does not recognise is a warning rather than a
+    quiet omission, because the way this goes wrong is a future feed publishing
+    something road-going in a range nobody thought to keep.
+    """
+    road = _road_modes_sql("route_type")
+    dropped = con.execute(f"""
+        SELECT nullif(trim(route_type), '') AS rt,
+               count(DISTINCT route_id)     AS n_routes,
+               count(*)                     AS n_trips
+        FROM trip WHERE NOT ({road})
+        GROUP BY rt ORDER BY n_trips DESC, rt
+    """).fetchall()
+    if not dropped:
+        return 0
+
+    for rt, n_routes, n_trips in dropped:
+        name = _mode_name(rt)
+        (log.info if name else log.warning)(
+            "dropping route_type %s (%s): %d routes, %d trips",
+            rt if rt is not None else "missing",
+            name or "unrecognised",
+            n_routes,
+            n_trips,
+        )
+    con.execute(f"DELETE FROM trip WHERE NOT ({road})")
+
+    # A feed of nothing but ferries is not a thing BODS or the NTA publishes, so
+    # this means the join to routes failed rather than that the timetable is all
+    # water -- and a run that quietly produces no patterns at all is the worst of
+    # the failure modes this stage has.
+    if not db.scalar(con, "SELECT count(*) FROM trip"):
+        raise RuntimeError(
+            "every trip was dropped as a non-road mode; routes.txt either carries no "
+            "bus, coach or trolleybus route_type or does not join to trips.txt"
+        )
+    return int(sum(r[2] for r in dropped))
+
+
 def build_patterns(
     gtfs_dir: Path,
     con: duckdb.DuckDBPyConnection,
@@ -68,7 +152,8 @@ def build_patterns(
     """)
     con.execute(f"""
         INSERT OR REPLACE INTO routes
-        SELECT route_id, agency_id, route_short_name, route_long_name
+        SELECT route_id, agency_id, route_short_name, route_long_name,
+               nullif(trim(route_type), '')
         FROM {_csv(gtfs_dir, "routes.txt")}
     """)
 
@@ -89,12 +174,15 @@ def build_patterns(
         CREATE OR REPLACE TEMP TABLE trip AS
         SELECT t.trip_id, t.route_id, t.shape_id,
                TRY_CAST(t.direction_id AS INTEGER) AS direction,
-               COALESCE(s.days_per_week, 5) AS days_per_week
+               COALESCE(s.days_per_week, 5) AS days_per_week,
+               r.route_type
         FROM {_csv(gtfs_dir, "trips.txt")} t
         LEFT JOIN service_days s USING (service_id)
+        LEFT JOIN routes r USING (route_id)
     """)
+    n_dropped = _drop_non_road_modes(con)
     n_trips = db.scalar(con, "SELECT count(*) FROM trip")
-    log.info("%d trips", n_trips)
+    log.info("%d trips on road modes, %d on other modes dropped", n_trips, n_dropped)
 
     _collapse_to_sequences(gtfs_dir, con)
 

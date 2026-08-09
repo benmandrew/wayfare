@@ -29,7 +29,11 @@ CREATE TABLE IF NOT EXISTS routes (
     route_id    VARCHAR PRIMARY KEY,
     agency_id   VARCHAR,
     short_name  VARCHAR,   -- the bus number the public sees; what we render
-    long_name   VARCHAR
+    long_name   VARCHAR,
+    -- GTFS route_type, as text. Kept because it decides which routes enter the
+    -- pipeline at all -- see config.ROAD_ROUTE_TYPES -- and because storing it is
+    -- what lets a later run report on a mode it dropped rather than forget it.
+    route_type  VARCHAR
 );
 
 -- A pattern is one distinct ordered stop sequence. 1.55M trips collapse to a far
@@ -272,6 +276,15 @@ def migrate(con: duckdb.DuckDBPyConnection) -> None:
 
     if "last_seen" not in columns(con, "patterns"):
         _migrate_pattern_ids(con)
+
+    if "route_type" not in columns(con, "routes"):
+        # The mode filter's column. Nothing already stored can supply it -- the old
+        # loader never read it -- so it is added empty and the next `patterns` run
+        # fills it in from routes.txt. Until then it is NULL, which no query treats
+        # as road-going, and no matched pattern is touched: a departed ferry keeps
+        # its rows and its match_status exactly like any other departed pattern.
+        con.execute("ALTER TABLE routes ADD COLUMN route_type VARCHAR")
+        logs.get("db").info("added routes.route_type; run `wayfare patterns` to fill it")
 
 
 def _migrate_pattern_ids(con: duckdb.DuckDBPyConnection) -> None:

@@ -95,6 +95,40 @@ MIN_MATCH_CONFIDENCE = 0.30
 MAX_DETOUR_RATIO = 3.0
 DETOUR_SLACK_M = 1_000.0
 
+# --- Modes -----------------------------------------------------------------
+
+# The GTFS route_type values that run on roads, and therefore the only ones the
+# matcher is asked about. Everything else is water, rail or wire, and Valhalla's
+# `bus` costing has nothing to snap it to: a ferry either fails outright or is
+# snapped to whatever coast road happens to be nearby, which is worse.
+#
+# Both the basic values and the extended ranges are here, because the basic ones
+# alone are wrong in a way that is invisible. 200-209 is coach, and the GB feed's
+# 316 route_type=200 routes are National Express and FlixBus -- real long-distance
+# road services that a `route_type = '3'` filter would silently delete.
+#
+#   3          bus            700-716  bus (extended)
+#   11, 800    trolleybus     200-209  coach (extended)
+#
+# Nothing else is added speculatively. A type nobody publishes is a line of code
+# that cannot be checked against a feed, and an unrecognised one is reported
+# rather than guessed at -- see gtfs._drop_non_road_modes.
+ROAD_ROUTE_TYPES = frozenset({3, 11, 800} | set(range(200, 210)) | set(range(700, 717)))
+
+# Names for the log line that reports what was dropped, and nothing else. Only the
+# basic types, which is what a GB or Irish feed actually carries; anything outside
+# this is logged as unrecognised, which is the point of reporting at all.
+ROUTE_TYPE_NAMES = {
+    0: "tram",
+    1: "metro",
+    2: "rail",
+    4: "ferry",
+    5: "cable tram",
+    6: "aerial lift",
+    7: "funicular",
+    12: "monorail",
+}
+
 # --- Patterns --------------------------------------------------------------
 
 # How many passes the stop_times group-by is split into. An ordered list aggregate

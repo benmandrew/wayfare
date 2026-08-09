@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+
+import pytest
 
 from wayfare import acquire, gtfs
 
@@ -84,6 +87,125 @@ def test_rebuild_is_idempotent(gtfs_dir: Path, con):
     gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB")
     assert con.execute("SELECT count(*) FROM patterns").fetchone()[0] == 2
     assert con.execute("SELECT count(*) FROM pattern_stops").fetchone()[0] == 6
+
+
+# --- Modes -------------------------------------------------------------------
+
+
+def _timetable(gtfs_dir: Path, routes: str, trips: str, stop_times: str) -> None:
+    """Replace the routes and the timetable, keeping the stops."""
+    (gtfs_dir / "routes.txt").write_text(
+        "route_id,agency_id,route_short_name,route_long_name,route_type\n" + routes
+    )
+    (gtfs_dir / "trips.txt").write_text(
+        "route_id,service_id,trip_id,direction_id,shape_id\n" + trips
+    )
+    (gtfs_dir / "stop_times.txt").write_text(
+        "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n" + stop_times
+    )
+
+
+def test_ferries_and_trains_never_become_patterns(gtfs_dir: Path, con):
+    """The mini feed carries a sea crossing and a train. Neither has a road under
+    it, and asking Valhalla to snap one produced the largest single class of error
+    in the GB run."""
+    gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB")
+    assert {
+        r[0] for r in con.execute("SELECT DISTINCT route_id FROM patterns").fetchall()
+    } == {"R1"}
+
+
+def test_coach_routes_are_kept(gtfs_dir: Path, con):
+    """route_type 200 is the extended code for coach, and the GB feed's 316 of them
+    are National Express and FlixBus -- long-distance buses on ordinary roads. A
+    filter written as `route_type = '3'` deletes the lot, which is the whole reason
+    the kept set is a range rather than a value."""
+    _timetable(
+        gtfs_dir,
+        "C1,OP1,X10,Alpha to Charlie,200\nF1,OP1,FERRY,Pier to Island,4\n",
+        "C1,WK,TC1,0,\nF1,WK,TF1,0,\n",
+        "TC1,08:00:00,08:00:00,S1,1\n"
+        "TC1,08:20:00,08:20:00,S3,2\n"
+        "TF1,12:00:00,12:00:00,P1,1\n"
+        "TF1,12:30:00,12:30:00,P2,2\n",
+    )
+    gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB")
+    assert [r[0] for r in con.execute("SELECT short_name FROM patterns").fetchall()] == [
+        "X10"
+    ]
+
+
+def test_trolleybus_is_kept_under_both_of_its_codes(gtfs_dir: Path, con):
+    """11 is the basic code and 800 the extended one, and they mean the same road
+    vehicle. Nothing in GB publishes either, which is exactly why it is pinned."""
+    _timetable(
+        gtfs_dir,
+        "T1,OP1,TB1,Alpha to Bravo,11\nT2,OP1,TB2,Alpha to Charlie,800\n",
+        "T1,WK,TT1,0,\nT2,WK,TT2,0,\n",
+        "TT1,08:00:00,08:00:00,S1,1\n"
+        "TT1,08:10:00,08:10:00,S2,2\n"
+        "TT2,09:00:00,09:00:00,S1,1\n"
+        "TT2,09:10:00,09:10:00,S3,2\n",
+    )
+    gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB")
+    assert {r[0] for r in con.execute("SELECT short_name FROM patterns").fetchall()} == {
+        "TB1",
+        "TB2",
+    }
+
+
+def test_dropped_modes_are_reported_by_type_and_trip_count(gtfs_dir: Path, con, caplog):
+    """Silent truncation is the failure this pipeline keeps getting bitten by, so a
+    mode leaving the feed has to be visible in the run's own log."""
+    with caplog.at_level(logging.INFO, logger="wayfare.gtfs"):
+        gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB")
+    lines = [r.getMessage() for r in caplog.records]
+    assert "dropping route_type 4 (ferry): 1 routes, 1 trips" in lines
+    assert "dropping route_type 2 (rail): 1 routes, 1 trips" in lines
+    assert "3 trips on road modes, 2 on other modes dropped" in lines
+
+
+def test_an_unrecognised_mode_is_a_warning_not_a_quiet_omission(
+    gtfs_dir: Path, con, caplog
+):
+    """A future feed publishing something road-going in a range nobody thought to
+    keep is how this filter goes wrong, so an unknown type is louder than a known
+    one rather than quieter."""
+    _timetable(
+        gtfs_dir,
+        "R1,OP1,42,Alpha to Delta,3\nZ1,OP1,ZZ,Alpha to Bravo,1200\n",
+        "R1,WK,T1,0,\nZ1,WK,TZ1,0,\n",
+        "T1,09:00:00,09:00:00,S1,1\n"
+        "T1,09:05:00,09:05:00,S2,2\n"
+        "TZ1,12:00:00,12:00:00,P1,1\n"
+        "TZ1,12:30:00,12:30:00,P2,2\n",
+    )
+    with caplog.at_level(logging.INFO, logger="wayfare.gtfs"):
+        gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB")
+    warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert "dropping route_type 1200 (unrecognised): 1 routes, 1 trips" in warned
+
+
+def test_a_feed_that_drops_to_nothing_is_refused(gtfs_dir: Path, con):
+    """Every trip dropping means the join to routes.txt failed, not that the
+    timetable is all water. A run that produces no patterns at all must say so."""
+    _timetable(
+        gtfs_dir,
+        "F1,OP1,FERRY,Pier to Island,4\n",
+        "F1,WK,TF1,0,\n",
+        "TF1,12:00:00,12:00:00,P1,1\nTF1,12:30:00,12:30:00,P2,2\n",
+    )
+    with pytest.raises(RuntimeError, match="non-road mode"):
+        gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB")
+
+
+def test_route_type_is_stored_as_text(gtfs_dir: Path, con):
+    """It is kept on `routes` so a later run can report on a mode it dropped, and
+    as text like every other column read out of the feed."""
+    gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB")
+    assert con.execute(
+        "SELECT route_type FROM routes WHERE route_id = 'F1'"
+    ).fetchone() == ("4",)
 
 
 def test_unpack_and_feed_version(gtfs_zip: Path, tmp_path: Path):
