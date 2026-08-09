@@ -101,11 +101,13 @@ and one-way systems read well as two parallel lines on the map.
 
 ## Next — correctness
 
-**Look at the skipped and errored patterns.** Wales skipped 4.2% on the
-`MAX_STOP_GAP_M` bound; GB skipped 1,555 and errored 462. Some are certainly
-TrawsCymru-style long-distance coaches, which genuinely have huge stop gaps and should
-probably be matched rather than dropped. Others may be bad stop coordinates. This is a
-concrete list to inspect rather than a hypothetical.
+**Re-match the patterns the old bounds dropped.** GB's 1,555 `skipped` and 462 `error`
+rows have been triaged and the bounds fixed — the stop gap is 180 km and is not
+applied at all to a pattern carrying an operator trace, and a refused connection is
+`transport_error` rather than a permanent fault — but nothing has been re-matched.
+`wayfare match --reclassify-transport`, then `--retry transient,skipped,error`, is the
+run, and it has not been done. Wales's 4.2% skipped is the same list at regional
+scale.
 
 **Validate the `stops` strategy against the `shape` strategy.** Wales is 85% `shape`,
 which makes it an unusually good validation set: those patterns are ground truth for

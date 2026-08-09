@@ -165,14 +165,18 @@ def test_reclassifying_leaves_our_own_configuration_error_alone(loaded):
     assert match.reclassify_transport_faults(loaded) == 0
 
 
-def test_huge_stop_gaps_are_skipped(loaded, monkeypatch):
+def test_huge_stop_gaps_are_skipped_only_without_operator_geometry(loaded, monkeypatch):
+    """The gap bound guards guesswork, so it must not touch a recorded trace.
+
+    The mini feed has one pattern with a shape and one without. Both blow the limit;
+    only the one whose road would have to be invented is skipped.
+    """
     monkeypatch.setattr(config, "MAX_STOP_GAP_M", 10)  # every hop is ~330 m
     client = FakeClient()
     match.run(loaded, client_=client)
-    assert client.calls == []
-    assert {r[0] for r in loaded.execute("SELECT status FROM match_status").fetchall()} == {
-        "skipped"
-    }
+    assert client.calls == ["shape"]
+    rows = loaded.execute("SELECT source, status FROM match_status").fetchall()
+    assert sorted(rows) == [("shape", "ok"), ("stops", "skipped")]
 
 
 def test_aggregate_inverts_to_services(loaded):

@@ -133,7 +133,7 @@ are never retried, but their edges are dropped.
 
 **Great Britain is complete end to end**, on the server, feed `20260807_022616`: 52,554
 patterns, 95.9% matched, 2,746,261 edges, 130 MB PMTiles. Wales and Greater London were
-the two rehearsals for it and both stand. 536 tests pass, ruff and mypy clean.
+the two rehearsals for it and both stand. 545 tests pass, ruff and mypy clean.
 
 **The Republic of Ireland runs as far as `patterns` and no further.** Feed
 `20260808_b375dfac`, 2,853 patterns, 100% operator geometry; figures in

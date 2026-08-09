@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from math import asin, cos, radians, sin, sqrt
 from typing import Any
 from urllib.parse import urljoin
 
@@ -60,6 +61,19 @@ EDGE_ATTRS = [
 # services run past that, so they are routed in overlapping chunks and stitched.
 MAX_LOCATIONS = 40
 CHUNK_OVERLAP = 1
+# And it caps the distance a request may cover, which is a different limit for a
+# different reason: 40 stops of a city service span a few kilometres, 40 stops of a
+# coach span the country. Both bounds hold at once, and the distance one is derived
+# from Valhalla's own cap so that raising the cap moves it rather than leaving it
+# stranded at a number nobody can place. See `config.VALHALLA_MAX_DISTANCE_M`.
+MAX_CHUNK_M = config.VALHALLA_MAX_DISTANCE_M * config.VALHALLA_DISTANCE_HEADROOM
+# Valhalla's `service_limits.trace.max_shape`. The distance bound always splits a
+# synthesised road shape first -- it runs about 24 points per kilometre, so 180 km is
+# some 4,300 points -- so this is a backstop rather than a working limit.
+MAX_SHAPE_POINTS = 16_000
+# The same sphere `gtfs._HAVERSINE` uses, so a chunk bound and a stored `span_m` are
+# the same measurement of the same leg.
+EARTH_RADIUS_M = 6_371_000.0
 
 
 class ValhallaError(RuntimeError):
@@ -198,7 +212,7 @@ class Client:
         Valhalla pass the stop on either side and produces jitter at termini.
         """
         shape: list[tuple[float, float]] = []
-        for chunk in _chunks(points, MAX_LOCATIONS, CHUNK_OVERLAP):
+        for chunk in _chunks(points, MAX_LOCATIONS, CHUNK_OVERLAP, MAX_CHUNK_M):
             payload = {
                 "locations": [
                     {"lat": lat, "lon": lon, "type": "break_through"} for lat, lon in chunk
@@ -243,24 +257,44 @@ class Client:
         ``edge_walk`` is used for the second call rather than ``map_snap`` because
         the input is Valhalla's own output: the points lie exactly on graph edges,
         so an exact walk is both faster and free of snapping error.
+
+        The walk is chunked by distance in its own right, not merely inherited from
+        the routing. Road is longer than the straight line it follows -- 1.26x and
+        1.58x on the long Welsh patterns -- so a stop chain that cleared the route cap
+        comfortably can produce a shape that does not clear the trace cap. Splitting
+        here is exact rather than a bound, because the shape's length is known before
+        the call is made.
         """
         road = self.route_shape(stops)
         if len(road) < 2:
             raise NoRoute("routed shape too short")
+        # A synthesised route is a guess about which roads the bus takes, not an
+        # observation of it. Confidence from edge_walk is meaningless (it is always
+        # 1.0 by construction), so it is not reported as if it were measured.
+        out = Match(edges=[], confidence=0.0, road_m=0.0, source="stops")
+        for part in _chunks(road, MAX_SHAPE_POINTS, CHUNK_OVERLAP, MAX_CHUNK_M):
+            for e in self._walk(part).edges:
+                # Parts overlap by a point, so a boundary falling inside an edge puts
+                # that edge at the end of one walk and the start of the next. Keeping
+                # the first occurrence loses the tail of one edge's geometry and no
+                # edge identity; counting it twice would inflate road_m instead.
+                if out.edges and e.edge_id == out.edges[-1].edge_id:
+                    continue
+                out.edges.append(e)
+                out.road_m += e.length_m
+        return out
+
+    def _walk(self, shape: list[tuple[float, float]]) -> Match:
         try:
-            data = self.trace_attributes(road, "edge_walk")
+            return _to_match(self.trace_attributes(shape, "edge_walk"), source="stops")
         except ValhallaError:
             # edge_walk is strict and refuses on the smallest discontinuity, which
             # chunk stitching can introduce. map_snap tolerates it. A TransportError
             # is not a ValhallaError and so is not caught here: there is nothing for
             # a second algorithm to fix about a connection that was refused.
-            data = self.trace_attributes(_thin(road), "map_snap")
-        m = _to_match(data, source="stops")
-        # A synthesised route is a guess about which roads the bus takes, not an
-        # observation of it. Confidence from edge_walk is meaningless (it is always
-        # 1.0 by construction), so it is not reported as if it were measured.
-        m.confidence = 0.0 if m.source == "stops" else m.confidence
-        return m
+            return _to_match(
+                self.trace_attributes(_thin(shape), "map_snap"), source="stops"
+            )
 
 
 # -- helpers ----------------------------------------------------------------
@@ -310,17 +344,48 @@ def _to_match(data: dict[str, Any], source: str) -> Match:
     )
 
 
+def _haversine_m(a: tuple[float, float], b: tuple[float, float]) -> float:
+    lat1, lon1 = radians(a[0]), radians(a[1])
+    lat2, lon2 = radians(b[0]), radians(b[1])
+    h = sin((lat2 - lat1) / 2) ** 2 + cos(lat1) * cos(lat2) * sin((lon2 - lon1) / 2) ** 2
+    return 2 * EARTH_RADIUS_M * asin(sqrt(h))
+
+
 def _chunks(
-    items: list[tuple[float, float]], size: int, overlap: int
+    items: list[tuple[float, float]],
+    size: int,
+    overlap: int,
+    max_m: float | None = None,
 ) -> list[list[tuple[float, float]]]:
-    if len(items) <= size:
+    """Split a point list into overlapping chunks, bounded by count and by length.
+
+    Both bounds are Valhalla's and they answer different questions. `size` bounds the
+    request: a route takes 50 locations and a trace 16,000 shape points. `max_m`
+    bounds the ground the request covers, which the count cannot stand in for -- 40
+    coach stops are half the country and 40 city stops are a suburb.
+
+    A chunk always holds at least two points, so a single leg longer than `max_m`
+    comes back whole and is refused by Valhalla rather than looping here. Nothing
+    upstream should hand one over: `config.MAX_STOP_GAP_M` is that leg, measured
+    against the same cap.
+    """
+    if len(items) < 2:
         return [items]
-    out = []
+    out: list[list[tuple[float, float]]] = []
     start = 0
-    step = size - overlap
     while start < len(items) - 1:
-        out.append(items[start : start + size])
-        start += step
+        end = start
+        run = 0.0
+        while end + 1 < len(items) and end - start + 2 <= size:
+            step = _haversine_m(items[end], items[end + 1])
+            if max_m is not None and end > start and run + step > max_m:
+                break
+            run += step
+            end += 1
+        out.append(items[start : end + 1])
+        if end == len(items) - 1:
+            break  # the overlap would otherwise re-emit the tail for ever
+        start = end + 1 - overlap
     return out
 
 

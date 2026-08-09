@@ -156,6 +156,95 @@ ratio alone is meaningless — a one-way system that sends the bus around one bl
 triples a 300 m span. Both `MAX_DETOUR_RATIO` and `DETOUR_SLACK_M` must be
 exceeded.
 
+**The stop-gap bound was a bound on long-distance coach, not on bad data.**
+`config.MAX_STOP_GAP_M` was 25 km, and a pattern with any consecutive stop pair
+further apart than that was recorded `skipped` without ever being matched. Nationally
+that skipped 1,555 patterns and 63,341 trips, 1.64% of every trip in the feed. Triage
+of all 1,555 turned up no null-island stops, and the only stops outside GB are real
+international coach halts — Paris Bercy, Amsterdam Sloterdijk, Brussels-North. 1,299
+of the 1,555 are National Express or FlixBus, median 6 stops, median longest leg
+147 km. The bound is now 180 km, and it is derived rather than chosen:
+`config.VALHALLA_MAX_DISTANCE_M` (200,000) times `VALHALLA_DISTANCE_HEADROOM` (0.9).
+Recovery measured against the completed national run, where *routable* means every
+stop in GB and the chain inside the cap:
+
+    50 km    356 patterns    15,566 trips    325 routable    14,186 routable trips
+    100 km   769             32,122          619             24,074
+    150 km   1,120           47,114          744             29,552
+    180 km   1,319           56,720          808             34,851
+
+200 km is Valhalla's own `service_limits.bus.max_distance`, past which it refuses with
+error 154, and 630 of the 1,555 span more than 200 km and cannot be routed at any
+setting. Filling the cap exactly buys nothing and only converts an honest `skipped`
+row into an `error` one.
+
+**The 200 km cap bites in two places, and it is the second one that actually bit.**
+Two Valhalla limits ship at 200 km. `service_limits.bus.max_distance` is checked by
+`/route` against the straight-line chain through the request's locations;
+`service_limits.trace.max_distance` is checked by `/trace_attributes` along the shape
+the request submits. The `stops` path calls both — route the stops to synthesise road,
+then walk that road. The expectation was that a 40-location chunk of a long pattern
+would blow the route cap, so `valhalla._chunks` gained a cumulative-distance bound
+alongside its existing location count (40, which exists for request size and is a
+different constraint). That is right and necessary — 40 coach stops are half the
+country and 40 city stops are a suburb — but it is not what was failing. What fails is
+the walk. Road is longer than the straight line it follows, by 1.26x and 1.58x on the
+two long Welsh patterns tested. A Welsh pattern with a 183.7 km stop chain routes
+without complaint as one 17-location request, then fails 154 on the trace of the
+232.2 km shape that came back; another, 173.4 km of chain, produced 273.8 km of road.
+So `_chunks` is now used twice, on the stops before routing and on the synthesised
+road before walking it, with the same ceiling both times. Chunking only the route
+would have converted `skipped` rows into `error` rows, which is the net loss the whole
+change exists to avoid. Parts overlap by one point, so a boundary falling inside an
+edge puts that edge at the end of one walk and the start of the next; the merge keeps
+the first occurrence, which loses the tail of one edge's geometry and no edge
+identity. Counting it twice would inflate `road_m` instead.
+
+Splitting the walk moves the `edge_walk` fallback rather than adding to it. Over 50 of
+Wales's 348 `stops` patterns, every single one falls back to `map_snap` today — the
+exact walk refuses on all 50 — and every single one still comes back as one part under
+the distance bound, reproducing its stored `pattern_edges` row for row. Where the walk
+does split, a chunk-stitch discontinuity now downgrades the part it falls in instead
+of the whole trace, so the fallback covers less geometry than it did rather than more.
+
+**Route 461's error 154 is the Wales extract, not the chunking.** All 10 of the Wales
+run's error-154 rows are route 461, 55 to 63 stops over 60-70 km chains. It is a
+cross-border service, Llandrindod Wells to Hereford, and the Wales-only OpenStreetMap
+extract has no roads east of the border, so its English stops snap back to the nearest
+Welsh road. Per-leg routing shows six legs of 21 to 78 km of road for 0.5 to 7 km of
+straight line, and several consecutive legs of 0.00 km where two stops snap to the
+same node. The whole 63 km chain routes as 260 km. Chunking cannot shorten it:
+measured at chunk sizes 40, 20, 10, 5, 3 and 2 the road stays 260.0 km, so the length
+is the graph's and not the request's. With the walk split it now traces rather than
+erroring — 1,266 edges — and lands in `low_confidence` at a detour ratio of 4.1, edges
+dropped, row kept. That is the right answer for geometry that is an artefact of the
+extract, and a better one than `error`, which reads as a bug.
+
+**The gap bound guards guesswork, so it must not be applied before the strategy is
+chosen.** `match_one` tested the gap several lines before it chose between
+`match_shape` and `match_stops`, so the bound was deciding for a path it was never
+written for. The reasoning on it — routing a long leg invents a plausible-but-wrong
+motorway — holds for `stops` and does not hold at all for `shape`: with an operator
+trace there is no routing and no guess, `map_snap` follows geometry the operator
+recorded, and the distance between two timing points says nothing about whether that
+geometry is good. This qualifies the "bad geometry is worse than missing geometry"
+entry above: that reasoning is about a guess, not about a recording. The test is now
+gated on `p.shape`. GB was losing 153 patterns and 6,062 trips to it, and the Republic
+of Ireland's feed loses 333 of 2,853 patterns, 11.7%, and 8,395 of 148,255 weekly
+trips — proportionally far worse only because that feed carries a shape on every trip,
+so it cannot lose the argument on the other path. The detour check does not catch
+them, which was the obvious risk and was measured. Wales shape-path detour ratio by
+longest-leg band: under 2 km, median 1.17, max 3.78; 2-5 km, 1.13 and 1.86; 5-10 km,
+1.13 and 1.60; 10-25 km, 1.14 and 1.34. A long leg makes a traced match straighter,
+not wilder, and the one Welsh shape-path `low_confidence` sits in the under-2 km band,
+which is the regime `DETOUR_SLACK_M` was written for. The two long patterns the raised
+bound admits measure 1.26 and 1.58 against a ratio of 3.0, so `MAX_DETOUR_RATIO` and
+`DETOUR_SLACK_M` are unchanged. `p.max_gap_m` is still computed for every pattern, and
+`load_batch` logs how many carry a trace across a leg past the bound, because a leg
+that long is still the thing that drops a pattern on the other path and a trace does
+not rule out the stop coordinate that produced it being wrong. The bound was never
+wrong about long legs; it was wrong about what a long leg is evidence of.
+
 **Spreading the work is `--max-seconds`.** Checked between batches, never inside
 one, because a batch is the unit of checkpointing — so the budget is a floor on run
 length, not a ceiling. It composes with the existing absence-of-a-status-row work
