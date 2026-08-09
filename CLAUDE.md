@@ -1,8 +1,9 @@
 # wayfare
 
-UK-wide dataset of bus routes snapped to the road network, from DfT BODS open data.
-Two consumers: an interactive web map (hover a road, see which buses use it) and
-artistic renderings of areas.
+UK-wide dataset of bus routes snapped to the road network, from DfT BODS open data,
+and now the Republic of Ireland from the National Transport Authority. Two consumers:
+an interactive web map (hover a road, see which buses use it) and artistic renderings
+of areas.
 
 ## Where the detail lives
 
@@ -129,7 +130,13 @@ are never retried, but their edges are dropped.
 
 **Great Britain is complete end to end**, on the server, feed `20260807_022616`: 52,554
 patterns, 95.9% matched, 2,746,261 edges, 130 MB PMTiles. Wales and Greater London were
-the two rehearsals for it and both stand. 483 tests pass, ruff and mypy clean.
+the two rehearsals for it and both stand. 511 tests pass, ruff and mypy clean.
+
+**The Republic of Ireland runs as far as `patterns` and no further.** Feed
+`20260808_b375dfac`, 2,853 patterns, 100% operator geometry; figures in
+`docs/data.md`. What is missing is the Valhalla graph — the island extract is 409 MB
+and has never been built — so nothing has been matched, aggregated or published. That
+is a run to start, not a step that was skipped.
 
 Feed churn — how many patterns are new month to month — is still the unmeasured number
 that decides everything, and it is one `acquire` and one `patterns` away from being

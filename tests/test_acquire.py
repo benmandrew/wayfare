@@ -146,9 +146,9 @@ def test_a_small_but_complete_feed_passes():
 
 
 class FakeResponse:
-    def __init__(self, status: int, body: bytes):
+    def __init__(self, status: int, body: bytes, headers: dict[str, str] | None = None):
         self.status_code = status
-        self.headers = {"Content-Length": str(len(body))}
+        self.headers = headers or {"Content-Length": str(len(body))}
         self._body = body
 
     def raise_for_status(self) -> None:
@@ -191,6 +191,58 @@ def test_a_server_that_ignores_range_restarts_cleanly(tmp_path, monkeypatch):
     src = acquire.Source("osm", "http://x/y.pbf", "x.pbf", resumable=True)
     acquire._stream(src, part)
     assert part.read_bytes() == b"WHOLE"
+
+
+# --- Declared length --------------------------------------------------------
+
+
+def test_a_short_read_is_caught_where_the_host_declares_a_length(tmp_path, monkeypatch):
+    """BODS sends no Content-Length, which is why check_gtfs opens the archive.
+    Every other host does send one, and it turns a cut-short transfer into an error
+    where it happened rather than a puzzle three stages later."""
+    monkeypatch.setattr(
+        acquire.requests,
+        "get",
+        lambda url, headers=None, **k: FakeResponse(200, b"AB", {"Content-Length": "1000"}),
+    )
+    src = acquire.Source("gtfs", "http://x/f.zip", "f.zip")
+    with pytest.raises(OSError, match="cut short"):
+        acquire._stream(src, tmp_path / "f.zip.part")
+
+
+def test_a_short_read_is_retried_rather_than_refused(tmp_path, monkeypatch):
+    """A dropped connection hands back different bytes next time, so it is a
+    network fault and not an Invalid one."""
+    attempts = []
+
+    def flaky(src, part):
+        attempts.append(1)
+        if len(attempts) < 2:
+            raise OSError("got 2 bytes of a declared 1000; the transfer was cut short")
+        _zip(part, list(acquire.REQUIRED_GTFS))
+
+    monkeypatch.setattr(acquire, "_stream", flaky)
+    monkeypatch.setattr(config, "DOWNLOAD_BACKOFF", 0.0)
+    monkeypatch.setattr(config, "MIN_GTFS_BYTES", 1)
+    acquire.download(acquire.sources("wales")[0], tmp_path)
+    assert len(attempts) == 2
+
+
+def test_a_compressed_body_is_not_measured_against_the_declared_length(
+    tmp_path, monkeypatch
+):
+    """requests decodes the body, so the bytes written are the decoded ones and the
+    declared length describes something else entirely."""
+    monkeypatch.setattr(
+        acquire.requests,
+        "get",
+        lambda url, headers=None, **k: FakeResponse(
+            200, b"decoded and longer", {"Content-Length": "4", "Content-Encoding": "gzip"}
+        ),
+    )
+    src = acquire.Source("naptan", "http://x/f.csv", "f.csv")
+    acquire._stream(src, tmp_path / "f.csv.part")
+    assert (tmp_path / "f.csv.part").read_bytes() == b"decoded and longer"
 
 
 def test_non_resumable_sources_send_no_range_header(tmp_path, monkeypatch):

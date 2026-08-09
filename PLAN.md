@@ -69,6 +69,17 @@ off by default. London `density` at 4,000px 5.05s -> 2.54s. It is deliberately n
 the default because it is not picture-preserving for `density` — see
 `docs/rendering.md`.
 
+**Republic of Ireland, acquire and patterns** (2026-08-09), feed
+`20260808_b375dfac`. The first source in this project that is not BODS: `ireland` is a
+region slug resolving through `config.FEEDS` to the National Transport Authority's
+108 MB bundle, and `config.Feed` carries the URL, the licence, the credit, whether the
+host resumes, and whether NaPTAN applies — it does not, since NaPTAN is the GB stop
+register. 123,903 road-going trips collapse to 2,853 patterns in 2 seconds, a 43.4x
+collapse, and 100% carry operator geometry against GB's 48.3%. The GUID feed version
+is rewritten rather than worked around, and a declared `Content-Length` is now checked
+because every host except BODS sends one. Numbers in `docs/data.md`. Nothing
+downstream of `patterns` has been run.
+
 ## Next — the picture
 
 **Decide whether `coalesce` becomes the default for `density`.** The flag exists and
@@ -110,6 +121,27 @@ over plain `through` is reasoned but unverified against real geometry.
 never rejected anything on merit — the one shape-path rejection was on detour, not
 score — so 0.30 remains an untested guess.
 
+## Next — the Republic of Ireland, end to end
+
+1. **Build the Valhalla graph** from `europe/ireland-and-northern-ireland-latest.osm.pbf`
+   (409 MB), in its own data root and its own instance, exactly as London was. The
+   extract covers both halves of the island, so this same graph is what Northern
+   Ireland will eventually match against — one build, one GraphId space, one database
+   if it comes to that.
+2. **Decide `MAX_STOP_GAP_M` for the `shape` path first.** 333 of the 2,853 patterns
+   (11.7%, 8,395 of 148,255 weekly trips) have a stop gap over 25 km, and every one of
+   them carries a dense operator trace. `match_one` checks the bound before it chooses
+   a strategy, so all 333 would be skipped on a rule written for routing between bare
+   stops. Wales's equivalent was 4.2%, and it is the same open question the
+   correctness section above raises about TrawsCymru coaches — the Republic just makes
+   it three times as expensive to leave alone.
+3. **Expect minutes, not hours.** Wales matched 3,552 patterns at 3.6/s on the `shape`
+   path; the Republic is 2,853 patterns and 100% `shape`.
+4. **Carry the attribution into what gets published.** CC BY 4.0 makes crediting the
+   NTA a condition, and `acquire` printing it in a log line is not that. The tiles and
+   the viewer need it before an Irish archive is served.
+5. `.env.example` has no `ireland` block; the README covers the two variables.
+
 ## Next — scale
 
 **Subsequence reduction.** Many patterns are short workings: a contiguous subsequence
@@ -128,7 +160,9 @@ hours, and it is one refresh away from being known.
 via OpenDataNI, and it does carry geometry — see `docs/data.md`. It needs a separate
 parser and the `ireland-and-northern-ireland` OSM extract (409 MB; there is no
 standalone NI extract). Sequenced after GB, because it shares nothing with the GTFS
-path except the matcher.
+path except the matcher — and now after the Republic, which reaches that same extract
+through the GTFS path and therefore builds the graph both halves of the island would
+share.
 
 **A graph rebuild is still a full re-match.** Geofabrik rebuilds daily and every
 `edge_id` depends on the build. `match.pin_graph` refuses rather than silently mixing

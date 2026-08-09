@@ -8,6 +8,8 @@ pipeline is expected to be re-run many times against the same inputs.
 
 from __future__ import annotations
 
+import csv
+import re
 import shutil
 import time
 import zipfile
@@ -26,6 +28,10 @@ log = logs.get("acquire")
 # roughly half of operators supply no geometry, and a feed without it is degraded
 # rather than broken.
 REQUIRED_GTFS = ("stop_times.txt", "trips.txt", "routes.txt", "stops.txt")
+
+# A feed_version shaped like this identifies a publication and describes nothing
+# about it -- see `feed_version`.
+_GUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 
 
 class Invalid(Exception):
@@ -69,20 +75,25 @@ def check_gtfs(path: Path) -> None:
 
 def sources(region: str | None = None, with_osm: bool = False) -> list[Source]:
     region = region or config.BODS_REGION
+    feed = config.feed(region)
     out = [
         Source(
             "gtfs",
-            config.BODS_GTFS_URL.format(region=region),
-            f"bods_gtfs_{region}.zip",
+            feed.url,
+            feed.filename,
             config.MIN_GTFS_BYTES,
             check=check_gtfs,
-        ),
-        Source("naptan", config.NAPTAN_URL, "naptan.csv", 10 << 20),
+            resumable=feed.resumable,
+        )
     ]
+    # NaPTAN is the GB stop register, so a region outside GB skips it rather than
+    # downloading 102 MB of stops none of its services call at.
+    if feed.stop_register:
+        out.append(Source("naptan", config.NAPTAN_URL, "naptan.csv", 10 << 20))
     if with_osm:
         url = config.osm_url(region)
         # Geofabrik answers Range requests with a 206; BODS and NaPTAN both ignore
-        # the header and resend the whole file. Verified against all three hosts.
+        # the header and resend the whole file. Verified against every host.
         out.append(Source("osm", url, url.rsplit("/", 1)[-1], 50 << 20, resumable=True))
     return out
 
@@ -165,8 +176,13 @@ def _stream(src: Source, part: Path) -> None:
             have = 0
 
         # BODS sends no Content-Length, so progress is reported in absolute bytes
-        # rather than as a percentage.
+        # rather than as a percentage. Every other host does send one -- see the
+        # completeness check below, which is the cheap version of check_gtfs.
         total = int(r.headers.get("Content-Length") or 0) + have
+        # requests transparently decodes a compressed body, so the bytes written
+        # are not the bytes declared and the check below would fire on a perfectly
+        # good transfer.
+        declared = total if not r.headers.get("Content-Encoding") else 0
         written = have
         next_report = written
         if resumed:
@@ -184,6 +200,16 @@ def _stream(src: Source, part: Path) -> None:
                         f" of {total / 1e9:.2f}" if total else "",
                     )
                     next_report = written + (250 << 20)
+
+    # A host that declares a length has told us what complete means, so a short
+    # read is knowable here rather than three stages later. This is a dropped
+    # connection and not bad content, so it raises OSError and is retried -- Invalid
+    # is for bytes that would come back the same next time.
+    if declared and written != declared:
+        raise OSError(
+            f"{src.name}: got {written} bytes of a declared {declared}; "
+            "the transfer was cut short"
+        )
 
 
 def unpack_gtfs(zip_path: Path, dest: Path | None = None, force: bool = False) -> Path:
@@ -211,16 +237,45 @@ def unpack_gtfs(zip_path: Path, dest: Path | None = None, force: bool = False) -
     return dest
 
 
-def feed_version(gtfs_dir: Path) -> str:
-    """BODS stamps the build into feed_info.txt; used to label the output."""
+def feed_info(gtfs_dir: Path) -> dict[str, str]:
+    """The single row of feed_info.txt, or nothing if the feed omits the file."""
     fi = gtfs_dir / "feed_info.txt"
     if not fi.exists():
-        return "unknown"
-    with fi.open() as fh:
-        header = fh.readline().rstrip("\n").split(",")
-        row = fh.readline().rstrip("\n").split(",")
-    fields = dict(zip(header, row, strict=False))
-    return fields.get("feed_version") or "unknown"
+        return {}
+    # utf-8-sig because a byte order mark on the first header name silently renames
+    # the column it belongs to, and csv rather than str.split because a publisher
+    # name is free text and may hold a comma.
+    with fi.open(encoding="utf-8-sig", newline="") as fh:
+        rows = csv.reader(fh)
+        header = next(rows, None)
+        row = next(rows, None)
+    if not header or not row:
+        return {}
+    return {k.strip(): v.strip() for k, v in zip(header, row, strict=False)}
+
+
+def feed_version(gtfs_dir: Path) -> str:
+    """The label every incremental stage keys its work on.
+
+    BODS stamps a build timestamp, which sorts and compares. The NTA stamps a GUID,
+    which does neither: two of them cannot be ordered, and nothing in the string
+    says whether a database holds this fortnight's timetable or last year's. So
+    where the version is opaque the date the feed declares it starts leads, and
+    eight hex digits of the GUID follow it -- the date is what makes it readable
+    and sortable, the digits are what keep two publications inside one validity
+    window distinct.
+
+    Distinctness is the half that matters. Every consumer of `patterns` filters on
+    `last_seen`, so a version that fails to change between feeds leaves withdrawn
+    services looking live and reports no churn at all, which is a wrong answer that
+    looks like a quiet month.
+    """
+    fields = feed_info(gtfs_dir)
+    version = fields.get("feed_version", "")
+    if not _GUID.fullmatch(version):
+        return version or "unknown"
+    start = fields.get("feed_start_date", "")
+    return f"{start}_{version[:8].lower()}" if start else version.lower()
 
 
 def _gb(p: Path) -> float:
@@ -231,6 +286,11 @@ def acquire_all(
     region: str | None = None, force: bool = False, with_osm: bool = False
 ) -> dict[str, Path]:
     config.ensure_dirs()
+    feed = config.feed(region)
+    # Printed every run, cache hit or not. The Republic's feed is CC BY 4.0 where
+    # every other source here is OGL, so attribution is a condition of using it and
+    # the run that fetches it is the last point at which nobody has yet forgotten.
+    log.info("gtfs: %s, %s (%s)", feed.url, feed.licence, feed.attribution)
     out: dict[str, Path] = {}
     for src in sources(region, with_osm=with_osm):
         out[src.name] = download(src, force=force)
