@@ -141,6 +141,27 @@ def test_coalesce_absent_is_off_and_a_typo_is_not():
         server.parse_art("area=cardiff&coalesce=nope")
 
 
+@pytest.mark.parametrize("raw", ["1", "true", "yes", "on"])
+def test_the_credit_caption_can_be_asked_for(raw):
+    assert server.parse_art(f"area=cardiff&credit={raw}").opts.credit is True
+
+
+def test_the_credit_caption_is_off_unless_asked_for():
+    """The metadata credit is unconditional and invisible; this one is drawn into
+    the picture, so it stays a decision."""
+    assert server.parse_art("area=cardiff").opts.credit is False
+    assert server.parse_art("area=cardiff&credit=off").opts.credit is False
+
+
+def test_the_credit_caption_splits_the_cache():
+    """A credited render and a plain one are different pictures, so an ETag that
+    covered both would serve one for the other."""
+    assert (
+        server.parse_art("area=cardiff&credit=1").key
+        != server.parse_art("area=cardiff").key
+    )
+
+
 def test_coalesce_splits_the_cache():
     """It is a different picture, so it must not be served from the same ETag."""
     assert (
@@ -481,6 +502,13 @@ def test_meta_reports_the_feed_version(art_db):
     assert database["feed_version"] == "20260806_022608"
     assert database["edges"] == 3
     assert "error" not in database
+
+
+def test_meta_serves_the_credit_the_renders_carry(art_db):
+    """The studio states it at the download, which is where the obligation lands.
+    Served rather than written into the page: it follows the region this server's
+    database holds, not the markup."""
+    assert server.art_meta(True)["credit"] == config.credit_html()
 
 
 def test_meta_publishes_the_query_vocabularies_in_a_stable_order(art_db):

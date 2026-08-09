@@ -123,6 +123,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--scale", type=float, default=1.0, help="2.0 is roughly 192 dpi")
     p.add_argument("--caption", default=None)
     p.add_argument(
+        "--credit",
+        action="store_true",
+        help="draw the data credit in the corner. Every render carries it in its "
+        "PNG or SVG metadata already; this is for anywhere that metadata will not "
+        "survive the trip",
+    )
+    p.add_argument(
         "--coalesce",
         action="store_true",
         help="join edges that meet end to end into one stroke, so a shared node is "
@@ -318,6 +325,7 @@ def _dispatch(args: argparse.Namespace) -> int:
                 width_px=args.width,
                 scale=args.scale,
                 caption=args.caption,
+                credit=args.credit,
                 coalesce=args.coalesce,
             ),
             workers=args.workers,

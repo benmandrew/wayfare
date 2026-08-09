@@ -299,6 +299,24 @@ rather than blankly.** MapLibre ignores an absent attribution, so the control fa
 to the basemap line alone. Bringing an old archive up to date is the `publish` stage
 only — no re-match, no re-aggregate.
 
+**The tiles were the first half of it and a render was the visible other half.** The
+art page credited the data on screen and then emitted images that carried none of it,
+which is the case the tileset metadata cannot reach: an archive is read through a viewer
+that shows the control, and a PNG is passed around on its own. A render now stamps
+`config.credit_text()` into its own file, and `config.credit_lines(region, links=False)`
+is the same credit shortened for a caption drawn on the canvas, one line per part. Both
+are built from `credit_parts` like the other two renderers, so adding a source to
+`FEEDS` still credits it everywhere and there is still no second hardcoded string. How a
+PNG chunk and an SVG `<metadata>` block are assembled is in docs/rendering.md; what
+matters here is what is owed and where it now travels.
+
+**The studio page states the credit at the download control**, not only beside the
+toggle that turns the caption on. The download is the moment the obligation attaches to
+somebody, and a flag nobody knows about does not discharge it. The line is served in
+`/art/meta` rather than written into the page, so it follows whichever region the
+server's database holds — the same reason the tiles carry theirs in the archive rather
+than in `web/index.html`.
+
 The credit travels with the bytes. That is the whole design, and the reason to keep
 testing it by copying an archive somewhere the page it was built against cannot reach,
 rather than by looking at the control on the machine that produced it.

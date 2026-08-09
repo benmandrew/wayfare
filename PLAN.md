@@ -203,8 +203,6 @@ score — so 0.30 remains an untested guess.
 1. **`.env.example` still has no `ireland` block.** The README covers the two variables.
 2. **Neither region is clustered.** `edges_clustered` reads `"no"` for both, so
    `wayfare cluster` has never run against either data root.
-3. **Rendered PNG and SVG output carries no credit at all.** `publish` stamps the
-   archive, but `art` stamps nothing, so a render leaves the credit behind.
 
 ## In progress — Greater London
 

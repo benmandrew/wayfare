@@ -414,6 +414,83 @@ can see it. A lat,lon-swapped window is the case that cannot raise — it is a l
 that draws nothing — so it comes back 200 with `X-Wayfare-Warning`, which is the CLI's log
 line put somewhere a browser can read.
 
+## Provenance
+
+**A rendered PNG or SVG used to carry no attribution at all.** The map and the tiles
+had theirs — `publish` stamps the credit into the PMTiles metadata, where it survives a
+copy to somebody else's bucket (see docs/data.md) — and `art` wrote a file with nothing
+in it. `/art` is served over HTTP and the studio page has a download control, so a
+render leaves the machine as a matter of course. What leaves is a derivative work of
+Creative Commons Attribution 4.0 (CC BY 4.0) timetable data and Open Database License
+(ODbL) road geometry, and no part of the file said so.
+
+**The metadata is unconditional and the visible caption is opt-in**, which is two
+mechanisms rather than one, deliberately. Metadata costs nothing, cannot alter the
+picture, and means every render leaves the server carrying its provenance even where
+nobody thought about it. A credit burned into a corner *is* a change to the artwork, and
+the person who knows whether an image is going somewhere public is the one asking for
+it, so the caption is off by default: `RenderOpts.credit`, `wayfare art --credit`,
+`credit=1` on `/art`. Both sit in `art._render`, the single funnel the file path and the
+`BytesIO` path share — the same reason `render_bytes` exists rather than a second
+drawing path.
+
+**Four fields go in.** `Title` is "wayfare density: cardiff"; `Description` carries the
+window as `minlon,minlat,maxlon,maxlat`; `Software` is "wayfare", bare; `Copyright` is
+`config.credit_text()`. The style and the window are in there because a render that has
+been through a chat client and back is otherwise a picture of somewhere nobody can name,
+and because both are arguments the caller supplied, so neither can move under a
+re-render. The feed version was considered and left out. It would have to be queried,
+which `render(edges=...)` has no connection to do, and it would make a render's bytes a
+function of when the timetable was downloaded rather than of what was asked for.
+
+**Nothing in the metadata may move.** That is the constraint the whole design bends
+around, because renders are asserted byte-identical run to run (see Determinism above).
+No timestamp, no hostname, no output path, and no version string — which is why
+`Software` is the bare name.
+`test_the_metadata_holds_nothing_that_moves` checks the four fields for a date, a year
+and a dotted version, and for the output path the render was written to.
+
+**pycairo writes neither format's metadata, so both are post-processes on finished
+bytes**, and cairo now draws into a buffer rather than straight into the sink. A PNG is
+a signature and a run of chunks — length, type, data, then a 32-bit cyclic redundancy
+check (CRC32) over the type and the data — so the chunk is written by hand rather than
+adding to a dependency set that is deliberately three packages (`pycairo`, `numpy`,
+`pyarrow`). It is spliced in after IHDR, where a reader looking for a copyright expects
+one, rather than after however many megabytes of IDAT. `tEXt` is Latin-1 and covers the
+copyright sign, so it covers the credit as it stands; a publisher whose name is not
+Latin-1 is one `config.FEEDS` entry away, so an unencodable value widens to `iTXt`
+(UTF-8) rather than raising a `UnicodeEncodeError` in the middle of a render. An SVG
+gets a Resource Description Framework (RDF) `<metadata>` block of Dublin Core elements
+inserted after the opening `<svg>` tag, the same four fields mapped through
+`_DC_ELEMENTS`.
+
+**The caption is drawn once, in the serial parent, after every band has been pasted
+in.** That is the banding trap: laid down inside `_draw_band` it would appear once per
+band, and each band would clip it to its own rows. It is also why the captions are the
+last thing to touch the surface — they composite with OVER, and the additive (`density`)
+and screening (`strands`) styles would otherwise take the text as light to accumulate.
+It reads the projection for a canvas size and nothing else: no weight scale, no window,
+no band collar, so a credited render draws the same map as an uncredited one.
+`spectrum`'s rule about never simplifying its geometry does not reach it, because a
+caption is drawn and not geometry.
+
+**One line per thing credited, so two lines**, bottom left, below the user's own
+caption, at `width_px / 220` against the canvas and shrunk further to fit between the
+margins. It drops the licence URIs through `config.credit_lines(links=False)`, the same
+builder as `credit_text` rather than a second string, because a URI in 7px text is
+unclickable, doubles a line that has to fit across the canvas, and is spelled out in
+full in the same file's metadata. **No floor on the shrinking**, for the reason
+`density`'s line widths have none: a thumbnail should look like the render reduced, and
+text that holds its point size while the canvas halves is the same mistake as a stroke
+width that does. Below a few hundred pixels it is a grey mark rather than a readable
+line, and the metadata is what carries the obligation at that size.
+
+`credit` reaches the `/art` cache key, because a credited render and a plain one are
+different pictures and an ETag covering both would hand out one for the other. The whole
+arrangement turns on a single asymmetry: a caption is a decision about a picture and
+belongs to whoever is publishing it, while the metadata is a fact about the file and
+belongs in every one of them.
+
 ## The studio page
 
 **The preview is measured from the stage, not guessed at from the viewport.** It used to
