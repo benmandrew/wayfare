@@ -7,6 +7,7 @@ pointed at a big volume and nothing escapes into the source tree.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 # --- Layout ----------------------------------------------------------------
@@ -24,6 +25,68 @@ DB_PATH = WORK / "wayfare.duckdb"
 BODS_GTFS_URL = "https://data.bus-data.dft.gov.uk/timetable/download/gtfs-file/{region}/"
 BODS_REGION = os.environ.get("WAYFARE_REGION", "all")
 
+# The National Transport Authority (NTA) publishes the Republic of Ireland's whole
+# timetable as one bundle, with no key and no registration. Per-operator bundles
+# sit beside it as GTFS_<Operator>.zip; the index is transitData/PT_Data.html.
+NTA_GTFS_URL = "https://www.transportforireland.ie/transitData/Data/GTFS_All.zip"
+
+OGL = "Open Government Licence v3.0"
+CC_BY_4 = "Creative Commons Attribution 4.0"
+
+
+@dataclass(frozen=True)
+class Feed:
+    """Where a region's timetable comes from, and what comes with it.
+
+    Everything except the Republic is a BODS slug, so `feed` builds those on
+    demand and only the exceptions need an entry in `FEEDS`. The licence and
+    attribution ride along because they differ between publishers and are the one
+    property of a source that has an obligation attached rather than a behaviour.
+    """
+
+    url: str
+    filename: str
+    licence: str
+    attribution: str
+    # NaPTAN is the GB stop register. It has nothing to say about anywhere else, so
+    # a non-GB region must not spend 102 MB fetching it.
+    stop_register: bool = True
+    # Whether the host answers a Range request with a 206, so an interrupted
+    # transfer resumes. Measured against each host, never assumed -- BODS ignores
+    # the header, Geofabrik and the NTA honour it.
+    resumable: bool = False
+
+
+FEEDS = {
+    # `ireland` is the Republic. Northern Ireland has no GTFS at all (see PLAN.md)
+    # and appears only in OSM_EXTRACTS, which is the same file for both.
+    "ireland": Feed(
+        url=NTA_GTFS_URL,
+        filename="nta_gtfs_ireland.zip",
+        # The first source here that is not OGL. Attribution is a condition of the
+        # licence rather than a courtesy, so anything published from this feed has
+        # to carry it -- see the README.
+        licence=CC_BY_4,
+        attribution="National Transport Authority",
+        stop_register=False,
+        resumable=True,
+    ),
+}
+
+
+def feed(region: str | None = None) -> Feed:
+    """The bundle for a region slug, BODS unless something else publishes it."""
+    region = region or BODS_REGION
+    if known := FEEDS.get(region):
+        return known
+    return Feed(
+        url=BODS_GTFS_URL.format(region=region),
+        filename=f"bods_gtfs_{region}.zip",
+        licence=OGL,
+        attribution="Department for Transport",
+    )
+
+
 # Geofabrik rebuilds these daily. Valhalla downloads its own copy at graph-build
 # time (see `tile_urls` in docker-compose.yml), so the pipeline does not need the
 # pbf at all -- nothing in Python reads it. Fetching it here is purely archival: a
@@ -40,13 +103,17 @@ OSM_EXTRACTS = {
     # Great Britain extract, which builds a graph for hours to answer questions
     # about one city.
     "london": "united-kingdom/england/greater-london-latest.osm.pbf",
-    # There is no standalone Northern Ireland extract.
+    # Geofabrik splits Ireland at the sea and not at the border, so both halves of
+    # the island read the same 409 MB file. That is convenient rather than awkward:
+    # one extract is one graph build and therefore one GraphId space, so the
+    # Republic and Northern Ireland can share a data root and a DuckDB file.
+    "ireland": "ireland-and-northern-ireland-latest.osm.pbf",
     "northern_ireland": "ireland-and-northern-ireland-latest.osm.pbf",
 }
 
 
 def osm_url(region: str | None = None) -> str:
-    """The extract matching a BODS region, so a dev run need not fetch all of GB.
+    """The extract matching a region, so a dev run need not fetch all of GB.
 
     BODS splits England far more finely than Geofabrik does, so anything without
     its own extract falls back to Great Britain.

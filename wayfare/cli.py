@@ -25,8 +25,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--log", default=None, help="log level")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("acquire", help="download BODS GTFS, OSM extract and NaPTAN")
-    p.add_argument("--region", default=None, help="BODS region slug (default: all)")
+    p = sub.add_parser("acquire", help="download the GTFS feed, OSM extract and NaPTAN")
+    p.add_argument(
+        "--region",
+        default=None,
+        help="region slug (default: all). A BODS slug, or `ireland` for the "
+        "National Transport Authority's Republic of Ireland feed",
+    )
     p.add_argument("--force", action="store_true", help="re-download even if present")
     p.add_argument(
         "--with-osm",

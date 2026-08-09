@@ -19,13 +19,18 @@ TransXChange TrackPoints, so whole cities arrive with no geometry at all. Map ma
 is therefore the main path and supplied geometry is the shortcut. Matching runs through
 Valhalla, the only engine that returns OSM way ids without a custom graph build.
 
+The Republic of Ireland is the opposite case and the sharpest available contrast: all
+129,405 trips in the National Transport Authority's feed carry a `shape_id`, across all
+108 agencies, with none of the per-operator split. That region is entirely the shortcut.
+
 ## Stages
 
 Each stage reads what the last one wrote, and each re-runs on its own.
 
-- **acquire** (`acquire.py`). The BODS General Transit Feed Specification (GTFS) bundle,
-  the Geofabrik OSM extract, and the National Public Transport Access Nodes (NaPTAN) stop
-  register.
+- **acquire** (`acquire.py`). The General Transit Feed Specification (GTFS) bundle for
+  the chosen region, the Geofabrik OSM extract, and the National Public Transport Access
+  Nodes (NaPTAN) stop register. The bundle comes from BODS for every region except
+  `ireland`, which comes from the NTA and skips NaPTAN, since NaPTAN covers only GB.
 - **patterns** (`gtfs.py`). The timetable collapses to distinct ordered stop sequences,
   in DuckDB.
 - **match** (`match.py`, `valhalla.py`). Each pattern becomes an ordered list of road
@@ -82,7 +87,26 @@ secrets a fork needs. The compose file's own header covers running single stages
 pointing `WAYFARE_IMAGE` at a local build.
 
 `WAYFARE_REGION` and `WAYFARE_OSM_URL` must describe the same area. Nothing checks this,
-and a mismatch fails every pattern rather than erroring.
+and a mismatch fails every pattern rather than erroring. The Republic of Ireland is
+`--region ireland`, whose extract is
+`https://download.geofabrik.de/europe/ireland-and-northern-ireland-latest.osm.pbf` —
+409 MB covering the whole island, because Geofabrik splits Ireland at the sea rather
+than at the border.
+
+## Data sources and licences
+
+| Source | Covers | Licence |
+|---|---|---|
+| DfT Bus Open Data Service (BODS) GTFS | Great Britain | Open Government Licence (OGL) v3.0 |
+| NaPTAN stop register | Great Britain | OGL v3.0 |
+| National Transport Authority (NTA) GTFS, published as Transport for Ireland | Republic of Ireland | Creative Commons Attribution (CC BY) 4.0 |
+| Geofabrik OpenStreetMap extracts | both | Open Database Licence (ODbL) |
+
+The NTA feed is the one that carries an obligation rather than a courtesy. CC BY 4.0
+makes attribution a condition of use, so anything published from it — a tile archive, a
+render, a map on a page — has to credit the National Transport Authority. `wayfare
+acquire` prints the licence and the credit on every run, whether it fetches the bundle
+or finds it already there.
 
 ## Requirements
 
