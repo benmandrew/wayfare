@@ -150,15 +150,54 @@ VALHALLA_URL = os.environ.get("WAYFARE_VALHALLA", "http://localhost:8002")
 VALHALLA_TIMEOUT = 120.0
 VALHALLA_WORKERS = int(os.environ.get("WAYFARE_WORKERS", "6"))
 
-# A pattern whose stops are further apart than this is likely an express or a data
-# error; matching it point-to-point tends to invent plausible-but-wrong roads.
-MAX_STOP_GAP_M = 25_000
+# Valhalla refuses a request past a distance limit and reports error 154. Two of its
+# limits bind the `stops` path and both are 200 km as shipped:
+# `service_limits.bus.max_distance`, checked against the straight-line chain through a
+# /route request's locations, and `service_limits.trace.max_distance`, checked along
+# the shape a /trace_attributes request submits. Nothing here may exceed it, and every
+# bound below is a fraction of it rather than a number of its own.
+VALHALLA_MAX_DISTANCE_M = 200_000
+# The fraction of that cap this project is willing to fill. The tenth held back covers
+# the difference between Valhalla's great-circle arithmetic and ours, and the metres a
+# location moves when it snaps to a road.
+VALHALLA_DISTANCE_HEADROOM = 0.9
+
+# A pattern whose consecutive stops are further apart than this is skipped. It is one
+# leg, so it is also the smallest chunk the matcher can build, and a leg past the cap
+# above cannot be routed at any chunk size -- hence the same derivation, giving
+# 180 km.
+#
+# This was 25 km, which was not a bound on bad data but a bound on long-distance
+# coach: triage of all 1,555 patterns it skipped nationally (63,341 trips, 1.64% of
+# every trip in the feed) found no null-island stops and no out-of-GB stops that were
+# not real international coach halts, and 1,299 of them were National Express or
+# FlixBus, median 6 stops and median longest leg 147 km. Recovery against the national
+# run, counting patterns whose stops are all in GB and whose chain fits the cap:
+#
+#     50 km   356 patterns   15,566 trips   325 routable   14,186 routable trips
+#    100 km   769            32,122         619            24,074
+#    150 km   1,120          47,114         744            29,552
+#    180 km   1,319          56,720         808            34,851
+#
+# 180 km reaches that ceiling. Rounding it up to 200 km buys nothing and costs
+# everything: 630 of the 1,555 span more than 200 km and Valhalla will not route them
+# at any setting, so the only effect of filling the cap exactly is to turn an honest
+# `skipped` row into an `error` one.
+MAX_STOP_GAP_M = int(VALHALLA_MAX_DISTANCE_M * VALHALLA_DISTANCE_HEADROOM)
 # Valhalla's own score for how well the trace fits the road graph.
 MIN_MATCH_CONFIDENCE = 0.30
 # Reject a match whose road distance wildly exceeds the straight-line stop chain.
 # The slack term matters: on a short pattern a ratio alone is meaningless, because
 # a one-way system that sends the bus around a single block can triple a 300 m
 # span. Both bounds must be exceeded before a match is called bad.
+#
+# Neither moved when the stop gap did. A motorway leg is nearly straight -- the long
+# Welsh patterns the raised gap admits measure 1.26x and 1.58x -- so 3.0 sits far
+# above what a coach costs and still well below the 4.1x that a genuinely lost match
+# runs to. The slack is what a long leg makes irrelevant rather than wrong: a
+# kilometre against a 150 km span is nothing, which is the same as saying the ratio
+# alone decides there, which is correct there and is exactly what the slack exists to
+# prevent on a 300 m one.
 MAX_DETOUR_RATIO = 3.0
 DETOUR_SLACK_M = 1_000.0
 

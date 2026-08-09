@@ -5,7 +5,7 @@ import json
 import pytest
 import requests
 
-from wayfare import polyline, valhalla
+from wayfare import config, polyline, valhalla
 
 # Two edges along a street, in the shape trace_attributes actually returns:
 # lengths in kilometres, geometry as one shared polyline indexed by each edge.
@@ -76,6 +76,245 @@ def test_chunking_covers_long_services(n, expected_chunks):
         assert a[-1] == b[0]
     # Every point must appear somewhere.
     assert {p for c in chunks for p in c} == set(points)
+
+
+def _chain_m(points):
+    return sum(
+        valhalla._haversine_m(a, b) for a, b in zip(points, points[1:], strict=False)
+    )
+
+
+@pytest.mark.parametrize(("n", "expected_chunks"), [(10, 1), (40, 1), (41, 2), (80, 3)])
+def test_the_distance_bound_changes_nothing_where_nothing_was_wrong(n, expected_chunks):
+    """A dense service is bounded by the location count, as it always was.
+
+    Forty stops of a city route span a couple of kilometres, so the distance ceiling
+    is never in play and the chunking must come out identical -- the same chunks, not
+    merely the same number of them."""
+    points = [(53.0 + i * 0.001, -2.0) for i in range(n)]  # ~111 m apart
+    plain = valhalla._chunks(points, valhalla.MAX_LOCATIONS, valhalla.CHUNK_OVERLAP)
+    bounded = valhalla._chunks(
+        points, valhalla.MAX_LOCATIONS, valhalla.CHUNK_OVERLAP, valhalla.MAX_CHUNK_M
+    )
+    assert bounded == plain
+    assert len(bounded) == expected_chunks
+
+
+def test_a_chunk_inside_the_location_count_still_splits_on_distance():
+    """Forty coach stops are half the country. The count bound cannot see that, and
+    Valhalla refuses the request with error 154 when it happens."""
+    points = [(51.0 + i * 0.09, -2.0) for i in range(40)]  # ~10 km apart, ~390 km total
+    assert len(valhalla._chunks(points, valhalla.MAX_LOCATIONS, 1)) == 1
+
+    chunks = valhalla._chunks(points, valhalla.MAX_LOCATIONS, 1, valhalla.MAX_CHUNK_M)
+    assert len(chunks) > 1
+    assert all(_chain_m(c) <= valhalla.MAX_CHUNK_M for c in chunks)
+    for a, b in zip(chunks, chunks[1:], strict=False):
+        assert a[-1] == b[0]
+    assert chunks[0] + [p for c in chunks[1:] for p in c[1:]] == points
+
+
+def test_a_single_leg_past_the_ceiling_is_not_split_further():
+    """A chunk always holds two points, or the chunker would never advance. Such a
+    leg is Valhalla's to refuse, and `config.MAX_STOP_GAP_M` is what keeps one from
+    ever being handed over."""
+    points = [(51.0, -2.0), (54.0, -2.0), (54.001, -2.0)]  # first leg ~333 km
+    chunks = valhalla._chunks(points, valhalla.MAX_LOCATIONS, 1, valhalla.MAX_CHUNK_M)
+    assert chunks[0] == points[:2]
+    assert _chain_m(chunks[0]) > valhalla.MAX_CHUNK_M
+
+
+def test_the_ceiling_is_derived_from_valhallas_own_cap():
+    """Not a number of its own: raising Valhalla's limit must move this one, and the
+    longest leg the matcher will accept is the same arithmetic."""
+    ceiling = valhalla.MAX_CHUNK_M
+    assert ceiling < config.VALHALLA_MAX_DISTANCE_M
+    assert ceiling == pytest.approx(config.MAX_STOP_GAP_M)
+
+
+class _FakeGraph:
+    """Answers /route and /trace_attributes over a straight line of points.
+
+    The route hands back the locations it was given, which is what makes the
+    stitched shape exactly the input. The trace hands back one edge per segment,
+    identified by where the segment starts -- and, when a part does not begin at the
+    start of the line, it repeats the segment the part's first point sits inside.
+    That repeat is the real behaviour the merge has to cope with: edge_walk reports
+    the whole edge a boundary falls into, at the end of one part and the start of
+    the next.
+    """
+
+    def __init__(self, points):
+        self.points = points
+        self.traces = []
+        self.routes = []
+
+    def post(self, path, payload):
+        if path == "route":
+            locs = [(loc["lat"], loc["lon"]) for loc in payload["locations"]]
+            self.routes.append(locs)
+            return {"trip": {"legs": [{"shape": polyline.encode(locs, 6)}]}}
+        shape = [(p["lat"], p["lon"]) for p in payload["shape"]]
+        self.traces.append(shape)
+        first = min(
+            range(len(self.points)),
+            key=lambda i: abs(self.points[i][0] - shape[0][0]),
+        )
+        begin = max(first - 1, 0)
+        edges = [
+            {"id": 1000 + i, "way_id": 2000 + i, "length": 0.1}
+            for i in range(begin, first + len(shape) - 1)
+        ]
+        return {"shape": polyline.encode(shape, 6), "edges": edges}
+
+
+def _fake_client(points):
+    client = valhalla.Client("http://valhalla.invalid/")
+    graph = _FakeGraph(points)
+    client._post = graph.post  # type: ignore[method-assign]
+    return client, graph
+
+
+def test_a_long_walk_is_split_and_stitched_back():
+    """The trace cap is measured along the routed road, which is longer than the stop
+    chain that produced it, so clearing the route cap does not clear this one."""
+    points = [(51.0 + i * 0.05, -2.0) for i in range(61)]  # ~5.6 km apart, ~333 km
+    client, graph = _fake_client(points)
+    m = client.match_stops(points)
+
+    assert len(graph.traces) > 1
+    assert all(_chain_m(t) <= valhalla.MAX_CHUNK_M for t in graph.traces)
+    # One edge per segment of the line, in order, with the seam counted once.
+    assert [e.edge_id for e in m.edges] == [1000 + i for i in range(len(points) - 1)]
+    assert m.road_m == pytest.approx(100.0 * (len(points) - 1))
+    assert m.confidence == 0.0
+
+
+def test_a_short_walk_is_one_call():
+    points = [(51.0 + i * 0.001, -2.0) for i in range(20)]
+    client, graph = _fake_client(points)
+    m = client.match_stops(points)
+    assert len(graph.routes) == 1
+    assert len(graph.traces) == 1
+    assert [e.edge_id for e in m.edges] == [1000 + i for i in range(len(points) - 1)]
+
+
+# -- location types ---------------------------------------------------------
+#
+# `break_through` forbids a U-turn at a stop, which is right for a bus passing one
+# and wrong for a bus turning round at one. These fix which stops get relaxed.
+
+
+def types(points):
+    return "".join("B" if t == "break" else "." for t in valhalla._location_types(points))
+
+
+def test_an_ordinary_pattern_keeps_break_through_everywhere():
+    """The default must not move: it is what makes edge_walk recover edges exactly."""
+    points = [(53.4800 + i * 0.005, -2.2450) for i in range(8)]
+    assert types(points) == "........"
+
+
+def test_an_out_and_back_spur_relaxes_the_stops_between_the_two_visits():
+    """The route reverses somewhere past the far end of the spur, so those stops
+    must be allowed to turn round. The two visits themselves are passed through."""
+    points = [
+        (53.4800, -2.2450),
+        (53.4850, -2.2450),  # out
+        (53.4900, -2.2450),  # spur
+        (53.4930, -2.2450),  # far end of the spur
+        (53.48502, -2.2450),  # back within 2 m of index 1
+        (53.4750, -2.2450),
+    ]
+    assert types(points) == "..BB.."
+
+
+def test_a_stop_served_twice_is_recognised_at_the_real_separation():
+    """Service 86B's two Montgomeryshire Infirmary stops are separate NaPTAN ids
+    28 m apart, so an exact coordinate test finds neither of them."""
+    points = [
+        (52.51839, -3.31595),  # Commercial Street
+        (52.52060, -3.31472),  # Montgomeryshire Infirmary, outbound
+        (52.52112, -3.31678),  # Bryn Lane
+        (52.52205, -3.31632),  # Bryn Meadows
+        (52.52062, -3.31431),  # Montgomeryshire Infirmary again, 28 m away
+        (52.52200, -3.31044),  # Brynglas Close North
+    ]
+    assert types(points) == "..BB.."
+
+
+def test_a_circular_ending_where_it_started_is_not_a_reversal():
+    """Otherwise every circular in the country relaxes end to end."""
+    points = [
+        (53.4800, -2.2450),
+        (53.4850, -2.2450),
+        (53.4900, -2.2450),
+        (53.4800, -2.2450),
+    ]
+    assert types(points) == "...."
+
+
+def test_adjacent_stops_at_the_same_place_are_two_kerbs_not_a_turn():
+    points = [
+        (53.4800, -2.2450),
+        (53.48018, -2.2450),
+        (53.4900, -2.2450),
+        (53.4700, -2.2450),
+    ]
+    assert types(points) == "...."
+
+
+@pytest.mark.parametrize(("dlat", "expected"), [(0.0004, ".B.."), (0.0006, "....")])
+def test_the_revisit_radius_is_a_distance_not_an_exact_match(dlat, expected):
+    """0.0004 degrees of latitude is 45 m and 0.0006 is 67 m, either side of 50."""
+    points = [
+        (53.4800, -2.2450),
+        (53.4850, -2.2450),
+        (53.4800 + dlat, -2.2450),
+        (53.4700, -2.2450),
+    ]
+    assert types(points) == expected
+
+
+def test_short_patterns_need_no_scan():
+    assert valhalla._location_types([(53.48, -2.245), (53.49, -2.245)]) == [
+        "break_through",
+        "break_through",
+    ]
+
+
+class _Recorder(valhalla.Client):
+    """A client that answers a route request with the straight line it was given."""
+
+    def __init__(self):
+        super().__init__(base_url="http://test/", timeout=1.0)
+        self.payloads = []
+
+    def _post(self, path, payload):
+        self.payloads.append(payload)
+        pts = [(loc["lat"], loc["lon"]) for loc in payload["locations"]]
+        return {"trip": {"legs": [{"shape": polyline.encode(pts, 6)}]}}
+
+
+def test_location_types_stay_aligned_with_their_stops_across_chunk_boundaries():
+    """Types are decided over the whole pattern and the request is chunked, so a
+    revisit that straddles a chunk boundary is the case that can slip."""
+    points = [(53.4800 + i * 0.005, -2.2450) for i in range(45)]
+    points[42] = (points[39][0] + 0.0001, points[39][1])  # a revisit spanning the cut
+    client = _Recorder()
+    client.route_shape(points)
+
+    assert len(client.payloads) == 2
+    rebuilt = list(client.payloads[0]["locations"])
+    for payload in client.payloads[1:]:
+        # Chunks overlap by one location; the repeat must carry the same type.
+        assert payload["locations"][0] == rebuilt[-1]
+        rebuilt.extend(payload["locations"][valhalla.CHUNK_OVERLAP :])
+
+    expected = valhalla._location_types(points)
+    assert [(loc["lat"], loc["lon"]) for loc in rebuilt] == points
+    assert [loc["type"] for loc in rebuilt] == expected
+    assert expected[40:42] == ["break", "break"]
 
 
 def test_thinning_preserves_the_endpoints():

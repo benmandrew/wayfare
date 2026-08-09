@@ -53,6 +53,11 @@ Complete end to end, on the server, feed `20260807_022616`.
 | publish | 130 MB PMTiles |
 | graph | pinned at `3.8.3/1786113507` |
 
+These figures predate the stop-gap and chunking fixes recorded in
+docs/pipeline.md, so the `skipped` and `error` counts are what those bounds cost
+rather than what the pipeline now achieves. Re-matching the 1,555 skipped and 462
+error patterns is a `wayfare match --retry skipped,error` away and has not been run.
+
 `patterns` holds exactly one feed version, so feed churn is still unmeasured — the
 number CLAUDE.md calls the one that decides everything. It costs one `acquire` and
 one `patterns` against a second national feed; the incremental machinery has been

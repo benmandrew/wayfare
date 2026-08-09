@@ -226,6 +226,19 @@ def load_batch(con: duckdb.DuckDBPyConnection, limit: int) -> list[Pattern]:
                 shape=shapes.get(shape_id, []) if shape_id else [],
             )
         )
+
+    # These are matched rather than skipped, because the geometry is recorded rather
+    # than invented. The count is still worth saying out loud: a leg that long is what
+    # drops a pattern on the other path, and a trace does not rule out the stop
+    # coordinate that produced the leg being wrong.
+    traced = sum(1 for p in out if p.shape and p.max_gap_m > config.MAX_STOP_GAP_M)
+    if traced:
+        log.info(
+            "%d of %d patterns carry operator geometry across a leg over %.0f km",
+            traced,
+            len(out),
+            config.MAX_STOP_GAP_M / 1000,
+        )
     return out
 
 
@@ -287,10 +300,19 @@ def _fetch_max_gap(con: duckdb.DuckDBPyConnection, ids: list[int]) -> dict[int, 
 def match_one(client: valhalla.Client, p: Pattern) -> Outcome:
     if len(p.points) < 2:
         return Outcome(p.pattern_id, "skipped", p.source, detail="fewer than two stops")
-    if p.max_gap_m > config.MAX_STOP_GAP_M:
-        # Usually a long-distance coach leg or a stop with bad coordinates. Routing
-        # through it produces a confident-looking line down a motorway that the bus
-        # may not use, which is worse than an absent one.
+    if not p.shape and p.max_gap_m > config.MAX_STOP_GAP_M:
+        # The bound guards the `stops` path and only the `stops` path. There, routing
+        # through a long leg produces a confident-looking line down a motorway the bus
+        # may not use, which is worse than an absent one, and past the limit Valhalla
+        # refuses the request outright -- so the choice is a `skipped` row or an
+        # `error` one, not a match.
+        #
+        # With an operator trace there is no route and no guess: map_snap follows
+        # geometry the operator recorded, and how far apart two timing points are says
+        # nothing about whether that geometry is good. Testing this before the strategy
+        # was chosen threw away 153 GB patterns (6,062 trips) that had the road already
+        # drawn for them, and 333 of Ireland's 2,853 -- 11.7%, because that feed carries
+        # a shape on every trip and so cannot lose the argument on the other path.
         return Outcome(
             p.pattern_id,
             "skipped",

@@ -25,7 +25,9 @@ Two matching strategies, chosen per pattern:
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from math import asin, cos, radians, sin, sqrt
 from typing import Any
 from urllib.parse import urljoin
 
@@ -60,6 +62,31 @@ EDGE_ATTRS = [
 # services run past that, so they are routed in overlapping chunks and stitched.
 MAX_LOCATIONS = 40
 CHUNK_OVERLAP = 1
+# And it caps the distance a request may cover, which is a different limit for a
+# different reason: 40 stops of a city service span a few kilometres, 40 stops of a
+# coach span the country. Both bounds hold at once, and the distance one is derived
+# from Valhalla's own cap so that raising the cap moves it rather than leaving it
+# stranded at a number nobody can place. See `config.VALHALLA_MAX_DISTANCE_M`.
+MAX_CHUNK_M = config.VALHALLA_MAX_DISTANCE_M * config.VALHALLA_DISTANCE_HEADROOM
+# Valhalla's `service_limits.trace.max_shape`. The distance bound always splits a
+# synthesised road shape first -- it runs about 24 points per kilometre, so 180 km is
+# some 4,300 points -- so this is a backstop rather than a working limit.
+MAX_SHAPE_POINTS = 16_000
+# The same sphere `gtfs._HAVERSINE` uses, so a chunk bound and a stored `span_m` are
+# the same measurement of the same leg.
+EARTH_RADIUS_M = 6_371_000.0
+
+# How close two stops have to be before the second counts as the route coming back
+# to the first. The two directions of one stop are separate NaPTAN ids on opposite
+# kerbs, so an exact coordinate test finds almost none of them: service 86B in
+# Newtown returns to Montgomeryshire Infirmary 28 m from where it left it, and to
+# Tan-y-Graig 7 m away. 50 m is wider than a road and well inside the gap between
+# stops: over Wales's 118,676 consecutive pairs the fifth percentile is 126 m, and
+# only 0.38% of stop-to-stop-after-next pairs -- the closest two the rule can even
+# consider -- fall within 50 m of each other.
+REVISIT_M = 50.0
+
+_M_PER_DEG_LAT = 111_320.0
 
 
 class ValhallaError(RuntimeError):
@@ -195,14 +222,26 @@ class Client:
 
         ``break_through`` forces the route to visit each stop without permitting a
         U-turn there, which is what a bus actually does. Plain ``through`` lets
-        Valhalla pass the stop on either side and produces jitter at termini.
+        Valhalla pass the stop on either side and produces jitter at termini. It is
+        the default and it is wrong wherever the pattern doubles back -- see
+        ``_location_types``.
         """
         shape: list[tuple[float, float]] = []
-        for chunk in _chunks(points, MAX_LOCATIONS, CHUNK_OVERLAP):
+        locations: list[dict[str, Any]] = [
+            {"lat": lat, "lon": lon, "type": t}
+            for (lat, lon), t in zip(points, _location_types(points), strict=True)
+        ]
+        # The types are decided over the whole pattern and the chunker only slices,
+        # so a revisit spanning a boundary keeps its relaxation on both sides.
+        for chunk in _chunks(
+            locations,
+            MAX_LOCATIONS,
+            CHUNK_OVERLAP,
+            MAX_CHUNK_M,
+            lambda loc: (loc["lat"], loc["lon"]),
+        ):
             payload = {
-                "locations": [
-                    {"lat": lat, "lon": lon, "type": "break_through"} for lat, lon in chunk
-                ],
+                "locations": chunk,
                 "costing": "bus",
                 "directions_options": {"units": "kilometers"},
                 "shape_format": "polyline6",
@@ -243,24 +282,44 @@ class Client:
         ``edge_walk`` is used for the second call rather than ``map_snap`` because
         the input is Valhalla's own output: the points lie exactly on graph edges,
         so an exact walk is both faster and free of snapping error.
+
+        The walk is chunked by distance in its own right, not merely inherited from
+        the routing. Road is longer than the straight line it follows -- 1.26x and
+        1.58x on the long Welsh patterns -- so a stop chain that cleared the route cap
+        comfortably can produce a shape that does not clear the trace cap. Splitting
+        here is exact rather than a bound, because the shape's length is known before
+        the call is made.
         """
         road = self.route_shape(stops)
         if len(road) < 2:
             raise NoRoute("routed shape too short")
+        # A synthesised route is a guess about which roads the bus takes, not an
+        # observation of it. Confidence from edge_walk is meaningless (it is always
+        # 1.0 by construction), so it is not reported as if it were measured.
+        out = Match(edges=[], confidence=0.0, road_m=0.0, source="stops")
+        for part in _chunks(road, MAX_SHAPE_POINTS, CHUNK_OVERLAP, MAX_CHUNK_M):
+            for e in self._walk(part).edges:
+                # Parts overlap by a point, so a boundary falling inside an edge puts
+                # that edge at the end of one walk and the start of the next. Keeping
+                # the first occurrence loses the tail of one edge's geometry and no
+                # edge identity; counting it twice would inflate road_m instead.
+                if out.edges and e.edge_id == out.edges[-1].edge_id:
+                    continue
+                out.edges.append(e)
+                out.road_m += e.length_m
+        return out
+
+    def _walk(self, shape: list[tuple[float, float]]) -> Match:
         try:
-            data = self.trace_attributes(road, "edge_walk")
+            return _to_match(self.trace_attributes(shape, "edge_walk"), source="stops")
         except ValhallaError:
             # edge_walk is strict and refuses on the smallest discontinuity, which
             # chunk stitching can introduce. map_snap tolerates it. A TransportError
             # is not a ValhallaError and so is not caught here: there is nothing for
             # a second algorithm to fix about a connection that was refused.
-            data = self.trace_attributes(_thin(road), "map_snap")
-        m = _to_match(data, source="stops")
-        # A synthesised route is a guess about which roads the bus takes, not an
-        # observation of it. Confidence from edge_walk is meaningless (it is always
-        # 1.0 by construction), so it is not reported as if it were measured.
-        m.confidence = 0.0 if m.source == "stops" else m.confidence
-        return m
+            return _to_match(
+                self.trace_attributes(_thin(shape), "map_snap"), source="stops"
+            )
 
 
 # -- helpers ----------------------------------------------------------------
@@ -310,17 +369,108 @@ def _to_match(data: dict[str, Any], source: str) -> Match:
     )
 
 
-def _chunks(
-    items: list[tuple[float, float]], size: int, overlap: int
-) -> list[list[tuple[float, float]]]:
-    if len(items) <= size:
+def _haversine_m(a: tuple[float, float], b: tuple[float, float]) -> float:
+    lat1, lon1 = radians(a[0]), radians(a[1])
+    lat2, lon2 = radians(b[0]), radians(b[1])
+    h = sin((lat2 - lat1) / 2) ** 2 + cos(lat1) * cos(lat2) * sin((lon2 - lon1) / 2) ** 2
+    return 2 * EARTH_RADIUS_M * asin(sqrt(h))
+
+
+def _as_point(item: Any) -> tuple[float, float]:
+    """The identity extractor, for chunking a list that is already coordinates."""
+    return item
+
+
+def _location_types(points: list[tuple[float, float]]) -> list[str]:
+    """One Valhalla location type per stop: ``break_through`` unless the route
+    doubles back through that stop.
+
+    ``break_through`` forbids a U-turn at the location, which is right for a bus
+    passing a stop and wrong for one turning round at it. A pattern that serves an
+    out-and-back spur, or a circular that reverses, comes back to within a few tens
+    of metres of a stop it has already served, and the reversal happens somewhere
+    between the two visits. Refused a U-turn there, Valhalla answers with a lap of
+    the block: service 86B in Newtown routes 24.3 km over a 5.9 km span, which is
+    not a failure anything downstream can see -- it is confident-looking geometry
+    down roads no bus uses.
+
+    So the stops *between* a stop and its return are relaxed to ``break``, which
+    permits the U-turn without asking for one; Valhalla still pays the turn cost and
+    takes it only where it is genuinely cheaper. The two visits themselves keep
+    ``break_through``, because the bus passes through those and turns round
+    somewhere beyond them -- relaxing them as well was measured and is very slightly
+    worse. Everything else keeps ``break_through`` too, since that is what makes the
+    ``edge_walk`` second pass recover edges exactly.
+
+    A pattern that ends where it started is not a reversal, so the first-to-last
+    pair is left alone -- otherwise every circular in the country would relax
+    end to end. Nor are adjacent stops, which are two kerbs of one junction rather
+    than a turn.
+    """
+    n = len(points)
+    types = ["break_through"] * n
+    if n < 3:
+        return types
+    # One longitude scale for the whole pattern. Over a bus route's extent the
+    # error against a proper haversine is centimetres, against a 50 m test.
+    lon_scale = _M_PER_DEG_LAT * cos(radians(points[0][0]))
+    for i in range(n):
+        lat_i, lon_i = points[i]
+        for j in range(i + 2, n):
+            if i == 0 and j == n - 1:
+                continue
+            dy = (points[j][0] - lat_i) * _M_PER_DEG_LAT
+            if abs(dy) > REVISIT_M:
+                continue  # cheap reject before the multiply; kills nearly every pair
+            dx = (points[j][1] - lon_i) * lon_scale
+            if dy * dy + dx * dx <= REVISIT_M * REVISIT_M:
+                types[i + 1 : j] = ["break"] * (j - i - 1)
+    return types
+
+
+def _chunks[T](
+    items: list[T],
+    size: int,
+    overlap: int,
+    max_m: float | None = None,
+    pos: Callable[[T], tuple[float, float]] | None = None,
+) -> list[list[T]]:
+    """Split a list into overlapping chunks, bounded by count and by length.
+
+    Both bounds are Valhalla's and they answer different questions. `size` bounds the
+    request: a route takes 50 locations and a trace 16,000 shape points. `max_m`
+    bounds the ground the request covers, which the count cannot stand in for -- 40
+    coach stops are half the country and 40 city stops are a suburb.
+
+    The items are not always coordinates: a route request carries a location type per
+    stop, decided over the whole pattern by `_location_types`, and chunking has to
+    carry that with the point rather than recompute it per chunk. `pos` says where the
+    coordinate lives; without it the items are the coordinates.
+
+    A chunk always holds at least two points, so a single leg longer than `max_m`
+    comes back whole and is refused by Valhalla rather than looping here. Nothing
+    upstream should hand one over: `config.MAX_STOP_GAP_M` is that leg, measured
+    against the same cap.
+    """
+    if len(items) < 2:
         return [items]
-    out = []
+    at: Callable[[T], tuple[float, float]] = pos or _as_point
+    out: list[list[T]] = []
     start = 0
-    step = size - overlap
     while start < len(items) - 1:
-        out.append(items[start : start + size])
-        start += step
+        end = start
+        run = 0.0
+        while end + 1 < len(items) and end - start + 2 <= size:
+            if max_m is not None:
+                step = _haversine_m(at(items[end]), at(items[end + 1]))
+                if end > start and run + step > max_m:
+                    break
+                run += step
+            end += 1
+        out.append(items[start : end + 1])
+        if end == len(items) - 1:
+            break  # the overlap would otherwise re-emit the tail for ever
+        start = end + 1 - overlap
     return out
 
 
