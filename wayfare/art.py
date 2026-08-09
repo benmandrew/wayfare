@@ -1473,12 +1473,29 @@ class Style:
     background: RGB = (0.02, 0.02, 0.035)
     needs_groups: bool = False
     blurb: str = ""
-    # The widest stroke this style lays down at `line_scale=1`, in logical pixels.
-    # Only banding reads it, and only to work out how far outside a band an edge can
-    # still be and paint into it -- a band whose collar is narrower than half a line
-    # width grows a seam. Declared rather than measured because it is a property of
-    # the ramps in `draw`, and a style that widens its lines has to say so here.
+    # The widest stroke this style lays down at `line_scale=1`. Only banding reads
+    # it, and only to work out how far outside a band an edge can still be and paint
+    # into it -- a band whose collar is narrower than half a line width grows a seam.
+    # Declared rather than measured because it is a property of the ramps in `draw`,
+    # and a style that widens its lines has to say so here.
+    #
+    # There are two regimes, and `ref_px` is which one this style is in. Left None,
+    # `max_line_px` is absolute pixels: the style strokes the same width whatever the
+    # canvas. Set, it is pixels *at a canvas `ref_px` wide*, and the real width scales
+    # with `width_px` -- which is what `density` does, so that the map and the lines
+    # shrink together. A canvas-scaling style that inherited the absolute reading
+    # would get a collar too wide below `ref_px` and, worse, too narrow above it.
     max_line_px: float = 20.0
+    ref_px: float | None = None
+
+    def max_stroke_px(self, width_px: float, line_scale: float = 1.0) -> float:
+        """The widest stroke this style can lay down on a canvas `width_px` wide."""
+        w = (
+            self.max_line_px
+            if self.ref_px is None
+            else self.max_line_px * width_px / self.ref_px
+        )
+        return w * line_scale
 
 
 # --- Styles -----------------------------------------------------------------
@@ -1688,7 +1705,9 @@ STYLES: dict[str, Style] = {
         draw=draw_density,
         background=(0.015, 0.018, 0.03),
         blurb="weekly trip volume as light",
-        max_line_px=19.0,  # the halo pass, 3.0 + 16.0
+        # The halo pass, 1.5 + 8.0, quoted at DENSITY_REF_PX like the ramps are.
+        max_line_px=9.5,
+        ref_px=DENSITY_REF_PX,
     ),
     "spectrum": Style(
         draw=draw_spectrum,
@@ -2036,6 +2055,17 @@ def _stats_table(rows: list[tuple[str, int, float]]) -> Any:
     )
 
 
+def _band_pad(sty: Style, opts: RenderOpts, width_px: float) -> float:
+    """How far outside its own rows a band must draw and query, in logical pixels.
+
+    Half the widest stroke, because a stroke is centred on its path, plus two pixels
+    of slack for the round caps and joins cairo adds past a vertex. The slack is
+    absolute, so it is proportionally thinner the wider the strokes get; it is a
+    margin on the arithmetic, not the arithmetic.
+    """
+    return sty.max_stroke_px(width_px, opts.line_scale) / 2.0 + 2.0
+
+
 def _draw_band(job: _BandJob) -> tuple[int, int, int, bytes]:
     """One band, drawn into its own surface and handed back as raw ARGB rows."""
     import cairo
@@ -2052,7 +2082,13 @@ def _draw_band(job: _BandJob) -> tuple[int, int, int, bytes]:
     # whole shape rasterised to. It showed up as one row of one Cardiff render off by
     # 1/255. Drawing past the cut and pasting only the middle means no shape is ever
     # split, and the clip that remains is exactly the serial path's.
-    pad = sty.max_line_px * job.opts.line_scale / 2.0 + 2.0
+    #
+    # `max_stroke_px` takes the canvas width because a style may quote its widths
+    # against a reference canvas rather than in absolute pixels. A fixed collar was
+    # right for every style until `density` started scaling with `width_px`, at which
+    # point it was twice what a 2,000px render needed and less than a 6,000px one did
+    # -- and only the second of those is a seam, which is why it went unnoticed.
+    pad = _band_pad(sty, job.opts, job.width)
     dev_pad = math.ceil(pad * s)
     origin = job.dev_y0 - dev_pad
     surface = cairo.ImageSurface(

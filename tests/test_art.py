@@ -615,13 +615,22 @@ def test_the_edge_stream_has_a_defined_order(con):
 # pieces that make it true, and the finished render.
 
 
-def _band_edge(con, edge_id, lat_e6, trips=100, services=("42",), agency="OP1"):
+def _band_edge(
+    con,
+    edge_id,
+    lat_e6,
+    trips=100,
+    services=("42",),
+    agency="OP1",
+    lon_span=(-3_200_000, -3_199_000),
+):
     """One edge at a given latitude. Banding cuts north to south, so unlike
     `_art_edge` the geometry has to vary in latitude rather than longitude."""
+    lon0, lon1 = lon_span
     con.execute(
         "INSERT INTO edges VALUES (?, 1, 'R', 'secondary', 100.0, "
-        "[-3200000, -3199000], [?, ?], -3200000, ?, -3199000, ?)",
-        [edge_id, lat_e6, lat_e6, lat_e6, lat_e6],
+        "[?, ?], [?, ?], ?, ?, ?, ?)",
+        [edge_id, lon0, lon1, lat_e6, lat_e6, lon0, lat_e6, lon1, lat_e6],
     )
     for s in services:
         con.execute(
@@ -680,6 +689,83 @@ def test_banding_survives_the_awkward_canvases(banded, opts):
     assert art.render_bytes(BAND_BOUNDS, "density", workers=1, **kw) == art.render_bytes(
         BAND_BOUNDS, "density", workers=4, **kw
     )
+
+
+@pytest.fixture
+def wide_banded(con, tmp_path, monkeypatch):
+    """Edges dense in latitude and alternating between busy and quiet, in a window
+    short enough that a 6,000px canvas is only 3.5 megapixels.
+
+    Both properties are load-bearing. `density`'s stroke width comes from the weight,
+    so only the busiest edges draw at the full width the collar is sized against, and
+    the fixture above puts those at one end of the window -- whether one lands in the
+    couple of pixels either side of a band cut where a collar that is too narrow
+    shows is then luck. Alternating the weight puts a full-width stroke every two
+    rows, so a seam is certain rather than likely."""
+    for i in range(600):
+        _band_edge(
+            con,
+            i + 1,
+            51_500_100 + i * 19,
+            trips=5000 if i % 2 == 0 else 10,
+            lon_span=(-3_290_000, -3_110_000),
+        )
+    con.close()
+    monkeypatch.setattr(art, "MIN_BAND_EDGES", 0)
+    ro = db.connect(tmp_path / "test.duckdb", read_only=True)
+    yield ro
+    ro.close()
+
+
+WIDE_BOUNDS = art.Bounds(-3.30, 51.500, -3.10, 51.512)
+
+
+def test_banding_holds_at_a_canvas_wider_than_the_style_reference(wide_banded):
+    """The regression. `density` quotes its widths against `DENSITY_REF_PX`, so its
+    widest stroke grows with the canvas, and a collar quoted in absolute pixels stops
+    covering half of it once the canvas passes about 4,842px at `line_scale=1`. Below
+    that the collar is merely too generous, which costs a little work and hides the
+    fault -- which is why every band test until this one drew at 200px and passed.
+
+    Bytes rather than a pixel tolerance, for the same reason the serial comparison
+    above is: a seam is a handful of pixels one part in 255 out, and any tolerance
+    loose enough to be robust is loose enough to miss it."""
+    kw = {"opts": art.RenderOpts(width_px=6000), "con": wide_banded}
+    assert art.render_bytes(WIDE_BOUNDS, "density", workers=1, **kw) == art.render_bytes(
+        WIDE_BOUNDS, "density", workers=4, **kw
+    )
+
+
+@pytest.mark.parametrize("style", sorted(art.STYLES))
+@pytest.mark.parametrize("width_px", [200, 2000, 4000, 6000, 20000])
+@pytest.mark.parametrize("line_scale", [0.5, 1.0, 2.0, 6.0])
+def test_the_collar_covers_half_the_widest_stroke(style, width_px, line_scale):
+    """The arithmetic behind the render above, checked over the range a render can
+    actually ask for. A band draws past its own rows by `pad` and queries the same
+    distance, so anything a stroke can reach beyond `pad` is paint the band never
+    makes -- a seam. The condition is one-sided: a collar wider than it needs to be
+    only costs work."""
+    sty = art.STYLES[style]
+    opts = art.RenderOpts(width_px=width_px, line_scale=line_scale)
+    assert (
+        art._band_pad(sty, opts, width_px) >= sty.max_stroke_px(width_px, line_scale) / 2.0
+    )
+
+
+def test_a_style_scaling_with_the_canvas_says_so():
+    """The two regimes, stated as a test so a new style has to choose one. `ref_px`
+    left None means `max_line_px` is absolute pixels; set, it means pixels at a
+    canvas that wide, and the collar scales with `width_px`."""
+    absolute = art.Style(draw=lambda *a: None, max_line_px=4.0)
+    assert absolute.max_stroke_px(1000) == absolute.max_stroke_px(8000) == 4.0
+    scaled = art.Style(draw=lambda *a: None, max_line_px=4.0, ref_px=2000.0)
+    assert scaled.max_stroke_px(1000) == 2.0
+    assert scaled.max_stroke_px(8000) == 16.0
+    assert scaled.max_stroke_px(8000, line_scale=2.0) == 32.0
+    # The one style that is in the scaled regime, and the constant it shares with
+    # `draw_density` -- the two must not drift, or the collar is sized for a picture
+    # the style does not draw.
+    assert art.STYLES["density"].ref_px == art.DENSITY_REF_PX
 
 
 def test_bands_hold_roughly_equal_numbers_of_edges(banded):

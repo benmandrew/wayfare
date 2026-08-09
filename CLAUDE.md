@@ -364,7 +364,9 @@ Four things had to be true and each was a bug first:
   at a raster boundary, and cairo tessellates in 24.8 fixed point, so the two halves'
   coverage does not always re-add to the whole shape's — one row of one Cardiff render
   came out 1/255 off. The band surface therefore carries a margin of half a line width,
-  drawn and discarded, and the only clip is the serial path's own window rect.
+  drawn and discarded, and the only clip is the serial path's own window rect. That
+  margin is `_band_pad`, and how wide it has to be depends on whether the style quotes
+  its widths in pixels or against a reference canvas — see the two regimes below.
 
 **Two scales must be the window's, never the band's.** `Weights` is injected into each
 band. So are the *group* statistics, through `Source.groups`, which now names an
@@ -469,6 +471,29 @@ proportionally lighter. No floor: a small canvas *should* draw hairlines, the
 same way downsampling the big render would. `spectrum` and `strands` still hold
 their widths in pixels, which is only defensible because neither stacks light
 additively the way `density` does; the studio's Widths note says so.
+
+**`Style.max_line_px` therefore has two regimes, and `ref_px` is which one.** The
+field exists for banding: a band draws and queries a *collar* past its own rows,
+half the widest stroke plus two pixels, so no stroke is ever cut at a raster
+boundary. Left `None`, `ref_px` means `max_line_px` is absolute pixels and the
+collar is fixed — `spectrum` at 4.0, `strands` at 3.9. Set, it means pixels at a
+canvas `ref_px` wide, and the collar scales with `width_px`. `density` is the only
+style in the second regime: `max_line_px=9.5`, `ref_px=DENSITY_REF_PX`, the halo
+ramp's `1.5 + 8.0` quoted against the same 2,000 the ramp itself is.
+
+Getting this wrong is a seam, and it is one-sided. A collar wider than the stroke
+only costs work, so the old fixed 19.0 was merely wasteful below 4,000px and
+silently broken above it: half the stroke is `9.5 * line_scale * width_px / 4000`
+and the collar was `9.5 * line_scale + 2`, which crosses at `width_px > 4000 * (1 +
+2 / (9.5 * line_scale))` — **4,842px at `line_scale=1`, 4,421px at 2, 4,211px at
+4**. The two-pixel slack is the only margin and it shrinks in relative terms as the
+lines widen, so a large export with the width knob raised sits closest to the edge.
+An edge whose centreline falls past the collar is never fetched, so the paint it
+owes the band is simply absent. Every banding test drew at 150 or 200px and passed;
+`test_banding_holds_at_a_canvas_wider_than_the_style_reference` renders at 6,000px
+and compares bytes. Its fixture alternates busy and quiet edges every row on
+purpose — only the busiest draw at the full width, and a fixture that puts those at
+one end makes the seam a matter of luck.
 
 **`spectrum` must never simplify its geometry.** Every other style would draw the
 same line through fewer points. This one takes the *hue* from the angle between
