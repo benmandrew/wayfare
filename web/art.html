@@ -170,16 +170,28 @@ input[type=color] {
   flex: 1;
   min-height: 0;
   display: grid;
+  /* One track, explicitly the size of the frame. An implicit track is `auto`,
+     which is sized by its content and is therefore *indefinite* -- and a
+     percentage height against an indefinite track silently becomes `auto`, so
+     the picture below kept its natural height and hung out of the bottom of the
+     panel however tall the render was. minmax(0, 1fr) is the definite version. */
+  grid-template: minmax(0, 1fr) / minmax(0, 1fr);
   place-items: center;
   padding: 12px;
   overflow: auto;
 }
+/* Fill the frame rather than only shrink to it. `max-width` alone caps a picture
+   that is already smaller than the stage at its own pixel size, which leaves the
+   render adrift in a much larger panel on a wide screen; `object-fit: contain`
+   scales it either way and keeps the aspect ratio, so the only empty ground left
+   is the letterbox a window's own proportions demand. The frame's request width
+   follows the same box (see fitWidth), so what fills it is usually drawn at size
+   rather than scaled up to it. */
 .frame img {
-  max-width: 100%;
-  max-height: 100%;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
   border-radius: 4px;
-  /* A render is nearly black; a border keeps it off the dark page background. */
-  box-shadow: 0 0 0 1px var(--border);
 }
 .frame.pending img { opacity: .55; transition: opacity .15s ease-in; }
 .status {
@@ -344,8 +356,11 @@ input[type=color] {
         <output id="widthOut"></output>
       </div>
       <input class="inp" type="number" id="width" min="64" step="100">
-      <div class="note">The preview is deliberately small so each change is cheap.
-        Line weight is in canvas units, so a wider export draws finer lines.</div>
+      <div class="note">The preview is sized to the stage, and re-fits when the
+        window changes until you set a width here yourself. <code>density</code>
+        scales its line weight with the canvas, so the export looks like the
+        preview; <code>spectrum</code> and <code>strands</code> hold theirs in
+        pixels and so draw finer lines at a wider export.</div>
     </div>
 
     <div class="field">
@@ -483,6 +498,7 @@ async function boot() {
   if (!renderable()) return;
 
   S = fromHash(defaults());
+  refit(); // defaults() ran before there was a window to shape the fit by
   build();
   apply();
   render();
@@ -533,6 +549,49 @@ function describeDatabase() {
 
 /* ---------- the parameter set ---------- */
 
+// Past this the preview stops being a preview. Nothing enforces it but the wish
+// to redraw on a slider move; the export width is a separate knob with the
+// server's own ceiling.
+const MAX_FIT_PX = 2000;
+
+// How wide a preview can be drawn and still fill the stage.
+//
+// The rule used to be a fraction of the viewport capped at 1,400px, and a cap is
+// exactly what leaves empty ground: an <img> only ever shrinks to its container,
+// so on a wide screen a 1,400px render sat in the middle of a much larger panel.
+// Measuring the frame gives the size of the space the picture actually goes in.
+//
+// Which edge the picture meets first is the window's business, not the frame's: a
+// tall window fits by height, and asking for the frame's full width there draws
+// pixels that are only scaled away again. `canvasHeight` is the server's own
+// arithmetic, so the ratio is known before anything is drawn.
+function fitWidth() {
+  const frame = $("frame");
+  if (!frame) return clamp(Math.round(window.innerWidth - 360), 320, MAX_FIT_PX);
+  const pad = parseFloat(getComputedStyle(frame).paddingLeft) || 0;
+  const box = frame.clientWidth - 2 * pad;
+  const height = frame.clientHeight - 2 * pad;
+  const b = S && bounds();
+  const wide = b ? (height * box) / canvasHeight(b, box) : box;
+  return clamp(Math.round(Math.min(box, wide)), 320, MAX_FIT_PX);
+}
+
+// Re-measure, unless somebody typed a width: that is a decision, and a decision
+// does not move because the stage did. Called wherever the fit can have changed --
+// the window resizing, and the *window* being reframed, since a differently
+// shaped one meets a different edge of the frame first.
+function refit() {
+  if (!S || !S.previewWidthAuto) return;
+  const w = fitWidth();
+  // Small changes are ignored on purpose. A scrollbar appearing, or a phone's
+  // address bar sliding away, is a few per cent of width and a whole render.
+  if (Math.abs(w - S.previewWidth) < 0.05 * S.previewWidth) return;
+  S.previewWidth = w;
+  if (!$("previewWidth")) return; // before build(); apply() will write it
+  $("previewWidth").value = w;
+  $("previewWidthOut").textContent = w + " px";
+}
+
 function defaults() {
   const d = META.defaults;
   // A city opens in a second or so; `uk` is the slowest window there is, and
@@ -556,9 +615,12 @@ function defaults() {
     alpha_scale: d.alpha_scale,
     scale: d.scale,
     width: d.width,
-    // Big enough to judge a design, small enough to redraw on every slider
-    // move. The stage is what has to hold it, not the export.
-    previewWidth: clamp(Math.round((window.innerWidth - 360) * 0.9), 700, 1400),
+    // The stage is what has to hold it, not the export -- so it is measured, not
+    // guessed at from the viewport. `previewWidthAuto` records that nobody chose
+    // it, which is what lets a resized window re-fit and keeps the number out of
+    // a shared link.
+    previewWidth: fitWidth(),
+    previewWidthAuto: true,
     caption: "",
     background: "",                   // "" means the style's own ground
     format: "png",
@@ -572,10 +634,14 @@ function toHash(s) {
   const p = new URLSearchParams();
   if (s.area) p.set("area", s.area); else p.set("bbox", s.bbox);
   for (const k of ["style", "hue", "line_scale", "alpha_scale", "scale",
-                   "width", "previewWidth", "caption", "background", "format",
+                   "width", "caption", "background", "format",
                    "weight", "group", "order", "min_trips"]) {
     if (String(s[k]) !== String(d[k])) p.set(k, String(s[k]));
   }
+  // An automatic preview width is the sender's stage, not a decision, and putting
+  // it in the link would reopen the page at whatever size their screen happened to
+  // be. Only a width somebody typed travels.
+  if (!s.previewWidthAuto) p.set("previewWidth", String(s.previewWidth));
   // Comma-joined, as the endpoint's own filters are: shorter than a repeated
   // parameter, and the same spelling the request uses.
   if (s.operator.length) p.set("operator", s.operator.join(","));
@@ -597,9 +663,14 @@ function fromHash(base) {
                    "weight", "group", "order"]) {
     if (p.has(k)) s[k] = p.get(k);
   }
-  for (const k of ["hue", "line_scale", "alpha_scale", "scale", "width", "previewWidth",
-                   "min_trips"]) {
+  for (const k of ["hue", "line_scale", "alpha_scale", "scale", "width", "min_trips"]) {
     if (p.has(k) && Number.isFinite(Number(p.get(k)))) s[k] = Number(p.get(k));
+  }
+  // A width in the link is one somebody typed, so it wins over the fitted one and
+  // stops the stage re-fitting it -- the counterpart of the rule in toHash.
+  if (p.has("previewWidth") && Number.isFinite(Number(p.get("previewWidth")))) {
+    s.previewWidth = clamp(Math.round(Number(p.get("previewWidth"))), 64, META.limits.max_width);
+    s.previewWidthAuto = false;
   }
   if (p.has("operator")) s.operator = splitList(p.get("operator"));
   if (p.has("class")) s.roadClass = splitList(p.get("class"));
@@ -779,11 +850,13 @@ function build() {
       if (!Number.isFinite(v) || v < 64) return; // mid-typing; wait for a usable number
       S[id] = Math.round(v);
       $(id + "Out").textContent = S[id] + " px";
-      if (id === "width") { writeHash(); exports(); } else changed();
+      if (id === "width") { writeHash(); exports(); }
+      else { S.previewWidthAuto = false; changed(); }
     });
   }
 
   initPicker();
+  watchStage();
 
   $("again").addEventListener("click", () => render(true));
   $("copyLink").addEventListener("click", async () => {
@@ -793,6 +866,22 @@ function build() {
     } catch {
       flash($("copyLink"), "Copy the address bar");
     }
+  });
+}
+
+// A resized window changes the size of the space the picture goes in, so an
+// automatic width follows it -- debounced, because a drag of the window edge is
+// dozens of resize events and each one would be a render.
+function watchStage() {
+  let pending = null;
+  addEventListener("resize", () => {
+    if (!S || !S.previewWidthAuto) return;
+    clearTimeout(pending);
+    pending = setTimeout(() => {
+      const before = S.previewWidth;
+      refit();
+      if (S.previewWidth !== before) render();
+    }, 250);
   });
 }
 
@@ -861,6 +950,7 @@ function applyQuery() {
 }
 
 function changed() {
+  refit(); // the area may have changed shape, which changes what fits
   writeHash();
   exports();
   $("busy").hidden = false;

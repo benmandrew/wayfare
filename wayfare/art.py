@@ -41,6 +41,11 @@ Ramp = Callable[[float], float]
 # a "1px" line means the same physical thickness at any `scale`.
 BASE_DPI = 96.0
 
+# The canvas width `density`'s stroke widths are quoted against. `scale` above
+# handles print resolution; this handles the other axis, how much map a pixel
+# covers. Chosen as 2,000 because that is `RenderOpts.width_px`'s own default.
+DENSITY_REF_PX = 2000.0
+
 
 # --- Geography --------------------------------------------------------------
 
@@ -1441,15 +1446,28 @@ def draw_density(
     ctx.set_operator(cairo.Operator.ADD)
 
     # (width, alpha, saturation) as functions of normalised traffic: first the
-    # broad dim halo, then the narrow bright core over it.
+    # broad dim halo, then the narrow bright core over it. Widths are in units of
+    # DENSITY_REF_PX of canvas, not in pixels -- see below.
     passes: tuple[tuple[Ramp, Ramp, Ramp], ...] = (
-        (lambda t: 3.0 + 16.0 * t, lambda t: 0.012 + 0.075 * t, lambda t: 0.95),
+        (lambda t: 1.5 + 8.0 * t, lambda t: 0.012 + 0.075 * t, lambda t: 0.95),
         (
-            lambda t: 0.5 + 3.6 * t**0.8,
+            lambda t: 0.25 + 1.8 * t**0.8,
             lambda t: 0.10 + 0.80 * t,
             lambda t: 0.90 - 0.75 * t,
         ),
     )
+    # A stroke width fixed in pixels is a different picture at every canvas size:
+    # the map shrinks with the canvas and the lines do not, so the same window at
+    # 1,600px lays the 4,000px weight over 40% of the road length and the additive
+    # passes clip to white in every town centre. That is what made the /art default
+    # (1,600px) look nothing like the CLI one (4,000px), and it made a preview a
+    # poor guide to the render it stands in for. Scaling with the canvas makes the
+    # two the same picture at two resolutions.
+    #
+    # No floor: a genuinely small canvas *should* draw hairlines, the same way
+    # downsampling the big render would. `line_scale` is the knob for overriding
+    # any of this.
+    weight_scale = opts.line_scale * opts.width_px / DENSITY_REF_PX
     # A sampled preview draws a fraction of the edges, so each survivor carries the
     # light of the ones that were dropped. Linear in the sample rate because ADD is
     # linear: n times the alpha over 1/n of the edges sums to the same brightness.
@@ -1471,7 +1489,7 @@ def draw_density(
         for width_of, alpha_of, sat_of in passes:
             r, g, b = colorsys.hsv_to_rgb(opts.hue, sat_of(t), 1.0)
             ctx.set_source_rgba(r, g, b, min(1.0, alpha_of(t) * alpha_scale))
-            ctx.set_line_width(width_of(t) * opts.line_scale)
+            ctx.set_line_width(width_of(t) * weight_scale)
             ctx.new_path()
             _stroke_path(ctx, pts)
             ctx.stroke()
