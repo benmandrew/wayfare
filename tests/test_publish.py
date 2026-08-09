@@ -275,6 +275,116 @@ def test_no_dropping_reports_only_the_size_limit(caplog):
     assert "full network" not in caplog.text
 
 
+# --- attribution -------------------------------------------------------------
+#
+# A licence condition rather than a label, so these test what reaches the archive
+# and not what a docstring says. The credit is stamped into the tiles because that
+# is the one place it travels with the data: an archive copied to a bucket keeps
+# it, where a line in the viewer or a field in /archives.json would not.
+
+
+def _tippecanoe_calls(monkeypatch, tmp_path, **kwargs):
+    """Run build_tiles against a fake tippecanoe and hand back the argv it built."""
+    import subprocess
+
+    calls = []
+
+    def fake_run(cmd, **_):
+        calls.append(cmd)
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
+    monkeypatch.setattr(publish.subprocess, "run", fake_run)
+    publish.build_tiles(tmp_path / "edges.geojsonl", tmp_path / "bus.pmtiles", **kwargs)
+    return calls
+
+
+def _attribution(cmd):
+    return next(a.split("=", 1)[1] for a in cmd if a.startswith("--attribution="))
+
+
+def test_every_licence_names_where_to_find_it():
+    """CC BY 4.0 requires the licence to be identified, which means a URI. A source
+    added with a licence nobody wrote a URL for must fail loudly at publish rather
+    than ship an archive crediting a licence it does not link to."""
+    for region in ("all", *config.FEEDS):
+        assert config.LICENCE_URLS[config.feed(region).licence].startswith("https://")
+
+
+def test_the_credit_names_the_publisher_the_licence_and_openstreetmap():
+    """Two obligations, and the second is the one that is easy to miss: every edge is
+    an OSM way, which makes the archive a derived database under ODbL whatever the
+    timetable's licence says."""
+    credit = config.credit_html("wales")
+    assert "Department for Transport" in credit
+    assert config.OGL in credit
+    assert config.LICENCE_URLS[config.OGL] in credit
+    assert "OpenStreetMap" in credit
+    assert config.LICENCE_URLS[config.ODBL] in credit
+    # And it says which half OSM covers, since the viewer's existing OSM line is
+    # about the backdrop and this one is about the lines drawn on it.
+    assert "Road geometry" in credit
+
+
+def test_a_region_on_a_different_licence_gets_a_different_credit():
+    """The Republic is CC BY 4.0 where every BODS slug is OGL. One string for both
+    would be wrong for whichever region is not showing."""
+    assert config.credit_html("ireland") != config.credit_html("all")
+    assert "National Transport Authority" in config.credit_html("ireland")
+    assert config.LICENCE_URLS[config.CC_BY_4] in config.credit_html("ireland")
+    assert "Department for Transport" not in config.credit_html("ireland")
+    # Northern Ireland is OGL like GB but a different publisher, so the licence
+    # alone does not decide the string.
+    assert "Translink" in config.credit_html("northern_ireland")
+
+
+def test_the_plain_text_credit_says_the_same_thing_without_markup():
+    """What a PNG tEXt chunk or an SVG <metadata> block can carry. The links have to
+    survive, since a licence identified by name alone is not identified."""
+    text = config.credit_text("ireland")
+    assert "<a href" not in text and "&copy;" not in text
+    assert "National Transport Authority" in text
+    assert config.LICENCE_URLS[config.CC_BY_4] in text
+    assert config.OSM_COPYRIGHT in text
+    # tEXt is Latin-1, so the sign has to be one of the 256 characters it allows.
+    text.encode("latin-1")
+
+
+def test_both_zoom_bands_are_stamped_with_the_credit(monkeypatch, tmp_path):
+    overview, detail, join = _tippecanoe_calls(monkeypatch, tmp_path)
+    assert _attribution(overview) == config.credit_html()
+    assert _attribution(detail) == config.credit_html()
+    # tile-join carries an input's attribution through to the joined archive --
+    # measured against tippecanoe 2.79.0, including where only one input has one --
+    # so it needs no flag of its own.
+    assert join[0] == "tile-join"
+
+
+def test_the_credit_follows_the_region_rather_than_the_call_site(monkeypatch, tmp_path):
+    """Derived from `config.Feed`, so it cannot drift from what `acquire` fetched."""
+    overview, _, _ = _tippecanoe_calls(
+        monkeypatch, tmp_path, attribution=config.credit_html("ireland")
+    )
+    assert "National Transport Authority" in _attribution(overview)
+    assert config.OGL not in _attribution(overview)
+
+
+def test_publish_stamps_the_region_it_was_given(monkeypatch, tmp_path):
+    """`wayfare publish --region ireland` has to reach tippecanoe, because the
+    licence is a property of the feed and not of the machine running the build."""
+    seen = {}
+
+    def fake_build_tiles(path, attribution=None):
+        seen["credit"] = attribution
+        return tmp_path / "bus.pmtiles"
+
+    monkeypatch.setattr(publish, "export_geojsonl", lambda con: tmp_path / "e.geojsonl")
+    monkeypatch.setattr(publish, "build_tiles", fake_build_tiles)
+    publish.build(None, region="ireland")
+    assert seen["credit"] == config.credit_html("ireland")
+
+
 def test_tippecanoe_failure_surfaces_stderr(monkeypatch, tmp_path):
     import subprocess
 

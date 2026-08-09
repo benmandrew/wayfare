@@ -164,6 +164,12 @@ input[type=color] {
 }
 /* A 272px-wide map has no room for the library's default attribution size. */
 .pickmap .maplibregl-ctrl-attrib { font-size: 10px; }
+/* The picker draws the published archives, so it shows licensed data and not
+   only a backdrop, and the archive's own credit lands in this control alongside
+   the basemap's. Expanded that is three sources, which at this width has to wrap
+   -- .pickmap is overflow: hidden, so anything wider is not shortened but cut
+   off. Content-box, and 190 + 36 of padding + 20 of margin clears 272. */
+.pickmap .maplibregl-ctrl-attrib.maplibregl-compact-show { max-width: 190px; }
 
 /* --- the picture --- */
 .frame {
@@ -403,6 +409,8 @@ input[type=color] {
      without web/vendor/ loses the map and keeps the studio. -->
 <script src="vendor/maplibre-gl.js"></script>
 <script src="vendor/pmtiles.js"></script>
+<!-- The basemap credit, shared with index.html so the two cannot drift. -->
+<script src="credits.js"></script>
 <script>
 "use strict";
 
@@ -1225,9 +1233,7 @@ function initPicker() {
           type: "raster",
           tiles: basemapTiles(theme),
           tileSize: 256,
-          attribution:
-            '<a href="https://carto.com/attributions">CARTO</a> · ' +
-            '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+          attribution: BASEMAP_CREDIT,
         },
       },
       layers: [{ id: "basemap", type: "raster", source: "basemap" }],
@@ -1251,7 +1257,20 @@ function initPicker() {
     changed();
   });
 
-  pickMap.on("load", () => addNetwork(pickMap));
+  pickMap.on("load", () => {
+    addNetwork(pickMap);
+    // MapLibre opens a compact credit expanded and collapses it on the first drag.
+    // That is right on a full-page map and wrong here: expanded it is 226 x 104 of
+    // a 270 x 200 picker, so it covers the map you are meant to drag and swallows
+    // the pointer that would drag it. Collapsed it is the (i) button, which is the
+    // conventional affordance and one click from the full text. Safe to do once --
+    // `_updateCompact` only adds the class to a control that is not already
+    // compact, so neither the later resize nor the network source reopens it.
+    pickMap
+      .getContainer()
+      .querySelector(".maplibregl-ctrl-attrib")
+      ?.classList.remove("maplibregl-compact-show");
+  });
 
   let sizing = null;
   addEventListener("resize", () => {
@@ -1308,7 +1327,11 @@ async function addNetwork(map) {
     archives = [];
   }
   const url = new URL(archives[0] || "./bus.pmtiles", location.href).href;
-  const protocol = new pmtiles.Protocol();
+  // `metadata: true`, and it is off by default: without it the plugin answers
+  // MapLibre's TileJSON request from the PMTiles header alone and the credit
+  // written into the archive's metadata block never leaves the file. This picker
+  // draws the published network, so it owes that credit as much as the viewer does.
+  const protocol = new pmtiles.Protocol({ metadata: true });
   maplibregl.addProtocol("pmtiles", protocol.tile);
   const archive = new pmtiles.PMTiles(url);
   protocol.add(archive);

@@ -170,9 +170,14 @@ score — so 0.30 remains an untested guess.
    it three times as expensive to leave alone.
 3. **Expect minutes, not hours.** Wales matched 3,552 patterns at 3.6/s on the `shape`
    path; the Republic is 2,853 patterns and 100% `shape`.
-4. **Carry the attribution into what gets published.** CC BY 4.0 makes crediting the
-   NTA a condition, and `acquire` printing it in a log line is not that. The tiles and
-   the viewer need it before an Irish archive is served.
+4. **The attribution is carried, and this item is done.** `wayfare publish` stamps the
+   credit into the archive's own tileset metadata through tippecanoe's `--attribution`,
+   so it travels with the file rather than with the page serving it, and both the viewer
+   and the art page's window picker read it back and show it. CC BY 4.0's condition on
+   crediting the NTA is therefore met by an Irish archive wherever it is copied. What
+   remains before one can be served publicly is items 1 to 3 above and nothing else: the
+   graph build, the match run, and `publish`. Rendered PNG and SVG output still carries
+   no credit at all, which is a separate branch.
 5. `.env.example` has no `ireland` block; the README covers the two variables.
 
 ## Next — Northern Ireland, end to end

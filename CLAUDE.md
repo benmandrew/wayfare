@@ -12,7 +12,8 @@ This file holds only what changes how code gets written. The measurements and th
 reasoning behind each decision are in `docs/`, and are worth reading before touching
 the area they cover — most of them record something that was a bug first.
 
-- `docs/data.md` — the feeds, their sizes and traps, mode filtering, coverage gaps.
+- `docs/data.md` — the feeds, their sizes and traps, mode filtering, coverage gaps,
+  attribution.
 - `docs/pipeline.md` — the five stages, storage, DuckDB lessons, clustering, tiles.
 - `docs/rendering.md` — `art`: the style/spec split, streaming, banding, coalescing,
   where a render's time actually goes, the `/art` endpoint and the studio page.
@@ -104,6 +105,13 @@ check that looks at pixels. Test that the order is *defined*, not that two runs 
 confident-looking line down a road no bus uses. `low_confidence` rows are kept so they
 are never retried, but their edges are dropped.
 
+**A licence condition travels with the data, not with the page.** `publish` stamps the
+credit into the archive's own tileset metadata, derived from `config.Feed`, so a copied
+archive keeps it and a viewer holding several regions shows the right one for each.
+Every region owes two credits: the timetable's publisher, and OpenStreetMap under ODbL
+for the geometry. `pmtiles.Protocol` needs `{ metadata: true }` or MapLibre never sees
+any of it, which looks like a viewer crediting only its basemap rather than an error.
+
 ## Standards
 
 - Python 3.12, ruff at line-length 92, mypy strict on `wayfare`. `ruff format` owns the
@@ -134,7 +142,7 @@ are never retried, but their edges are dropped.
 
 **Great Britain is complete end to end**, on the server, feed `20260807_022616`: 52,554
 patterns, 95.9% matched, 2,746,261 edges, 130 MB PMTiles. Wales and Greater London were
-the two rehearsals for it and both stand. 585 tests pass, ruff and mypy clean.
+the two rehearsals for it and both stand. 500 tests pass, ruff and mypy clean.
 
 **Both parts of Ireland run as far as `patterns` and no further.** The Republic on
 feed `20260808_b375dfac`, 2,853 patterns, 100% operator geometry; Northern Ireland

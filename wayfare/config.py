@@ -37,6 +37,22 @@ OPENDATANI_API = "https://admin.opendatani.gov.uk/api/3/action/package_show"
 
 OGL = "Open Government Licence v3.0"
 CC_BY_4 = "Creative Commons Attribution 4.0"
+# Not a spelling mistake and not to be tidied to the British form the rest of this
+# codebase uses: "Open Database License" is the licence's own name.
+ODBL = "Open Database License"
+
+# CC BY 4.0 requires the licence to be *identified*, which in practice means a name
+# and a URI; OGL and ODbL ask for the same. A table keyed on the licence rather than
+# a field on `Feed`, so two publishers under one licence cannot disagree about where
+# it is, and a credit raises on a licence with no entry rather than quietly omitting
+# it.
+LICENCE_URLS = {
+    OGL: "https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/",
+    CC_BY_4: "https://creativecommons.org/licenses/by/4.0/",
+    ODBL: "https://opendatacommons.org/licenses/odbl/",
+}
+
+OSM_COPYRIGHT = "https://www.openstreetmap.org/copyright"
 
 
 @dataclass(frozen=True)
@@ -140,6 +156,75 @@ def feed(region: str | None = None) -> Feed:
         licence=OGL,
         attribution="Department for Transport",
     )
+
+
+@dataclass(frozen=True)
+class Credit:
+    """One thing that has to be acknowledged: what it is, whose it is, its licence."""
+
+    what: str
+    who: str
+    licence: str
+    # Where the work itself lives, where the publisher gives one. The licence's own
+    # URI is looked up from `LICENCE_URLS` and is not optional.
+    who_url: str | None = None
+
+
+def credit_parts(region: str | None = None) -> tuple[Credit, ...]:
+    """Everything a picture of this region owes an acknowledgement to.
+
+    Built from the `Feed` rather than from a table of its own, so a source added to
+    `FEEDS` is credited by the act of describing it.
+
+    Two obligations, and the second is the one that is easy to miss. The timetable
+    is the publisher's, under their licence -- a condition rather than a courtesy
+    now that the Republic's feed is CC BY 4.0. The geometry is OpenStreetMap's,
+    under ODbL, whatever the timetable says: every edge is an OSM way that Valhalla
+    matched a route onto, so an archive is a derived database. The viewer's existing
+    OpenStreetMap line is about the *backdrop* and says nothing about the lines drawn
+    on top of it, which is why the wording here names what each credit covers.
+
+    The basemap is not here. It belongs to the page that chooses it, not to the data,
+    and a render carries no basemap at all.
+    """
+    f = feed(region)
+    return (
+        Credit("Bus routes", f.attribution, f.licence),
+        Credit("Road geometry", "OpenStreetMap contributors", ODBL, OSM_COPYRIGHT),
+    )
+
+
+def credit_html(region: str | None = None) -> str:
+    """The credit as a map attribution control wants it.
+
+    `publish` stamps this into the tileset metadata, which is the one place a licence
+    condition travels with the data: an archive copied to a bucket takes its credit
+    with it, where a line in the viewer or a field in `/archives.json` would be left
+    behind.
+    """
+    return " &middot; ".join(
+        f"{c.what}: &copy; {_link(c.who, c.who_url)}, "
+        f"{_link(c.licence, LICENCE_URLS[c.licence])}"
+        for c in credit_parts(region)
+    )
+
+
+def credit_text(region: str | None = None) -> str:
+    """The same credit with the links spelled out, for anywhere HTML is not read.
+
+    A PNG `tEXt` chunk, an SVG `<metadata>` block, a log line. The copyright sign is
+    deliberate and safe in all three: it is in Latin-1, which is what `tEXt` allows.
+    """
+    return " ".join(
+        f"{c.what}: \N{COPYRIGHT SIGN} {c.who}"
+        + (f" <{c.who_url}>" if c.who_url else "")
+        + f", {c.licence} <{LICENCE_URLS[c.licence]}>."
+        for c in credit_parts(region)
+    )
+
+
+def _link(text: str, url: str | None) -> str:
+    return f'<a href="{url}">{text}</a>' if url else text
 
 
 # Geofabrik rebuilds these daily. Valhalla downloads its own copy at graph-build

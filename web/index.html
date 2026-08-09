@@ -153,11 +153,31 @@ a.btn { text-decoration: none; }
 }
 .spin { color: var(--muted); font-size: 12px; }
 
+/* --- credits --- */
+/* One control carries the lot: the basemap's line, and each source's own
+   attribution, which for the bus archive is stamped into the tiles themselves.
+   It sits bottom-left rather than in MapLibre's default bottom-right, where it
+   shared a column with the zoom buttons. See the addControl calls. */
 .maplibregl-ctrl-attrib { font-size: 10.5px; }
+/* Expanded it names three sources rather than one, so it has to wrap instead of
+   running off the side of a narrow screen. The compact control is content-box,
+   so this is the text width and not the pill's. */
+.maplibregl-ctrl-attrib.maplibregl-compact-show { max-width: 340px; }
+/* The panels are z-index 2 and come later in the document, so they would paint
+   over the expanded credit. A credit a panel covers is not a credit. The corner
+   is a stacking context, so this has to be raised rather than the control. */
+.maplibregl-ctrl-bottom-left { z-index: 3; }
 
 @media (max-width: 720px) {
   .stack--tl, .stack--tr { width: auto; left: 12px; right: 12px; }
-  .stack--tr { top: auto; bottom: 30px; max-height: 44%; }
+  /* 40px rather than 30: the collapsed credit is a 24px button on a 10px margin,
+     and it has to sit clear of the card rather than under its lower edge. */
+  .stack--tr { top: auto; bottom: 40px; max-height: 44%; }
+  /* That leaves one strip along the bottom, which fits one control and not two.
+     The credit is the one that has to be in it, so the scale bar stands down on a
+     phone -- it is the only thing here nobody is obliged to show. */
+  .maplibregl-ctrl-scale { display: none; }
+  .maplibregl-ctrl-attrib.maplibregl-compact-show { max-width: calc(100vw - 60px); }
 }
 </style>
 </head>
@@ -221,6 +241,8 @@ a.btn { text-decoration: none; }
      while every byte it actually renders sat on disk. See web/vendor/README.md. -->
 <script src="vendor/maplibre-gl.js"></script>
 <script src="vendor/pmtiles.js"></script>
+<!-- The basemap credit, shared with art.html so the two cannot drift. -->
+<script src="credits.js"></script>
 <script>
 "use strict";
 
@@ -299,7 +321,12 @@ document.documentElement.dataset.theme = theme;
 $("theme").textContent = theme === "dark" ? "Light" : "Dark";
 paintRamp();
 
-const protocol = new pmtiles.Protocol();
+// `metadata: true` is what makes the archive's credit reach the map, and it is
+// off by default: without it the plugin answers MapLibre's TileJSON request from
+// the PMTiles *header* alone -- bounds and zooms -- and the attribution written
+// into the metadata block never leaves the file. That failure looks like a viewer
+// crediting only the basemap rather than like an error.
+const protocol = new pmtiles.Protocol({ metadata: true });
 maplibregl.addProtocol("pmtiles", protocol.tile);
 
 boot();
@@ -428,7 +455,9 @@ function start(header) {
     // zooming further would drop the network rather than show more of it.
     minZoom: 4.6,
     maxZoom: 18,
-    attributionControl: { compact: true },
+    // Off here so it can be positioned; added below. The two are exclusive --
+    // configuring it in the constructor and adding a second one gives two.
+    attributionControl: false,
     style: {
       version: 8,
       sources: {
@@ -436,15 +465,22 @@ function start(header) {
           type: "raster",
           tiles: basemapTiles(theme),
           tileSize: 256,
-          attribution:
-            '<a href="https://carto.com/attributions">CARTO</a> · ' +
-            '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+          attribution: BASEMAP_CREDIT,
         },
         [SRC]: {
           type: "vector",
           url: "pmtiles://" + TILES,
           // No promoteId: tippecanoe writes the edge id into the MVT feature id
           // field itself, which is what setFeatureState addresses.
+          //
+          // No `attribution` either, and that is the point: `wayfare publish`
+          // puts the timetable's publisher, its licence and OpenStreetMap's ODbL
+          // claim on the road geometry into the archive's own metadata, which
+          // pmtiles.js hands back as TileJSON and MapLibre reads off the source.
+          // So switching region switches the credit, and an archive copied to a
+          // bucket keeps it. An archive built before that change carries none,
+          // and the control then shows the basemap line alone rather than a
+          // blank entry -- MapLibre ignores an absent attribution.
           maxzoom: header.maxZoom,
         },
       },
@@ -496,6 +532,17 @@ function start(header) {
 
   map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom-right");
   map.addControl(new maplibregl.ScaleControl({ maxWidth: 90, unit: "metric" }), "bottom-left");
+  // Last, and bottom-left, for two reasons. A corner stacks its controls in the
+  // order they were added, so adding the credit after the scale bar puts it
+  // nearest the bottom edge -- which is the strip still free once the info card
+  // drops to the bottom on a phone. And bottom-right is the zoom control's
+  // column, where the credit and the buttons were sharing 30 pixels of width.
+  //
+  // Compact, so it is an (i) until someone asks: that is the accepted convention
+  // for a map and keeps the credit one click from anywhere, which is what the
+  // licences require. Every source's attribution lands in this one control,
+  // deduplicated by MapLibre, so there is nothing to assemble here.
+  map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-left");
 
   /* ---------- hover ---------- */
 
