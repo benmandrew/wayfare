@@ -213,6 +213,7 @@ class ArtRequest:
                 o.caption,
                 o.background,
                 o.simplify_px,
+                o.coalesce,
                 # `sample` is not listed: it lives in the query spec, so it is
                 # already inside `self.query.key`.
             )
@@ -226,6 +227,23 @@ class ArtRequest:
 def _one(q: dict[str, list[str]], name: str) -> str | None:
     values = q.get(name)
     return values[-1].strip() if values and values[-1].strip() else None
+
+
+def _flag(q: dict[str, list[str]], name: str) -> bool:
+    """An on/off switch, absent meaning off.
+
+    The spellings a checkbox, a hand-typed URL and a scripted caller each reach for.
+    Anything else is a mistake worth naming rather than reading as false, which is
+    what `bool(raw)` would do with `coalesce=no`.
+    """
+    raw = _one(q, name)
+    if raw is None:
+        return False
+    if raw.lower() in ("1", "true", "yes", "on"):
+        return True
+    if raw.lower() in ("0", "false", "no", "off"):
+        return False
+    raise BadRequest(f"{name}={raw!r} is not a yes or a no")
 
 
 def _number(
@@ -438,6 +456,7 @@ def parse_art(query: str) -> ArtRequest:
             hue=_number(q, "hue", 0.0, 1.0, DEFAULTS.hue),
             line_scale=_number(q, "line_scale", 0.05, 8.0, DEFAULTS.line_scale),
             alpha_scale=_number(q, "alpha_scale", 0.05, 8.0, DEFAULTS.alpha_scale),
+            coalesce=_flag(q, "coalesce"),
         ),
     )
 

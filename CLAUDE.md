@@ -457,6 +457,57 @@ and `Projection.batch` projects a whole 20,000-row fetch with numpy at once. Per
 edge numpy would lose — 4.14 vertices is far too few to pay for array setup — so
 the batching is the point, not the library. Together, 53.2s to 25.8s.
 
+**Coalescing is the "fewer strokes" the paragraph above asks for, and it is
+`RenderOpts.coalesce`, off by default.** `art` strokes one path per directed edge
+and an edge is 4.14 coordinates over tens of metres, so a road is dozens of short
+strokes end to end, each with a round cap at both ends, and `density` composites
+with ADD. Joining runs that meet head to tail into one stroke removes the duplicate.
+Cardiff 11,644 edges → 2,113 runs, London 197,276 → 28,597, `uk` over Wales 169,857
+→ 59,309. Serial `density` at 4,000px: Cardiff 0.88s → 0.73s, London 5.05s → 2.54s.
+Peak RSS on `uk` 277 → 281 MB — the assignment is ~20 bytes an edge in Arrow and is
+released before the drawing stream opens, so the streaming rule holds.
+
+Three things about it are worth knowing before looking at a render.
+
+*The junction dot is not the biggest thing it removes.* `density`'s halo pass is
+9.5px wide at `DENSITY_REF_PX` and an edge is a couple of pixels long at city
+scale, so consecutive halos overlap along the *whole* road, not just at the node.
+Coalescing therefore drops mean brightness to 82% on a Cardiff crop and 63% on a
+West End one, and the lit footprint is unchanged (0.6% and 0.9% of lit pixels lost,
+all fringe). So the plain render's glow is partly a picture of how finely Valhalla
+chopped the road. Compare at matched exposure — `alpha_scale` about 1.35 for
+Cardiff, 1.9 for London — or you are judging the exposure and not the change.
+
+*Chaining is directed, unlike `publish._chain`.* A two-way street is two coincident
+edges pointing opposite ways, so at a node where two roads meet there are four
+incidences and the undirected "exactly two meet here" rule fires on nothing. Head
+to tail, each direction chains independently, and the doubling-back trap `publish`
+records cannot arise. Directed pairs are *not* collapsed the way `publish` does:
+that would halve the light on every two-way road, which is a different picture
+rather than a repaired one. The group key is the drawn weight, because that is what
+the paint is a function of.
+
+*Banding survives, but only because the parent ships the assignment.* Whether two
+edges share a stroke is a fact about the graph, and a band that worked it out from
+its own collar sees a fork as a through node wherever the third edge fell outside —
+and under ADD that is not a local error, since two strokes double-count wherever
+they overlap. Measured: London at 6,000px differed in 356 pixels by up to 89/255,
+all within 40 rows of a cut, and was byte-identical at 2,000px, which is exactly
+the kind of fault that gets waved through. `Source.chains` is the fix and it is the
+same arrangement `Source.groups` already uses for `gstat`. With it, serial and
+banded are byte-identical on the real databases at 2,000px, 4,000px and 6,000px,
+at 4 and 8 workers, under `scale`, `line_scale=6`, a letterbox and `sample=4`.
+Simplification stays *per edge* rather than per run for the same family of reason:
+`simplify` compares against the last vertex kept, so a run-level pass would depend
+on where the run started, and a band's runs start where its collar cut them.
+
+*`spectrum` and `strands` both decline, for opposite reasons.* `spectrum` strokes
+each segment separately to colour it by its own bearing, so it has a cap at every
+vertex and no chaining removes them. `strands` already puts a service's edges into
+one cairo path, and cairo fills a stroke's outline once with nonzero winding, so
+caps overlapping inside a single stroke never accumulated. `Style.coalesces` says
+which is which, and a request against a style that ignores it warns.
+
 **A stroke width fixed in pixels is a different picture at every canvas size.**
 The map shrinks with the canvas and the lines do not, so the same window at
 1,600px carries the 4,000px line weight over 40% of the road length, and
@@ -756,7 +807,7 @@ this number.
 ## Current state
 
 **Great Britain is complete end to end**, on the server, feed `20260807_022616`.
-Wales and Greater London were the two rehearsals for it and both stand. 395 tests
+Wales and Greater London were the two rehearsals for it and both stand. 483 tests
 pass, ruff and mypy clean. See PLAN.md.
 
 | Stage | Result |

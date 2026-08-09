@@ -123,6 +123,32 @@ def test_hue_zero_survives():
     assert server.parse_art("area=cardiff").opts.hue == server.DEFAULTS.hue
 
 
+@pytest.mark.parametrize("raw", ["1", "true", "yes", "on", "TRUE"])
+def test_coalesce_takes_the_spellings_a_caller_would_reach_for(raw):
+    assert server.parse_art(f"area=cardiff&coalesce={raw}").opts.coalesce is True
+
+
+@pytest.mark.parametrize("raw", ["0", "false", "no", "off"])
+def test_coalesce_off_is_off(raw):
+    assert server.parse_art(f"area=cardiff&coalesce={raw}").opts.coalesce is False
+
+
+def test_coalesce_absent_is_off_and_a_typo_is_not():
+    """Reading anything unrecognised as false is how `coalesce=nope` silently
+    renders the picture the caller was trying to change."""
+    assert server.parse_art("area=cardiff").opts.coalesce is False
+    with pytest.raises(server.BadRequest, match="yes or a no"):
+        server.parse_art("area=cardiff&coalesce=nope")
+
+
+def test_coalesce_splits_the_cache():
+    """It is a different picture, so it must not be served from the same ETag."""
+    assert (
+        server.parse_art("area=cardiff&coalesce=1").key
+        != server.parse_art("area=cardiff").key
+    )
+
+
 def test_the_pixel_budget_catches_what_the_width_cap_cannot():
     """Width alone is not the size of a render: the window's aspect ratio picks the
     height and `scale` multiplies both, so a legal width over a tall window is
