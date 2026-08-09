@@ -33,6 +33,53 @@ def test_a_row_per_point_shapes_table_migrates_in_place(tmp_path: Path):
     con.close()
 
 
+def _old_routes_table(path: Path) -> None:
+    """`routes` as it stood before the mode filter: no route_type at all."""
+    old = duckdb.connect(str(path))
+    old.execute(
+        "CREATE TABLE routes (route_id VARCHAR PRIMARY KEY, agency_id VARCHAR, "
+        "short_name VARCHAR, long_name VARCHAR)"
+    )
+    old.execute("INSERT INTO routes VALUES ('R1', 'OP1', '42', 'Alpha to Delta')")
+    old.close()
+
+
+def test_routes_gains_route_type_without_losing_its_rows(tmp_path: Path):
+    """The column is added rather than the table rebuilt, because nothing already
+    stored can supply it -- the old loader never read route_type -- and a database
+    that cost a day of matching must open either way."""
+    path = tmp_path / "old.duckdb"
+    _old_routes_table(path)
+
+    con = db.connect(path)
+    try:
+        assert "route_type" in db.columns(con, "routes")
+        # Empty until the next `patterns` run, and empty is not road-going, so no
+        # stale row can pass the filter by accident.
+        assert con.execute("SELECT route_type FROM routes").fetchone() == (None,)
+    finally:
+        con.close()
+
+
+def test_an_old_database_migrates_and_then_builds(gtfs_dir: Path, tmp_path: Path):
+    """The migration on its own proves nothing; what matters is that the next run
+    against the migrated file fills the column in and filters on it."""
+    from wayfare import gtfs
+
+    path = tmp_path / "old.duckdb"
+    _old_routes_table(path)
+
+    con = db.connect(path)
+    try:
+        gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB")
+        assert db.scalar(con, "SELECT route_type FROM routes WHERE route_id = 'R1'") == "3"
+        assert {
+            r[0] for r in con.execute("SELECT DISTINCT route_id FROM patterns").fetchall()
+        } == {"R1"}
+    finally:
+        con.close()
+
+
 def _one_live_pattern(con) -> None:
     db.set_meta(con, "feed_version", "F1")
     con.execute(

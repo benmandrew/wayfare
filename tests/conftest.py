@@ -64,6 +64,11 @@ class FakeClient:
 # A four-stop line running east along a single street, with two trips sharing one
 # pattern and a third trip that turns short. Enough to exercise the collapse from
 # trips to patterns, the shape_id carry-through, and the span calculation.
+#
+# It also carries one ferry and one rail route, which must never reach a pattern.
+# They are in the shared fixture rather than in a test of their own so that every
+# test using this feed is a check on the mode filter: the counts elsewhere in the
+# suite are the counts for the bus route alone, and stay that way.
 MINI = {
     "agency.txt": "agency_id,agency_name,agency_url,agency_timezone\nOP1,Example,http://x,Europe/London\n",
     "stops.txt": (
@@ -72,10 +77,14 @@ MINI = {
         "S2,Bravo,53.4800,-2.2400\n"
         "S3,Charlie,53.4800,-2.2350\n"
         "S4,Delta,53.4800,-2.2300\n"
+        "P1,Pier Head,53.4050,-2.9960\n"
+        "P2,Island Quay,53.3200,-3.1800\n"
     ),
     "routes.txt": (
         "route_id,agency_id,route_short_name,route_long_name,route_type\n"
         "R1,OP1,42,Alpha to Delta,3\n"
+        "F1,OP1,FERRY,Pier Head to Island Quay,4\n"
+        "X1,OP1,EXPRESS,Alpha to Island Quay,2\n"
     ),
     "calendar.txt": (
         "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
@@ -87,6 +96,8 @@ MINI = {
         "R1,WK,T1,0,SH1\n"
         "R1,WK,T2,0,SH1\n"
         "R1,WK,T3,0,\n"
+        "F1,WK,TF1,0,\n"
+        "X1,WK,TX1,0,\n"
     ),
     "stop_times.txt": (
         "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
@@ -100,6 +111,11 @@ MINI = {
         "T2,10:15:00,10:15:00,S4,4\n"
         "T3,11:00:00,11:00:00,S1,1\n"
         "T3,11:05:00,11:05:00,S2,2\n"
+        # A sea crossing and a train, neither of which has any road under it.
+        "TF1,12:00:00,12:00:00,P1,1\n"
+        "TF1,12:30:00,12:30:00,P2,2\n"
+        "TX1,13:00:00,13:00:00,S1,1\n"
+        "TX1,13:40:00,13:40:00,P2,2\n"
     ),
     "shapes.txt": (
         "shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence\n"
