@@ -349,9 +349,17 @@ Four things had to be true and each was a bug first:
   DuckDB's background threads do not cross a fork. The child dies on first use and it
   presents as `BrokenProcessPool` with no traceback, because it is killed rather than
   raising.
-- **One band per worker, not more.** `edge_services` cannot prune (see below), so every
-  band scans all 8.3M rows whatever its height — a per-band floor that does not shrink.
-  24 balanced bands measured *slower* than 8, 36.7s against 27.0s.
+- **One band per worker, not more.** 24 balanced bands measured *slower* than 8, 36.7s
+  against 27.0s. This was first attributed to `edge_services` being unable to prune, so
+  that every band scans all 8.3M rows whatever its height. **That floor is real and it
+  is not the reason.** Timing a single band in isolation at 1, 2, 4, 8, 16 and 24 bands,
+  with the drawing suppressed to separate the data path, the per-band data cost halves
+  every time the bands double: 20.08s, 10.05s, 5.08s, 2.64s, 1.38s, 1.00s. Fitting a
+  constant to that gives a floor of **0.16s a band** — 4.6% of a 24-way band, about one
+  second of wall clock across all 24. Total CPU work across every band stays inside 10%
+  from one band to 24. What actually costs the 10s is spawn, at about a second each and
+  24 of them on four cores, plus the oversubscription itself. Same shape for `strands`
+  (floor 0.18s) and for a filtered spec (0.13s), so it is not a quirk of one style.
 - **Draw past the cut and paste only the middle.** Clipping to the band splits a stroke
   at a raster boundary, and cairo tessellates in 24.8 fixed point, so the two halves'
   coverage does not always re-add to the whole shape's — one row of one Cardiff render
@@ -410,6 +418,23 @@ a lever. None of these are taken — they all change the picture, and banding wa
 available and does not. Coalescing runs of edges into single subpaths the way `publish`
 already does would keep round caps *and* remove them from every internal joint; that is
 the next real win and it is unbuilt.
+
+**Cairo is 76% of a band at every band count**, which is what makes coalescing worth
+building: 62.21s of 82.29s at one band, 8.23s of 10.87s at eight, 2.50s of 3.50s at 24.
+Banding changed the wall clock and not the composition, so coalescing attacks the same
+three quarters whether a render is banded or not.
+
+**But coalescing is not picture-preserving for `density`, and that has to be a
+decision rather than a discovery.** Two edges meeting end to end each lay a round cap at
+the shared node, and ADD counts the overlap twice; one continuous subpath counts it
+once. Measured at density's own widths and alphas, the junction pixel drops 85 → 53 at
+t=0.25, **200 → 108 at t=0.5**, and 255 → 230 at t=1.0, while mid-edge is unchanged to
+the byte. The effect peaks in the middle because a doubled value saturates at the top.
+Nationally that is a bright dot at every one of millions of nodes, so what coalescing
+removes is arguably an artefact of drawing per edge rather than anything in the data —
+but every existing render changes, and `publish`'s chaining is not the precedent it
+looks like: an MVT feature carries attributes, not additive light, so that merge really
+was lossless and this one is not.
 
 **A render costs per edge and per vertex, never per pixel.** The section below
 measures the cairo half at 75% and asks for "fewer strokes: dropping sub-pixel
@@ -668,13 +693,27 @@ this number.
 
 ## Current state
 
-Wales complete end to end. Greater London matching in progress in its own data
-root against its own Valhalla instance. 391 tests pass, ruff and mypy clean. GB
-not yet attempted. See PLAN.md.
+**Great Britain is complete end to end**, on the server, feed `20260807_022616`.
+Wales and Greater London were the two rehearsals for it and both stand. 395 tests
+pass, ruff and mypy clean. See PLAN.md.
+
+| Stage | Result |
+|---|---|
+| patterns | **52,554** |
+| match | ok 50,395 (95.9%) · skipped 1,555 (3.0%) · error 462 (0.9%) · low_confidence 142 (0.3%) |
+| aggregate | 2,746,261 edges, 8,301,705 edge-service pairs |
+| cluster | current — `meta.edges_clustered` = 2,746,261, the whole table |
+| publish | 130 MB PMTiles |
+| graph | pinned at `3.8.3/1786113507` |
+
+`patterns` holds exactly one feed version, so **feed churn is still unmeasured** —
+the number this file has called the one that decides everything. It now costs one
+`acquire` and one `patterns` against a second national feed; the incremental
+machinery has been built and waiting since 2026-08-07.
 
 The banding numbers above are the first `art` measurements taken against real
 national data rather than a synthetic database: 2,746,261 edges and 8,301,705
-edge-service rows, feed `20260807_022616`, on the eight-core box that serves it.
+edge-service rows, on the four-core, eight-thread box that serves it.
 
 `pyarrow` joined the `art` extra alongside `pycairo` and `numpy`, and only that
 extra — the pipeline and the tile server do not import it. It is what makes the
