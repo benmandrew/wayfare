@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS patterns (
     agency_id   VARCHAR,
     short_name  VARCHAR,
     direction   INTEGER,
-    shape_id    VARCHAR,   -- NULL for ~52% of trips; see CLAUDE.md
+    shape_id    VARCHAR,   -- NULL for ~52% of trips; see docs/data.md
     n_stops     INTEGER,
     n_trips     INTEGER,   -- how many timetabled trips use this pattern
     span_m      DOUBLE,    -- straight-line length of the stop chain

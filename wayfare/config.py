@@ -19,7 +19,7 @@ DB_PATH = WORK / "wayfare.duckdb"
 
 # --- Sources ---------------------------------------------------------------
 
-# BODS publishes one national GTFS bundle. Regional slugs exist (see PLAN.md) and
+# BODS publishes one national GTFS bundle. Regional slugs exist (see docs/data.md) and
 # are useful for development, but `all` is what a production run wants.
 BODS_GTFS_URL = "https://data.bus-data.dft.gov.uk/timetable/download/gtfs-file/{region}/"
 BODS_REGION = os.environ.get("WAYFARE_REGION", "all")

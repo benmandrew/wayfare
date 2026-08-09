@@ -95,6 +95,10 @@ lives in a single DuckDB file under `WAYFARE_DATA`.
 
 ## Further reading
 
-- `CLAUDE.md` — architecture, measured results, and the facts worth not rediscovering.
-- `PLAN.md` — roadmap, regions in progress, known gaps.
+- `CLAUDE.md` — the architecture in brief, and the rules a change has to hold to.
+- `docs/data.md` — the feeds, their sizes and traps, mode filtering, coverage gaps.
+- `docs/pipeline.md` — the five stages, storage, DuckDB lessons, clustering, tiles.
+- `docs/rendering.md` — how `art` draws, and where a render's time actually goes.
+- `docs/results.md` — measured runs: Wales, Greater London, Great Britain.
+- `PLAN.md` — roadmap, what is next, known gaps.
 - `web/README.md` — serving the viewer, hosting the archive, and rendering over HTTP.

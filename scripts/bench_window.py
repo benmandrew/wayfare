@@ -106,7 +106,7 @@ GB = art.PRESETS["uk"]
 # Share of edges that fall outside any city. Rural mileage is long but sparse.
 RURAL_SHARE = 0.20
 
-# CLAUDE.md: a Valhalla directed edge averages 4.14 coordinates. These thresholds
+# docs/pipeline.md: a Valhalla directed edge averages 4.14 coordinates. These thresholds
 # on a uniform draw give a mean of 4.17, which is close enough that the geometry
 # column compresses and scans like the real one.
 POINT_BUCKETS = ((0.34, 3), (0.63, 4), (0.86, 5), (1.01, 6))
