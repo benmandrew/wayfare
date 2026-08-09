@@ -243,3 +243,62 @@ skipped despite the operator having supplied a dense trace of the road the coach
 actually takes. The bound exists because *routing* through a 40 km gap invents
 plausible-but-wrong roads; a supplied shape invents nothing. Decide this before the
 Republic is matched, not after — see PLAN.md.
+
+## Attribution
+
+**Every archive owes two credits, never one.** The timetable is the publisher's, under
+whatever licence that publisher chose: OGL v3.0 for BODS and Translink, CC BY 4.0 for
+the NTA. The road geometry is OpenStreetMap's under the Open Database License (ODbL,
+carrying the licence's own American spelling because that is its name). The second
+obligation is the one that is easy to miss. Every edge in the database is an OSM way
+that Valhalla matched a route onto, so an archive is a derived database whatever the
+timetable's licence says, and that holds for an OGL region as much as for the Irish
+one. The viewer's pre-existing OpenStreetMap line credits the *basemap tiles* and says
+nothing about the lines drawn on top of them, so the wording names what each credit
+covers — "Bus routes:" and "Road geometry:".
+
+**The credit is derived from `config.Feed` rather than written out per region.** The
+feed already carried `licence` and `attribution`; `config` adds `ODBL`, a
+`LICENCE_URLS` table from each licence constant to its URI, `OSM_COPYRIGHT`, and a
+frozen `Credit` dataclass of `what`, `who`, `licence` and `who_url`. Three functions
+read them: `credit_parts(region)` returns a region's credits, `credit_html(region)`
+renders them for a map attribution control, and `credit_text(region)` renders them with
+the links spelled out for anywhere HTML is not read. Adding a source to `FEEDS` credits
+it. A licence with no entry in `LICENCE_URLS` raises a `KeyError` at publish time rather
+than dropping the URI and publishing anyway.
+
+**The credit lives in the tiles because that is the one place it travels with the
+data.** `publish.py` passes `--attribution=<credit_html>` to both tippecanoe passes,
+tippecanoe writes it to the tileset metadata, PMTiles carries that block verbatim, and
+MapLibre reads a source's own attribution into the control with no help from the page.
+An archive copied to an R2 bucket — which `web/index.html` supports through `?tiles=` —
+takes its credit with it, where a sidecar file or a field in `/archives.json` would be
+left behind. It is also what makes the credit per-archive: the viewer serves several
+regions from one page and switches between them at runtime, so a single hardcoded line
+would be wrong for whichever region is not showing. `build_tiles` gained an
+`attribution` parameter, and `publish.build(con, region)` and `wayfare publish --region`
+pass it through.
+
+**`tile-join` carries an input's attribution through, measured rather than assumed.**
+Against tippecanoe 2.79.0 the joined archive keeps it, including where only one of the
+two inputs has one, and in either argument order. Both passes are stamped regardless,
+since either archive can be opened on its own.
+
+**The trap was `pmtiles.Protocol`, whose `metadata` option defaults to false.** Without
+`{ metadata: true }` the plugin answers MapLibre's *TileJSON* request from the PMTiles
+header alone — bounds and zoom range — and the attribution written into the metadata
+block never leaves the file. Both pages now construct the protocol with it. This failure
+looks like a viewer crediting only its basemap rather than like an error, which is how
+it was found: the credit was in the archive and absent from the control. The basemap
+line itself was the same string typed into `web/index.html` and `web/art.html` character
+for character, and now lives once in `web/credits.js` as `BASEMAP_CREDIT`; the data
+credit is deliberately not there, because it comes from the archive.
+
+**An archive built before this change carries no attribution, and degrades quietly
+rather than blankly.** MapLibre ignores an absent attribution, so the control falls back
+to the basemap line alone. Bringing an old archive up to date is the `publish` stage
+only — no re-match, no re-aggregate.
+
+The credit travels with the bytes. That is the whole design, and the reason to keep
+testing it by copying an archive somewhere the page it was built against cannot reach,
+rather than by looking at the control on the machine that produced it.

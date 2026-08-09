@@ -119,6 +119,14 @@ render, a map on a page — has to credit the National Transport Authority. `way
 acquire` prints the licence and the credit on every run, whether it fetches the bundle
 or finds it already there.
 
+The credit also reaches the map. `wayfare publish` stamps it into the PMTiles archive's
+own tileset metadata, along with OpenStreetMap's ODbL credit for the road geometry,
+which every region owes because every road segment is an OSM way. Putting it there
+rather than on the page is what makes it survive a copy to someone else's bucket. The
+viewer and the art page's window picker both read it out of the archive and show it in
+the map's attribution control, so an archive built for one region credits that region's
+publisher even though the two pages are shared.
+
 ## Requirements
 
 The flake supplies the toolchain: Python 3.12, uv, cairo and pkg-config (pycairo ships

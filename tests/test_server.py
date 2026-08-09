@@ -774,6 +774,34 @@ def test_archives_lists_only_the_tile_archives(serve_at):
         assert json.loads(response.read()) == ["wales.pmtiles"]
 
 
+# --- The pages' own credits --------------------------------------------------
+#
+# The data credit rides in the archive, so nothing here needs to know it. The
+# basemap credit cannot: it belongs to the page, and it used to be the same string
+# typed into two files. These guard the drift, not the wording.
+
+WEB = Path(__file__).resolve().parents[1] / "web"
+PAGES = ("index.html", "art.html")
+
+
+def test_both_pages_take_the_basemap_credit_from_one_place():
+    assert "carto.com/attributions" in (WEB / "credits.js").read_text()
+    for page in PAGES:
+        text = (WEB / page).read_text()
+        assert 'src="credits.js"' in text
+        assert "BASEMAP_CREDIT" in text
+        # The copy each page used to carry. Both draw the same backdrop, so a
+        # second spelling of it is a spelling that will drift.
+        assert "carto.com/attributions" not in text
+
+
+def test_neither_page_hardcodes_the_data_credit():
+    """Which is the whole design: `wayfare publish` puts it in the archive, and a
+    page that also stated it would be wrong for whichever region is not showing."""
+    for page in (*PAGES, "credits.js"):
+        assert "Open Government Licence" not in (WEB / page).read_text()
+
+
 def _connect(base: str) -> http.client.HTTPConnection:
     """A raw connection, because urllib sends `Connection: close` on every request
     and so can never show one being reused."""

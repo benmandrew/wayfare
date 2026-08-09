@@ -86,7 +86,14 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     sub.add_parser("aggregate", help="invert to edge -> services")
-    sub.add_parser("publish", help="export GeoJSON and build PMTiles")
+    p = sub.add_parser("publish", help="export GeoJSON and build PMTiles")
+    p.add_argument(
+        "--region",
+        default=None,
+        help="which feed's credit to stamp into the archive (default: the "
+        "WAYFARE_REGION this data root was acquired with). The licence is a "
+        "condition, not a label, so this has to match the data",
+    )
     sub.add_parser("status", help="show progress and coverage")
     sub.add_parser(
         "prune", help="drop operator geometry once matching is complete (reclaims space)"
@@ -241,7 +248,7 @@ def _dispatch(args: argparse.Namespace) -> int:
     if args.cmd == "publish":
         _require_db()
         con = db.connect(read_only=True)
-        out = publish.build(con)
+        out = publish.build(con, region=args.region)
         con.close()
         log.info("done: %s", out)
         return 0
@@ -337,7 +344,7 @@ def _dispatch(args: argparse.Namespace) -> int:
         gtfs.build_patterns(config.WORK / "gtfs", con)
         match.run(con, workers=args.workers)
         aggregate.build(con)
-        publish.build(con)
+        publish.build(con, region=args.region)
         print(json.dumps(aggregate.coverage(con), indent=2))
         con.close()
         return 0

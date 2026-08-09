@@ -295,7 +295,9 @@ def _chain(members: list[Member]) -> list[Member]:
 _DETAIL_ONLY = ("way", "refs", "trips", "name")
 
 
-def build_tiles(geojsonl: Path, out: Path | None = None) -> Path:
+def build_tiles(
+    geojsonl: Path, out: Path | None = None, attribution: str | None = None
+) -> Path:
     """Build the archive in two zoom bands and join them.
 
     tippecanoe stores attributes per feature per zoom, and -x is global to a run --
@@ -304,8 +306,14 @@ def build_tiles(geojsonl: Path, out: Path | None = None) -> Path:
     exist purely for the info card, the detail band is built with everything, and
     tile-join concatenates the two into one PMTiles file. The join is cheap; the
     second tippecanoe pass is the real cost, and it only touches z5-z10.
+
+    `attribution` goes into both passes. tile-join carries an input's attribution
+    through to the joined archive -- measured, including where only one of the two
+    inputs has one -- but a band that can be inspected on its own should say where
+    it came from, and passing it twice costs nothing.
     """
     out = out or (config.OUT / "bus.pmtiles")
+    attribution = attribution or config.credit_html()
     out.parent.mkdir(parents=True, exist_ok=True)
 
     for tool in ("tippecanoe", "tile-join"):
@@ -321,20 +329,31 @@ def build_tiles(geojsonl: Path, out: Path | None = None) -> Path:
     detail = out.with_name(out.stem + ".detail.pmtiles")
     try:
         _tippecanoe(
-            geojsonl, overview, config.MIN_ZOOM, config.DETAIL_ZOOM - 1, _DETAIL_ONLY
+            geojsonl,
+            overview,
+            config.MIN_ZOOM,
+            config.DETAIL_ZOOM - 1,
+            _DETAIL_ONLY,
+            attribution,
         )
-        _tippecanoe(geojsonl, detail, config.DETAIL_ZOOM, config.MAX_ZOOM, ())
+        _tippecanoe(geojsonl, detail, config.DETAIL_ZOOM, config.MAX_ZOOM, (), attribution)
         _tile_join(out, [overview, detail])
     finally:
         for p in (overview, detail):
             p.unlink(missing_ok=True)
 
     log.info("tiles built: %.1f MB", out.stat().st_size / 1e6)
+    log.info("attribution: %s", attribution)
     return out
 
 
 def _tippecanoe(
-    geojsonl: Path, out: Path, min_zoom: int, max_zoom: int, exclude: Sequence[str]
+    geojsonl: Path,
+    out: Path,
+    min_zoom: int,
+    max_zoom: int,
+    exclude: Sequence[str],
+    attribution: str,
 ) -> None:
     cmd = [
         "tippecanoe",
@@ -353,6 +372,11 @@ def _tippecanoe(
         "--use-attribute-for-id=id",
         "-x",
         "id",
+        # Where the credit is kept. It lands in the tileset metadata, PMTiles carries
+        # that verbatim, and MapLibre reads a source's own attribution into the
+        # control without the page saying anything -- so both the viewer and the art
+        # page's window picker credit whichever archive they happen to be showing.
+        f"--attribution={attribution}",
         # The national GeoJSONL is around 1.6 GB. Reading it single-threaded is
         # minutes of wall clock for nothing.
         "-P",
@@ -425,6 +449,6 @@ def _tail(text: str, lines: int = 20) -> str:
     return "\n".join(text.strip().splitlines()[-lines:])
 
 
-def build(con: duckdb.DuckDBPyConnection) -> Path:
+def build(con: duckdb.DuckDBPyConnection, region: str | None = None) -> Path:
     config.ensure_dirs()
-    return build_tiles(export_geojsonl(con))
+    return build_tiles(export_geojsonl(con), attribution=config.credit_html(region))
