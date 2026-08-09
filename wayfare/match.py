@@ -9,7 +9,10 @@ reboots, Valhalla runs out of memory, the process is killed. So:
   where it left off with no bookkeeping of its own.
 * Failures are recorded, not retried forever. A pattern whose stops cannot be
   connected by road will never succeed, and a matcher that retries it on every
-  restart never finishes.
+  restart never finishes. That rule holds only while "failed" means "impossible",
+  so a fault that was never about the pattern -- the connection refused, the read
+  timed out, Valhalla restarting -- is recorded as ``transport_error`` and is the
+  one status a later run is invited to clear. See RETRYABLE.
 * One batch is both the unit of concurrency and the unit of checkpointing. Those
   cannot be separated: because work is selected by the absence of a status row, a
   batch still in flight is still selectable, so loading the next batch before
@@ -34,10 +37,21 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+import requests
 
 from . import config, db, logs, valhalla
 
 log = logs.get("match")
+
+# The one outcome that is a statement about the world at that moment rather than
+# about the pattern. Everything else in match_status is permanent by design.
+TRANSPORT_ERROR = "transport_error"
+
+# What `--retry transient` expands to. Kept as a name rather than spelled out at
+# the call site so that adding a status here reaches the CLI, the help text and
+# the recovery path together.
+RETRYABLE = (TRANSPORT_ERROR,)
+_RETRY_ALIASES = {"transient": RETRYABLE}
 
 
 @dataclass
@@ -91,13 +105,21 @@ def retry(con: duckdb.DuckDBPyConnection, statuses: list[str]) -> int:
     Failures are deliberately never retried automatically -- a pattern that cannot
     be routed will never route, and retrying it every restart means never
     finishing. But when the matcher itself was wrong, the recorded failures are
-    wrong too, and this is how they get cleared.
+    wrong too, and this is how they get cleared. ``transient`` is the alias for the
+    statuses that are safe to clear unattended, which is ``transport_error`` alone:
+    nothing was ever learned about those patterns.
+
+    Call this *before* matching starts, never between batches. Work is selected by
+    the absence of a status row, so deleting one while a batch holding that pattern
+    is in flight hands the same pattern out twice -- the same trap that makes a
+    batch the unit of both concurrency and checkpointing.
     """
+    wanted = expand_statuses(statuses)
     ids = [
         r[0]
         for r in con.execute(
             "SELECT pattern_id FROM match_status WHERE status IN (SELECT unnest(?))",
-            [statuses],
+            [wanted],
         ).fetchall()
     ]
     if not ids:
@@ -107,8 +129,55 @@ def retry(con: duckdb.DuckDBPyConnection, statuses: list[str]) -> int:
     # `edges` is left alone: it is shared across patterns and re-inserted by
     # ON CONFLICT DO NOTHING, so a stale row costs nothing and deleting one that
     # another pattern still references would lose that pattern's geometry.
-    log.info("cleared %d outcomes with status in %s", len(ids), statuses)
+    log.info("cleared %d outcomes with status in %s", len(ids), wanted)
     return len(ids)
+
+
+def expand_statuses(statuses: list[str]) -> list[str]:
+    """Resolve the ``transient`` alias, leaving any literal status alone."""
+    out: list[str] = []
+    for s in statuses:
+        out.extend(_RETRY_ALIASES.get(s, (s,)))
+    return out
+
+
+def reclassify_transport_faults(con: duckdb.DuckDBPyConnection) -> int:
+    """Repair a database matched before transport faults had a status of their own.
+
+    Until they did, ``match_one`` filed every fault under ``error``, so a Valhalla
+    host that was down or restarting left a permanent hole in the map for every
+    pattern handed out in that window -- 262 of Great Britain's 462 error rows, and
+    nothing that would ever retry them.
+
+    The rows can be told apart after the fact because ``detail`` records which side
+    the failure came from. Anything Valhalla answered is stored as ``"<http
+    status>: <json body>"``; a fault that never got an answer carries whatever the
+    HTTP library said instead. So the test is the shape of the detail this codebase
+    itself writes, not the wording of anyone's error message.
+
+    One-off and explicit rather than a migration on connect: it decides what gets
+    re-matched, and a match run costs a day or two, so it is the operator's call.
+    Run it, then ``wayfare match --retry transient``.
+    """
+    before = _count(con, TRANSPORT_ERROR)
+    con.execute(
+        """
+        UPDATE match_status SET status = ?
+        WHERE status = 'error'
+          AND NOT regexp_matches(coalesce(detail, ''), '^[0-9]{3}: ')
+          AND coalesce(detail, '') NOT LIKE ?
+        """,
+        [TRANSPORT_ERROR, f"{valhalla.NO_SCORE_MESSAGE}%"],
+    )
+    moved = _count(con, TRANSPORT_ERROR) - before
+    log.info("reclassified %d error rows as %s", moved, TRANSPORT_ERROR)
+    return moved
+
+
+def _count(con: duckdb.DuckDBPyConnection, status: str) -> int:
+    return int(
+        db.scalar(con, "SELECT count(*) FROM match_status WHERE status = ?", [status])
+    )
 
 
 def load_batch(con: duckdb.DuckDBPyConnection, limit: int) -> list[Pattern]:
@@ -233,6 +302,10 @@ def match_one(client: valhalla.Client, p: Pattern) -> Outcome:
         m = client.match_shape(p.shape) if p.shape else client.match_stops(p.points)
     except valhalla.NoRoute as exc:
         return Outcome(p.pattern_id, "no_route", p.source, detail=str(exc)[:400])
+    except valhalla.TransportError as exc:
+        # Nothing was learned about this pattern, so recording it as a permanent
+        # failure would be a lie. It stays selectable through `--retry transient`.
+        return Outcome(p.pattern_id, TRANSPORT_ERROR, p.source, detail=str(exc)[:400])
     except valhalla.ValhallaError as exc:
         return Outcome(p.pattern_id, "error", p.source, detail=str(exc)[:400])
 
@@ -341,6 +414,17 @@ def run(
         total = min(total, limit)
     log.info("%d patterns to match, %d workers", total, workers)
 
+    # Said rather than acted on. Clearing these automatically would be a second
+    # source of work selection, and one that fires without anyone asking; saying so
+    # keeps a run reproducible while making sure the hole is never silent.
+    stalled = _count(con, TRANSPORT_ERROR)
+    if stalled:
+        log.warning(
+            "%d patterns failed on transport in an earlier run and are still "
+            "unmatched; `wayfare match --retry transient` puts them back in the queue",
+            stalled,
+        )
+
     tally: dict[str, int] = {}
     done = 0
     started = time.monotonic()
@@ -399,7 +483,17 @@ def _match_batch(
     def one(p: Pattern) -> Outcome:
         try:
             return match_one(client, p)
+        except (valhalla.TransportError, requests.RequestException) as exc:
+            # The client turns these into TransportError itself, so reaching here
+            # means a code path that talks HTTP by some other route. Either way the
+            # pattern was never judged. No traceback: a Valhalla host that goes down
+            # produces hundreds of these and they are all the same fault.
+            log.warning("pattern %d: %s", p.pattern_id, exc)
+            return Outcome(p.pattern_id, TRANSPORT_ERROR, p.source, detail=str(exc)[:400])
         except Exception as exc:  # noqa: BLE001 - one bad pattern must not stop a run of days
+            # The genuine last resort: a bug in this code. Permanent on purpose --
+            # a defect that retries forever is worse than one that records the
+            # traceback and moves on.
             log.exception("pattern %d raised", p.pattern_id)
             return Outcome(p.pattern_id, "error", p.source, detail=str(exc)[:400])
 

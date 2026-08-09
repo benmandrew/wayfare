@@ -4,6 +4,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+import requests
 from conftest import FakeClient
 
 from wayfare import aggregate, config, gtfs, match, valhalla
@@ -69,11 +70,99 @@ def test_unroutable_patterns_are_not_retried_forever(loaded):
     }
 
 
-def test_transient_errors_are_also_recorded(loaded):
-    match.run(loaded, client_=FakeClient(fail=valhalla.ValhallaError("503")))
-    assert {r[0] for r in loaded.execute("SELECT status FROM match_status").fetchall()} == {
-        "error"
-    }
+def _statuses(con) -> set[str]:
+    return {r[0] for r in con.execute("SELECT status FROM match_status").fetchall()}
+
+
+def test_a_valhalla_error_is_recorded_as_permanent(loaded):
+    match.run(loaded, client_=FakeClient(fail=valhalla.ValhallaError("400: {}")))
+    assert _statuses(loaded) == {"error"}
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        valhalla.TransportError("ConnectionError: Connection refused"),
+        valhalla.TransportError("Timeout: Read timed out (read timeout=120.0)"),
+    ],
+)
+def test_transport_faults_are_not_recorded_as_permanent(loaded, fault):
+    """A refused connection says nothing about the pattern. Recording it as `error`
+    is what put 262 recoverable patterns beyond the reach of any retry."""
+    match.run(loaded, client_=FakeClient(fail=fault))
+    assert _statuses(loaded) == {match.TRANSPORT_ERROR}
+    # Still recorded, so the run terminates rather than spinning on them.
+    assert match.pending_count(loaded) == 0
+
+
+def test_a_raw_requests_fault_is_also_transport(loaded):
+    """The client converts these itself; this is the belt-and-braces catch for any
+    other path that talks HTTP."""
+    match.run(loaded, client_=FakeClient(fail=requests.ConnectionError("refused")))
+    assert _statuses(loaded) == {match.TRANSPORT_ERROR}
+
+
+def test_a_bug_in_our_own_code_stays_permanent(loaded):
+    """The bare except is the last resort and must not become retryable: a defect
+    that retries forever is worse than one that records and moves on."""
+    match.run(loaded, client_=FakeClient(fail=KeyError("shape")))
+    assert _statuses(loaded) == {"error"}
+    assert match.retry(loaded, ["transient"]) == 0
+
+
+def test_retry_transient_selects_transport_faults_and_nothing_else(loaded):
+    match.run(loaded, client_=FakeClient(fail=valhalla.TransportError("refused")))
+    assert match.pending_count(loaded) == 0
+
+    assert match.retry(loaded, ["transient"]) == 2
+    assert match.pending_count(loaded) == 2
+
+    match.run(loaded, client_=FakeClient())
+    assert _statuses(loaded) == {"ok"}
+
+
+def test_retry_transient_leaves_permanent_failures_alone(loaded):
+    match.run(loaded, client_=FakeClient(fail=valhalla.NoRoute("400: {}")))
+    assert _statuses(loaded) == {"no_route"}
+    assert match.retry(loaded, ["transient"]) == 0
+    assert match.pending_count(loaded) == 0
+
+
+def test_reclassifying_an_old_database_moves_only_the_transport_rows(loaded):
+    """What an existing database needs. Every fault used to be `error`, and the two
+    kinds are told apart by the shape of the detail this codebase writes: a reply
+    from Valhalla is "<http status>: <json body>", anything else never got one."""
+    match.run(loaded, client_=FakeClient())
+    ids = [r[0] for r in loaded.execute("SELECT pattern_id FROM match_status").fetchall()]
+    details = [
+        '400: {"error_code": 442, "error": "No path could be found for input"}',
+        "ConnectionError: HTTPConnectionPool(host='valhalla', port=8002): "
+        "Max retries exceeded (Caused by NewConnectionError: Connection refused)",
+    ]
+    for pattern_id, detail in zip(ids, details, strict=True):
+        loaded.execute(
+            "UPDATE match_status SET status = 'error', detail = ? WHERE pattern_id = ?",
+            [detail, pattern_id],
+        )
+
+    assert match.reclassify_transport_faults(loaded) == 1
+    assert _statuses(loaded) == {"error", match.TRANSPORT_ERROR}
+    # And the reply from Valhalla stays permanent.
+    kept = loaded.execute(
+        "SELECT detail FROM match_status WHERE status = 'error'"
+    ).fetchone()
+    assert kept is not None and kept[0].startswith("400:")
+
+
+def test_reclassifying_leaves_our_own_configuration_error_alone(loaded):
+    """The one ValhallaError raised without a reply to quote. It is a bad request,
+    not a bad network, and re-matching it would fail the same way."""
+    match.run(loaded, client_=FakeClient())
+    loaded.execute(
+        "UPDATE match_status SET status = 'error', detail = ?",
+        [f"{valhalla.NO_SCORE_MESSAGE}; 'confidence_score' must be listed"],
+    )
+    assert match.reclassify_transport_faults(loaded) == 0
 
 
 def test_huge_stop_gaps_are_skipped(loaded, monkeypatch):

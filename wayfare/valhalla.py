@@ -70,6 +70,46 @@ class NoRoute(ValhallaError):
     """Valhalla could not connect the points at all -- not a transient failure."""
 
 
+class TransportError(RuntimeError):
+    """The request never got an answer: connection refused, timed out, cut off.
+
+    Deliberately *not* a ValhallaError. Valhalla answering "no path" is a fact
+    about the input and is permanent; a request that never arrived is a fact about
+    the network at that moment and says nothing about the pattern. The two must not
+    share a base class, because ``match_stops`` retries an edge_walk failure as a
+    map_snap on ``except ValhallaError`` -- a second call down a dead socket is
+    pointless, and it would relabel the fault as one of the matcher's own.
+    """
+
+
+# Valhalla answers every one of these with HTTP 400, so the HTTP status says
+# nothing; the discriminator is `error_code` in the JSON body (src/exceptions.cc in
+# the Valhalla tree, serialised by `serialize_error`). Each of these is a statement
+# that no path exists for this input, and none of them will answer differently on a
+# second attempt:
+#
+#   154  Path distance exceeds the max distance limit
+#   170  Locations are in unconnected regions
+#   171  No suitable edges near location
+#   172  Exceeded breakage distance for all pairs
+#   440  Cannot reach destination - too far from a transit stop
+#   441  Location is unreachable
+#   442  No path could be found for input
+#   443  Exact route match algorithm failed to find path   (edge_walk)
+#   444  Map Match algorithm failed to find path           (map_snap)
+#
+# This used to be `"no route" in body.lower()`, which matched none of the prose
+# Valhalla actually sends, so NoRoute was never raised and every permanent no-path
+# was filed as a transient `error` instead. Match on the code, never on the words:
+# the message text is a third party's English and is free to change.
+NO_PATH_CODES = frozenset({154, 170, 171, 172, 440, 441, 442, 443, 444})
+
+# The one ValhallaError this module raises that did not come off the wire. Named
+# because `match.reclassify_transport_faults` has to tell it apart from a genuine
+# transport fault when reading old rows back.
+NO_SCORE_MESSAGE = "trace_attributes returned no confidence_score"
+
+
 @dataclass
 class Edge:
     edge_id: int
@@ -98,16 +138,23 @@ class Client:
 
     def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         url = urljoin(self.base, path)
-        r = self.session.post(url, json=payload, timeout=self.timeout)
-        if r.status_code >= 400:
-            body = _valhalla_error(r)
-            # 442/443 mean "no path here", which is a property of the input, not a
-            # transient fault. Distinguishing them stops the matcher retrying
-            # patterns that will never succeed.
-            if r.status_code in (400, 442, 443) and "no route" in body.lower():
-                raise NoRoute(body)
-            raise ValhallaError(f"{r.status_code}: {body}")
-        return r.json()
+        try:
+            r = self.session.post(url, json=payload, timeout=self.timeout)
+            if r.status_code < 400:
+                # A body that will not parse is a truncated read, not a bad match.
+                return r.json()
+        except requests.RequestException as exc:
+            raise TransportError(f"{type(exc).__name__}: {exc}") from exc
+
+        body, code = _valhalla_error(r)
+        # A no-path code is a property of the input: recorded, never retried.
+        if code in NO_PATH_CODES:
+            raise NoRoute(f"{r.status_code}: {body}")
+        # 5xx is Valhalla itself unable to answer -- it is shutting down (codes 102,
+        # 203, 402), reloading tiles (446), or crashed. Nothing about the pattern.
+        if r.status_code >= 500:
+            raise TransportError(f"{r.status_code}: {body}")
+        raise ValhallaError(f"{r.status_code}: {body}")
 
     def healthy(self) -> bool:
         try:
@@ -204,7 +251,9 @@ class Client:
             data = self.trace_attributes(road, "edge_walk")
         except ValhallaError:
             # edge_walk is strict and refuses on the smallest discontinuity, which
-            # chunk stitching can introduce. map_snap tolerates it.
+            # chunk stitching can introduce. map_snap tolerates it. A TransportError
+            # is not a ValhallaError and so is not caught here: there is nothing for
+            # a second algorithm to fix about a connection that was refused.
             data = self.trace_attributes(_thin(road), "map_snap")
         m = _to_match(data, source="stops")
         # A synthesised route is a guess about which roads the bus takes, not an
@@ -223,8 +272,7 @@ def _to_match(data: dict[str, Any], source: str) -> Match:
     # match, so fail loudly instead. edge_walk scores nothing, hence shape-only.
     if source == "shape" and "confidence_score" not in data:
         raise ValhallaError(
-            "trace_attributes returned no confidence_score; "
-            "'confidence_score' must be listed in filters.attributes"
+            f"{NO_SCORE_MESSAGE}; 'confidence_score' must be listed in filters.attributes"
         )
 
     shape = polyline.decode(data["shape"], 6) if data.get("shape") else []
@@ -294,8 +342,16 @@ def _thin(
     return thinned
 
 
-def _valhalla_error(r: requests.Response) -> str:
+def _valhalla_error(r: requests.Response) -> tuple[str, int | None]:
+    """The error body, and Valhalla's own error code if it sent one.
+
+    The code is the whole point: every failure Valhalla reports arrives as HTTP
+    400, and only ``error_code`` says whether it means "no path exists here" or
+    "your request was malformed".
+    """
     try:
-        return json.dumps(r.json())[:500]
+        data = r.json()
     except ValueError:
-        return r.text[:500]
+        return r.text[:500], None
+    code = data.get("error_code") if isinstance(data, dict) else None
+    return json.dumps(data)[:500], code if isinstance(code, int) else None
