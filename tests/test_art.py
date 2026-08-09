@@ -590,3 +590,18 @@ def test_streaming_paths_survives_the_scale_being_resolved(con):
     assert w._weights is None
     drawn = [w.weights.of(weight) for weight, _ in w.paths(proj)]
     assert len(drawn) == art.FETCH_ROWS + 500
+
+
+def test_the_edge_stream_has_a_defined_order(con):
+    """A query with no ORDER BY has no row order, and DuckDB's parallel hash join
+    returns one that varies run to run -- `density` to SVG gave four distinct
+    outputs in four runs over the real databases. The test above cannot catch it:
+    three edges never reach a second thread, so an undefined order is a stable one.
+    What is checkable at any size is that the order is *defined*, so this asserts
+    the edges arrive by edge_id rather than in whatever order they were inserted."""
+    for edge_id, lon in ((7, -3200000), (3, -3190000), (9, -3180000), (1, -3170000)):
+        _art_edge(con, edge_id, lon, trips=100)
+    w = art.Window(art.Bounds(-3.30, 51.40, -3.10, 51.60), con)
+    query, params = w.sql.edges_query(with_groups=False, by_weight=False)
+    assert [r[0] for r in con.execute(query, params).fetchall()] == [1, 3, 7, 9]
+    assert [e.edge_id for e in w.edges()] == [1, 3, 7, 9]

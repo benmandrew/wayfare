@@ -699,7 +699,27 @@ class _Sql:
         groups_col = ", svc.groups" if with_groups else ""
         # edge_id breaks the tie, so equally busy roads draw in a fixed order rather
         # than whichever way the scan happened to return them.
-        order = "ORDER BY coalesce(svc.weight, 0), win.edge_id" if by_weight else ""
+        #
+        # Unordered, it is edge_id alone -- and that clause is not decoration. A
+        # query with no ORDER BY has no defined row order, and DuckDB's parallel
+        # hash join genuinely returns one that varies between runs of the same query
+        # against the same file: `density` to SVG produced four distinct outputs in
+        # four runs. PNG hid it, because ADD is saturating and therefore commutative
+        # so the buffer is identical whatever order the strokes arrive in, and SVG
+        # does not, because it records the strokes in the order they were issued.
+        # This is the same failure `_order_sql` already fixes for `strands`, found
+        # the same way and fixed the same way.
+        #
+        # Which order hardly matters -- no style whose geometry comes through here
+        # draws differently for it -- so it is edge_id, matching the tiebreak above.
+        # It costs a sort the scan did not previously pay for: measured on the real
+        # databases at +1.2 ms over cardiff, +10.1 ms over `uk` and +9.1 ms over
+        # London, against renders of 0.4 s to 4.4 s. Reproducibility is worth 0.2%.
+        order = (
+            "ORDER BY coalesce(svc.weight, 0), win.edge_id"
+            if by_weight
+            else "ORDER BY win.edge_id"
+        )
         sql = f"""
 WITH win AS ({win}
 ), svc AS (
