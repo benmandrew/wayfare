@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Wayfare — UK bus routes on the road network</title>
+<title>Wayfare — bus routes on the road network</title>
 <link rel="stylesheet" href="vendor/maplibre-gl.css">
 <style>
 /* Visible to a screen reader, not on screen. The search input is identified only
@@ -70,8 +70,13 @@ h1 {
   letter-spacing: .02em;
 }
 .sub { color: var(--muted); font-size: 11.5px; margin-top: 2px; }
-.head { padding: 10px 12px; display: flex; align-items: flex-start; gap: 8px; }
-.head > div { flex: 1; min-width: 0; }
+/* Wraps, because a fourth control does not fit beside the title at this width.
+   The floor on the title column is what forces the wrap: without it flexbox
+   spends the whole row on the controls and squeezes the strapline down to one
+   word per line. 110px is under what is free with the three buttons alone, so a
+   single region still gets the one-row header it always had. */
+.head { padding: 10px 12px; display: flex; align-items: flex-start; gap: 8px; flex-wrap: wrap; }
+.head > div { flex: 1; min-width: 110px; }
 
 .btn {
   font: inherit;
@@ -86,6 +91,12 @@ h1 {
 }
 .btn:hover { color: var(--text); border-color: var(--muted); }
 a.btn { text-decoration: none; }
+/* A `select` is as wide as its widest option unless told otherwise, and the
+   options are whole region names. Capped so it cannot claim the width of the
+   panel on the line it wraps onto, and pushed to the right-hand end of that
+   line. Its own text is only ever "Go to…"; the popup still opens as wide as
+   its contents. */
+#region { max-width: 160px; margin-left: auto; }
 
 /* --- search --- */
 .search { padding: 0 12px 10px; }
@@ -159,9 +170,10 @@ a.btn { text-decoration: none; }
    It sits bottom-left rather than in MapLibre's default bottom-right, where it
    shared a column with the zoom buttons. See the addControl calls. */
 .maplibregl-ctrl-attrib { font-size: 10.5px; }
-/* Expanded it names three sources rather than one, so it has to wrap instead of
-   running off the side of a narrow screen. The compact control is content-box,
-   so this is the text width and not the pill's. */
+/* Expanded it names the basemap and then every archive on the map, each with its
+   own publisher and OpenStreetMap's claim on the geometry, so it has to wrap
+   instead of running off the side of a narrow screen. The compact control is
+   content-box, so this is the text width and not the pill's. */
 .maplibregl-ctrl-attrib.maplibregl-compact-show { max-width: 340px; }
 /* The panels are z-index 2 and come later in the document, so they would paint
    over the expanded credit. A credit a panel covers is not a credit. The corner
@@ -183,19 +195,24 @@ a.btn { text-decoration: none; }
 </head>
 <body>
 
-<div id="map" role="application" aria-label="Map of UK bus services by road segment"></div>
+<div id="map" role="application" aria-label="Map of bus services by road segment"></div>
 
 <div class="stack stack--tl">
   <div class="panel">
     <div class="head">
       <div>
         <h1>Wayfare</h1>
-        <div class="sub" id="sub">UK bus services by road segment</div>
+        <!-- Not "UK": the Republic of Ireland is one of the regions, and every
+             region on the map shares this line. A single named region overwrites
+             it with its own name. -->
+        <div class="sub" id="sub">Bus services by road segment</div>
       </div>
-      <select class="btn" id="region" title="Which region to show" aria-label="Which region to show" hidden></select>
       <a class="btn" href="art.html" title="Draw the network as a picture">Art</a>
       <button class="btn" id="theme" title="Toggle light/dark" aria-label="Toggle light or dark theme">Dark</button>
       <button class="btn" id="helpBtn" title="What am I looking at?" aria-label="What am I looking at?" aria-expanded="false" aria-controls="help">?</button>
+      <!-- Last, so that it is this one that wraps to a second line when the four
+           of them do not fit. Reading order and tab order then still agree. -->
+      <select class="btn" id="region" title="Jump to a region" aria-label="Jump to a region" hidden></select>
     </div>
     <div class="search">
       <label class="sr-only" for="q">Filter by bus number</label>
@@ -250,15 +267,20 @@ a.btn { text-decoration: none; }
 // or a bucket: ?tiles=https://pub-xxxx.r2.dev/bus.pmtiles
 //
 // With no ?tiles= the page asks the server what it has rather than assuming a
-// name. `bus.pmtiles` is only the fallback for a static host with no index --
-// assuming it outright meant that renaming an archive, which is exactly what
-// holding two regions requires, left the page reporting no tiles at all.
+// name, and loads every archive it names at once. Britain, Northern Ireland and
+// the Republic are separate archives because they are separate feeds on separate
+// data roots, but they are one country to look at, so they go on one map rather
+// than behind a switch. `bus.pmtiles` is only the fallback for a static host with
+// no index -- assuming it outright meant that renaming an archive, which is
+// exactly what holding two regions requires, left the page reporting no tiles.
 const WANTED = new URLSearchParams(location.search).get("tiles");
-let TILES = "";
 let ARCHIVES = [];
+// One entry per archive that opened, carrying the ids it owns in the style. Ids
+// are per-archive because MapLibre needs one source per PMTiles file: the format
+// is one archive, one tile pyramid, and there is no union source.
+let REGIONS = [];
 
-const SRC = "bus";          // source id
-const LAYER_SRC = "bus";    // the single vector layer inside the archive
+const LAYER_SRC = "bus";    // the single vector layer inside every archive
 
 // Sequential ramps over service count. Light goes pale-blue -> deep violet so
 // busy roads darken against the light basemap; dark goes the other way, into
@@ -302,6 +324,15 @@ const width = (bump) => [
 ];
 const HOVER_BUMP = ["case", ["boolean", ["feature-state", "hover"], false], 2, 0];
 
+// The hovered segment in the accent colour, everything else off the ramp. Shared
+// with the theme toggle, which rebuilds the same expression for every region.
+const hoverOr = (base) => [
+  "case",
+  ["boolean", ["feature-state", "hover"], false],
+  HOVER_COLOUR[theme],
+  base,
+];
+
 // `refs` is a comma-separated list ("42,43,142,X57"). A naive substring test for
 // "4" would hit "42" and "X4", so wrap both sides in commas and look for ",4,"
 // inside ",42,43,142,X57,". Upcased so "x57" finds "X57".
@@ -339,31 +370,49 @@ async function boot() {
   } catch {
     ARCHIVES = [];
   }
-  TILES = new URL(WANTED || ARCHIVES[0] || "./bus.pmtiles", location.href).href;
+  // ?tiles= still names one archive and only one: its job is pointing the page at
+  // a bucket, not choosing between regions, and there is no longer anything to
+  // choose. Everything the server lists otherwise.
+  const wanted = WANTED ? [WANTED] : ARCHIVES.length ? ARCHIVES : ["./bus.pmtiles"];
 
-  const archive = new pmtiles.PMTiles(TILES);
+  // In parallel, and one failure does not sink the rest: a half-copied archive in
+  // the output directory should cost its own region, not the map. What it must not
+  // do is cost it silently, so the count of what did not open is carried into the
+  // header rather than left in the console.
+  REGIONS = (await Promise.all(wanted.map(openArchive))).filter(Boolean);
+  if (!REGIONS.length) {
+    failed(wanted);
+    return;
+  }
+  start(wanted.length - REGIONS.length);
+}
+
+async function openArchive(name, i) {
+  const url = new URL(name, location.href).href;
+  const archive = new pmtiles.PMTiles(url);
   protocol.add(archive); // share the instance so the header is fetched once
   try {
-    start(await archive.getHeader());
+    return {
+      name,
+      url,
+      header: await archive.getHeader(),
+      src: `region-${i}`,
+      layer: `bus-${i}`,
+      match: `bus-match-${i}`,
+    };
   } catch (err) {
-    failed(err);
+    console.error(`could not read ${url}`, err);
+    return null;
   }
 }
 
-function failed(err) {
-  console.error(err);
-  // If the server does have archives, the useful thing is a way into one of them,
-  // not instructions for building the archive that is already there.
-  const offer = ARCHIVES.length
-    ? `<p>This server does have:</p><ul>${ARCHIVES.map(
-        (n) => `<li><a href="${escapeHtml(regionHref(n))}">${escapeHtml(regionLabel(n))}</a></li>`
-      ).join("")}</ul>`
-    : "";
+function failed(tried) {
   $("boot").innerHTML = `
     <div class="panel">
       <h2>No tiles found</h2>
-      <p>Could not read <code>${escapeHtml(TILES)}</code>.</p>
-      ${offer}
+      <p>Could not read ${tried
+        .map((n) => `<code>${escapeHtml(n)}</code>`)
+        .join(", ")}.</p>
       <p>To build one and serve it:</p>
       <pre>wayfare publish
 wayfare serve</pre>
@@ -378,29 +427,67 @@ wayfare serve</pre>
 /* ---------- regions ---------- */
 
 // The page is a static bundle and cannot list a directory, so the server says
-// which archives it has. One archive and the control stays hidden; several and
-// you get a picker. Switching reloads with ?tiles= and drops the #hash, because
-// a position in Cardiff means nothing in an archive covering London.
+// which archives it has, and every one of them is on screen at once. The control
+// is therefore somewhere to go rather than something to choose: the regions are
+// hundreds of miles apart and panning between them at a national zoom is a chore.
+// A ?tiles= URL is a name we cannot label -- it may be somebody's bucket -- so it
+// is left out of the list rather than title-cased into nonsense.
 const regionLabel = (n) =>
   n.replace(/\.pmtiles$/, "").replace(/[-_]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 
-const regionHref = (n) => `${location.pathname}?tiles=${encodeURIComponent(n)}`;
+const named = () => REGIONS.filter((r) => !r.name.includes("/") && framed(r.header));
 
-function offerRegions(current) {
-  const here = decodeURIComponent(current.split("/").pop());
-  if (ARCHIVES.includes(here)) {
-    $("sub").textContent = `${regionLabel(here)} — bus services by road segment`;
+function offerRegions(map, missing) {
+  const here = named();
+  // The strapline the page ships with already covers the ordinary case, and the
+  // dropdown below names the regions, so several loaded regions need nothing
+  // said. It speaks up for the two cases it cannot: one region, which it can
+  // name, and an archive that did not open, which nothing else would report.
+  if (missing) {
+    $("sub").textContent =
+      `${REGIONS.length} region${REGIONS.length === 1 ? "" : "s"}, ${missing} unavailable` +
+      ` — bus services by road segment`;
+  } else if (REGIONS.length === 1 && here.length === 1) {
+    $("sub").textContent = `${regionLabel(here[0].name)} — bus services by road segment`;
   }
-  if (ARCHIVES.length < 2) return; // one region needs no picker
+  if (here.length < 2) return; // nowhere to jump to
 
   const sel = $("region");
-  sel.innerHTML = ARCHIVES.map(
-    (n) => `<option value="${n}"${n === here ? " selected" : ""}>${regionLabel(n)}</option>`
-  ).join("");
+  // A placeholder that stays selected, because the control does not hold a state
+  // any more. Leaving a region selected would mean picking it twice in a row
+  // fires no `change` and the second click appears to do nothing.
+  sel.innerHTML =
+    `<option value="">Go to…</option>` +
+    here
+      .map((r) => `<option value="${escapeHtml(r.name)}">${escapeHtml(regionLabel(r.name))}</option>`)
+      .join("");
   sel.hidden = false;
   sel.addEventListener("change", () => {
-    location.href = regionHref(sel.value);
+    const to = here.find((r) => r.name === sel.value);
+    sel.value = "";
+    if (to) map.fitBounds(bounds(to.header), { padding: 24 });
   });
+}
+
+/* ---------- what the archives cover ---------- */
+
+const bounds = (h) => [
+  [h.minLon, h.minLat],
+  [h.maxLon, h.maxLat],
+];
+
+const framed = (h) => Number.isFinite(h.minLon) && h.maxLon > h.minLon;
+
+// The union of every archive's own bounds. Britain and Ireland together are close
+// enough to the whole box that this barely differs from ISLES, but one region on
+// its own still opens framed on itself rather than on a country it does not cover.
+function coveredBounds() {
+  const hs = REGIONS.map((r) => r.header).filter(framed);
+  if (!hs.length) return null;
+  return [
+    [Math.min(...hs.map((h) => h.minLon)), Math.min(...hs.map((h) => h.minLat))],
+    [Math.max(...hs.map((h) => h.maxLon)), Math.max(...hs.map((h) => h.maxLat))],
+  ];
 }
 
 /* ---------- how far you may roam ---------- */
@@ -431,19 +518,85 @@ function roamingBounds(el) {
   return [[w - grow, s], [e + grow, n]];
 }
 
-function start(header) {
-  $("boot").remove();
-  offerRegions(TILES);
+/* ---------- one pair of layers per region ---------- */
 
-  // Frame the archive rather than the country. A regional build is a small part
-  // of the British Isles, and opening at a UK-wide view puts London on screen as
-  // a smudge a few pixels across. The header carries the bounds, and it has
-  // already been fetched to get here.
-  const covered = [
-    [header.minLon, header.minLat],
-    [header.maxLon, header.maxLat],
-  ];
-  const framed = Number.isFinite(header.minLon) && header.maxLon > header.minLon;
+const busLayer = (r) => ({
+  id: r.layer,
+  type: "line",
+  source: r.src,
+  "source-layer": LAYER_SRC,
+  layout: { "line-cap": "round", "line-join": "round" },
+  paint: {
+    "line-color": hoverOr(colourExpr(theme)),
+    "line-width": width(HOVER_BUMP),
+    "line-opacity": 0.85,
+  },
+});
+
+// Drawn only while a filter is active: the matching services on top of the
+// dimmed network.
+const matchLayer = (r) => ({
+  id: r.match,
+  type: "line",
+  source: r.src,
+  "source-layer": LAYER_SRC,
+  filter: NEVER,
+  layout: { "line-cap": "round", "line-join": "round", visibility: "none" },
+  paint: {
+    "line-color": HOVER_COLOUR[theme],
+    "line-width": width(1.4),
+  },
+});
+
+function start(missing) {
+  $("boot").remove();
+
+  // Frame what is loaded rather than the country. A regional build is a small
+  // part of the British Isles, and opening at a UK-wide view puts London on
+  // screen as a smudge a few pixels across. The headers carry the bounds, and
+  // they have already been fetched to get here.
+  const covered = coveredBounds();
+
+  const sources = {
+    basemap: {
+      type: "raster",
+      tiles: basemapTiles(theme),
+      tileSize: 256,
+      attribution: BASEMAP_CREDIT,
+    },
+  };
+  for (const r of REGIONS) {
+    sources[r.src] = {
+      type: "vector",
+      url: "pmtiles://" + r.url,
+      // No promoteId: tippecanoe writes the edge id into the MVT feature id
+      // field itself, which is what setFeatureState addresses. Ids are unique
+      // within an archive and not across them, so anything keyed on one is
+      // keyed on the source too.
+      //
+      // No `attribution` either, and that is the point: `wayfare publish` puts
+      // the timetable's publisher, its licence and OpenStreetMap's ODbL claim on
+      // the road geometry into the archive's own metadata, which pmtiles.js
+      // hands back as TileJSON and MapLibre reads off the source. So each region
+      // brings its own credit to a map showing several, and an archive copied to
+      // a bucket keeps it. An archive built before that change carries none, and
+      // the control then shows the remaining lines rather than a blank entry --
+      // MapLibre ignores an absent attribution.
+      maxzoom: r.header.maxZoom,
+    };
+  }
+
+  // Every region's network first, then every region's matches above all of them,
+  // rather than a network/match pair per region. A filtered service has to draw
+  // on top of the neighbouring region's dimmed network too -- and the two parts
+  // of Ireland genuinely overlap, because both were matched against the same
+  // island graph, so a cross-border road is in both archives.
+  const layers = [{ id: "basemap", type: "raster", source: "basemap" }];
+  for (const r of REGIONS) layers.push(busLayer(r));
+  for (const r of REGIONS) layers.push(matchLayer(r));
+
+  const BUS = REGIONS.map((r) => r.layer);
+  const MATCH = REGIONS.map((r) => r.match);
 
   const map = new maplibregl.Map({
     container: "map",
@@ -453,76 +606,20 @@ function start(header) {
     maxBounds: roamingBounds($("map")),
     // Below this the tiles run out -- the overview build starts at z5 -- so
     // zooming further would drop the network rather than show more of it.
-    // Take the floor from the archive itself, not a constant: a hardcoded 4.6
-    // sat *below* z5, and MapLibre floors the map zoom to pick a tile level, so
-    // every view between 4.6 and 5 asked for z4, got nothing, and drew the
+    // Take the floor from the archives themselves, not a constant: a hardcoded
+    // 4.6 sat *below* z5, and MapLibre floors the map zoom to pick a tile level,
+    // so every view between 4.6 and 5 asked for z4, got nothing, and drew the
     // basemap alone. That reads as "this region has no buses", not as a limit.
-    minZoom: header.minZoom,
+    //
+    // The deepest floor of the several, not the shallowest: at a zoom one archive
+    // cannot answer, its region alone goes blank, which is the same lie told about
+    // a smaller area and harder to spot.
+    minZoom: Math.max(...REGIONS.map((r) => r.header.minZoom)),
     maxZoom: 18,
     // Off here so it can be positioned; added below. The two are exclusive --
     // configuring it in the constructor and adding a second one gives two.
     attributionControl: false,
-    style: {
-      version: 8,
-      sources: {
-        basemap: {
-          type: "raster",
-          tiles: basemapTiles(theme),
-          tileSize: 256,
-          attribution: BASEMAP_CREDIT,
-        },
-        [SRC]: {
-          type: "vector",
-          url: "pmtiles://" + TILES,
-          // No promoteId: tippecanoe writes the edge id into the MVT feature id
-          // field itself, which is what setFeatureState addresses.
-          //
-          // No `attribution` either, and that is the point: `wayfare publish`
-          // puts the timetable's publisher, its licence and OpenStreetMap's ODbL
-          // claim on the road geometry into the archive's own metadata, which
-          // pmtiles.js hands back as TileJSON and MapLibre reads off the source.
-          // So switching region switches the credit, and an archive copied to a
-          // bucket keeps it. An archive built before that change carries none,
-          // and the control then shows the basemap line alone rather than a
-          // blank entry -- MapLibre ignores an absent attribution.
-          maxzoom: header.maxZoom,
-        },
-      },
-      layers: [
-        { id: "basemap", type: "raster", source: "basemap" },
-        {
-          id: "bus",
-          type: "line",
-          source: SRC,
-          "source-layer": LAYER_SRC,
-          layout: { "line-cap": "round", "line-join": "round" },
-          paint: {
-            "line-color": [
-              "case",
-              ["boolean", ["feature-state", "hover"], false],
-              HOVER_COLOUR[theme],
-              colourExpr(theme),
-            ],
-            "line-width": width(HOVER_BUMP),
-            "line-opacity": 0.85,
-          },
-        },
-        // Drawn only while a filter is active: the matching services on top of
-        // the dimmed network.
-        {
-          id: "bus-match",
-          type: "line",
-          source: SRC,
-          "source-layer": LAYER_SRC,
-          filter: NEVER,
-          layout: { "line-cap": "round", "line-join": "round", visibility: "none" },
-          paint: {
-            "line-color": HOVER_COLOUR[theme],
-            "line-width": width(1.4),
-          },
-        },
-      ],
-    },
+    style: { version: 8, sources, layers },
   });
 
   // A resize changes the aspect, and with it how wide the box has to be for the
@@ -530,9 +627,11 @@ function start(header) {
   map.on("resize", () => map.setMaxBounds(roamingBounds(map.getContainer())));
 
   // A #hash in the URL is someone sharing a place, so it outranks the framing.
-  if (framed && !location.hash) {
+  if (covered && !location.hash) {
     map.fitBounds(covered, { padding: 24, animate: false });
   }
+
+  offerRegions(map, missing);
 
   map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom-right");
   map.addControl(new maplibregl.ScaleControl({ maxWidth: 90, unit: "metric" }), "bottom-left");
@@ -550,24 +649,30 @@ function start(header) {
 
   /* ---------- hover ---------- */
 
-  let hovered = null;
-  const setHover = (id, on) =>
-    map.setFeatureState({ source: SRC, sourceLayer: LAYER_SRC, id }, { hover: on });
+  // A feature is identified by its source as well as its id: the id is
+  // tippecanoe's edge id, unique inside one archive and meaningless across them.
+  let hovered = null; // { src, id }
+  const setHover = (h, on) =>
+    map.setFeatureState({ source: h.src, sourceLayer: LAYER_SRC, id: h.id }, { hover: on });
 
-  map.on("mousemove", "bus", (e) => {
-    const f = e.features[0];
-    if (!f || f.id === hovered) return;
-    if (hovered !== null) setHover(hovered, false);
-    hovered = f.id;
+  // One query over every region's layer, rather than a handler bound to each.
+  // Where two archives meet at a border the same road is in both, and this takes
+  // the topmost hit once instead of letting two handlers fight over the card.
+  //
+  // The card deliberately keeps the last segment when the cursor leaves the road
+  // — the service lists run long and reading one shouldn't require holding the
+  // cursor still. The highlight does not: it says where the card came from.
+  map.on("mousemove", (e) => {
+    const f = map.queryRenderedFeatures(e.point, { layers: BUS })[0];
+    map.getCanvas().style.cursor = f ? "pointer" : "";
+    if (hovered && (!f || hovered.id !== f.id || hovered.src !== f.source)) {
+      setHover(hovered, false);
+      hovered = null;
+    }
+    if (!f || hovered) return; // nothing under the cursor, or the same road still
+    hovered = { src: f.source, id: f.id };
     setHover(hovered, true);
-    map.getCanvas().style.cursor = "pointer";
     showFeature(f.properties);
-  });
-
-  // The card deliberately keeps the last segment on mouseout — the service
-  // lists run long and reading one shouldn't require holding the cursor still.
-  map.on("mouseleave", "bus", () => {
-    map.getCanvas().style.cursor = "";
   });
 
   /* ---------- filter ---------- */
@@ -581,24 +686,29 @@ function start(header) {
       .split(/[\s,]+/)
       .filter(Boolean);
 
-    if (!active.length) {
-      map.setFilter("bus-match", NEVER);
-      map.setLayoutProperty("bus-match", "visibility", "none");
-      map.setPaintProperty("bus", "line-opacity", 0.85);
-      $("hint").innerHTML = "Press <b>/</b> to search.";
-    } else {
-      map.setFilter("bus-match", tokenFilter(active));
-      map.setLayoutProperty("bus-match", "visibility", "visible");
-      map.setPaintProperty("bus", "line-opacity", 0.12);
+    // Every region filters together. A service number is a national search, not
+    // a search of whichever archive the cursor happens to be over.
+    const on = active.length > 0;
+    for (const id of MATCH) {
+      map.setFilter(id, on ? tokenFilter(active) : NEVER);
+      map.setLayoutProperty(id, "visibility", on ? "visible" : "none");
+    }
+    for (const id of BUS) map.setPaintProperty(id, "line-opacity", on ? 0.12 : 0.85);
+
+    if (on) {
       countMatches();
+    } else {
+      $("hint").innerHTML = "Press <b>/</b> to search.";
     }
     redrawChips();
   }
 
   function countMatches() {
     if (!active.length || !map.isStyleLoaded()) return;
+    // Keyed on the source too, because an id is only unique within an archive
+    // and counting on the id alone would quietly merge one region into another.
     const seen = new Set(
-      map.queryRenderedFeatures({ layers: ["bus-match"] }).map((f) => f.id)
+      map.queryRenderedFeatures({ layers: MATCH }).map((f) => `${f.source}:${f.id}`)
     );
     const label = active.map((t) => `<b>${escapeHtml(t)}</b>`).join(", ");
     $("hint").innerHTML = seen.size
@@ -642,13 +752,9 @@ function start(header) {
     paintRamp();
 
     map.getSource("basemap").setTiles(basemapTiles(theme));
-    map.setPaintProperty("bus", "line-color", [
-      "case",
-      ["boolean", ["feature-state", "hover"], false],
-      HOVER_COLOUR[theme],
-      colourExpr(theme),
-    ]);
-    map.setPaintProperty("bus-match", "line-color", HOVER_COLOUR[theme]);
+    const colour = hoverOr(colourExpr(theme));
+    for (const id of BUS) map.setPaintProperty(id, "line-color", colour);
+    for (const id of MATCH) map.setPaintProperty(id, "line-color", HOVER_COLOUR[theme]);
   });
 
   /* ---------- info card ---------- */

@@ -107,7 +107,8 @@ are never retried, but their edges are dropped.
 
 **A licence condition travels with the data, not with the page.** `publish` stamps the
 credit into the archive's own tileset metadata, derived from `config.Feed`, so a copied
-archive keeps it and a viewer holding several regions shows the right one for each.
+archive keeps it and the viewer, which loads every archive it is offered onto one
+map, shows all of their credits together in the one control.
 Every region owes two credits: the timetable's publisher, and OpenStreetMap under ODbL
 for the geometry. `pmtiles.Protocol` needs `{ metadata: true }` or MapLibre never sees
 any of it, which looks like a viewer crediting only its basemap rather than an error.

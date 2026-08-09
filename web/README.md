@@ -22,7 +22,7 @@ A plain `file://` open does not work either, because the browser blocks `fetch` 
 
 ## Hold several regions side by side
 
-Because the server takes any archive rather than a fixed name, one machine can carry several regions at once:
+The viewer loads every archive the server can see, all at once and into one map: one MapLibre vector source and one pair of layers per archive. The regions barely overlap, so several archives side by side read as a single network. There is nothing to switch between.
 
 ```
 data/out/wales.pmtiles
@@ -33,15 +33,21 @@ data/out/london.pmtiles
 
 `wayfare serve` answers `GET /archives.json` with a JavaScript Object Notation (JSON) list of the archive filenames it can see. The viewer is a static page and cannot list a directory, so without that request the region names would have to be compiled into it.
 
-The header shows a region dropdown when more than one archive exists, and hides it when there is only one. Choosing a region reloads the page with `?tiles=<name>` and drops any `#hash`, because a saved map position in Cardiff means nothing in an archive that covers London.
+The header dropdown survives with a different job. It is now "Go to…", and choosing a region calls `fitBounds` on that archive's bounds rather than reloading the page, then resets to the placeholder. It appears once at least two archives carry names the page can label; a `?tiles=` URL is left out of that list.
+
+An archive that fails to open no longer takes the map down with it. The others still load, and the strapline reports the count instead of a name: "3 regions, 1 unavailable — bus services by road segment".
+
+Three things follow from holding a set rather than one archive. `minZoom` is the deepest floor of the set, the maximum of the loaded headers, because at a zoom one archive cannot answer, that region alone goes blank. Feature ids are unique within an archive and not across archives, so hover highlighting and the match count are keyed on the source as well as the id. And where two archives genuinely overlap, the same road is in both, drawn twice and counted twice — Northern Ireland and the Republic were matched against one island graph, so every cross-border road is in each.
+
+Each archive still carries its own attribution in its own tileset metadata, and MapLibre gathers every loaded credit into the one control.
 
 ## Opening view
 
-The viewer frames itself from the bounds in the PMTiles header rather than opening on a fixed UK-wide view. A regional archive covers a small part of the British Isles, and a UK-wide opening view put London on screen as a smudge a few pixels across. A `#hash` in the URL still wins, because that is someone sharing a place.
+The viewer frames itself from the union of the bounds in every loaded archive's PMTiles header, rather than opening on a fixed UK-wide view. A regional archive covers a small part of the British Isles, and a UK-wide opening view put London on screen as a smudge a few pixels across. A `#hash` in the URL still wins, because that is someone sharing a place.
 
 ## Point at a remote archive
 
-The viewer reads the tiles URL from the `?tiles=` query parameter, which defaults to whichever archive is chosen.
+The `?tiles=` query parameter names exactly one archive by URL, and the page loads that one alone rather than everything in `/archives.json`. Its purpose is pointing the page at a bucket, not choosing a region.
 
 ```
 http://localhost:8000/?tiles=https://pub-xxxx.r2.dev/bus.pmtiles

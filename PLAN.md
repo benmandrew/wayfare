@@ -320,5 +320,7 @@ Ansible does not know about and that no committed file reproduces.
 **`publish.build_tiles` hardcodes `out/bus.pmtiles`** (`wayfare/publish.py:308`), and
 `publish.build` passes no path, so a second region's archive is renamed and copied into
 the served directory by hand. Nothing automates the step, and the viewer takes each
-region's label from the filename (`web/index.html:358`), so that hand step is also where
-the label on the map is decided.
+region's label from the filename (`web/index.html:435`), so that hand step is also where
+the name in the viewer's "Go to…" list is decided. The viewer no longer chooses between
+the archives — it loads every one the server offers onto a single map — so a filename is
+now a label and a jump target rather than the thing that selects what is on screen.
