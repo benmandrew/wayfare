@@ -127,6 +127,11 @@ Ran 2026-08-09, against the real national database on the server (2,746,261 edge
   CLI overrides both.
 - 376 -> 391 tests.
 
+Followed up 2026-08-09, after the merge. `default_workers` now counts **physical
+cores**, not hardware threads: the box is four cores of eight threads and `uk`
+`density` at 2,000px is 26.9s on four workers against 28.1s on eight. 391 -> 395
+tests.
+
 Three bugs found on the way: `fork` with an open DuckDB handle kills the child with
 no traceback; clipping to the band splits strokes at a raster boundary and cairo's
 fixed-point tessellation does not re-add exactly; and a band trusting `config.DB_PATH`

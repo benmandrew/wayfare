@@ -388,6 +388,17 @@ start eight processes to share four cores' quota and a 3 GB memory limit.
 defaults to a thread per core *per process*, and eight bands would put sixty-four on
 eight cores.
 
+**And it counts physical cores, not hardware threads.** The box is four cores of eight
+threads, and the second thread of a core draws no faster: `uk` `density` at 2,000px is
+78.1s on one worker, 44.9s on two, **26.9s on four**, 27.2s on six, 28.1s on eight,
+30.9s on twelve, 33.2s on sixteen, 37.5s on 24. Speed-up tops out at 2.90x on four,
+which is the core count and not the thread count — tessellating round caps is ALU- and
+branch-bound, so there are no memory stalls for a sibling thread to fill. The 4.6%
+between eight workers and four is the smaller half of it; eight interpreters and eight
+DuckDB connections against a 3 GB container limit is the half that bites.
+`_physical_cpus` reads distinct `(physical id, core id)` pairs from `/proc/cpuinfo` and
+returns None anywhere that file is absent, where the logical count stands as before.
+
 **Round caps are what a render costs, and this is where the rest of the time is.**
 Measured by replaying the whole `uk` window through cairo under different settings:
 butt caps and mitre joins take 55.4s to 25.5s — a 54% cut — because at national scale
