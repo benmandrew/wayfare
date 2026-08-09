@@ -209,18 +209,31 @@ def credit_html(region: str | None = None) -> str:
     )
 
 
+def credit_lines(region: str | None = None, *, links: bool = True) -> tuple[str, ...]:
+    """The credit as plain text, one line per thing being credited.
+
+    `links=False` drops the URIs. That is for the one place they cost more than they
+    carry: a credit burned into the corner of a picture, where a URI is unclickable,
+    doubles the length of a line that has to fit across the canvas, and is spelled
+    out in full in the same file's metadata anyway. Everywhere else keeps them,
+    because identifying the licence is what the licence asks for.
+    """
+    return tuple(
+        f"{c.what}: \N{COPYRIGHT SIGN} {c.who}"
+        + (f" <{c.who_url}>" if c.who_url and links else "")
+        + f", {c.licence}"
+        + (f" <{LICENCE_URLS[c.licence]}>." if links else ".")
+        for c in credit_parts(region)
+    )
+
+
 def credit_text(region: str | None = None) -> str:
     """The same credit with the links spelled out, for anywhere HTML is not read.
 
     A PNG `tEXt` chunk, an SVG `<metadata>` block, a log line. The copyright sign is
     deliberate and safe in all three: it is in Latin-1, which is what `tEXt` allows.
     """
-    return " ".join(
-        f"{c.what}: \N{COPYRIGHT SIGN} {c.who}"
-        + (f" <{c.who_url}>" if c.who_url else "")
-        + f", {c.licence} <{LICENCE_URLS[c.licence]}>."
-        for c in credit_parts(region)
-    )
+    return " ".join(credit_lines(region))
 
 
 def _link(text: str, url: str | None) -> str:

@@ -351,6 +351,20 @@ def test_the_plain_text_credit_says_the_same_thing_without_markup():
     text.encode("latin-1")
 
 
+def test_dropping_the_links_keeps_every_name_and_still_credits_both():
+    """What `art` burns into a corner, where a URI is unclickable and twice the
+    length of the line that has to fit. It is the same credit, shortened -- not a
+    second one, which is the failure this whole arrangement exists to prevent."""
+    lines = config.credit_lines("ireland", links=False)
+    assert len(lines) == len(config.credit_parts("ireland")) == 2
+    joined = " ".join(lines)
+    assert "http" not in joined
+    assert "National Transport Authority" in joined
+    assert config.CC_BY_4 in joined
+    assert "OpenStreetMap contributors" in joined and config.ODBL in joined
+    assert " ".join(config.credit_lines("ireland")) == config.credit_text("ireland")
+
+
 def test_both_zoom_bands_are_stamped_with_the_credit(monkeypatch, tmp_path):
     overview, detail, join = _tippecanoe_calls(monkeypatch, tmp_path)
     assert _attribution(overview) == config.credit_html()

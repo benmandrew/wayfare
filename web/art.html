@@ -343,6 +343,11 @@ input[type=color] {
       <div class="label">Caption</div>
       <input class="inp" id="caption" maxlength="120" autocomplete="off"
              placeholder="Drawn in the corner, if you want one">
+      <label class="pick" id="creditPick" style="margin-top:6px">
+        <input type="checkbox" id="credit">
+        <span class="name">Draw the credit</span>
+        <div class="blurb">Burns the data credit into the bottom corner.</div>
+      </label>
     </div>
 
     <div class="field">
@@ -377,6 +382,9 @@ input[type=color] {
         <button class="btn" id="copyLink" title="Copy this design's address">Copy link</button>
       </div>
       <div class="meta" id="exportSize" style="margin-top:7px"></div>
+      <!-- The download is the moment the licence condition attaches to somebody,
+           so the credit is stated here rather than left to a flag nobody found. -->
+      <div class="meta" id="exportCredit" style="margin-top:7px"></div>
     </div>
   </div>
 
@@ -630,6 +638,7 @@ function defaults() {
     previewWidth: fitWidth(),
     previewWidthAuto: true,
     caption: "",
+    credit: false,
     background: "",                   // "" means the style's own ground
     format: "png",
   };
@@ -650,6 +659,10 @@ function toHash(s) {
   // it in the link would reopen the page at whatever size their screen happened to
   // be. Only a width somebody typed travels.
   if (!s.previewWidthAuto) p.set("previewWidth", String(s.previewWidth));
+  // Written as the flag the endpoint reads rather than through the loop above, so
+  // a link never carries `credit=false` and a truthiness test never sees the
+  // string "false", which is true.
+  if (s.credit) p.set("credit", "1");
   // Comma-joined, as the endpoint's own filters are: shorter than a repeated
   // parameter, and the same spelling the request uses.
   if (s.operator.length) p.set("operator", s.operator.join(","));
@@ -680,6 +693,7 @@ function fromHash(base) {
     s.previewWidth = clamp(Math.round(Number(p.get("previewWidth"))), 64, META.limits.max_width);
     s.previewWidthAuto = false;
   }
+  if (p.has("credit")) s.credit = ["1", "true", "yes", "on"].includes(p.get("credit"));
   if (p.has("operator")) s.operator = splitList(p.get("operator"));
   if (p.has("class")) s.roadClass = splitList(p.get("class"));
   if (!META.styles.some((st) => st.name === s.style)) s.style = base.style;
@@ -851,6 +865,12 @@ function build() {
     changed();
   });
 
+  $("credit").addEventListener("change", () => {
+    S.credit = $("credit").checked;
+    apply();
+    changed();
+  });
+
   for (const id of ["width", "previewWidth"]) {
     $(id).max = META.limits.max_width;
     $(id).addEventListener("input", () => {
@@ -918,6 +938,8 @@ function apply() {
   $("background").value = S.background || styleSpec().background;
   $("groundReset").hidden = !S.background;
   $("caption").value = S.caption;
+  $("credit").checked = S.credit;
+  $("creditPick").classList.toggle("on", S.credit);
   $("width").value = S.width;
   $("previewWidth").value = S.previewWidth;
   $("widthOut").textContent = S.width + " px";
@@ -995,6 +1017,7 @@ function query({ width, scale, format, download, sample }) {
   p.set("alpha_scale", trim(S.alpha_scale));
   if (sample && sample > 1) p.set("sample", String(sample));
   if (S.caption) p.set("caption", S.caption);
+  if (S.credit) p.set("credit", "1");
   if (S.background) p.set("background", S.background);
   let q = p.toString();
   if (download) q += "&download"; // a valueless flag, which URLSearchParams cannot write
@@ -1129,6 +1152,15 @@ function serverMs(res) {
 // a wasted wait, so the same arithmetic runs here first.
 function exports() {
   const b = bounds();
+  // Said at the download rather than buried in a note beside the toggle. Every file
+  // that leaves here already carries this in its PNG or SVG metadata, which is the
+  // half nobody has to remember; the half that needs saying is that metadata does
+  // not survive most places a picture gets posted.
+  $("exportCredit").innerHTML = META.credit
+    ? `Every download carries its credit in the file's metadata &mdash; ${META.credit}. ` +
+      `Metadata rarely survives a repost, so tick <b>Draw the credit</b> under Caption ` +
+      `for anything going somewhere public.`
+    : "";
   const png = query({ width: S.width, scale: S.scale, format: "png", download: true });
   const svg = query({ width: S.width, scale: 1, format: "svg", download: true });
   $("dlPng").href = png;

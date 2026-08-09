@@ -127,6 +127,12 @@ viewer and the art page's window picker both read it out of the archive and show
 the map's attribution control, so an archive built for one region credits that region's
 publisher even though the two pages are shared.
 
+A render carries it too, and without being asked. Every PNG and SVG `wayfare art` writes
+holds the credit in its own file metadata — a `tEXt` chunk and an RDF `<metadata>` block
+— which costs nothing and changes no pixel. `--credit`, or `credit=1` on `/art`, also
+draws it into the bottom corner of the picture, for anywhere a file's metadata will not
+survive the trip.
+
 ## Requirements
 
 The flake supplies the toolchain: Python 3.12, uv, cairo and pkg-config (pycairo ships

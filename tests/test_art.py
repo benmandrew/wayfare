@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import io
 import math
+import re
+import struct
+import zlib
+from dataclasses import replace
+from xml.etree import ElementTree
 
 import pytest
 
-from wayfare import art, db
+from wayfare import art, config, db
 
 
 def test_presets_are_well_formed():
@@ -1198,3 +1204,178 @@ def test_physical_cpus_reads_core_ids(tmp_path, monkeypatch):
         art, "Path", lambda p: cpuinfo if p == "/proc/cpuinfo" else real_path(p)
     )
     assert art._physical_cpus() == 2
+
+
+# --- Provenance ---------------------------------------------------------------
+
+
+def _png_chunks(data: bytes) -> list[tuple[bytes, bytes]]:
+    """Every chunk in a PNG, with its CRC checked. Fails on a malformed one."""
+    assert data.startswith(art.PNG_SIGNATURE)
+    out, i = [], 8
+    while i < len(data):
+        (length,) = struct.unpack(">I", data[i : i + 4])
+        kind, body = data[i + 4 : i + 8], data[i + 8 : i + 8 + length]
+        (crc,) = struct.unpack(">I", data[i + 8 + length : i + 12 + length])
+        assert crc == zlib.crc32(kind + body), kind
+        out.append((kind, body))
+        i += 12 + length
+    return out
+
+
+def _png_text(data: bytes) -> dict[str, str]:
+    fields = {}
+    for kind, body in _png_chunks(data):
+        if kind == b"tEXt":
+            keyword, _, value = body.partition(b"\0")
+            fields[keyword.decode("latin-1")] = value.decode("latin-1")
+    return fields
+
+
+def _rows(data: bytes) -> tuple[int, int, list[bytes]]:
+    """A PNG decoded back to pixel rows by cairo -- a real decoder, and one that
+    refuses a file whose chunks do not check out."""
+    import cairo
+
+    surface = cairo.ImageSurface.create_from_png(io.BytesIO(data))
+    surface.flush()
+    stride, height = surface.get_stride(), surface.get_height()
+    raw = bytes(surface.get_data())
+    rows = [raw[y * stride : (y + 1) * stride] for y in range(height)]
+    return surface.get_width(), height, rows
+
+
+CREDIT_OPTS = replace(RENDER_OPTS, credit=True)
+
+
+def test_a_render_carries_the_credit_with_no_flag(drawable):
+    """Metadata is unconditional: an image served over HTTP leaves this machine
+    whether or not whoever asked for it thought about the licence."""
+    png = art.render_bytes(RENDER_BOUNDS, "density", opts=RENDER_OPTS, con=drawable)
+    assert _png_text(png)["Copyright"] == config.credit_text()
+
+
+def test_a_png_with_metadata_still_decodes(drawable):
+    """The chunk is written by hand, so what is worth testing is that a decoder
+    which validates CRCs still reads the file."""
+    png = art.render_bytes(RENDER_BOUNDS, "density", opts=RENDER_OPTS, con=drawable)
+    width, height, _ = _rows(png)
+    assert (width, height) == (300, art.Projection.canvas_height(RENDER_BOUNDS, 300))
+
+
+def test_the_text_chunks_come_before_the_image_data(drawable):
+    """Where a reader looking for a copyright expects one, rather than after
+    however many megabytes of IDAT."""
+    png = art.render_bytes(RENDER_BOUNDS, "density", opts=RENDER_OPTS, con=drawable)
+    kinds = [kind for kind, _ in _png_chunks(png)]
+    assert kinds[0] == b"IHDR"
+    assert kinds.index(b"tEXt") < kinds.index(b"IDAT")
+
+
+def test_a_value_outside_latin_1_widens_the_chunk():
+    """`tEXt` is Latin-1 only, and a publisher whose name is not is one
+    `config.FEEDS` entry away. It must widen rather than raise mid-render. Latin-1
+    covers the accents these islands need, so the case is a name from further off."""
+    wide = art._png_text("Copyright", "\N{COPYRIGHT SIGN} Zarząd Transportu")
+    assert wide[4:8] == b"iTXt"
+    assert "Zarząd" in wide[8:-4].decode("utf-8")
+    assert art._png_text("Copyright", "\N{COPYRIGHT SIGN} plain")[4:8] == b"tEXt"
+
+
+def test_svg_metadata_parses_as_xml_and_holds_the_credit(drawable):
+    svg = art.render_bytes(
+        RENDER_BOUNDS, "density", fmt=".svg", opts=RENDER_OPTS, con=drawable
+    )
+    root = ElementTree.fromstring(svg.decode("utf-8"))
+    dc = "{http://purl.org/dc/elements/1.1/}"
+    assert [e.text for e in root.findall(f".//{dc}rights")] == [config.credit_text()]
+    assert root.findall(f".//{dc}title")[0].text == "wayfare density: a window"
+
+
+def test_the_metadata_says_where_the_picture_is(drawable):
+    """A render that has been through a chat client and back is otherwise a picture
+    of somewhere nobody can name."""
+    png = art.render_bytes(RENDER_BOUNDS, "density", opts=RENDER_OPTS, con=drawable)
+    assert "-3.3,51.4,-3.1,51.6" in _png_text(png)["Description"]
+
+
+def test_the_metadata_holds_nothing_that_moves(tmp_path, drawable):
+    """No timestamp, no version, no path. A render is compared byte for byte, so a
+    field that moved would break that for every window rather than for one."""
+    out = tmp_path / "a-nameable-path.png"
+    art.render(RENDER_BOUNDS, "density", out, opts=RENDER_OPTS, con=drawable, workers=1)
+    fields = _png_text(out.read_bytes())
+    assert fields["Software"] == "wayfare"  # bare: a version string would move
+    assert not any(
+        re.search(r"\d{4}-\d\d-\d\d|20\d\d|\d+\.\d+\.\d+", v) for v in fields.values()
+    )
+    assert not any(str(tmp_path) in v for v in fields.values())
+
+
+@pytest.mark.parametrize("fmt", [".png", ".svg"])
+def test_a_credited_render_is_byte_identical_across_two_calls(drawable, fmt):
+    """Both halves of this change sit in the hot path of the determinism claim, and
+    neither may make a render a function of anything but its request."""
+    kw = {"fmt": fmt, "opts": CREDIT_OPTS, "con": drawable}
+    assert art.render_bytes(RENDER_BOUNDS, "density", **kw) == art.render_bytes(
+        RENDER_BOUNDS, "density", **kw
+    )
+
+
+def test_the_credit_caption_is_absent_until_it_is_asked_for(drawable):
+    """Off by default because it changes the artwork; on, it changes only the strip
+    it is drawn in and never the map."""
+    plain = art.render_bytes(RENDER_BOUNDS, "density", opts=RENDER_OPTS, con=drawable)
+    credited = art.render_bytes(RENDER_BOUNDS, "density", opts=CREDIT_OPTS, con=drawable)
+    assert plain != credited
+    _, height, before = _rows(plain)
+    _, _, after = _rows(credited)
+    differing = [y for y in range(height) if before[y] != after[y]]
+    assert differing, "the caption drew nothing"
+    assert min(differing) > height * 0.9, "the caption reached above the bottom strip"
+
+
+def test_a_credited_banded_render_draws_one_caption(banded):
+    """Bands are pasted in before the caption is drawn, so the parent lays it down
+    once. Drawn inside `_draw_band` there would be one per band -- which is what the
+    equality catches, and the strip is where it would show."""
+    opts = art.RenderOpts(width_px=200, credit=True)
+    serial = art.render_bytes(BAND_BOUNDS, "density", opts=opts, con=banded, workers=1)
+    parallel = art.render_bytes(BAND_BOUNDS, "density", opts=opts, con=banded, workers=4)
+    assert serial == parallel
+    plain = art.RenderOpts(width_px=200)
+    _, height, before = _rows(
+        art.render_bytes(BAND_BOUNDS, "density", opts=plain, con=banded, workers=4)
+    )
+    _, _, after = _rows(parallel)
+    differing = [y for y in range(height) if before[y] != after[y]]
+    # A looser strip than the test above, because this canvas is 200px tall enough
+    # for two lines of shrunken text; four bands would still put ink at a quarter,
+    # a half and three quarters of the way down, which this rules out.
+    assert differing and min(differing) > height * 0.8
+
+
+def test_the_credit_shrinks_to_fit_a_small_canvas(drawable):
+    """No floor, for the reason `density`'s line widths have none: a thumbnail
+    should look like the render reduced. What it must not do is run off the edge."""
+    kw = {"con": drawable}
+    plain = _rows(
+        art.render_bytes(
+            RENDER_BOUNDS, "density", opts=replace(RENDER_OPTS, width_px=120), **kw
+        )
+    )
+    credited = _rows(
+        art.render_bytes(
+            RENDER_BOUNDS, "density", opts=replace(CREDIT_OPTS, width_px=120), **kw
+        )
+    )
+    width, height, before = plain
+    _, _, after = credited
+    inked = [
+        x
+        for y in range(height)
+        for x in range(width)
+        if before[y][x * 4 : x * 4 + 4] != after[y][x * 4 : x * 4 + 4]
+    ]
+    assert inked, "the caption drew nothing at all"
+    assert max(inked) < width - 10, "the caption ran past the right margin"

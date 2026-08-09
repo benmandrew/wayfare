@@ -211,6 +211,7 @@ class ArtRequest:
                 o.line_scale,
                 o.alpha_scale,
                 o.caption,
+                o.credit,
                 o.background,
                 o.simplify_px,
                 o.coalesce,
@@ -452,6 +453,10 @@ def parse_art(query: str) -> ArtRequest:
             height_px=height,
             scale=scale,
             caption=caption,
+            # Off unless asked for, which is the whole design: the metadata credit
+            # is unconditional and invisible, and this one is visible and therefore
+            # a decision. See `art`'s provenance section.
+            credit=_flag(q, "credit"),
             background=_colour(background) if background else None,
             hue=_number(q, "hue", 0.0, 1.0, DEFAULTS.hue),
             line_scale=_number(q, "line_scale", 0.05, 8.0, DEFAULTS.line_scale),
@@ -659,6 +664,10 @@ def art_meta(enabled: bool) -> dict[str, Any]:
             "max_filter_values": MAX_FILTER_VALUES,
             "max_min_trips": MAX_MIN_TRIPS,
         },
+        # What a render owes, from the one definition `art` also stamps into every
+        # file it writes. Served rather than written into the page because it follows
+        # the region this server's database holds, not the page's markup.
+        "credit": config.credit_html(),
         "database": {"present": config.DB_PATH.exists()},
     }
     if meta["database"]["present"]:
