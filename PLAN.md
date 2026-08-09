@@ -127,6 +127,11 @@ Ran 2026-08-09, against the real national database on the server (2,746,261 edge
   CLI overrides both.
 - 376 -> 391 tests.
 
+Followed up 2026-08-09, after the merge. `default_workers` now counts **physical
+cores**, not hardware threads: the box is four cores of eight threads and `uk`
+`density` at 2,000px is 26.9s on four workers against 28.1s on eight. 391 -> 395
+tests.
+
 Three bugs found on the way: `fork` with an open DuckDB handle kills the child with
 no traceback; clipping to the band splits strokes at a raster boundary and cairo's
 fixed-point tessellation does not re-add exactly; and a band trusting `config.DB_PATH`
@@ -140,16 +145,25 @@ vertices**, so almost every stroke is one tiny segment and its cost is tessellat
 two round caps. Replacing round caps with butt/mitre halves a render (55.4s -> 25.5s),
 which says where the time is but is not a change anyone wants.
 
-- **Coalescing runs of edges into single subpaths** is the one that keeps the picture:
-  `publish` already chains by `way_id` (169,857 -> 53,013 features on Wales), and a
-  chain pays two caps instead of two per edge. Needs breaking at weight changes.
-  Unbuilt, and now the largest remaining win.
+- **Coalescing runs of edges into single subpaths** is the largest remaining win, and
+  it is confirmed: cairo is 76% of a band at *every* band count, so it attacks the
+  same three quarters banded or not. `publish` already chains by `way_id` (169,857 ->
+  53,013 features on Wales), and a chain pays two caps instead of two per edge. Needs
+  breaking at weight changes.
+- **It does not, however, keep the picture** — measured, not assumed. Two edges meeting
+  end to end each cap the shared node and ADD counts the overlap twice; a chain counts
+  it once. At density's own widths the junction pixel goes 200 -> 108 at t=0.5, and
+  mid-edge does not move. `publish`'s chaining is not the precedent it looks like: an
+  MVT feature carries attributes, not additive light. Build it as a deliberate change
+  to the picture, with before-and-after renders reviewed, not as a free optimisation.
 - `ctx.set_tolerance(1.0)` is 78.5% of cairo for a coarser cap arc; `Antialias.FAST`
   is 74.4%. Both change the output, neither is taken.
 - `Antialias.GOOD`/`DEFAULT` are byte-identical to `BEST` — the antialias setting is
   not a lever at all.
-- `edge_services` still cannot prune, and under banding that is worse than it was:
-  it is a per-band floor, which is why more bands than cores is slower.
+- `edge_services` still cannot prune, and that is still a per-band floor — but the
+  floor is **0.16s a band**, measured, and it is *not* why more bands than cores is
+  slower. Spawn at a second each and oversubscribing four cores is. Same shape for
+  `strands` (0.18s) and a filtered spec (0.13s). Do not spend a bbox column on it.
 
 ## Superseded — make the drawing cheaper, not the query
 

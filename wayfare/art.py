@@ -1804,10 +1804,18 @@ def _default_path(bounds_or_name: Bounds | str, style: str) -> Path:
 def default_workers(workers: int | None = None) -> int:
     """How many bands to draw at once, when a caller has not said.
 
-    Every core, because the thing being parallelised is the only thing running: the
-    render server takes one render at a time by design, and a command-line render is
-    what the operator is sitting waiting for. `WAYFARE_RENDER_WORKERS` overrides, for
-    a box where that is not true.
+    Every *physical* core, because the thing being parallelised is the only thing
+    running: the render server takes one render at a time by design, and a
+    command-line render is what the operator is sitting waiting for.
+    `WAYFARE_RENDER_WORKERS` overrides, for a box where that is not true.
+
+    Physical rather than logical, which is measured rather than assumed. On the
+    four-core, eight-thread Xeon that serves this, `uk` `density` at 2,000px takes
+    26.9s on four workers, 27.2s on six and 28.1s on eight: the second thread of a
+    core buys nothing, because tessellating round caps is ALU- and branch-bound and
+    there are no memory stalls for it to fill. Eight processes also carry eight
+    interpreters and eight DuckDB connections against the render container's memory
+    limit, which is the part that actually bites.
     """
     if workers is not None:
         return max(1, workers)
@@ -1817,7 +1825,38 @@ def default_workers(workers: int | None = None) -> int:
             return max(1, int(env))
         except ValueError:
             log.warning("ignoring WAYFARE_RENDER_WORKERS=%r, which is not a number", env)
-    return max(1, min(os.cpu_count() or 1, _cgroup_cpus() or 1_000))
+    logical = os.cpu_count() or 1
+    return max(1, min(_physical_cpus() or logical, _cgroup_cpus() or 1_000))
+
+
+def _physical_cpus() -> int | None:
+    """Cores rather than hardware threads, or None if that cannot be established.
+
+    Linux only, and deliberately: it reads the distinct `core_id`/`physical_id`
+    pairs out of `/proc/cpuinfo`, which is where the render actually runs. Anywhere
+    else this returns None and the logical count stands, which is the old
+    behaviour -- over-counting costs a few percent, and guessing wrong in the other
+    direction would leave half the box idle.
+    """
+    try:
+        text = Path("/proc/cpuinfo").read_text()
+    except OSError:
+        return None
+    cores: set[tuple[str, str]] = set()
+    physical = core = None
+    for line in text.splitlines():
+        key, _, value = line.partition(":")
+        key, value = key.strip(), value.strip()
+        if key == "physical id":
+            physical = value
+        elif key == "core id":
+            core = value
+        elif not line.strip() and physical is not None and core is not None:
+            cores.add((physical, core))
+            physical = core = None
+    if physical is not None and core is not None:
+        cores.add((physical, core))
+    return len(cores) or None
 
 
 def _cgroup_cpus() -> int | None:

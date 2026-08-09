@@ -780,3 +780,49 @@ def test_worker_count_comes_from_the_environment_when_it_is_set(monkeypatch):
     assert art.default_workers(7) == 7, "an explicit request still wins"
     monkeypatch.setenv("WAYFARE_RENDER_WORKERS", "not a number")
     assert art.default_workers() >= 1, "a bad value warns and falls back"
+
+
+def test_worker_count_counts_cores_rather_than_threads(monkeypatch):
+    """A hyperthreaded core does not draw a band any faster. Measured on the box that
+    serves this: `uk` `density` at 2,000px is 26.9s on four workers and 28.1s on
+    eight, on four cores of eight threads."""
+    monkeypatch.delenv("WAYFARE_RENDER_WORKERS", raising=False)
+    monkeypatch.setattr(art.os, "cpu_count", lambda: 8)
+    monkeypatch.setattr(art, "_cgroup_cpus", lambda: None)
+    monkeypatch.setattr(art, "_physical_cpus", lambda: 4)
+    assert art.default_workers() == 4
+
+
+def test_worker_count_falls_back_to_threads_where_cores_are_unknown(monkeypatch):
+    """Off Linux there is no /proc/cpuinfo to read. Over-counting costs a few percent;
+    guessing low would leave half the box idle, so the logical count stands."""
+    monkeypatch.delenv("WAYFARE_RENDER_WORKERS", raising=False)
+    monkeypatch.setattr(art.os, "cpu_count", lambda: 8)
+    monkeypatch.setattr(art, "_cgroup_cpus", lambda: None)
+    monkeypatch.setattr(art, "_physical_cpus", lambda: None)
+    assert art.default_workers() == 8
+
+
+def test_a_cpu_quota_still_wins_over_the_core_count(monkeypatch):
+    """The render container runs at `cpus: 4` on a bigger box. Whichever is smaller."""
+    monkeypatch.delenv("WAYFARE_RENDER_WORKERS", raising=False)
+    monkeypatch.setattr(art.os, "cpu_count", lambda: 64)
+    monkeypatch.setattr(art, "_physical_cpus", lambda: 32)
+    monkeypatch.setattr(art, "_cgroup_cpus", lambda: 4)
+    assert art.default_workers() == 4
+
+
+def test_physical_cpus_reads_core_ids(tmp_path, monkeypatch):
+    """Two hardware threads sharing a (physical id, core id) pair are one core."""
+    cpuinfo = tmp_path / "cpuinfo"
+    cpuinfo.write_text(
+        "processor\t: 0\nphysical id\t: 0\ncore id\t: 0\n\n"
+        "processor\t: 1\nphysical id\t: 0\ncore id\t: 1\n\n"
+        "processor\t: 2\nphysical id\t: 0\ncore id\t: 0\n\n"
+        "processor\t: 3\nphysical id\t: 0\ncore id\t: 1\n"
+    )
+    real_path = art.Path
+    monkeypatch.setattr(
+        art, "Path", lambda p: cpuinfo if p == "/proc/cpuinfo" else real_path(p)
+    )
+    assert art._physical_cpus() == 2
