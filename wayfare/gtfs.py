@@ -143,12 +143,17 @@ def build_patterns(
     con.execute("SET preserve_insertion_order = false")
 
     log.info("loading stops, routes, trips")
+    # A latitude of exactly zero is the equator, and no feed this pipeline reads
+    # runs a bus there. It is worth a clause of its own because it is not a null:
+    # Translink's own stop list has shipped 0.0 in both columns, which satisfies
+    # every IS NOT NULL test and then drags a pattern's span across two continents.
     con.execute(f"""
         INSERT OR REPLACE INTO stops
         SELECT stop_id, stop_name,
                TRY_CAST(stop_lat AS DOUBLE), TRY_CAST(stop_lon AS DOUBLE)
         FROM {_csv(gtfs_dir, "stops.txt")}
         WHERE TRY_CAST(stop_lat AS DOUBLE) IS NOT NULL
+          AND TRY_CAST(stop_lat AS DOUBLE) <> 0
     """)
     con.execute(f"""
         INSERT OR REPLACE INTO routes

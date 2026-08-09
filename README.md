@@ -1,8 +1,10 @@
 # wayfare
 
-wayfare builds a Great Britain-wide dataset of bus routes snapped to the real road
-network, from Department for Transport (DfT) Bus Open Data Service (BODS) open data. A
-timetable says which stops a service calls at, not which roads the bus drives down. So
+wayfare builds a dataset of bus routes snapped to the real road network across these
+islands: Great Britain from Department for Transport (DfT) Bus Open Data Service (BODS)
+open data, the Republic of Ireland from the National Transport Authority, and Northern
+Ireland from Translink through OpenDataNI. A timetable says which stops a service calls
+at, not which roads the bus drives down. So
 wayfare resolves each route onto OpenStreetMap (OSM) way identifiers and inverts the
 result: every road segment carries the list of services that use it.
 
@@ -88,10 +90,18 @@ pointing `WAYFARE_IMAGE` at a local build.
 
 `WAYFARE_REGION` and `WAYFARE_OSM_URL` must describe the same area. Nothing checks this,
 and a mismatch fails every pattern rather than erroring. The Republic of Ireland is
-`--region ireland`, whose extract is
+`--region ireland` and Northern Ireland is `--region northern_ireland`; both read the
+same extract,
 `https://download.geofabrik.de/europe/ireland-and-northern-ireland-latest.osm.pbf` —
 409 MB covering the whole island, because Geofabrik splits Ireland at the sea rather
-than at the border.
+than at the border. One extract is one graph build and therefore one set of edge ids,
+so the two regions can share a data root.
+
+Northern Ireland is the one region `acquire` assembles rather than downloads. Translink
+publishes no GTFS: `--region northern_ireland` resolves four OpenDataNI datasets through
+CKAN, fetches them, and builds a GTFS bundle from the TransXChange timetables and the
+MapInfo road geometry before `patterns` ever runs. Two builds of one publication are
+byte-identical.
 
 ## Data sources and licences
 
@@ -100,7 +110,8 @@ than at the border.
 | DfT Bus Open Data Service (BODS) GTFS | Great Britain | Open Government Licence (OGL) v3.0 |
 | NaPTAN stop register | Great Britain | OGL v3.0 |
 | National Transport Authority (NTA) GTFS, published as Transport for Ireland | Republic of Ireland | Creative Commons Attribution (CC BY) 4.0 |
-| Geofabrik OpenStreetMap extracts | both | Open Database Licence (ODbL) |
+| Translink TransXChange timetables and MapInfo route geometry, via OpenDataNI | Northern Ireland | OGL v3.0 |
+| Geofabrik OpenStreetMap extracts | all three | Open Database Licence (ODbL) |
 
 The NTA feed is the one that carries an obligation rather than a courtesy. CC BY 4.0
 makes attribution a condition of use, so anything published from it — a tile archive, a

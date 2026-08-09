@@ -29,8 +29,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--region",
         default=None,
-        help="region slug (default: all). A BODS slug, or `ireland` for the "
-        "National Transport Authority's Republic of Ireland feed",
+        help="region slug (default: all). A BODS slug, `ireland` for the "
+        "National Transport Authority's Republic of Ireland feed, or "
+        "`northern_ireland` for Translink's four OpenDataNI datasets",
     )
     p.add_argument("--force", action="store_true", help="re-download even if present")
     p.add_argument(

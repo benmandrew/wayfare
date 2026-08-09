@@ -92,6 +92,21 @@ of the named tail cases turned out not to be this bug: patterns 1790 and 1346 ro
 95.9 km and 26.2 km because their stops fall outside the Wales extract, and both stay
 rejected, which is the right answer.
 
+**Northern Ireland, acquire and patterns** (2026-08-09), feed `20260806_140751`.
+The first region this project assembles rather than downloads: `northern_ireland`
+resolves through `config.FEEDS` to four OpenDataNI datasets, found by CKAN
+`package_show` because resource ids and filenames rotate on every publication.
+`config.Feed` gained `parts`, and `acquire.assemble` builds a GTFS bundle from the
+TransXChange timetables and the MapInfo road geometry into `WORK`, skipping the
+rebuild while the parts stand. `wayfare/translink.py` is the CKAN resolution, the
+TransXChange reader and the GTFS writer; `wayfare/mapinfo.py` is the MIF/MID
+parser. Translink dropped ATCO.CIF for TransXChange 2.4 on 2026-08-06, three days
+before this was built, which removed the converter and the reprojection this was
+planned around. 21,105 journeys collapse to 2,071 patterns in 3 seconds, a 10.2x
+collapse, and shape coverage came in well under prediction for a reason nothing
+here can fix — numbers in `docs/data.md`. 554 -> 585 tests, none of them needing
+the real download. Nothing downstream of `patterns` has been run.
+
 ## Next — the picture
 
 **Decide whether `coalesce` becomes the default for `density`.** The flag exists and
@@ -160,6 +175,93 @@ score — so 0.30 remains an untested guess.
    the viewer need it before an Irish archive is served.
 5. `.env.example` has no `ireland` block; the README covers the two variables.
 
+## Next — Northern Ireland, end to end
+
+1. **One graph, both halves.** The Republic's build above is the same
+   `ireland-and-northern-ireland` extract, so it is one GraphId space. Decide before
+   matching whether the two share a data root; nothing built so far prevents it, and
+   the only measured collision is `service_id`, which NI already prefixes `NI-`.
+2. **Expect a mixed run, unlike the Republic.** 58.0% `shape` and 42.0% `stops`, so
+   throughput should land between Wales's 3.6/s and London's 1.0/s rather than at
+   either.
+3. **Watch the geometry cadence.** The timetable refreshes far more often than the
+   road geometry, so shape coverage falls as the two drift apart and rises whenever
+   `PtLinks` is republished — see `docs/data.md` for where it stands. It is worth
+   logging on every run rather than measuring once.
+4. **Cross-border services reach Dublin and Donegal.** Goldline stops sit in the
+   Republic, which the shared extract covers, so they will match — but if the two
+   feeds ever merge, those stops are the four known `stop_id` collisions and they
+   are the same physical stops.
+
+## In progress — Greater London
+
+Running in a separate data root (`data-london`) against its own Valhalla instance
+on port 8003, built from
+`europe/united-kingdom/england/greater-london-latest.osm.pbf`. A second instance
+rather than a rebuild, because rebuilding the shared graph invalidates every
+`edge_id` in the Wales database.
+
+- 304 MB zip, 1.5 GB unpacked, `stop_times.txt` 1.50 GB, 17,611,239 stop times.
+- 480,412 trips -> **4,709 patterns**, a 102x collapse against Wales's 10.3x.
+  London runs the same route all day at high frequency.
+- Only **0.9% carry operator geometry** (44 shapes), against Wales's 85.2% and the
+  national 48.3%. London is almost entirely the `stops` path, at two Valhalla
+  calls per pattern.
+- Matching at **1.0/s** against Wales's 3.6/s, ETA about 1h15m. This is the honest
+  cost of `stops` at London road density, and a far better basis than Wales for
+  extrapolating to GB.
+
+## Next — GB
+
+1. **Extrapolate from London, not Wales.** Wales's 3.6/s is a `shape`-path rate on
+   sparse roads; London's 1.0/s is a `stops`-path rate on dense ones, and the
+   nation at 48% `shape` sits between them. Re-measure on the first national batch
+   regardless.
+2. **Watch memory on `patterns`.** The partitioned aggregate handled London's 1.50
+   GB `stop_times.txt` in 6 seconds inside an 8 GB limit; nationally the file is
+   5.09 GB. `WAYFARE_MEM` defaults to 8 GB and DuckDB spills to `temp_directory` —
+   make sure that path has room.
+3. **Pin the OSM extract.** Set `force_rebuild: "False"` and leave the graph alone
+   for the whole run; every `edge_id` in the database depends on it.
+4. **Budget the disk.** ~40 GB including the graph.
+
+## Next — correctness
+
+**Look at the 148 skipped and 23 errored patterns.** Wales skipped 4.2% on the
+`MAX_STOP_GAP_M` bound. Some are certainly TrawsCymru long-distance coaches, which
+genuinely have huge stop gaps and should probably be matched rather than dropped.
+Others may be bad stop coordinates. This is now a concrete list to inspect rather
+than a hypothetical.
+
+**Check `break_through` at termini and on one-way pairs.** Still untested; the
+choice over plain `through` is reasoned but unverified against real geometry.
+
+**Validate the `stops` strategy against the `shape` strategy.** Wales is 85%
+`shape`, which makes it an unusually good validation set: those patterns are
+ground truth for the synthesised ones. Match a
+sample of them *both* ways and measure how often the synthesised route recovers
+the same edge set. This is the single best available check on the primary code
+path, and it costs almost nothing because the data is already there. Report it as
+a coverage/agreement figure alongside `status`.
+
+**Eyeball the coalescing on the rendered map.** The merge is lossless by
+construction and the counts check out, but nobody has yet confirmed that the
+merged segments read well on hover — a feature now spans a run of edges, so the
+highlighted stretch and the info card cover more road than before. Look in
+particular at forks, where chaining stops, and at long uniform ways.
+
+**Direction.** Valhalla edges are directed, and `edge_id` distinguishes the two
+directions of a one-way pair. Coincident pairs now collapse where the service sets
+agree, which handles ordinary two-way streets, and a one-way pair carrying
+different buses each way still renders as two lines. What remains unverified is
+whether dual carriageways and one-way systems read well as two parallel lines on
+the map. Decide after seeing Wales rendered.
+
+**Tune the rejection bounds against real output.** Wales rejected 13 patterns as
+low confidence and skipped 148 on stop gap. `MIN_MATCH_CONFIDENCE` in particular
+has still never rejected anything on merit -- the one shape-path rejection was on
+detour, not score -- so 0.30 remains an untested guess.
+
 ## Next — scale
 
 **Subsequence reduction.** Many patterns are short workings: a contiguous subsequence
@@ -169,18 +271,13 @@ covers before building it.
 
 ## Known gaps
 
-**Feed churn is unmeasured.** The incremental path is built and `patterns` logs new /
-carried over / departed on every run, but nobody has yet put two consecutive BODS
-feeds through it. That number decides whether a monthly refresh takes minutes or
-hours, and it is one refresh away from being known.
-
-**Northern Ireland.** BODS and NaPTAN are both GB-only. Translink publishes ATCO.CIF
-via OpenDataNI, and it does carry geometry — see `docs/data.md`. It needs a separate
-parser and the `ireland-and-northern-ireland` OSM extract (409 MB; there is no
-standalone NI extract). Sequenced after GB, because it shares nothing with the GTFS
-path except the matcher — and now after the Republic, which reaches that same extract
-through the GTFS path and therefore builds the graph both halves of the island would
-share.
+**Northern Ireland's two halves are published on unrelated cadences.** The
+timetable is republished every few weeks and the road geometry has not moved since
+2025-09-23, so hundreds of timetabled stops exist that the geometry has never heard
+of, and journey-level shape coverage sits far below hop-level coverage as a result.
+It will drift further until Translink republishes `PtLinks`. Nothing here can fix
+it; the pipeline just has to report it honestly and let the `stops` path take the
+rest.
 
 **A graph rebuild is still a full re-match.** Geofabrik rebuilds daily and every
 `edge_id` depends on the build. `match.pin_graph` refuses rather than silently mixing

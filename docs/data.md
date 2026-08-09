@@ -18,6 +18,20 @@ Transport Authority's feed carries a `shape_id` — which makes it the sharpest
 available contrast and the cheapest region this project has added. See Beyond Great
 Britain below.
 
+**Northern Ireland sits between the two, and its figure moves for a reason neither
+of the others has.** 58.0% of its patterns and 62.0% of its journeys carry
+geometry, against the 83.5% predicted from the previous timetable. A shape is all
+of a journey's hops or none of them: stitching what exists and jumping the rest
+hands `map_snap` a straight line across a town, which it lays down the wrong roads
+with confidence, and bad geometry is worse than none. Individual hops are 96.1%
+covered, so the loss is concentrated — 791 of 12,372 timetabled stops appear
+nowhere in the geometry at all, and account for 1,408 of the 1,995 missing hops.
+Falling back to the reversed polyline of the opposite hop was measured and
+rejected: it exists for 23 of the 1,995, and a one-way system makes it wrong.
+Translink publishes the two halves on unrelated cadences — the timetable every few
+weeks, the road geometry not since 2025-09-23 — so this figure falls further until
+`PtLinks` is republished.
+
 An operator switching on `TrackPoint`s is an opt-in re-match. A pattern matched
 from bare stops that later gains a `shape_id` is worth redoing — it turns a guess
 into an observation — but it adds work to a queue meant to be predictable. The
@@ -82,21 +96,98 @@ bus route does. So an existing database keeps its ferry edges until the next
 nations. The `london` slug therefore fell back silently to the 2.16 GB Great
 Britain extract until `config.OSM_EXTRACTS` got an entry.
 
+**One Geofabrik extract covers the whole island of Ireland.**
+`ireland-and-northern-ireland-latest.osm.pbf` is 409 MB and splits at the sea
+rather than at the border, so the Republic and Northern Ireland match against one
+graph build and therefore one GraphId space. Nothing forces the two feeds into one
+database and nothing prevents it: the island can share a data root.
+
 **OSM `route=bus` relations are not viable as a source.** 12,968 nationally, only
 818 `route_master` relations, and Greater London alone is 13% of the total. BODS is
 the authority for what services exist; OSM is only the geometry substrate.
 
 ## Beyond Great Britain
 
-**Northern Ireland has no GTFS, but it does have geometry.** BODS and NaPTAN are
-both GB-only, and Translink publishes ATCO.CIF through OpenDataNI. That file is not
-geometry-free: its `QB` records carry each stop's position as a six-figure Irish
-Grid reference (EPSG:29903), and only 13 of 11,090 stops lack one. Round-tripping
-those against Translink's own lat/lon list gives a median error of 3.1 m, which
-pins the projection rather than assuming it. Translink also publishes
-road-following geometry separately, as MapInfo MIF/MID `PtLinks`: 37,913
-stop-to-stop polylines covering 97.5% of hops and 83.5% of trips. Not yet covered —
-see PLAN.md.
+**Northern Ireland has no GTFS, and since 2026-08-06 it has no ATCO.CIF either.**
+BODS and NaPTAN are both GB-only, so Translink publishes the province itself
+through OpenDataNI. Both timetable datasets now carry TransXChange 2.4, the same
+format BODS is built from, and that deleted the plan this file used to record: a
+third-party ATCO.CIF converter, and a six-figure Irish Grid reprojection to get
+stop positions out of `QB` records. TransXChange `StopPoint`s carry World Geodetic
+System 1984 (WGS84) longitude and latitude directly, so there is no conversion, no
+`pyproj`, and no converter anywhere near the pattern identity — where a version
+bump would have invalidated the whole match cache silently. Re-check the format
+before trusting any figure in this section; it moved once with no announcement.
+
+**The source is four OpenDataNI datasets, and their slugs are the only stable
+handle.** Two TransXChange timetables (Ulsterbus and Goldline, 69.6 MB over two
+files; Metro and Glider, 104.6 MB) and two MapInfo route bundles. Translink
+re-uploads rather than overwrites, so the CKAN resource id and the filename both
+move on every publication — the timetable was `ulb-gle-16042026.zip` in April and
+`ulsterbus-and-goldline-until-31st-august-26.zip` in August. `translink.resource`
+therefore resolves each dataset through CKAN `package_show` and takes the most
+recently published ZIP, which is also what separates the current Metro routes from
+the 2022 Glider ones filed in the same dataset. The slugs are historical names that
+stopped describing their contents years ago — the one that says "metro timetable
+valid from 18 June until 31 August 2016" is the live Metro and Glider feed — so do
+not tidy them. Like BODS, OpenDataNI answers a generic scraper with a 403, so
+`config.USER_AGENT` is load-bearing here too. Everything is OGL v3.0.
+
+**Road geometry comes separately, and `None` is a real object type.** The `PtLinks`
+bundle is MapInfo Interchange Format (MIF) with its companion MID attribute file:
+37,913 stop-to-stop polylines, read by `wayfare/mapinfo.py` in about 155 lines with
+no new dependency. The `.MIF` holds one object per feature and the `.MID` one
+delimited row per object, in order, with no key of its own, so an unrecognised
+keyword does not degrade — it shifts every later attribute row onto the wrong road
+and the result still draws. The parser therefore raises on any object type it does
+not know, and checks that both files run out together. `None` is the trap: an
+attribute row with no geometry, on a line of its own, that looks like nothing.
+Translink writes 152 of them among the 37,913. `CoordSys Earth Projection 1` is
+asserted for the same class of reason — Irish Grid eastings read as degrees are
+still numbers, and would put Belfast in the Atlantic without raising.
+
+**`StoppingPoints.GlobalId` is the NaPTAN ATCO code, and it is the whole join.**
+The timetable knows a stop only by ATCO code and the geometry only by a numeric
+triple; that column is the one place the two meet. It checks out: of 14,754 hops
+whose polyline could be tested against both stops, 14,747 start nearer the
+from-stop than the to-stop, at a median 6 m and a p90 of 13 m from it. A hop
+usually has several polylines, one per line and branch that runs it, and the kept
+one is the *shortest* rather than the first, because a pick made from file order
+changes every shape when Translink re-exports.
+
+**The pattern identity is Translink's own fields.** `route_id` is the operator code
+plus the line name, `ULB-40`. The obvious choice, the TransXChange `ServiceCode`
+`2-40-_-y18-1`, carries an operating branch, a schedule dataset tag and a
+registration revision, and all three move without the bus changing. It also splits
+what should be one route: eight lines are registered twice under different branch
+numbers, and `ULB-40` merges them where the `ServiceCode` would not. Stop ids are
+the ATCO codes verbatim and direction is TransXChange's own, so nothing in the
+identity is invented here. `shape_id` is a hash of the stop sequence rather than
+the journey pattern id, because `gtfs.py` collapses patterns with `mode(shape_id)`
+and that has no tiebreak — the tie is removed rather than resolved. `calendar.txt`
+ids are prefixed `NI-`, since Translink's day patterns and the Republic's service
+ids are both numeric and collide.
+
+**Run through `patterns`, the province is Wales-shaped.** Measured 2026-08-09
+against feed `20260806_140751`: 21,105 journeys over 687 routes collapse to
+**2,071 patterns in 3 seconds**, a **10.2x** collapse — Wales's 10.3x rather than
+the Republic's 43.4x or London's 102x, because Translink runs long rural services
+that repeat few times a day. Earlier research predicted 2,348 patterns from a trip
+base of 18,975; the trip base was wrong, so treat the collapse ratio rather than
+the count as the thing that carried over. Six
+operators (ULB 1,123 patterns, MET 479, UTS 193, GLE 154, FY 110, GDR 12), 1,178
+distinct shapes, and 4.7% of patterns over `MAX_STOP_GAP_M` — Wales's 4.2%, not the
+Republic's 11.7%. The window reaches 53.35°N and 8.27°W, which is Dublin and
+Donegal: Goldline runs across the border and those stops are in the feed. The
+assembled bundle is byte-identical between two builds of one publication,
+timestamps included, because this is the one feed here whose bytes are ours to
+make comparable.
+
+**A stop at latitude zero is not a null, and the old guard missed it.** Translink
+has shipped stops at exactly `0.0`/`0.0`, which is in the Gulf of Guinea, passes
+`IS NOT NULL`, and drags a pattern's span across two continents. `gtfs.py` now
+drops a zero latitude on load, and `translink.py` drops it before it is ever
+written — belt and braces, because the two guards catch it at different costs.
 
 **The Republic of Ireland inverts the fact at the top of this file.** The National
 Transport Authority's Transport for Ireland feed
