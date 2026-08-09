@@ -108,7 +108,50 @@ grouped one, so `density` and `strands` drew different networks from one spec; a
 `strands` to SVG was never deterministic, because the edges within a ribbon had no
 tiebreak and SCREEN compositing hid it from every PNG comparison.
 
+## Done — parallel rendering
+
+Ran 2026-08-09, against the real national database on the server (2,746,261 edges,
+8,301,705 edge-service rows) rather than a synthetic one. Numbers in CLAUDE.md.
+
+- **A render is drawn in horizontal bands, one process each.** `uk` at 2,000px:
+  `density` 77–98s -> 28–32s, `spectrum` 58–67s -> 21–31s, `strands` 71–72s -> 37–40s.
+  At 4,000px `density` 98s -> 42s. **Byte-identical**, for all three styles and for
+  letterboxed, scaled, filtered, sampled and wide-lined canvases.
+- **Bands cut on edge count, not height.** Equal-height bands gave one of eight 48%
+  of the country's edges. That alone was 37s -> 27s.
+- **`Source.groups`** carries the window's `(grp, n_edges, trips)` into every band, so
+  ribbon widths and draw order stay global. Without it `strands` differed by up to
+  4/255 across 2.8% of the image — eight-bit rounding under a reordered SCREEN.
+- **`default_workers` reads the cgroup quota**, so the `cpus: 4` render container does
+  not start eight processes. `WAYFARE_RENDER_WORKERS` overrides; `--workers` on the
+  CLI overrides both.
+- 376 -> 391 tests.
+
+Three bugs found on the way: `fork` with an open DuckDB handle kills the child with
+no traceback; clipping to the band splits strokes at a raster boundary and cairo's
+fixed-point tessellation does not re-add exactly; and a band trusting `config.DB_PATH`
+would draw from a different database than the connection it was given.
+
 ## Next — make the drawing cheaper, not the query
+
+Banding bought a factor of three by using the cores. What is left is the work itself,
+and it is now measured on real data: an edge in the `uk` window simplifies to **2.08
+vertices**, so almost every stroke is one tiny segment and its cost is tessellating
+two round caps. Replacing round caps with butt/mitre halves a render (55.4s -> 25.5s),
+which says where the time is but is not a change anyone wants.
+
+- **Coalescing runs of edges into single subpaths** is the one that keeps the picture:
+  `publish` already chains by `way_id` (169,857 -> 53,013 features on Wales), and a
+  chain pays two caps instead of two per edge. Needs breaking at weight changes.
+  Unbuilt, and now the largest remaining win.
+- `ctx.set_tolerance(1.0)` is 78.5% of cairo for a coarser cap arc; `Antialias.FAST`
+  is 74.4%. Both change the output, neither is taken.
+- `Antialias.GOOD`/`DEFAULT` are byte-identical to `BEST` — the antialias setting is
+  not a lever at all.
+- `edge_services` still cannot prune, and under banding that is worse than it was:
+  it is a per-band floor, which is why more bands than cores is slower.
+
+## Superseded — make the drawing cheaper, not the query
 
 The prototype's measurements point somewhere other than where I expected. A render
 is **75% cairo**; the whole database side is a quarter, and the percentile pass under

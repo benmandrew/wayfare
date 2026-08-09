@@ -4,7 +4,7 @@ import math
 
 import pytest
 
-from wayfare import art
+from wayfare import art, db
 
 
 def test_presets_are_well_formed():
@@ -605,3 +605,178 @@ def test_the_edge_stream_has_a_defined_order(con):
     query, params = w.sql.edges_query(with_groups=False, by_weight=False)
     assert [r[0] for r in con.execute(query, params).fetchall()] == [1, 3, 7, 9]
     assert [e.edge_id for e in w.edges()] == [1, 3, 7, 9]
+
+
+# --- Banding ------------------------------------------------------------------
+#
+# The claim banding rests on is that it changes nothing: `workers=8` and `workers=1`
+# must produce the same bytes, or every measurement taken against one of them is
+# about a different picture. The tests below check that claim from both ends -- the
+# pieces that make it true, and the finished render.
+
+
+def _band_edge(con, edge_id, lat_e6, trips=100, services=("42",), agency="OP1"):
+    """One edge at a given latitude. Banding cuts north to south, so unlike
+    `_art_edge` the geometry has to vary in latitude rather than longitude."""
+    con.execute(
+        "INSERT INTO edges VALUES (?, 1, 'R', 'secondary', 100.0, "
+        "[-3200000, -3199000], [?, ?], -3200000, ?, -3199000, ?)",
+        [edge_id, lat_e6, lat_e6, lat_e6, lat_e6],
+    )
+    for s in services:
+        con.execute(
+            "INSERT INTO edge_services VALUES (?, ?, ?, 1, ?)", [edge_id, s, agency, trips]
+        )
+
+
+@pytest.fixture
+def banded(con, tmp_path, monkeypatch):
+    """A window with edges spread over its whole height, read through a *read-only*
+    handle -- which is what both `_render` and the server open, and what a band
+    process needs the file to still be openable as. `MIN_BAND_EDGES` is dropped to
+    nothing because the floor is about start-up cost, not about correctness."""
+    for i in range(60):
+        _band_edge(
+            con,
+            i + 1,
+            51_420_000 + i * 3_000,
+            trips=1 + i * 40,
+            services=("42",) if i % 3 else ("9A", "7"),
+        )
+    con.close()
+    monkeypatch.setattr(art, "MIN_BAND_EDGES", 0)
+    ro = db.connect(tmp_path / "test.duckdb", read_only=True)
+    yield ro
+    ro.close()
+
+
+BAND_BOUNDS = art.Bounds(-3.30, 51.40, -3.10, 51.60)
+
+
+@pytest.mark.parametrize("style", sorted(art.STYLES))
+def test_a_banded_render_is_byte_identical_to_a_serial_one(banded, style):
+    """The whole justification. Verified on the real 2.7M-edge database over the
+    `uk` window as well, for all three styles."""
+    kw = {"opts": art.RenderOpts(width_px=200), "con": banded}
+    assert art.render_bytes(BAND_BOUNDS, style, workers=1, **kw) == art.render_bytes(
+        BAND_BOUNDS, style, workers=4, **kw
+    )
+
+
+@pytest.mark.parametrize(
+    "opts",
+    [
+        art.RenderOpts(width_px=200, height_px=320),  # letterboxed
+        art.RenderOpts(width_px=150, scale=2.0),  # bands cut on device rows
+        art.RenderOpts(width_px=200, line_scale=6.0),  # a wider collar is needed
+    ],
+    ids=["letterbox", "scaled", "wide-lines"],
+)
+def test_banding_survives_the_awkward_canvases(banded, opts):
+    """A letterbox makes the band extent and the window clip disagree; `scale` puts
+    the cuts on device rows under a scaled context; `line_scale` widens the strokes
+    past the collar a band queries, which is the seam this could most easily grow."""
+    kw = {"opts": opts, "con": banded}
+    assert art.render_bytes(BAND_BOUNDS, "density", workers=1, **kw) == art.render_bytes(
+        BAND_BOUNDS, "density", workers=4, **kw
+    )
+
+
+def test_bands_hold_roughly_equal_numbers_of_edges(banded):
+    """Cutting the canvas into equal heights put 48% of Great Britain's edges into
+    one of eight bands, so the render waited on one core. The cuts follow the edges."""
+    proj = art.Projection.fit(BAND_BOUNDS, 200, 400)
+    w = art.Window(BAND_BOUNDS, banded)
+    n_edges, cuts = art.band_cuts(banded, w.sql, BAND_BOUNDS, proj, 400, 4)
+    assert n_edges == 60
+    counts = [
+        sum(
+            1
+            for lat in range(51_420_000, 51_420_000 + 60 * 3_000, 3_000)
+            if lo <= proj(BAND_BOUNDS.min_lon, lat / 1e6)[1] < hi
+        )
+        for lo, hi in zip(cuts, cuts[1:], strict=False)
+    ]
+    assert len(counts) == 4
+    assert max(counts) - min(counts) <= 2
+
+
+def test_the_edge_count_respects_the_spec_filter(banded):
+    """The count decides whether to band at all, so it has to be the count of what
+    will actually be drawn. Reading it straight off `edges` would start eight
+    processes for a spec that filters the window down to nothing."""
+    proj = art.Projection.fit(BAND_BOUNDS, 200, 400)
+    w = art.Window(BAND_BOUNDS, banded, spec=art.QuerySpec(road_class=("motorway",)))
+    n_edges, _ = art.band_cuts(banded, w.sql, BAND_BOUNDS, proj, 400, 4)
+    assert n_edges == 0
+
+
+def test_a_band_never_queries_outside_the_window(banded):
+    """An unclamped collar would select edges the serial render never drew, and for a
+    grouped style those arrive with groups the window's statistics have never seen."""
+    proj = art.Projection.fit(BAND_BOUNDS, 200, 400)
+    top = art._band_window(BAND_BOUNDS, proj, 0.0, 100.0, pad=500.0)
+    assert top.max_lat <= BAND_BOUNDS.max_lat
+    assert top.min_lat >= BAND_BOUNDS.min_lat
+
+
+def test_injected_group_statistics_are_what_the_grouped_queries_read(banded):
+    """`Source.groups` is how every band gets the whole window's ribbon widths and
+    draw order rather than its own. If the substitution silently fell back to the
+    derived CTE, `strands` would still render -- just differently per band."""
+    stats = art.Window(BAND_BOUNDS, banded, with_groups=True).group_stats()
+    banded.register("wf_gstat", art._stats_table([(g, n, t * 3) for g, n, t in stats]))
+    injected = art.Window(
+        BAND_BOUNDS, banded, with_groups=True, source=art.Source(groups="wf_gstat")
+    )
+    assert [(g, n, t * 3) for g, n, t in stats] == injected.group_stats()
+
+
+def test_svg_falls_back_rather_than_failing(banded):
+    """Banding pastes rasters, so there is nothing to paste for a vector format. A
+    request for speed that cannot be honoured is not an error.
+
+    Asserted on the bytes rather than by comparing against a serial render, because
+    on libcairo 1.16 -- which the shipped image has, though the dev shell has 1.18 --
+    `density` and `strands` fall back to one embedded `<image>` whose id comes from a
+    process-wide counter. Two SVGs from one process differ there however identical
+    their pixels are, so the comparison would fail for a reason that has nothing to
+    do with banding."""
+    kw = {"fmt": ".svg", "opts": art.RenderOpts(width_px=200), "con": banded}
+    out = art.render_bytes(BAND_BOUNDS, "strands", workers=4, **kw)
+    assert out.startswith(b"<?xml") and out == art.render_bytes(
+        BAND_BOUNDS, "strands", workers=1, **kw
+    )
+
+
+def test_held_edges_fall_back_too(banded):
+    """`render(edges=...)` never touches the database, and a band process has no way
+    to be handed a list that lives in the parent."""
+    edges = art.load_edges(BAND_BOUNDS, con=banded)
+    kw = {"opts": art.RenderOpts(width_px=200), "edges": edges}
+    assert art.render_bytes(BAND_BOUNDS, "density", workers=4, **kw) == art.render_bytes(
+        BAND_BOUNDS, "density", workers=1, **kw
+    )
+
+
+def test_a_writable_connection_is_not_banded(con):
+    """DuckDB gives a writer an exclusive lock, so a band process could not open the
+    file at all. `band_source` probes rather than assuming, and the render falls back
+    instead of dying in a worker with an IOException nobody asked about."""
+    assert art.band_source(con) is None
+
+
+def test_a_band_reopens_the_database_it_was_given(banded):
+    """Not `config.DB_PATH`. A caller may hand `render` a connection to any database,
+    and a band that opened the configured one instead would quietly draw a different
+    picture -- in the parallel path only."""
+    path = art.band_source(banded)
+    assert path is not None and path.name == "test.duckdb"
+
+
+def test_worker_count_comes_from_the_environment_when_it_is_set(monkeypatch):
+    monkeypatch.setenv("WAYFARE_RENDER_WORKERS", "3")
+    assert art.default_workers() == 3
+    assert art.default_workers(7) == 7, "an explicit request still wins"
+    monkeypatch.setenv("WAYFARE_RENDER_WORKERS", "not a number")
+    assert art.default_workers() >= 1, "a bad value warns and falls back"
