@@ -91,7 +91,7 @@ class Bounds:
 # and a bit of slack around the edge of a conurbation usually renders better than
 # a tight legal border would.
 PRESETS: dict[str, Bounds] = {
-    "greater_manchester": Bounds(-2.75, 53.32, -1.90, 53.70),
+    "manchester": Bounds(-2.75, 53.32, -1.90, 53.70),
     "london": Bounds(-0.55, 51.26, 0.32, 51.71),
     "west_midlands": Bounds(-2.20, 52.35, -1.60, 52.68),
     "greater_glasgow": Bounds(-4.55, 55.75, -4.00, 56.00),
@@ -102,7 +102,6 @@ PRESETS: dict[str, Bounds] = {
     "edinburgh": Bounds(-3.42, 55.87, -3.03, 56.02),
     "liverpool": Bounds(-3.10, 53.29, -2.72, 53.53),
     "sheffield": Bounds(-1.65, 53.30, -1.32, 53.47),
-    "belfast": Bounds(-6.10, 54.50, -5.70, 54.72),
     "uk": Bounds(-8.75, 49.85, 1.95, 60.90),
 }
 

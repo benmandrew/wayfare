@@ -21,9 +21,9 @@ def test_degenerate_bounds_are_rejected():
 
 
 def test_resolve_names_the_alternatives():
-    assert art.resolve("greater_manchester") is art.PRESETS["greater_manchester"]
-    with pytest.raises(KeyError, match="greater_manchester"):
-        art.resolve("manchester")
+    assert art.resolve("manchester") is art.PRESETS["manchester"]
+    with pytest.raises(KeyError, match="manchester"):
+        art.resolve("greater_manchester")
 
 
 def test_resolve_passes_bounds_through():
