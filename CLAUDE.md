@@ -455,6 +455,21 @@ and `Projection.batch` projects a whole 20,000-row fetch with numpy at once. Per
 edge numpy would lose — 4.14 vertices is far too few to pay for array setup — so
 the batching is the point, not the library. Together, 53.2s to 25.8s.
 
+**A stroke width fixed in pixels is a different picture at every canvas size.**
+The map shrinks with the canvas and the lines do not, so the same window at
+1,600px carries the 4,000px line weight over 40% of the road length, and
+`density`'s two additive passes then clip to white through every town centre.
+That is why the `/art` default (1,600px) looked nothing like the CLI one
+(4,000px), and why a preview was a poor guide to the render it stands in for.
+`draw_density` now quotes its widths against `DENSITY_REF_PX` (2,000) and
+multiplies by `width_px`. The ramp constants were halved to match, and halving
+then doubling is exact in binary, so the 4,000px render is byte-identical to the
+one before the change — verified on Cardiff — while every smaller canvas gets
+proportionally lighter. No floor: a small canvas *should* draw hairlines, the
+same way downsampling the big render would. `spectrum` and `strands` still hold
+their widths in pixels, which is only defensible because neither stacks light
+additively the way `density` does; the studio's Widths note says so.
+
 **`spectrum` must never simplify its geometry.** Every other style would draw the
 same line through fewer points. This one takes the *hue* from the angle between
 consecutive points, so dropping a vertex merges two bearings into their average and
@@ -590,6 +605,28 @@ not pay, for the reason above: Cardiff went 2,347 ms -> 2,320 ms and London 28,9
 more than the scan it saved. `art.Source` survives as the substitution seam, with
 the numbers recorded on it; do not reintroduce the extract without first making the
 drawing cheaper.
+
+**The studio's preview is measured from the stage, not guessed at from the
+viewport.** It used to be a fraction of `innerWidth` capped at 1,400px, and a cap
+is what leaves empty ground: an `<img>` only ever shrinks to its container, so on
+a wide screen the render sat in the middle of a much larger panel. `fitWidth`
+takes the frame's box and the window's own aspect — through `canvasHeight`, which
+is the server's arithmetic — so the picture is drawn at the size it is displayed
+at. Cardiff on a 2,200px screen went from a 1,842x1,849 render shown inside an
+1,842x1,112 box to a 1,108x1,112 one drawn 1:1. A typed width switches the fitting
+off (`previewWidthAuto`) and is the only width that reaches a shared link, since
+an automatic one is the sender's screen rather than a decision.
+
+**A percentage height against an implicit grid track silently becomes `auto`.**
+`.frame` was `display: grid; place-items: center` with no `grid-template`, so its
+row was content-sized and therefore indefinite, and both `max-height: 100%` and
+`height: 100%` on the picture resolved to nothing. A render taller than the panel
+hung out of the bottom of it, scrolled to the top, which reads as a cropped and
+off-centre picture rather than as a layout bug. `grid-template: minmax(0, 1fr) /
+minmax(0, 1fr)` is the definite version. Found by measuring the computed boxes in
+a headless Chrome rather than by reading the CSS: the img reported its natural
+1,849px height inside a 1,112px frame, which no reading of `max-height: 100%`
+would have predicted.
 
 **Every `/art` error is JSON, and the message is the interface.** `send_error`
 writes an HTML page, which an `<img>` renders as a broken-image icon with the reason
