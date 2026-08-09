@@ -77,8 +77,8 @@ host resumes, and whether NaPTAN applies — it does not, since NaPTAN is the GB
 register. 123,903 road-going trips collapse to 2,853 patterns in 2 seconds, a 43.4x
 collapse, and 100% carry operator geometry against GB's 48.3%. The GUID feed version
 is rewritten rather than worked around, and a declared `Content-Length` is now checked
-because every host except BODS sends one. Numbers in `docs/data.md`. Nothing
-downstream of `patterns` has been run.
+because every host except BODS sends one. Numbers in `docs/data.md`. Everything
+downstream of `patterns` ran later the same day, in the entry below.
 
 **The `stops` strategy validated against the `shape` strategy, and `break_through`
 fixed** (2026-08-09), against the Wales data root and its own Valhalla. A census
@@ -105,7 +105,51 @@ before this was built, which removed the converter and the reprojection this was
 planned around. 21,105 journeys collapse to 2,071 patterns in 3 seconds, a 10.2x
 collapse, and shape coverage came in well under prediction for a reason nothing
 here can fix — numbers in `docs/data.md`. 554 -> 585 tests, none of them needing
-the real download. Nothing downstream of `patterns` has been run.
+the real download. Everything downstream of `patterns` ran later the same day, in the
+entry below.
+
+**Both parts of Ireland, end to end** (2026-08-09), against one shared Valhalla graph
+`3.8.3/1786309727`, built from `europe/ireland-and-northern-ireland-latest.osm.pbf` (409
+MB) and living at `/home/ben/wayfare-ireland/valhalla`. The Republic, feed
+`20260808_b375dfac` in `/home/ben/wayfare-ireland/data`: 2,853 patterns, 2,721 ok (95.4%),
+132 `no_route`, 0 skipped, 0 pending; 97.2% of trips, 352,945 edges, 737 services, 16.4 MB
+PMTiles; 18.4 patterns/s with 2 workers, 2m35s; mean 558.8 edges per matched pattern,
+detour ratio 1.18. Northern Ireland, feed `20260806_140751` in `/home/ben/wayfare-ni/data`:
+2,071 patterns, 2,061 ok (99.5%), 10 `no_route`, 0 skipped, 0 pending; 99.7% of trips,
+121,384 edges, 638 services, 6.1 MB PMTiles; 18.1 patterns/s with 2 workers, under two
+minutes; the 121,384 edges coalesced to 32,041 features, 45 of them over the 64-service
+cap, and no tile hit the size limit at any zoom. Both runs took minutes, not hours. One
+data root per region rather than the shared one item 1 of the old Northern Ireland section
+left open: the extract and therefore the GraphId space is shared, so a shared root was
+possible, but `meta.feed_version` is single-valued (`wayfare/db.py:184`), so acquiring the
+second region into the first's database would make it the current feed and the next
+`publish` would overwrite the first region's archive. Two predictions in this file did not
+hold. Northern Ireland was expected to land between Wales's 3.6/s and London's 1.0/s
+because it is 58% `shape` and 42% `stops`; it ran at 18.1/s, indistinguishable from the
+Republic's 18.4/s at 100% `shape`, and why the mix made no difference is unexplained and
+unmeasured. And `MAX_STOP_GAP_M` did not need deciding for the Republic ahead of matching:
+the bound is 180 km and is not applied to a pattern carrying an operator trace, so none of
+the 333 patterns (11.7%) with a stop gap over 25 km was skipped, and the run logged runs of
+"N of 200 patterns carry operator geometry across a leg over 180 km" throughout. The viewer
+now serves three regions from `/home/samba/sambashare/wayfare/out`: `great_britain.pmtiles`
+(130.2 MB), `ireland.pmtiles` (16.4 MB) and `northern_ireland.pmtiles` (6.1 MB). Great
+Britain's archive was renamed from `bus.pmtiles` because `web/index.html:358` builds each
+dropdown label from the filename; the default view is unchanged, because
+`web/index.html:315` takes `ARCHIVES[0]` and `great_britain` still sorts first.
+
+## Next — republish the three served archives with their credit
+
+**The attribution code landed 38 minutes after the image that published these tiles was
+built.** `publish` now stamps the credit into the archive's own tileset metadata
+(`93623bc`), but `benmandrew/wayfare:latest` on the server was built at 21:04Z and the
+commit landed at 21:42Z, so all three archives now being served — Great Britain, the
+Republic and Northern Ireland — were written without it. The Republic's CC BY 4.0 and
+Translink's Open Government Licence v3.0 both make the credit a condition of publication,
+so this is a live breach for as long as those files are up. The code is done and nothing
+needs re-matching: rebuild the image, run `wayfare publish --region <region>` against each
+of the three data roots, and copy each archive back into
+`/home/samba/sambashare/wayfare/out` under its region name. This is the most urgent item
+in this file.
 
 ## Next — the picture
 
@@ -154,49 +198,13 @@ almost no `shape` patterns to be ground truth. GB is the only place both halves 
 never rejected anything on merit — the one shape-path rejection was on detour, not
 score — so 0.30 remains an untested guess.
 
-## Next — the Republic of Ireland, end to end
+## Next — the two Irish regions
 
-1. **Build the Valhalla graph** from `europe/ireland-and-northern-ireland-latest.osm.pbf`
-   (409 MB), in its own data root and its own instance, exactly as London was. The
-   extract covers both halves of the island, so this same graph is what Northern
-   Ireland will eventually match against — one build, one GraphId space, one database
-   if it comes to that.
-2. **Decide `MAX_STOP_GAP_M` for the `shape` path first.** 333 of the 2,853 patterns
-   (11.7%, 8,395 of 148,255 weekly trips) have a stop gap over 25 km, and every one of
-   them carries a dense operator trace. `match_one` checks the bound before it chooses
-   a strategy, so all 333 would be skipped on a rule written for routing between bare
-   stops. Wales's equivalent was 4.2%, and it is the same open question the
-   correctness section above raises about TrawsCymru coaches — the Republic just makes
-   it three times as expensive to leave alone.
-3. **Expect minutes, not hours.** Wales matched 3,552 patterns at 3.6/s on the `shape`
-   path; the Republic is 2,853 patterns and 100% `shape`.
-4. **The attribution is carried, and this item is done.** `wayfare publish` stamps the
-   credit into the archive's own tileset metadata through tippecanoe's `--attribution`,
-   so it travels with the file rather than with the page serving it, and both the viewer
-   and the art page's window picker read it back and show it. CC BY 4.0's condition on
-   crediting the NTA is therefore met by an Irish archive wherever it is copied. What
-   remains before one can be served publicly is items 1 to 3 above and nothing else: the
-   graph build, the match run, and `publish`. Rendered PNG and SVG output still carries
-   no credit at all, which is a separate branch.
-5. `.env.example` has no `ireland` block; the README covers the two variables.
-
-## Next — Northern Ireland, end to end
-
-1. **One graph, both halves.** The Republic's build above is the same
-   `ireland-and-northern-ireland` extract, so it is one GraphId space. Decide before
-   matching whether the two share a data root; nothing built so far prevents it, and
-   the only measured collision is `service_id`, which NI already prefixes `NI-`.
-2. **Expect a mixed run, unlike the Republic.** 58.0% `shape` and 42.0% `stops`, so
-   throughput should land between Wales's 3.6/s and London's 1.0/s rather than at
-   either.
-3. **Watch the geometry cadence.** The timetable refreshes far more often than the
-   road geometry, so shape coverage falls as the two drift apart and rises whenever
-   `PtLinks` is republished — see `docs/data.md` for where it stands. It is worth
-   logging on every run rather than measuring once.
-4. **Cross-border services reach Dublin and Donegal.** Goldline stops sit in the
-   Republic, which the shared extract covers, so they will match — but if the two
-   feeds ever merge, those stops are the four known `stop_id` collisions and they
-   are the same physical stops.
+1. **`.env.example` still has no `ireland` block.** The README covers the two variables.
+2. **Neither region is clustered.** `edges_clustered` reads `"no"` for both, so
+   `wayfare cluster` has never run against either data root.
+3. **Rendered PNG and SVG output carries no credit at all.** `publish` stamps the
+   archive, but `art` stamps nothing, so a render leaves the credit behind.
 
 ## In progress — Greater London
 
@@ -300,3 +308,19 @@ if it ran a normal week.
 
 **`agency_id` is carried but unused.** Colouring or filtering by operator is plausible
 for both the map and the art, and the data is already there.
+
+**Cross-border services reach Dublin and Donegal.** Goldline stops sit in the Republic,
+which the shared extract covers, so they match — but the two regions are now separate
+databases on one GraphId space, and if the feeds ever merge, those stops are the four
+known `stop_id` collisions and they are the same physical stops. `service_id` is the
+only other measured collision, and NI already prefixes it `NI-`.
+
+**Northern Ireland has no Compose project.** It was driven by hand with `docker run`
+against the Ireland project's network, so `/home/ben/wayfare-ni` is host state that
+Ansible does not know about and that no committed file reproduces.
+
+**`publish.build_tiles` hardcodes `out/bus.pmtiles`** (`wayfare/publish.py:308`), and
+`publish.build` passes no path, so a second region's archive is renamed and copied into
+the served directory by hand. Nothing automates the step, and the viewer takes each
+region's label from the filename (`web/index.html:358`), so that hand step is also where
+the label on the map is decided.

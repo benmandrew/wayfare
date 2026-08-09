@@ -144,12 +144,16 @@ any of it, which looks like a viewer crediting only its basemap rather than an e
 patterns, 95.9% matched, 2,746,261 edges, 130 MB PMTiles. Wales and Greater London were
 the two rehearsals for it and both stand. 500 tests pass, ruff and mypy clean.
 
-**Both parts of Ireland run as far as `patterns` and no further.** The Republic on
-feed `20260808_b375dfac`, 2,853 patterns, 100% operator geometry; Northern Ireland
-on `20260806_140751`, 2,071 patterns, 58.0% operator geometry. Numbers for both are
-in `docs/data.md`. What is missing for either is the Valhalla graph: they share one 409 MB
-island extract and it has never been built, so nothing has been matched, aggregated
-or published. That is the user's call to start, not a step that was skipped.
+**Both parts of Ireland are complete end to end**, on the server, against one shared
+Valhalla graph `3.8.3/1786309727` built from the 409 MB island extract. The Republic on
+feed `20260808_b375dfac`: 2,853 patterns, 95.4% matched, 352,945 edges, 16.4 MB PMTiles.
+Northern Ireland on `20260806_140751`: 2,071 patterns, 99.5% matched, 121,384 edges, 6.1
+MB PMTiles. One data root per region, not one shared: `meta.feed_version` is single-valued,
+so a second region acquired into the first's database becomes the current feed and the next
+`publish` overwrites the first region's archive. **All three served archives predate the
+attribution code and carry no credit** — the image that wrote them was built 38 minutes
+before `93623bc` landed — so serving them breaches CC BY 4.0 and OGL v3.0 until each is
+republished. Nothing needs re-matching; see `PLAN.md`.
 
 Feed churn — how many patterns are new month to month — is still the unmeasured number
 that decides everything, and it is one `acquire` and one `patterns` away from being
