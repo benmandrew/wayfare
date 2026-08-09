@@ -87,6 +87,76 @@ Confidence from the `stops` path is deliberately reported as 0.0, not 1.0: it is
 guess about which roads the bus takes, not an observation of it, and `edge_walk`
 returns 1.0 by construction.
 
+**The `stops` path recovers 95.1% of the road an operator trace covers, and the way it
+fails is by inventing.** Wales is 85% `shape`, which makes it ground truth for the
+strategy that has to carry the other half of the country. All 3,052 Wales patterns
+that carry operator geometry and matched ok on the `shape` path were matched *both*
+ways in one run against one live Valhalla — once normally, once with the geometry
+withheld so `match_one` takes the `stops` branch — and the edge sets compared. Pooled
+length recall 0.951, 0.960 trip-weighted; pooled precision 0.892. So the synthesised
+route under-recovers by 4.4% and over-draws by 7.4%, which is 1,456 km of phantom road
+at network level. Invention is the larger error, and bad geometry is worse than
+missing geometry — the entry below. Span predicts quality and stop spacing does not:
+under 2 km scores 0.907 and over 20 km scores 0.959, because a short urban pattern's
+length is dominated by a town centre where one wrong block is a large share of the
+route. That is not reassuring for London, which is entirely `stops` path and entirely
+dense urban. The harness is a census rather than a sample and takes 84 s a pass, so
+re-running it is the cheap way to judge any change to the matcher.
+
+**`break_through` is wrong wherever a pattern doubles back, and the answer is 50 m
+wide.** Valhalla's `break_through` location type forbids a U-turn at the stop, which
+is what a bus does at an ordinary stop and not what it does on an out-and-back spur.
+Refused the turn, the router replies with a lap of the block: service 86B in Newtown
+routed 24.3 km over a 5.9 km span, was thrown out by the detour guard, and drew
+nothing at all across three patterns. `_location_types` now relaxes the stops
+*between* a stop and its return to plain `break`, which permits the turn without
+asking for one — Valhalla still pays the turn cost. Everything else keeps
+`break_through`, because that is what lets the `edge_walk` second pass recover edges
+exactly.
+
+**The two visits are separate stops tens of metres apart, so an exact coordinate test
+finds none of them.** 86B returns to Montgomeryshire Infirmary 28 m from where it left
+it and to Tan-y-Graig 7 m away, on different NaPTAN ids — the two kerbs of one road.
+`REVISIT_M` is 50 m, wider than a road and well inside the gap between stops — Wales's
+118,676 consecutive pairs are 126 m apart at the fifth percentile, and only 0.38% of
+stop-to-stop-after-next pairs, the closest two the rule can even consider, fall within
+50 m. Adjacent stops are excluded, since those are a junction rather than a turn, and
+so is the first-to-last pair, or every circular in the country would relax end to end.
+1,018 of Wales's 3,584 patterns carry at least one revisit.
+
+**The fix trades 21 km of real road for 465 km of invented road, and that is the whole
+argument for it.** Measured by re-running the census above with the shipped matcher
+under each rule, paired pattern by pattern in one process against one graph build:
+pooled length recall 0.9513 → 0.9510, trip-weighted 0.9601 → 0.9601, pooled precision
+0.8748 → 0.8802. Phantom road falls 9,309 km → 8,844 km and three patterns stop being
+rejected. Recall alone reads as a loss — 191 patterns improve and 268 regress —
+because the relaxation mostly *removes* road, and removing road can only lower recall.
+The symmetric measures are the ones to read: Jaccard improves on 353 patterns against
+191, the harmonic mean of precision and recall on 354 against 182, and its
+trip-weighted mean goes 0.9212 → 0.9242. Nothing predicts which patterns regress.
+Bucketed by revisit span, by number of revisits and by the fraction of stops relaxed,
+every bucket shows a small negative recall delta and a positive precision delta.
+
+**Two narrower rules were measured and rejected, and the tempting one is the retry.**
+Relaxing the two visits as well as the stops between them costs 36.6 km of real road
+against 20.8 km for the same phantom saving, and regresses 283 patterns rather than
+268. Applying the relaxation only after the detour guard fires has a blast radius of
+exactly three patterns and no regressions at all, which sounds ideal until the numbers
+land: it rescues the same three 86B patterns and forfeits the entire 465 km of
+precision gain. Three rescues are worth 85 trips. The precision gain is worth 5% of
+every invented metre in Wales.
+
+**Half the named tail is not this bug, and one case was misfiled.** Patterns 1790 and
+1346 route 95.9 km and 26.2 km because stops fall outside the Wales extract, not
+because they double back — 1346 carries no revisit within 50 m at all, and six of its
+ten stops are Gloucestershire ATCO codes. Both are unchanged by the fix and both stay
+rejected, which is correct: `map_snap` on an operator shape degrades gracefully when
+the graph does not cover the route and `break_through` cannot, so the detour guard is
+the only thing standing between a regional extract and 95 km of confident-looking
+phantom. Pattern 1 (Cardiff service 6, 1,360 trips, recall 0.808) is unchanged too. It
+takes Callaghan Square where the bus takes Bute Street, two ways round one block, both
+plausible to a router. Nothing detects that.
+
 **The match stage must survive interruption.** It runs for days on a server that
 may reboot. Work is selected by the *absence* of a `match_status` row. This means
 one batch is both the unit of concurrency and the unit of checkpointing, and they

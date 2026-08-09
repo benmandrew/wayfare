@@ -80,6 +80,18 @@ is rewritten rather than worked around, and a declared `Content-Length` is now c
 because every host except BODS sends one. Numbers in `docs/data.md`. Nothing
 downstream of `patterns` has been run.
 
+**The `stops` strategy validated against the `shape` strategy, and `break_through`
+fixed** (2026-08-09), against the Wales data root and its own Valhalla. A census
+rather than a sample: all 3,052 Wales patterns that carry operator TrackPoints and
+matched ok were matched both ways in one run, 84 s a pass. Pooled length recall 0.951,
+pooled precision 0.892 — the synthesised route under-recovers by 4.4% and over-draws
+by 7.4%. That found `break_through` forbidding the U-turn an out-and-back spur needs,
+so `_location_types` relaxes the stops between a stop and its return; phantom road
+falls 9,309 km -> 8,844 km for 21 km of real road. Numbers in `docs/pipeline.md`. Two
+of the named tail cases turned out not to be this bug: patterns 1790 and 1346 route
+95.9 km and 26.2 km because their stops fall outside the Wales extract, and both stay
+rejected, which is the right answer.
+
 ## Next — the picture
 
 **Decide whether `coalesce` becomes the default for `density`.** The flag exists and
@@ -109,15 +121,19 @@ applied at all to a pattern carrying an operator trace, and a refused connection
 run, and it has not been done. Wales's 4.2% skipped is the same list at regional
 scale.
 
-**Validate the `stops` strategy against the `shape` strategy.** Wales is 85% `shape`,
-which makes it an unusually good validation set: those patterns are ground truth for
-the synthesised ones. Match a sample of them *both* ways and measure how often the
-synthesised route recovers the same edge set. This is the single best available check
-on the primary code path, and it costs almost nothing because the data is already
-there. Report it as a coverage/agreement figure alongside `status`.
+**Re-run the census on a graph that covers the whole route.** The 22 low-confidence
+patterns in the Wales census are almost all stops over the England border, where
+`map_snap` on an operator shape matches the Welsh half and stops while `break_through`
+has to reach every stop and loops the extract boundary to do it. That is an artefact
+of a regional extract, so the national graph should clear it — but nobody has checked,
+and the asymmetry is real. It also means the Wales figures understate the strategy: on
+the clean subset of 2,950 patterns pooled recall is 0.955 rather than 0.951.
 
-**Check `break_through` at termini and on one-way pairs.** Still untested; the choice
-over plain `through` is reasoned but unverified against real geometry.
+**The census has never been run against dense urban geometry.** Span predicts quality
+and short urban patterns are the worst of it — under 2 km scores 0.907 against 0.959
+over 20 km — and London is entirely `stops` path and entirely dense urban. Running the
+same harness against the London data root would cost one pass, except that London has
+almost no `shape` patterns to be ground truth. GB is the only place both halves exist.
 
 **Tune the rejection bounds against real output.** `MIN_MATCH_CONFIDENCE` has still
 never rejected anything on merit — the one shape-path rejection was on detour, not
