@@ -36,7 +36,11 @@ Each stage reads what the last one wrote, and each re-runs on its own.
 - **publish** (`publish.py`). One GeoJSON feature per line, then tippecanoe to
   `bus.pmtiles`.
 - **art** (`art.py`). A bounding box or named preset to PNG or SVG, in one of three
-  styles: `density`, `spectrum` or `strands`.
+  styles: `density`, `spectrum` or `strands`. A PNG is drawn in horizontal bands, one
+  process per core, which is about three times faster over a national window and
+  byte-identical to drawing it on one. `--workers` sets the count;
+  `WAYFARE_RENDER_WORKERS` sets it for a deployment, and the default follows the
+  container's CPU quota.
 
 `cli.py` fronts all six, plus `serve`, `status`, `prune`, `cluster` and `all`. `serve`
 (`server.py`) answers the viewer, the archives and `GET /art`, which renders a window on

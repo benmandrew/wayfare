@@ -100,6 +100,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--width", type=int, default=4000)
     p.add_argument("--scale", type=float, default=1.0, help="2.0 is roughly 192 dpi")
     p.add_argument("--caption", default=None)
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="bands drawn in parallel; default one per core, 1 to draw serially",
+    )
 
     p = sub.add_parser("serve", help="serve the viewer, the tiles and /art")
     p.add_argument("--port", type=int, default=8099)
@@ -278,6 +284,7 @@ def _dispatch(args: argparse.Namespace) -> int:
             opts=art.RenderOpts(
                 width_px=args.width, scale=args.scale, caption=args.caption
             ),
+            workers=args.workers,
         )
         log.info("done: %s", out)
         return 0

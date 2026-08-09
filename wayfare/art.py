@@ -18,6 +18,7 @@ import hashlib
 import io
 import json
 import math
+import os
 import time
 from array import array
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -485,6 +486,14 @@ ORDERS: dict[str, tuple[str, str]] = {
 # materialises a row per group. `way` over a city is the way to trip it.
 MAX_GROUPS = 20_000
 
+# Below this many edges in the window, a render is drawn on one core. Banding starts
+# eight interpreters -- `spawn`, not `fork`, because the parent holds a DuckDB handle
+# -- and that costs about a second whatever the picture. Cardiff at 1,200px is 56,000
+# edges and 0.75s serial, so banding it made it twice as slow; London at 200,000 goes
+# 8.2s to 4.2s. The floor sits between them, nearer the small end because the loss
+# below it is bounded by the start-up cost and the win above it is not.
+MIN_BAND_EDGES = 150_000
+
 
 @dataclass(frozen=True, slots=True)
 class QuerySpec:
@@ -586,6 +595,17 @@ class Source:
 
     edges: str = "edges"
     services: str = "edge_services"
+    # A relation holding (grp, n_edges, trips) already computed, in place of the
+    # `gstat` a grouped query would derive from this window. Only banding sets it,
+    # and it is the whole reason a band draws the same picture as the serial render
+    # rather than one that merely looks like it: `gstat` decides both how wide a
+    # ribbon is and what order the ribbons are laid down in, and a band that derives
+    # it from its own rows gets both from a fraction of the country. The widths would
+    # be visibly wrong; the order is subtler, because SCREEN is commutative in real
+    # arithmetic but rounds in eight-bit, so reordering shifted 2.8% of the pixels by
+    # up to 4/255 across the whole image -- diffuse, tiny, and not a seam, which is
+    # exactly the kind of difference that gets waved through.
+    groups: str | None = None
 
 
 DEFAULT_SOURCE = Source()
@@ -632,12 +652,27 @@ class _Sql:
         width and draw order -- a preview whose palette differs from the render it
         previews is worse than no preview at all.
         """
+        where, params = self.where(sampled=sampled)
         sql = f"""
     SELECT edge_id, way_id, road_name, road_class, length_m, lon_e6, lat_e6
     FROM {self.source.edges}
-    WHERE min_lon_e6 <= ? AND max_lon_e6 >= ?
-      AND min_lat_e6 <= ? AND max_lat_e6 >= ?
+    WHERE {where}
 """
+        return sql, params
+
+    def where(self, *, sampled: bool = False) -> tuple[str, list[Any]]:
+        """Just the predicate, for a caller selecting something other than geometry.
+
+        Split out for `band_cuts`, which counts the window and takes quantiles of the
+        stored bounding boxes. Sharing the predicate rather than restating it is what
+        keeps the decision to band honest: a spec filtered to one road class draws a
+        fraction of the edges, and a count that ignored the filter would start eight
+        processes for a picture one core finishes in a tenth of a second.
+        """
+        sql = (
+            "min_lon_e6 <= ? AND max_lon_e6 >= ?\n"
+            "      AND min_lat_e6 <= ? AND max_lat_e6 >= ?\n"
+        )
         # The bounds belong to this fragment, so it carries them. Every query puts the
         # window first, but a fragment that owns its own parameters can be moved
         # without a caller having to know where its holes went.
@@ -827,6 +862,16 @@ FROM ranked
         """
         win, win_p = self.window()
         svc, svc_p = self.services()
+        # Substituted, not derived, when the caller has already computed it over a
+        # wider window than this one -- see `Source.groups`. The identifier comes
+        # from the Source and never from a request, the same rule as the two tables.
+        gstat = (
+            f"SELECT grp, n_edges, trips FROM {self.source.groups}"
+            if self.source.groups
+            else """SELECT p.grp, count(*) AS n_edges, sum(w.weight) AS trips
+    FROM pair p JOIN edge_w w USING (edge_id)
+    GROUP BY p.grp"""
+        )
         sql = f"""
 WITH win AS ({win}
 ), edge_w AS (
@@ -838,9 +883,7 @@ WITH win AS ({win}
     SELECT DISTINCT {self.group} AS grp, s.edge_id
     FROM {svc} JOIN win USING (edge_id) JOIN edge_w USING (edge_id)
 ), gstat AS (
-    SELECT p.grp, count(*) AS n_edges, sum(w.weight) AS trips
-    FROM pair p JOIN edge_w w USING (edge_id)
-    GROUP BY p.grp
+    {gstat}
 )
 """
         # The window CTE is declared once; the services fragment appears twice, in
@@ -849,8 +892,15 @@ WITH win AS ({win}
         return sql, win_p + svc_p + svc_p
 
     def group_query(self) -> tuple[str, list[Any]]:
-        base, params = self._grouped_base()
         order = _order_sql(self.spec.order, grouped=False)
+        if self.source.groups:
+            # Already computed; the window CTEs would be a full scan to read a
+            # relation that does not depend on them.
+            return (
+                f"SELECT grp, n_edges, trips FROM {self.source.groups}\nORDER BY {order}\n",
+                [],
+            )
+        base, params = self._grouped_base()
         return f"{base}\nSELECT grp, n_edges, trips FROM gstat\nORDER BY {order}\n", params
 
     def grouped_query(self) -> tuple[str, list[Any]]:
@@ -1104,6 +1154,38 @@ class Window:
                 line = Polyline(xs, ys, range(offs[i], offs[i + 1]))
                 yield float(weights[i]), line.simplified(tol)
 
+    def group_stats(self) -> list[tuple[str, int, float]]:
+        """(group, edges it covers, its total traffic), widest first.
+
+        Split out of `_group_rows` because banding needs it as data: the parent
+        computes it once over the whole picture and every band is handed the same
+        rows, through `Source.groups`. A band deriving it from its own edges would
+        both mis-size the ribbons and reorder them.
+
+        The listing is materialised because it is small -- hundreds of services for a
+        city, thousands nationally. That assumption is the spec's to break:
+        `group=way` over a city is one group per OSM way, so the count is checked
+        against MAX_GROUPS here rather than discovered as a render that never ends.
+        """
+        query, params = self.sql.group_query()
+        rows = self.con.execute(query, params).fetchall()
+        if len(rows) > MAX_GROUPS:
+            raise ValueError(
+                f"group={self.spec.group!r} gives {len(rows)} groups in this window, "
+                f"over the {MAX_GROUPS} limit. Each group is a separate composited "
+                "stroke, so this would draw slowly and read as noise. Narrow the "
+                "window, or group by something coarser."
+            )
+        return [(r[0], int(r[1]), float(r[2] or 0.0)) for r in rows]
+
+    def group_weights(self) -> dict[str, float]:
+        """Every group in this window, mapped to its normalised ribbon weight."""
+        rows = self.group_stats()
+        if not rows:
+            return {}
+        weights = Weights.over(array("d", (t for _, _, t in rows)))
+        return {g: weights.of(t) for g, _, t in rows}
+
     def groups(self) -> Iterator[tuple[str, float, list[tuple[float, float]]]]:
         """(group, its weight, one edge's coordinates), grouped.
 
@@ -1133,19 +1215,9 @@ class Window:
         `group=way` over a city is one group per OSM way, so the count is checked
         against MAX_GROUPS here rather than discovered as a render that never ends.
         """
-        query, params = self.sql.group_query()
-        rows = self.con.execute(query, params).fetchall()
-        if not rows:
+        weight_of = self.group_weights()
+        if not weight_of:
             return
-        if len(rows) > MAX_GROUPS:
-            raise ValueError(
-                f"group={self.spec.group!r} gives {len(rows)} groups in this window, "
-                f"over the {MAX_GROUPS} limit. Each group is a separate composited "
-                "stroke, so this would draw slowly and read as noise. Narrow the "
-                "window, or group by something coarser."
-            )
-        weights = Weights.over(array("d", (float(r[2] or 0.0) for r in rows)))
-        weight_of = {r[0]: weights.of(float(r[2] or 0.0)) for r in rows}
 
         query, params = self.sql.grouped_query()
         box = self.bounds.as_e6()
@@ -1396,6 +1468,12 @@ class Style:
     background: RGB = (0.02, 0.02, 0.035)
     needs_groups: bool = False
     blurb: str = ""
+    # The widest stroke this style lays down at `line_scale=1`, in logical pixels.
+    # Only banding reads it, and only to work out how far outside a band an edge can
+    # still be and paint into it -- a band whose collar is narrower than half a line
+    # width grows a seam. Declared rather than measured because it is a property of
+    # the ramps in `draw`, and a style that widens its lines has to say so here.
+    max_line_px: float = 20.0
 
 
 # --- Styles -----------------------------------------------------------------
@@ -1592,17 +1670,20 @@ STYLES: dict[str, Style] = {
         draw=draw_density,
         background=(0.015, 0.018, 0.03),
         blurb="weekly trip volume as light",
+        max_line_px=19.0,  # the halo pass, 3.0 + 16.0
     ),
     "spectrum": Style(
         draw=draw_spectrum,
         background=(0.03, 0.03, 0.04),
         blurb="hue by compass bearing",
+        max_line_px=4.0,  # 0.6 + 3.4
     ),
     "strands": Style(
         draw=draw_strands,
         background=(0.04, 0.035, 0.045),
         needs_groups=True,
         blurb="one ribbon per service",
+        max_line_px=3.9,  # 0.9 + 3.0
     ),
 }
 
@@ -1705,6 +1786,360 @@ def _default_path(bounds_or_name: Bounds | str, style: str) -> Path:
     return config.OUT / f"{stem}-{style}.png"
 
 
+# --- Banding ----------------------------------------------------------------
+#
+# A render is CPU-bound cairo on one core, and the box it runs on has eight. The
+# canvas splits into horizontal bands, one process each, and the bands are pasted
+# back together. Nothing about the picture changes: the bands are disjoint, each is
+# clipped to its own rows, so no pixel is painted twice and no compositing operator
+# has to be commutative across a cut. Measured byte-identical to the serial render
+# on all three styles over the `uk` window.
+#
+# Two things have to be global rather than per band, and both are scales rather than
+# geometry: `Weights` and, for a grouped style, the ribbon weights. A band that took
+# its contrast from its own edges would be brighter over the Highlands than over the
+# Midlands, and the join would be visible as a step.
+
+
+def default_workers(workers: int | None = None) -> int:
+    """How many bands to draw at once, when a caller has not said.
+
+    Every core, because the thing being parallelised is the only thing running: the
+    render server takes one render at a time by design, and a command-line render is
+    what the operator is sitting waiting for. `WAYFARE_RENDER_WORKERS` overrides, for
+    a box where that is not true.
+    """
+    if workers is not None:
+        return max(1, workers)
+    env = os.environ.get("WAYFARE_RENDER_WORKERS")
+    if env:
+        try:
+            return max(1, int(env))
+        except ValueError:
+            log.warning("ignoring WAYFARE_RENDER_WORKERS=%r, which is not a number", env)
+    return max(1, min(os.cpu_count() or 1, _cgroup_cpus() or 1_000))
+
+
+def _cgroup_cpus() -> int | None:
+    """The container's CPU quota, whole cores, or None outside a limited cgroup.
+
+    `os.cpu_count()` reports the host's cores from inside a container, so the render
+    service -- which runs at `cpus: 4` on an eight-core box -- would otherwise start
+    eight band processes to share four cores' worth of quota and four gigabytes of
+    memory limit. Overcommitting CPU only wastes context switches; overcommitting the
+    memory limit gets the container killed.
+    """
+    try:
+        quota, period = Path("/sys/fs/cgroup/cpu.max").read_text().split()
+    except (OSError, ValueError):
+        return None
+    if quota == "max":
+        return None
+    try:
+        return max(1, int(float(quota) / float(period)))
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def _lat_at(proj: Projection, y_px: float) -> float:
+    """Inverse of :meth:`Projection.__call__`'s y, in degrees. Bands cut in pixels."""
+    my = proj.y1 - (y_px - proj.oy) / proj.k
+    return math.degrees(2.0 * math.atan(math.exp(my)) - math.pi / 2.0)
+
+
+def _band_window(
+    bounds: Bounds, proj: Projection, y0: float, y1: float, pad: float
+) -> Bounds:
+    """The window a band has to query: its own rows, plus a collar, clamped.
+
+    The collar is what stops a seam. An edge whose geometry sits just outside the
+    band still strokes into it, by up to half a line width, so the query has to
+    reach that far past the cut.
+
+    Clamped back to `bounds` because the collar must not *add* edges the serial
+    render would not have drawn. Serial selects every edge whose bbox overlaps the
+    window; an unclamped collar on the outermost band would select edges beyond it,
+    and for a grouped style those bring groups the global weight map has never seen.
+    Clamping costs nothing, because anything outside the window is clipped away.
+    """
+    north = min(_lat_at(proj, y0 - pad), bounds.max_lat)
+    south = max(_lat_at(proj, y1 + pad), bounds.min_lat)
+    # A band can be thinner than the clamp when the window is tiny; keep it legal.
+    if north <= south:
+        north = min(bounds.max_lat, south + 1e-9)
+    return Bounds(bounds.min_lon, south, bounds.max_lon, north)
+
+
+def band_cuts(
+    con: duckdb.DuckDBPyConnection,
+    sql: _Sql,
+    bounds: Bounds,
+    proj: Projection,
+    height: float,
+    n: int,
+) -> tuple[int, list[float]]:
+    """How many edges the window holds, and band boundaries splitting them evenly.
+
+    The count comes back with the cuts because it is the same scan and it is what
+    decides whether to band at all -- see MIN_BAND_EDGES.
+
+    Equal-height bands do not work here and it is not a close call. Great Britain's
+    buses are not spread evenly in latitude: cutting the `uk` window into eight equal
+    strips put 1,307,069 of 2,746,261 edges into one of them, so seven cores finished
+    in seconds and the render waited on the eighth for 35. Balancing on the edge
+    distribution instead took the same render from 37s to 27s.
+
+    Latitude quantiles rather than a count per band, because the cost is per edge and
+    the quantiles are one cheap aggregate over a column the zonemaps already prune.
+    The cuts land on whole device rows so the paste is a memcpy of exact rows.
+    """
+    where, params = sql.where(sampled=True)
+    row = con.execute(
+        "SELECT count(*), quantile_cont((min_lat_e6 + max_lat_e6) / 2.0, ?) "
+        f"FROM {sql.source.edges} WHERE {where}",
+        [[i / n for i in range(1, n)], *params],
+    ).fetchone()
+    n_edges = int(row[0]) if row else 0
+    cuts = [0.0]
+    # North to south, because y grows downward and the bands are listed top first.
+    for lat_e6 in sorted(row[1] if row and row[1] else [], reverse=True):
+        y = float(round(proj(bounds.min_lon, lat_e6 / 1e6)[1]))
+        if cuts[-1] < y < height:
+            cuts.append(y)
+    cuts.append(float(height))
+    return n_edges, cuts
+
+
+@dataclass(frozen=True, slots=True)
+class _BandJob:
+    """Everything a worker needs, and nothing it cannot pickle.
+
+    Notably not a connection: DuckDB handles do not cross a process boundary, so a
+    band opens the file read-only itself and closes it when it is done. That keeps
+    the rule the render server depends on -- no handle outlives a render -- rather
+    than working around it.
+    """
+
+    db_path: str
+    bounds: tuple[float, float, float, float]
+    width: int
+    height: int
+    dev_y0: int
+    dev_y1: int
+    draw_scale: float
+    style: str
+    opts: RenderOpts
+    query: QuerySpec
+    source: Source
+    weights: Weights
+    group_stats: list[tuple[str, int, float]] | None
+
+
+def band_source(con: duckdb.DuckDBPyConnection) -> Path | None:
+    """The file a band process should reopen, or None if it cannot.
+
+    Asked of the connection rather than assumed from the config, because they are not
+    always the same file: a caller can hand `render` a connection to any database, and
+    a band that opened `config.DB_PATH` instead would draw a different picture from the
+    one it was asked for -- quietly, and only in the parallel path.
+
+    None means do not band. That covers an in-memory database, which a worker has no
+    way to reach, and a file this process cannot open a second time read-only, which
+    is what a *writable* handle looks like: DuckDB gives a writer an exclusive lock.
+    The probe is an open and a close, so it tests the thing that has to work rather
+    than reasoning about it.
+    """
+    try:
+        row = con.execute(
+            "SELECT path FROM duckdb_databases() WHERE NOT internal ORDER BY database_oid"
+        ).fetchone()
+    except Exception:  # an older DuckDB without the view; not worth a version check
+        return None
+    if not row or not row[0]:
+        return None
+    path = Path(row[0])
+    try:
+        db.connect(path, read_only=True).close()
+    except Exception as exc:
+        log.debug("not banding: %s cannot be reopened read-only (%s)", path, exc)
+        return None
+    return path
+
+
+def _stats_table(rows: list[tuple[str, int, float]]) -> Any:
+    """The parent's group statistics as an Arrow table, ready to `register`."""
+    import pyarrow
+
+    return pyarrow.table(
+        {
+            "grp": pyarrow.array([r[0] for r in rows], pyarrow.string()),
+            "n_edges": pyarrow.array([r[1] for r in rows], pyarrow.int64()),
+            "trips": pyarrow.array([r[2] for r in rows], pyarrow.float64()),
+        }
+    )
+
+
+def _draw_band(job: _BandJob) -> tuple[int, int, int, bytes]:
+    """One band, drawn into its own surface and handed back as raw ARGB rows."""
+    import cairo
+
+    bounds = Bounds(*job.bounds)
+    proj = Projection.fit(bounds, job.width, job.height)
+    sty = STYLES[job.style]
+    s = job.draw_scale
+
+    # The surface is the band plus a margin, and the margin is thrown away. That is
+    # what makes a band byte-identical rather than merely indistinguishable: clipping
+    # to the band would cut a stroke in half at the boundary, and cairo tessellates in
+    # 24.8 fixed point, so the two halves' coverage does not always re-add to what the
+    # whole shape rasterised to. It showed up as one row of one Cardiff render off by
+    # 1/255. Drawing past the cut and pasting only the middle means no shape is ever
+    # split, and the clip that remains is exactly the serial path's.
+    pad = sty.max_line_px * job.opts.line_scale / 2.0 + 2.0
+    dev_pad = math.ceil(pad * s)
+    origin = job.dev_y0 - dev_pad
+    surface = cairo.ImageSurface(
+        cairo.FORMAT_ARGB32,
+        max(1, round(job.width * s)),
+        (job.dev_y1 - job.dev_y0) + 2 * dev_pad,
+    )
+    # Typed loosely for the same reason `_render` is: a style takes a
+    # Context[Surface] and cairo's stubs make that invariant in the surface type.
+    ctx: Any = cairo.Context(surface)
+    # Device-space shift first, then the print scale, so `y_device = y_user * s -
+    # origin` and a style still draws in the logical units it was written in.
+    ctx.translate(0, -origin)
+    ctx.scale(s, s)
+    ctx.set_antialias(cairo.Antialias.BEST)
+    ctx.set_line_cap(cairo.LineCap.ROUND)
+    ctx.set_line_join(cairo.LineJoin.ROUND)
+
+    r, g, b = job.opts.background or sty.background
+    ctx.set_source_rgb(r, g, b)
+    ctx.paint()
+
+    ctx.save()
+    # Clip to the window and nothing else -- the same rectangle `_render` uses, so an
+    # edge in the collar is kept out of the letterbox here too. The band's own extent
+    # is not a clip; it is which rows get returned.
+    ctx.rectangle(*proj.content_rect(bounds))
+    ctx.clip()
+    top, bottom = job.dev_y0 / s, job.dev_y1 / s
+    con = db.connect(Path(job.db_path), read_only=True)
+    try:
+        # One thread each. DuckDB defaults to a thread per core *per process*, so
+        # eight bands would put sixty-four of them on eight cores; the scan was
+        # never the bottleneck here and the contention is real.
+        con.execute("SET threads=1")
+        source = job.source
+        if job.group_stats is not None:
+            # Registered rather than inserted: at most MAX_GROUPS rows, and
+            # DuckDB takes about 2,700 a second through bound parameters, so
+            # 20,000 services would cost seven seconds a band. `register` hands
+            # it an Arrow table and costs nothing. The name is ours, so
+            # `Source.groups` still only ever holds an identifier this code chose.
+            con.register("wf_gstat", _stats_table(job.group_stats))
+            source = replace(source, groups="wf_gstat")
+        window = Window(
+            _band_window(bounds, proj, top, bottom, pad),
+            con,
+            with_groups=sty.needs_groups,
+            spec=job.query,
+            source=source,
+        )
+        # The window's scale, injected rather than recomputed. See the section
+        # header: a band that scales itself draws a different picture.
+        window._weights = job.weights
+        sty.draw(ctx, window, proj, job.opts)
+    finally:
+        con.close()
+    ctx.restore()
+
+    surface.flush()
+    stride = surface.get_stride()
+    rows = job.dev_y1 - job.dev_y0
+    data = bytes(surface.get_data())
+    return job.dev_y0, rows, stride, data[dev_pad * stride : (dev_pad + rows) * stride]
+
+
+def _draw_banded(
+    surface: Any,
+    bounds: Bounds,
+    proj: Projection,
+    sty: Style,
+    style: str,
+    opts: RenderOpts,
+    draw_scale: float,
+    con: duckdb.DuckDBPyConnection,
+    query: QuerySpec,
+    source: Source,
+    workers: int,
+) -> bool:
+    """Fill `surface` from `workers` processes, one band each; False if it declined.
+
+    Declining rather than raising, because `workers` is a request for speed and a
+    small window is simply faster without it. The caller then draws serially, which
+    is the only other thing it could sensibly do.
+
+    One band per worker rather than several, because the per-band cost has a floor
+    that does not shrink as bands do: `edge_services` carries no bbox column and
+    DuckDB pushes no min/max filter through the join, so every band scans all of it
+    whatever its height. Twenty-four balanced bands measured *slower* than eight
+    (36.7s against 27.0s) for exactly that reason. Balancing the cuts is what buys
+    the parallelism; multiplying them only buys more scans.
+    """
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+
+    db_path = band_source(con)
+    if db_path is None:
+        return False
+    window = Window(bounds, con, with_groups=sty.needs_groups, spec=query, source=source)
+    n_edges, cuts = band_cuts(
+        con, window.sql, bounds, proj, surface.get_height() / draw_scale, workers
+    )
+    if n_edges < MIN_BAND_EDGES or len(cuts) < 3:
+        return False
+    jobs = [
+        _BandJob(
+            db_path=str(db_path),
+            bounds=(bounds.min_lon, bounds.min_lat, bounds.max_lon, bounds.max_lat),
+            width=opts.width_px,
+            height=proj.height,
+            dev_y0=round(cuts[i] * draw_scale),
+            dev_y1=round(cuts[i + 1] * draw_scale),
+            draw_scale=draw_scale,
+            style=style,
+            opts=opts,
+            query=query,
+            source=source,
+            # Resolved here, on the parent's connection, precisely once.
+            weights=window.weights,
+            group_stats=window.group_stats() if sty.needs_groups else None,
+        )
+        for i in range(len(cuts) - 1)
+    ]
+
+    surface.flush()
+    dst = surface.get_data()
+    dst_stride = surface.get_stride()
+    # Spawn, not the Linux default of fork. The parent is holding an open DuckDB
+    # connection at this point -- it just read the weights off it -- and DuckDB runs
+    # background threads, which a fork does not carry across. The child inherits the
+    # connection's state without the threads that maintain it and dies on first use;
+    # it presents as BrokenProcessPool with no traceback, because the child is killed
+    # rather than raising. Spawn costs an interpreter start and a re-import per band,
+    # which against a render measured in tens of seconds is not worth avoiding.
+    ctx = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
+        for dev_y0, rows, stride, data in pool.map(_draw_band, jobs):
+            for row in range(rows):
+                off = (dev_y0 + row) * dst_stride
+                dst[off : off + dst_stride] = data[row * stride : row * stride + dst_stride]
+    surface.mark_dirty()
+    return True
+
+
 def _render(
     bounds_or_name: Bounds | str,
     style: str,
@@ -1717,6 +2152,7 @@ def _render(
     source: Source = DEFAULT_SOURCE,
     con: duckdb.DuckDBPyConnection | None = None,
     edges: Sequence[Edge] | None = None,
+    workers: int = 1,
 ) -> None:
     """Draw into `sink`, which is a path to write or a buffer to fill.
 
@@ -1728,6 +2164,11 @@ def _render(
     the query decides which edges there are, what their weight means, and what a
     group is. Neither knows about the other, which is what lets three styles cover
     the whole product of the two.
+
+    `workers` splits the canvas into that many horizontal bands and draws them in
+    separate processes -- see the banding section. It is a speed knob and nothing
+    else: the output is byte-identical either way, which is what makes it safe to
+    turn on by default rather than something a caller has to reason about.
     """
     # Argument checks come first, and before requiring cairo: a mistyped style
     # should say which styles exist, not tell the caller to install a dependency
@@ -1774,18 +2215,45 @@ def _render(
     ctx.set_source_rgb(r, g, b)
     ctx.paint()
 
-    ctx.save()
-    # Clip to the window rather than the frame: the query returns a collar of edges
-    # just outside the bounds, and without this they bleed into the letterbox.
-    ctx.rectangle(*proj.content_rect(bounds))
-    ctx.clip()
+    # Banding needs a file to reopen per process and a raster to paste into, so it is
+    # off for an SVG, for edges the caller already holds, and for a database that is
+    # not the configured one. Each of those falls back rather than failing: `workers`
+    # asks for speed, and a request for speed that cannot be honoured is not an error.
+    banded = workers > 1 and fmt == ".png" and edges is None and con is not None
+
     t0 = time.monotonic()
-    try:
-        sty.draw(ctx, window, proj, opts)
-    finally:
-        if own_con and con is not None:
-            con.close()
-    ctx.restore()
+    if banded:
+        assert con is not None
+        try:
+            banded = _draw_banded(
+                surface,
+                bounds,
+                proj,
+                sty,
+                style,
+                opts,
+                draw_scale,
+                con,
+                query,
+                source,
+                workers,
+            )
+        finally:
+            if own_con and banded:
+                con.close()
+    if not banded:
+        ctx.save()
+        # Clip to the window rather than the frame: the query returns a collar of
+        # edges just outside the bounds, and without this they bleed into the
+        # letterbox.
+        ctx.rectangle(*proj.content_rect(bounds))
+        ctx.clip()
+        try:
+            sty.draw(ctx, window, proj, opts)
+        finally:
+            if own_con and con is not None:
+                con.close()
+        ctx.restore()
 
     if opts.caption:
         _caption(ctx, opts.caption, proj)
@@ -1816,12 +2284,15 @@ def render(
     source: Source = DEFAULT_SOURCE,
     con: duckdb.DuckDBPyConnection | None = None,
     edges: Sequence[Edge] | None = None,
+    workers: int | None = None,
 ) -> Path:
     """Draw `bounds_or_name` in `style` and return the path written.
 
     `out_path` decides the format by suffix (.png or .svg) and defaults to
     ``OUT/<area>-<style>.png``. Pass `edges` to re-render a window you already
     loaded without touching the database again.
+
+    `workers` defaults to every core -- see :func:`default_workers`.
     """
     path = Path(out_path) if out_path else _default_path(bounds_or_name, style)
     fmt = _fmt(path)  # before the query, so a typo'd suffix fails in milliseconds
@@ -1838,6 +2309,7 @@ def render(
         source=source,
         con=con,
         edges=edges,
+        workers=default_workers(workers),
     )
     return path
 
@@ -1852,6 +2324,7 @@ def render_bytes(
     source: Source = DEFAULT_SOURCE,
     con: duckdb.DuckDBPyConnection | None = None,
     edges: Sequence[Edge] | None = None,
+    workers: int | None = None,
 ) -> bytes:
     """The same render, returned rather than written.
 
@@ -1872,5 +2345,6 @@ def render_bytes(
         source=source,
         con=con,
         edges=edges,
+        workers=default_workers(workers),
     )
     return buf.getvalue()

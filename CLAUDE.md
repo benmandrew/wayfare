@@ -317,7 +317,8 @@ open — the open is metadata, the lock is the pipeline.
 
 **Renders are serialised, and the cap is pixels, not width.** One at a time because
 a render is CPU-bound cairo over a full scan of `edges` and the same box is usually
-also matching; two would not finish either sooner. The bound is `width` x derived
+also matching; two would not finish either sooner. That holds all the more now one
+render uses every core it is allowed — see banding below. The bound is `width` x derived
 height x `scale`², because the window's aspect ratio sets the height and `scale`
 multiplies both — `width=4000&scale=4` over a tall window is 200 megapixels and
 looks modest. Past `QUEUE_LIMIT` waiters the answer is 503, since a studio page
@@ -328,6 +329,76 @@ the whole table, over HTTP as much as on the command line. The pixel cap does
 nothing about that; the serialisation and the queue limit are the only protection.
 See the clustering measurements further down for what would actually prune, and the
 paragraph after that for why it is not where the time goes.
+
+**A render is drawn in horizontal bands, one process each, and the output is
+byte-identical.** Everything above optimises one core; the box has eight. The canvas
+splits into bands, each band is drawn by its own process against its own read-only
+handle, and the rasters are pasted back. Measured over the `uk` window on the real
+2.75M-edge database at 2,000px: `density` 77–98s → 28–32s, `spectrum` 58–67s → 21–31s,
+`strands` 71–72s → 37–40s; at 4,000px `density` 98s → 42s. Verified byte-identical for
+all three styles, and on the awkward canvases — letterboxed, `scale=3`, filtered,
+sampled, `line_scale=6`. `strands` gains least because its cost is the (service, edge)
+fan-out, not vertices.
+
+Four things had to be true and each was a bug first:
+
+- **Cut on edge count, not on height.** Equal-height bands put 1,307,069 of 2,746,261
+  edges into one of eight, so seven cores idled while the eighth ran 35s. Latitude
+  quantiles over the window took the same render 37s → 27s.
+- **Spawn, not fork.** The parent holds an open DuckDB handle when the pool starts, and
+  DuckDB's background threads do not cross a fork. The child dies on first use and it
+  presents as `BrokenProcessPool` with no traceback, because it is killed rather than
+  raising.
+- **One band per worker, not more.** `edge_services` cannot prune (see below), so every
+  band scans all 8.3M rows whatever its height — a per-band floor that does not shrink.
+  24 balanced bands measured *slower* than 8, 36.7s against 27.0s.
+- **Draw past the cut and paste only the middle.** Clipping to the band splits a stroke
+  at a raster boundary, and cairo tessellates in 24.8 fixed point, so the two halves'
+  coverage does not always re-add to the whole shape's — one row of one Cardiff render
+  came out 1/255 off. The band surface therefore carries a margin of half a line width,
+  drawn and discarded, and the only clip is the serial path's own window rect.
+
+**Two scales must be the window's, never the band's.** `Weights` is injected into each
+band. So are the *group* statistics, through `Source.groups`, which now names an
+optional pre-computed `(grp, n_edges, trips)` relation — registered as an Arrow table,
+because inserting 20,000 rows through bound parameters would cost seven seconds a band.
+`gstat` sets both ribbon width and draw order. Width being per-band is visibly wrong;
+order is the subtle one, because SCREEN is commutative in real arithmetic and *rounds*
+in eight-bit, so reordering moved 2.8% of the pixels by up to 4/255 — diffuse, across
+the whole image, nothing like a seam, and exactly the kind of difference that gets
+waved through.
+
+**Banding declines rather than fails, and the cases matter.** SVG (nothing to paste),
+`render(edges=...)` (the list lives in the parent), a window under `MIN_BAND_EDGES`
+(spawn costs about a second whatever the picture — Cardiff at 1,200px is 0.75s serial
+and banding made it twice as slow), and a connection a worker could not reopen.
+`band_source` asks the *connection* for its path via `duckdb_databases()` rather than
+assuming `config.DB_PATH` — a caller may hand `render` any database, and a band opening
+the configured one instead would quietly draw a different picture in the parallel path
+only — then probes it with a read-only open. That probe is what catches a writable
+handle: DuckDB gives a writer an exclusive lock, so bands could not open the file at
+all. The count that `MIN_BAND_EDGES` is compared against comes from the render's own
+`WHERE`, so a spec filtered to one road class does not start eight processes for a
+picture one core finishes in a tenth of a second.
+
+**`default_workers` reads the cgroup, not `os.cpu_count()`.** The render service runs
+at `cpus: 4` on an eight-core box and `os.cpu_count()` reports the host's, so it would
+start eight processes to share four cores' quota and a 3 GB memory limit.
+`WAYFARE_RENDER_WORKERS` overrides. Each band also does `SET threads=1`: DuckDB
+defaults to a thread per core *per process*, and eight bands would put sixty-four on
+eight cores.
+
+**Round caps are what a render costs, and this is where the rest of the time is.**
+Measured by replaying the whole `uk` window through cairo under different settings:
+butt caps and mitre joins take 55.4s to 25.5s — a 54% cut — because at national scale
+an edge has already simplified to 2.08 vertices, so nearly every stroke is one tiny
+segment whose cost is tessellating two round caps. `ctx.set_tolerance` coarsens that
+arc: 1.0 gives 78.5%, 2.0 gives 73.7%. `Antialias.FAST` gives 74.4%; `GOOD` and
+`DEFAULT` are byte-identical to `BEST` and buy nothing, so the antialias setting is not
+a lever. None of these are taken — they all change the picture, and banding was
+available and does not. Coalescing runs of edges into single subpaths the way `publish`
+already does would keep round caps *and* remove them from every internal joint; that is
+the next real win and it is unbuilt.
 
 **A render costs per edge and per vertex, never per pixel.** The section below
 measures the cairo half at 75% and asks for "fewer strokes: dropping sub-pixel
@@ -394,6 +465,20 @@ order is *defined* rather than that two runs agree. The sort is close to free �
 assumption that ordering the hottest query in the render path would be expensive.
 It is about 0.2%, measured after the Arrow fetch above, so against the faster
 numerator rather than the one it was originally waved away with.
+
+**Which cairo you have decides whether an SVG is vectors or one embedded raster,
+and it changes what an SVG test can see.** The dev shell's libcairo 1.18.4 writes all
+three styles as real `<path>` strokes. The shipped image's 1.16.0 writes `spectrum` as
+35,188 paths but falls back to a *single* `<image>` for `density` and `strands` — cairo
+cannot express ADD or SCREEN in SVG, and 1.16 gives up where 1.18 does not. Two
+consequences, both of which cost time to work out. Any stroke-order bug the paragraph
+above is about is invisible in a 1.16 `density` SVG, because there are no strokes in
+it. And on 1.16 two SVGs rendered in *one process* never compare equal even when the
+pixels are identical, because the fallback names its elements from a process-wide
+counter: `id="image5"`/`id="surface1"` against `id="image11"`/`id="surface7"`, with
+byte-identical base64 between them. Compare SVGs across processes, or compare the
+payload rather than the file. Rendering the same window in three fresh 1.16 processes
+gives one hash.
 
 **A render is 75% cairo, and the scan is not the problem.** Measured on a synthetic
 4.2M-edge / 10.25M-service database (`scripts/bench_window.py`), `density` at 800px:
@@ -573,8 +658,12 @@ this number.
 ## Current state
 
 Wales complete end to end. Greater London matching in progress in its own data
-root against its own Valhalla instance. 376 tests pass, ruff and mypy clean. GB
+root against its own Valhalla instance. 391 tests pass, ruff and mypy clean. GB
 not yet attempted. See PLAN.md.
+
+The banding numbers above are the first `art` measurements taken against real
+national data rather than a synthetic database: 2,746,261 edges and 8,301,705
+edge-service rows, feed `20260807_022616`, on the eight-core box that serves it.
 
 `pyarrow` joined the `art` extra alongside `pycairo` and `numpy`, and only that
 extra — the pipeline and the tile server do not import it. It is what makes the
