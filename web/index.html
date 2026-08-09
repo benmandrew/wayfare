@@ -453,7 +453,11 @@ function start(header) {
     maxBounds: roamingBounds($("map")),
     // Below this the tiles run out -- the overview build starts at z5 -- so
     // zooming further would drop the network rather than show more of it.
-    minZoom: 4.6,
+    // Take the floor from the archive itself, not a constant: a hardcoded 4.6
+    // sat *below* z5, and MapLibre floors the map zoom to pick a tile level, so
+    // every view between 4.6 and 5 asked for z4, got nothing, and drew the
+    // basemap alone. That reads as "this region has no buses", not as a limit.
+    minZoom: header.minZoom,
     maxZoom: 18,
     // Off here so it can be positioned; added below. The two are exclusive --
     // configuring it in the constructor and adding a second one gives two.
