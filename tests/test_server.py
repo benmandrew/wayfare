@@ -7,6 +7,7 @@ import http.client
 import io
 import json
 import os
+import socket
 import socketserver
 import threading
 import time
@@ -689,7 +690,9 @@ def serve_at(tmp_path: Path, monkeypatch):
     """Starts one server on an ephemeral port and shuts it down again."""
     running: list[tuple[socketserver.TCPServer, threading.Thread]] = []
 
-    def start(*, art_enabled: bool = True) -> str:
+    def start(
+        *, art_enabled: bool = True, handler_cls: type[server.Handler] = server.Handler
+    ) -> str:
         web = tmp_path / "web"
         web.mkdir(exist_ok=True)
         out = tmp_path / "out"
@@ -700,7 +703,7 @@ def serve_at(tmp_path: Path, monkeypatch):
         monkeypatch.setattr(
             server.Handler, "renderer", server.Renderer() if art_enabled else None
         )
-        handler = functools.partial(server.Handler, directory=str(web))
+        handler = functools.partial(handler_cls, directory=str(web))
         httpd = socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler)
         httpd.daemon_threads = True
         # A short poll interval only so shutdown() returns promptly in teardown.
@@ -869,6 +872,42 @@ def test_two_requests_share_one_connection(serve_at):
         assert conn.sock is socket  # the same connection, not a reconnect
     finally:
         conn.close()
+
+
+def test_a_kept_alive_connection_sends_without_waiting_for_nagle(serve_at):
+    """The other half of keep-alive, and a cost it introduced rather than found.
+
+    `BaseHTTPRequestHandler` flushes its headers and then writes the body as a
+    second, smaller write. Nagle holds that write until the peer acknowledges the
+    first, and Linux delays that acknowledgement by 40 ms. Closing after each
+    response flushed it, so HTTP/1.0 could not show this; keeping the connection
+    open put the timer on every request after the first. Measured on loopback in
+    the deployed container: 41 ms a request, against 0.3 ms with TCP_NODELAY set.
+
+    The assertion is on the socket rather than on a duration, because a timing
+    threshold either has to be loose enough to pass while the stall is back or
+    tight enough to fail on a loaded runner.
+    """
+    seen: list[int] = []
+
+    class Recording(server.Handler):
+        def do_GET(self) -> None:
+            seen.append(self.connection.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))
+            super().do_GET()
+
+    conn = _connect(serve_at(handler_cls=Recording))
+    try:
+        for _ in range(2):
+            conn.request("GET", "/wales.pmtiles")
+            conn.getresponse().read()
+    finally:
+        conn.close()
+
+    # Both requests, so this cannot pass on the first while the reused connection --
+    # the only one that ever stalled -- goes back to waiting for the timer. The
+    # option is a flag and not a 1: Linux reports it set as 1 and macOS as 4.
+    assert len(seen) == 2
+    assert all(seen)
 
 
 def test_a_range_naming_neither_end_is_a_400(serve_at):

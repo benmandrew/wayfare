@@ -114,6 +114,45 @@ names, were globbed by `server.archives` and offered to the viewer as though an
 overview band were another region. Anything that moves this work back beside the
 archive brings both back.
 
+## Serving
+
+The viewer is tailnet-only. A Tailscale sidecar terminates HTTPS on :443 and proxies
+to `wayfare serve` on loopback, and there is no content delivery network (CDN) and no
+reverse proxy behind that sidecar, so nothing between the browser and Python caches a
+byte. The container has 4 CPUs and 3 GB on emel, a box with 8 cores and 15 GB. HTTP/2
+is negotiated to the browser, and the sidecar-to-Python hop is HTTP/1.1 keep-alive.
+
+**Keep-alive without `disable_nagle_algorithm` costs 40 ms a request.**
+`wayfare/server.py` sets `protocol_version = "HTTP/1.1"` for keep-alive, which removed
+a round trip per range request and silently added a stall to every request after the
+first on a connection. `BaseHTTPRequestHandler` flushes its headers, then writes the
+body as a second, smaller write. *Nagle's algorithm* holds that second write until the
+peer acknowledges the first, and Linux delays that acknowledgement by 40 ms. Under
+HTTP/1.0 the close after each response flushed the body at once, so the stall could
+not appear until keep-alive existed.
+
+On loopback inside the deployed container, keep-alive requests took 41 ms each against
+0.3 ms with `TCP_NODELAY` set — a controlled A/B, same handler shape, no network in the
+path. From a laptop over the tailnet a warm 16 KB range took 62 ms against a 21 ms
+round trip, so about three requests in four paid the timer. The fix is
+`disable_nagle_algorithm = True` on the Handler.
+
+Two other suspects were measured and cleared. The relay is one: 21.7 ms round trip via
+the London Designated Encrypted Relay for Packets (DERP) node against 20.1 ms direct to
+the same host, so relaying costs ~1.6 ms and a direct path is not worth chasing.
+
+The disk is the other. The archives sit on a rotational drive and are essentially not
+in page cache, `great_britain.pmtiles` being 0.5% resident, and isolated random 16 KB
+reads cost p50 7.4 ms and p90 11.7 ms. End to end, 40 parallel ranges took 343 ms cold
+against 330 ms warm, a difference of 4%. The network masks the seeks. Moving `out/`
+(146 MB) to the SSD is still worth doing for the tail, where worst-case reads under
+16-way concurrency reach 155 ms, and it is safe because `publish` creates its scratch
+directory inside `out.parent`, keeping the atomic `os.replace` on one filesystem.
+
+Nothing in this path caches, so every millisecond in it is one the browser pays on
+every tile it fetches. The 40 ms hid for as long as it did because it arrived inside a
+change that made the same requests cheaper by a round trip.
+
 ## Cadence
 
 **Monthly is the largest sensible gap rather than the natural one.** BODS
