@@ -4,6 +4,30 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Wayfare — bus routes on the road network</title>
+<!-- The basemap is on another origin, so its first tile pays a DNS lookup, a TCP
+     handshake and a TLS handshake before a byte of it moves. None of that needs
+     anything from this page, so it can overlap the 803 KB library download
+     instead of queueing behind it. `crossorigin` because MapLibre sets
+     crossOrigin="anonymous" on a cross-origin tile: a preconnect without it
+     warms a different entry in the connection pool and buys nothing. Two
+     subdomains, because basemapTiles() spreads tiles over four and these are the
+     two the first screenful mostly comes from. -->
+<link rel="preconnect" href="https://a.basemaps.cartocdn.com" crossorigin>
+<link rel="preconnect" href="https://b.basemaps.cartocdn.com" crossorigin>
+<!-- Off the critical path, and this is the whole reason it is up here rather
+     than in boot(). The old order was: parse the page, download and run the
+     library, *then* ask what archives exist, then read their headers, then build
+     the map. Those are four serial round trips and the first two have nothing to
+     do with each other. Starting the request in <head> overlaps it with the
+     library download, so the answer is usually waiting by the time boot() asks
+     for it. Measured against a 90 ms round trip -- roughly the deployed tailnet
+     path -- that is about one round trip off every stage of boot: map
+     constructed 445 -> 349 ms, first basemap tile 625 -> 518, first bus tile
+     854 -> 719, idle 1213 -> 1095 (medians of five runs, three archives).
+     It must not reject. A static host with no index answers 404, and that 404 is
+     the signal to fall back to bus.pmtiles, so an unhandled rejection here would
+     put an error in the console of every such host. -->
+<script>window.__archives = fetch("archives.json").then((r) => r.json()).catch(() => []);</script>
 <link rel="stylesheet" href="vendor/maplibre-gl.css">
 <style>
 /* Visible to a screen reader, not on screen. The search input is identified only
@@ -365,11 +389,9 @@ boot();
 async function boot() {
   // Ask before assuming. A server that offers an index tells us what exists; one
   // that does not is a plain static host, where `bus.pmtiles` is the convention.
-  try {
-    ARCHIVES = await (await fetch("archives.json")).json();
-  } catch {
-    ARCHIVES = [];
-  }
+  // Already in flight since <head>; this is the await, not the request. The
+  // promise catches its own failure, so [] here still means "no index".
+  ARCHIVES = (await window.__archives) || [];
   // ?tiles= still names one archive and only one: its job is pointing the page at
   // a bucket, not choosing between regions, and there is no longer anything to
   // choose. Everything the server lists otherwise.
