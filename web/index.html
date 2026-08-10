@@ -660,14 +660,16 @@ function start(missing) {
     map.setFeatureState({ source: h.src, sourceLayer: LAYER_SRC, id: h.id }, { hover: on });
 
   // One query over every region's layer, rather than a handler bound to each.
-  // Where two archives meet at a border the same road is in both, and this takes
-  // the topmost hit once instead of letting two handlers fight over the card.
+  // Every hit goes to the card, because on a road two archives both hold, one
+  // hit is one feed's answer and not the road's. The highlight stays on the
+  // topmost of them: it says where the card came from.
   //
   // The card deliberately keeps the last segment when the cursor leaves the road
   // — the service lists run long and reading one shouldn't require holding the
-  // cursor still. The highlight does not: it says where the card came from.
+  // cursor still. The highlight does not.
   map.on("mousemove", (e) => {
-    const f = map.queryRenderedFeatures(e.point, { layers: BUS })[0];
+    const hits = map.queryRenderedFeatures(e.point, { layers: BUS });
+    const f = hits[0];
     map.getCanvas().style.cursor = f ? "pointer" : "";
     if (hovered && (!f || hovered.id !== f.id || hovered.src !== f.source)) {
       setHover(hovered, false);
@@ -676,7 +678,7 @@ function start(missing) {
     if (!f || hovered) return; // nothing under the cursor, or the same road still
     hovered = { src: f.source, id: f.id };
     setHover(hovered, true);
-    showFeature(f.properties);
+    showFeature(mergeRegions(hits));
   });
 
   /* ---------- filter ---------- */
@@ -709,10 +711,16 @@ function start(missing) {
 
   function countMatches() {
     if (!active.length || !map.isStyleLoaded()) return;
-    // Keyed on the source too, because an id is only unique within an archive
-    // and counting on the id alone would quietly merge one region into another.
+    // Counted by OSM way, the one identity every archive holding the road agrees
+    // on. Counted by `source:id` -- an id is unique inside an archive and nowhere
+    // else -- a road two archives both cover scored once per archive, and two
+    // overlapping regions reported twice the segments on screen. Below
+    // DETAIL_ZOOM the way id is not in the tiles at all, so the fallback is what
+    // runs on every national view rather than a branch that never fires.
     const seen = new Set(
-      map.queryRenderedFeatures({ layers: MATCH }).map((f) => `${f.source}:${f.id}`)
+      map.queryRenderedFeatures({ layers: MATCH }).map((f) =>
+        f.properties.way !== undefined ? `w${f.properties.way}` : `${f.source}:${f.id}`
+      )
     );
     const label = active.map((t) => `<b>${escapeHtml(t)}</b>`).join(", ");
     $("hint").innerHTML = seen.size
@@ -809,6 +817,47 @@ function start(missing) {
 }
 
 /* ---------- helpers ---------- */
+
+// One card for a road that several archives hold. Northern Ireland and the
+// Republic were matched against one island graph, so a cross-border road is a
+// feature in each, carrying that feed's services and no others. Showing the
+// topmost hit alone gave one country's list and dropped the other's without
+// saying so — a wrong answer rather than a thin one. `way` is the OSM id and the
+// only identity the archives share; ids are per-archive.
+//
+// One feature per source before anything is added up. Within a single archive a
+// way is drawn as several features — wherever the service set changes along it,
+// and wherever tippecanoe cuts it at a tile edge — and those repeat each other's
+// refs and carry their own `n`, so adding them counts the region twice. A
+// service belongs to one feed, which is what makes `n` safe to sum across
+// sources and unsafe to sum within one.
+function mergeRegions(hits) {
+  const top = hits[0].properties;
+  // Below DETAIL_ZOOM the tiles carry geometry and `n` alone: no way id to match
+  // hits on, and no refs to union. That path is untouched.
+  if (top.way === undefined) return top;
+
+  const first = new Map();
+  for (const h of hits) {
+    if (h.properties.way !== top.way || first.has(h.source)) continue;
+    first.set(h.source, h.properties);
+  }
+  if (first.size < 2) return top;
+
+  const refs = [];
+  let n = 0;
+  let trips = 0;
+  for (const p of first.values()) {
+    n += Number(p.n) || 0;
+    trips += Number(p.trips) || 0;
+    for (const ref of String(p.refs || "").split(",").filter(Boolean)) {
+      if (!refs.includes(ref)) refs.push(ref);
+    }
+  }
+  // Name and way id describe the road itself, so they come through unchanged.
+  // `n` stays the true total against which `refs`, capped per archive, is short.
+  return { ...top, n, trips, refs: refs.join(",") };
+}
 
 function basemapTiles(t) {
   // MapLibre has no {s} or {r} placeholder: expand the subdomains itself and
