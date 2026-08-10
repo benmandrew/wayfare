@@ -157,8 +157,8 @@ timestamp, no path, no version, or the byte-identical tests are a fiction.
 ## Current state
 
 **Great Britain is complete end to end**, on the server, feed `20260807_022616`: 52,554
-patterns, 95.9% matched, 2,746,261 edges, 130 MB PMTiles. Wales and Greater London were
-the two rehearsals for it and both stand. 532 tests pass, ruff and mypy clean.
+patterns, 95.9% matched, 2,746,261 edges, 129.5 MB PMTiles. Wales and Greater London were
+the two rehearsals for it and both stand. 546 tests pass, ruff and mypy clean.
 
 **Both parts of Ireland are complete end to end**, on the server, against one shared
 Valhalla graph `3.8.3/1786309727` built from the 409 MB island extract. The Republic on
@@ -166,10 +166,16 @@ feed `20260808_b375dfac`: 2,853 patterns, 95.4% matched, 352,945 edges, 16.4 MB 
 Northern Ireland on `20260806_140751`: 2,071 patterns, 99.5% matched, 121,384 edges, 6.1
 MB PMTiles. One data root per region, not one shared: `meta.feed_version` is single-valued,
 so a second region acquired into the first's database becomes the current feed and the next
-`publish` overwrites the first region's archive. **All three served archives predate the
-attribution code and carry no credit** — the image that wrote them was built 38 minutes
-before `93623bc` landed — so serving them breaches CC BY 4.0 and OGL v3.0 until each is
-republished. Nothing needs re-matching; see `PLAN.md`.
+`publish` overwrites the first region's archive.
+
+**All three were republished on 2026-08-10 and every one of them now carries its credit**,
+which closes the CC BY 4.0 and OGL v3.0 breach that serving the earlier archives was. The
+same republish carried the `far` band, so Great Britain's low zooms changed with it: z5
+holds 100,836 features against 55,998 before, z6 134,950 against 106,626 and z7 169,382
+against 157,209, chosen by service level rather than by which cities happened to be dense.
+z8 upwards is unchanged, and both parts of Ireland are under the cap and came back
+feature-for-feature identical at every zoom. Nothing was re-matched. The archives the
+republish replaced are on the server at `/home/ben/archive-backup-20260810/`.
 
 Feed churn is measured: two Wales feeds two days apart took 3,584 patterns to 3,541 — 30
 new, 73 departed, about 8 seconds of matching to catch up against 16m23s for the full run.
