@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from wayfare import acquire, config, db, gtfs
+from wayfare import acquire, config, db, gtfs, licences
 
 # The real header and row, GUID and all, taken from the 2026-08-08 publication.
 NTA_FEED_INFO = (
@@ -42,15 +42,15 @@ def test_an_unrecognised_slug_is_still_a_bods_region():
     feed = config.feed("north_east")
     assert feed.url == config.BODS_GTFS_URL.format(region="north_east")
     assert feed.filename == "bods_gtfs_north_east.zip"
-    assert feed.licence == config.OGL
+    assert feed.licence == licences.OGL
 
 
 def test_the_licence_is_the_one_thing_that_differs_with_an_obligation():
     """CC BY 4.0 rather than OGL, so crediting the NTA is a condition of using the
     data and not a courtesy. Nothing else in this project is licensed that way."""
-    assert config.feed("ireland").licence == config.CC_BY_4
+    assert config.feed("ireland").licence == licences.CC_BY_4
     assert config.feed("ireland").attribution == "National Transport Authority"
-    assert config.feed("wales").licence == config.OGL
+    assert config.feed("wales").licence == licences.OGL
 
 
 def test_the_licence_is_reported_on_every_run(tmp_path, monkeypatch, caplog):

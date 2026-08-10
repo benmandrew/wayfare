@@ -11,6 +11,14 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import licences
+
+# The licence names a `Feed` is declared with. Everything else about them -- their
+# URIs, the `Credit` type, and how a credit is rendered -- lives in `licences`,
+# because the list only grows and none of it is configuration. Imported by name so
+# that a feed reads as a description of a source rather than as a lookup.
+from .licences import CC_BY_4, OGL
+
 # --- Layout ----------------------------------------------------------------
 
 DATA = Path(os.environ.get("WAYFARE_DATA", "data")).resolve()
@@ -35,25 +43,6 @@ NTA_GTFS_URL = "https://www.transportforireland.ie/transitData/Data/GTFS_All.zip
 # Resource ids and filenames move on every publication, so the datasets are named
 # by slug and resolved through CKAN at fetch time -- see `translink.resource`.
 OPENDATANI_API = "https://admin.opendatani.gov.uk/api/3/action/package_show"
-
-OGL = "Open Government Licence v3.0"
-CC_BY_4 = "Creative Commons Attribution 4.0"
-# Not a spelling mistake and not to be tidied to the British form the rest of this
-# codebase uses: "Open Database License" is the licence's own name.
-ODBL = "Open Database License"
-
-# CC BY 4.0 requires the licence to be *identified*, which in practice means a name
-# and a URI; OGL and ODbL ask for the same. A table keyed on the licence rather than
-# a field on `Feed`, so two publishers under one licence cannot disagree about where
-# it is, and a credit raises on a licence with no entry rather than quietly omitting
-# it.
-LICENCE_URLS = {
-    OGL: "https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/",
-    CC_BY_4: "https://creativecommons.org/licenses/by/4.0/",
-    ODBL: "https://opendatacommons.org/licenses/odbl/",
-}
-
-OSM_COPYRIGHT = "https://www.openstreetmap.org/copyright"
 
 
 @dataclass(frozen=True)
@@ -182,28 +171,19 @@ def archive_name(region: str | None = None) -> str:
     return f"{name}.pmtiles"
 
 
-@dataclass(frozen=True)
-class Credit:
-    """One thing that has to be acknowledged: what it is, whose it is, its licence."""
-
-    what: str
-    who: str
-    licence: str
-    # Where the work itself lives, where the publisher gives one. The licence's own
-    # URI is looked up from `LICENCE_URLS` and is not optional.
-    who_url: str | None = None
-
-
 def credit_parts(
     region: str | None = None, *, road: bool = True, operator: bool = False
-) -> tuple[Credit, ...]:
+) -> tuple[licences.Credit, ...]:
     """Everything a picture of this region owes an acknowledgement to.
 
-    Built from the `Feed` rather than from a table of its own, so a source added to
-    `FEEDS` is credited by the act of describing it.
+    This is the only part of crediting that belongs here rather than in `licences`:
+    it needs the `Feed`, and a feed is configuration. What a licence is called and
+    how a credit is written are not.
 
-    The timetable is always the publisher's, under their licence -- a condition
-    rather than a courtesy now that the Republic's feed is CC BY 4.0.
+    Built from the `Feed` rather than from a table of its own, so a source added to
+    `FEEDS` is credited by the act of describing it. The timetable is always the
+    publisher's, under their licence -- a condition rather than a courtesy now that
+    the Republic's feed is CC BY 4.0.
 
     The second credit is the one that is easy to miss, and it is *conditional*.
     Where a route was map-matched, every edge is an OpenStreetMap way that Valhalla
@@ -227,29 +207,17 @@ def credit_parts(
     what = (
         "Routes, timetables and operator geometry" if operator else "Routes and timetables"
     )
-    parts = [Credit(what, f.attribution, f.licence)]
+    parts = [licences.Credit(what, f.attribution, f.licence)]
     if road:
-        parts.append(
-            Credit("Road geometry", "OpenStreetMap contributors", ODBL, OSM_COPYRIGHT)
-        )
+        parts.append(licences.OPENSTREETMAP)
     return tuple(parts)
 
 
 def credit_html(
     region: str | None = None, *, road: bool = True, operator: bool = False
 ) -> str:
-    """The credit as a map attribution control wants it.
-
-    `publish` stamps this into the tileset metadata, which is the one place a licence
-    condition travels with the data: an archive copied to a bucket takes its credit
-    with it, where a line in the viewer or a field in `/archives.json` would be left
-    behind.
-    """
-    return " &middot; ".join(
-        f"{c.what}: &copy; {_link(c.who, c.who_url)}, "
-        f"{_link(c.licence, LICENCE_URLS[c.licence])}"
-        for c in credit_parts(region, road=road, operator=operator)
-    )
+    """This region's credit, rendered for a map attribution control."""
+    return licences.html(credit_parts(region, road=road, operator=operator))
 
 
 def credit_lines(
@@ -259,36 +227,15 @@ def credit_lines(
     road: bool = True,
     operator: bool = False,
 ) -> tuple[str, ...]:
-    """The credit as plain text, one line per thing being credited.
-
-    `links=False` drops the URIs. That is for the one place they cost more than they
-    carry: a credit burned into the corner of a picture, where a URI is unclickable,
-    doubles the length of a line that has to fit across the canvas, and is spelled
-    out in full in the same file's metadata anyway. Everywhere else keeps them,
-    because identifying the licence is what the licence asks for.
-    """
-    return tuple(
-        f"{c.what}: \N{COPYRIGHT SIGN} {c.who}"
-        + (f" <{c.who_url}>" if c.who_url and links else "")
-        + f", {c.licence}"
-        + (f" <{LICENCE_URLS[c.licence]}>." if links else ".")
-        for c in credit_parts(region, road=road, operator=operator)
-    )
+    """This region's credit as plain text, one line per thing being credited."""
+    return licences.lines(credit_parts(region, road=road, operator=operator), links=links)
 
 
 def credit_text(
     region: str | None = None, *, road: bool = True, operator: bool = False
 ) -> str:
-    """The same credit with the links spelled out, for anywhere HTML is not read.
-
-    A PNG `tEXt` chunk, an SVG `<metadata>` block, a log line. The copyright sign is
-    deliberate and safe in all three: it is in Latin-1, which is what `tEXt` allows.
-    """
-    return " ".join(credit_lines(region, road=road, operator=operator))
-
-
-def _link(text: str, url: str | None) -> str:
-    return f'<a href="{url}">{text}</a>' if url else text
+    """This region's credit with the links spelled out, for anywhere HTML is not read."""
+    return licences.text(credit_parts(region, road=road, operator=operator))
 
 
 # Geofabrik rebuilds these daily. Valhalla downloads its own copy at graph-build

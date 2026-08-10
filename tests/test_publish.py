@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from wayfare import cli, config, publish
+from wayfare import cli, config, licences, publish
 
 
 def _row(edge_id, pts, refs, way_id=1, name="Oxford Road", trips=100):
@@ -501,7 +501,7 @@ def test_every_licence_names_where_to_find_it():
     added with a licence nobody wrote a URL for must fail loudly at publish rather
     than ship an archive crediting a licence it does not link to."""
     for region in ("all", *config.FEEDS):
-        assert config.LICENCE_URLS[config.feed(region).licence].startswith("https://")
+        assert licences.URLS[config.feed(region).licence].startswith("https://")
 
 
 def test_the_credit_names_the_publisher_the_licence_and_openstreetmap():
@@ -510,10 +510,10 @@ def test_the_credit_names_the_publisher_the_licence_and_openstreetmap():
     timetable's licence says."""
     credit = config.credit_html("wales")
     assert "Department for Transport" in credit
-    assert config.OGL in credit
-    assert config.LICENCE_URLS[config.OGL] in credit
+    assert licences.OGL in credit
+    assert licences.URLS[licences.OGL] in credit
     assert "OpenStreetMap" in credit
-    assert config.LICENCE_URLS[config.ODBL] in credit
+    assert licences.URLS[licences.ODBL] in credit
     # And it says which half OSM covers, since the viewer's existing OSM line is
     # about the backdrop and this one is about the lines drawn on it.
     assert "Road geometry" in credit
@@ -524,7 +524,7 @@ def test_a_region_on_a_different_licence_gets_a_different_credit():
     would be wrong for whichever region is not showing."""
     assert config.credit_html("ireland") != config.credit_html("all")
     assert "National Transport Authority" in config.credit_html("ireland")
-    assert config.LICENCE_URLS[config.CC_BY_4] in config.credit_html("ireland")
+    assert licences.URLS[licences.CC_BY_4] in config.credit_html("ireland")
     assert "Department for Transport" not in config.credit_html("ireland")
     # Northern Ireland is OGL like GB but a different publisher, so the licence
     # alone does not decide the string.
@@ -537,8 +537,8 @@ def test_the_plain_text_credit_says_the_same_thing_without_markup():
     text = config.credit_text("ireland")
     assert "<a href" not in text and "&copy;" not in text
     assert "National Transport Authority" in text
-    assert config.LICENCE_URLS[config.CC_BY_4] in text
-    assert config.OSM_COPYRIGHT in text
+    assert licences.URLS[licences.CC_BY_4] in text
+    assert licences.OSM_COPYRIGHT in text
     # tEXt is Latin-1, so the sign has to be one of the 256 characters it allows.
     text.encode("latin-1")
 
@@ -552,8 +552,8 @@ def test_dropping_the_links_keeps_every_name_and_still_credits_both():
     joined = " ".join(lines)
     assert "http" not in joined
     assert "National Transport Authority" in joined
-    assert config.CC_BY_4 in joined
-    assert "OpenStreetMap contributors" in joined and config.ODBL in joined
+    assert licences.CC_BY_4 in joined
+    assert "OpenStreetMap contributors" in joined and licences.ODBL in joined
     assert " ".join(config.credit_lines("ireland")) == config.credit_text("ireland")
 
 
@@ -574,7 +574,7 @@ def test_the_credit_follows_the_region_rather_than_the_call_site(monkeypatch, tm
         monkeypatch, tmp_path, attribution=config.credit_html("ireland")
     )
     assert "National Transport Authority" in _attribution(far)
-    assert config.OGL not in _attribution(far)
+    assert licences.OGL not in _attribution(far)
 
 
 def test_publish_stamps_the_region_it_was_given(monkeypatch, tmp_path):
@@ -1015,10 +1015,10 @@ def test_an_archive_with_no_matched_edges_makes_no_odbl_claim():
     publisher never imposed one. No OSM way was involved, so no OSM credit."""
     credit = config.credit_html("ireland", road=False, operator=True)
     assert "OpenStreetMap" not in credit
-    assert config.LICENCE_URLS[config.ODBL] not in credit
+    assert licences.URLS[licences.ODBL] not in credit
     # The publisher is still credited, and CC BY 4.0 makes that a condition.
     assert "National Transport Authority" in credit
-    assert config.LICENCE_URLS[config.CC_BY_4] in credit
+    assert licences.URLS[licences.CC_BY_4] in credit
 
 
 def test_the_default_is_unchanged_for_a_road_only_archive():

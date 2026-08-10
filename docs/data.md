@@ -308,15 +308,26 @@ misdescribes its own contents. The noun is now "Routes and timetables", widening
 arrives in the same bundle under the same licence, so it is named inside the publisher's
 credit rather than given a third line of its own.
 
-**The credit is derived from `config.Feed` rather than written out per region.** The
-feed already carried `licence` and `attribution`; `config` adds `ODBL`, a
-`LICENCE_URLS` table from each licence constant to its URI, `OSM_COPYRIGHT`, and a
-frozen `Credit` dataclass of `what`, `who`, `licence` and `who_url`. Three functions
-read them: `credit_parts(region)` returns a region's credits, `credit_html(region)`
-renders them for a map attribution control, and `credit_text(region)` renders them with
-the links spelled out for anywhere HTML is not read. Adding a source to `FEEDS` credits
-it. A licence with no entry in `LICENCE_URLS` raises a `KeyError` at publish time rather
-than dropping the URI and publishing anyway.
+**The licences live in `wayfare/licences.py`, and nothing else does.** The names, the
+`URLS` table from each name to its URI, `OSM_COPYRIGHT`, the frozen `Credit` dataclass
+of `what`, `who`, `licence` and `who_url`, the one `OPENSTREETMAP` credit that is the
+same for every region, and the three renderers — `html`, `lines` and `text`. The list
+only grows: Transport for London publishes under an amended Open Government Licence
+v2.0 with three attribution strings of its own, and Network Rail's feeds are not open
+at all, so this stopped being something to keep beside paths and tunables. A licence
+with no entry in `URLS` raises a `KeyError` at publish time rather than dropping the
+URI and publishing anyway.
+
+**The credit is still derived from `config.Feed` rather than written out per region.**
+`config.credit_parts(region)` is the one part of crediting that belongs in `config`,
+because it needs the feed and a feed is configuration — what a licence is called and
+how a credit is written are not. `credit_html`, `credit_lines` and `credit_text` are
+thin wrappers that hand its result to the matching renderer. Adding a source to
+`FEEDS` credits it.
+
+The dependency runs one way and has to: `config` imports `licences` for the two names
+it declares feeds with, and `licences` imports nothing of ours. Putting `credit_parts`
+in `licences` would have needed `Feed`, and `Feed` needs the licence names.
 
 **The credit lives in the tiles because that is the one place it travels with the
 data.** `publish.py` passes `--attribution=<credit_html>` to both tippecanoe passes,
