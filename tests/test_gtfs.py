@@ -158,7 +158,16 @@ def test_dropped_modes_are_reported_by_type_and_trip_count(gtfs_dir: Path, con, 
     lines = [r.getMessage() for r in caplog.records]
     assert "dropping route_type 4 (ferry): 1 routes, 1 trips" in lines
     assert "dropping route_type 2 (rail): 1 routes, 1 trips" in lines
-    assert "3 trips on road modes, 2 on other modes dropped" in lines
+    assert "3 trips on the selected modes (bus, coach), 2 on other modes dropped" in lines
+
+
+def test_kept_modes_are_reported_too(gtfs_dir: Path, con, caplog):
+    """The complement of the dropping lines. Reporting only what went means a feed
+    that quietly stops publishing a mode reads the same as one that never had it,
+    and now that keeping a mode is a choice, what arrived is the thing to check."""
+    with caplog.at_level(logging.INFO, logger="wayfare.gtfs"):
+        gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB")
+    assert "keeping bus: 1 routes, 3 trips" in [r.getMessage() for r in caplog.records]
 
 
 def test_an_unrecognised_mode_is_a_warning_not_a_quiet_omission(
@@ -191,7 +200,7 @@ def test_a_feed_that_drops_to_nothing_is_refused(gtfs_dir: Path, con):
         "F1,WK,TF1,0,\n",
         "TF1,12:00:00,12:00:00,P1,1\nTF1,12:30:00,12:30:00,P2,2\n",
     )
-    with pytest.raises(RuntimeError, match="non-road mode"):
+    with pytest.raises(RuntimeError, match="unselected mode"):
         gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB")
 
 
@@ -202,3 +211,48 @@ def test_route_type_is_stored_as_text(gtfs_dir: Path, con):
     assert con.execute(
         "SELECT route_type FROM routes WHERE route_id = 'F1'"
     ).fetchone() == ("4",)
+
+
+# --- Selecting modes ----------------------------------------------------------
+
+
+def test_the_default_selection_is_road_only(gtfs_dir: Path, con):
+    """Adding modes must not change what an existing run produces. The mini feed
+    carries a ferry and a train, and neither becomes a pattern unless asked for."""
+    gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB")
+    assert {r[0] for r in con.execute("SELECT DISTINCT mode FROM patterns").fetchall()} == {
+        "bus"
+    }
+
+
+def test_a_selected_mode_becomes_a_pattern_and_says_which_mode(gtfs_dir: Path, con):
+    """The whole point of the change: a ferry kept for its operator geometry is a
+    pattern like any other, and carries the mode that decides how it gets drawn."""
+    gtfs.build_patterns(
+        gtfs_dir, con, memory_limit="1GB", modes=frozenset({"bus", "ferry"})
+    )
+    assert dict(
+        con.execute("SELECT mode, count(*) FROM patterns GROUP BY 1").fetchall()
+    ) == {"bus": 2, "ferry": 1}
+
+
+def test_selecting_a_mode_does_not_move_any_other_pattern_id(gtfs_dir: Path, con):
+    """`pattern_id` is route, direction and stops, and mode is deliberately not in
+    it. Were it in the hash, turning a mode on would renumber every pattern already
+    matched and throw away a national match run."""
+    gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB")
+    road = {r[0] for r in con.execute("SELECT pattern_id FROM patterns").fetchall()}
+    gtfs.build_patterns(
+        gtfs_dir, con, memory_limit="1GB", modes=frozenset({"bus", "ferry", "rail"})
+    )
+    after = {r[0] for r in con.execute("SELECT pattern_id FROM patterns").fetchall()}
+    assert road < after
+
+
+def test_an_unknown_mode_name_is_refused(gtfs_dir: Path, con):
+    """A typo in --modes would otherwise read as a feed that happens to carry no
+    trams, which is the quiet-wrong-answer failure this codebase keeps hitting."""
+    with pytest.raises(ValueError, match="unknown mode"):
+        gtfs.build_patterns(
+            gtfs_dir, con, memory_limit="1GB", modes=frozenset({"bus", "tramm"})
+        )

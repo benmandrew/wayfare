@@ -5,9 +5,13 @@ This is the stage that makes the rest affordable. The national feed holds about
 the day. Grouping trips by their ordered stop sequence collapses that to a far
 smaller set of *patterns*, and a pattern is what we pay the map matcher for.
 
-Only road-going modes get this far. A feed carries ferries, trains and trams as
-well as buses, and a sea crossing handed to a road matcher either fails outright or
-snaps to whatever coast road is nearest -- see ``_drop_non_road_modes``.
+Which modes get this far is a choice, and it defaults to road only. A feed carries
+ferries, trains and trams as well as buses; keeping one is worthwhile where the
+operator supplies its geometry, since a tram with a trace needs no matcher at all.
+What must never happen is handing one to the matcher -- a sea crossing snapped by
+`bus` costing either fails outright or lands on the nearest coast road, which is
+worse. Selecting a mode is ``_drop_unselected_modes``; refusing to match it is
+``db.matchable``, and they are deliberately separate decisions.
 
 The work is done in DuckDB rather than Python because ``stop_times.txt`` is 5.1 GB
 and the central operation is a group-by over every row of it. DuckDB does that out
@@ -47,12 +51,12 @@ def _csv(gtfs_dir: Path, name: str) -> str:
     return f"read_csv('{path}', all_varchar=true, header=true)"
 
 
-def _road_modes_sql(col: str) -> str:
-    """Predicate for a route_type this pipeline is willing to map-match.
+def _kept_modes_sql(col: str, kept: frozenset[int]) -> str:
+    """Predicate for a route_type this run was asked to keep.
 
-    The values are integers looked up in ``config.ROAD_ROUTE_TYPES`` and nothing
-    else reaches the SQL, so the list is a closed vocabulary in the same sense the
-    art query spec is.
+    The values are integers derived from ``config.MODES`` and nothing else reaches
+    the SQL, so the list is a closed vocabulary in the same sense the art query spec
+    is.
 
     TRY_CAST rather than a string comparison because route_type is an enum, not an
     id: "03" and "3" mean the same mode, where route "07" and route "7" are two
@@ -60,8 +64,23 @@ def _road_modes_sql(col: str) -> str:
     route is missing from routes.txt has no mode at all, and ``NOT (NULL IN (...))``
     is NULL, so without it the rows this is meant to catch would be kept.
     """
-    keep = ", ".join(str(t) for t in sorted(config.ROAD_ROUTE_TYPES))
+    if not kept:
+        return "false"
+    keep = ", ".join(str(t) for t in sorted(kept))
     return f"COALESCE(TRY_CAST({col} AS INTEGER) IN ({keep}), false)"
+
+
+def _mode_case_sql(col: str) -> str:
+    """SQL mapping a route_type to its ``config.MODES`` name, NULL if unknown.
+
+    Built from ``config.MODE_OF_TYPE`` so the vocabulary has one definition. A type
+    outside it yields NULL, which is the same thing a missing route yields, and both
+    are reported rather than guessed at.
+    """
+    whens = " ".join(
+        f"WHEN {t} THEN '{name}'" for t, name in sorted(config.MODE_OF_TYPE.items())
+    )
+    return f"CASE TRY_CAST({col} AS INTEGER) {whens} ELSE NULL END"
 
 
 def _mode_name(route_type: str | None) -> str | None:
@@ -78,8 +97,8 @@ def _mode_name(route_type: str | None) -> str | None:
         return None
 
 
-def _drop_non_road_modes(con: duckdb.DuckDBPyConnection) -> int:
-    """Remove trips that do not run on roads, and say exactly what went.
+def _drop_unselected_modes(con: duckdb.DuckDBPyConnection, modes: frozenset[str]) -> int:
+    """Remove trips whose mode this run was not asked for, and say exactly what went.
 
     Ferries are the reason this exists. Every one of the 52 Valhalla-444 errors in
     the completed GB run was a two-stop sea crossing on the `shape` path, and the
@@ -88,17 +107,23 @@ def _drop_non_road_modes(con: duckdb.DuckDBPyConnection) -> int:
     same problem waiting: the Irish feed carries 2,847 Irish Rail and 2,655 LUAS
     trips, which `bus` costing would happily route down the nearest street.
 
+    Keeping a mode is now a choice rather than a fact about the pipeline, because a
+    tram that arrives with an operator trace needs no matcher at all and should be
+    drawn rather than deleted. What stops it reaching Valhalla is `db.matchable`,
+    not this function -- the two are deliberately separate, so selecting a mode and
+    map-matching it are different decisions.
+
     Nothing here is silent. Every dropped mode is reported with its route and trip
     counts, and a type this file does not recognise is a warning rather than a
     quiet omission, because the way this goes wrong is a future feed publishing
     something road-going in a range nobody thought to keep.
     """
-    road = _road_modes_sql("route_type")
+    keep = _kept_modes_sql("route_type", config.route_types(modes))
     dropped = con.execute(f"""
         SELECT nullif(trim(route_type), '') AS rt,
                count(DISTINCT route_id)     AS n_routes,
                count(*)                     AS n_trips
-        FROM trip WHERE NOT ({road})
+        FROM trip WHERE NOT ({keep})
         GROUP BY rt ORDER BY n_trips DESC, rt
     """).fetchall()
     if not dropped:
@@ -113,7 +138,7 @@ def _drop_non_road_modes(con: duckdb.DuckDBPyConnection) -> int:
             n_routes,
             n_trips,
         )
-    con.execute(f"DELETE FROM trip WHERE NOT ({road})")
+    con.execute(f"DELETE FROM trip WHERE NOT ({keep})")
 
     # A feed of nothing but ferries is not a thing BODS or the NTA publishes, so
     # this means the join to routes failed rather than that the timetable is all
@@ -121,10 +146,27 @@ def _drop_non_road_modes(con: duckdb.DuckDBPyConnection) -> int:
     # the failure modes this stage has.
     if not db.scalar(con, "SELECT count(*) FROM trip"):
         raise RuntimeError(
-            "every trip was dropped as a non-road mode; routes.txt either carries no "
-            "bus, coach or trolleybus route_type or does not join to trips.txt"
+            "every trip was dropped as an unselected mode; routes.txt either carries "
+            f"no route_type in the selected modes ({', '.join(sorted(modes))}) or does "
+            "not join to trips.txt"
         )
     return int(sum(r[2] for r in dropped))
+
+
+def _report_kept_modes(con: duckdb.DuckDBPyConnection) -> None:
+    """Say what survived the filter, one line per mode.
+
+    The complement of the dropping lines above. Without it a run reports only what
+    it threw away, so a feed that quietly stops publishing its trams looks the same
+    as one that never had any -- and now that keeping a mode is a choice, the thing
+    worth checking is what came in rather than what went.
+    """
+    for mode, n_routes, n_trips in con.execute("""
+        SELECT COALESCE(mode, '(unrecognised)'),
+               count(DISTINCT route_id), count(*)
+        FROM trip GROUP BY 1 ORDER BY 3 DESC, 1
+    """).fetchall():
+        log.info("keeping %s: %d routes, %d trips", mode, n_routes, n_trips)
 
 
 def build_patterns(
@@ -133,9 +175,12 @@ def build_patterns(
     memory_limit: str | None = None,
     feed_version: str | None = None,
     upgrade_shapes: bool = False,
+    modes: frozenset[str] | None = None,
 ) -> None:
     from . import acquire
 
+    kept_modes = modes if modes is not None else config.DEFAULT_MODES
+    config.route_types(kept_modes)  # reject a bad name before any work is done
     feed = feed_version or acquire.feed_version(gtfs_dir)
     limit = memory_limit or os.environ.get("WAYFARE_MEM", "8GB")
     con.execute(f"SET memory_limit = '{limit}'")
@@ -180,14 +225,21 @@ def build_patterns(
         SELECT t.trip_id, t.route_id, t.shape_id,
                TRY_CAST(t.direction_id AS INTEGER) AS direction,
                COALESCE(s.days_per_week, 5) AS days_per_week,
-               r.route_type
+               r.route_type,
+               {_mode_case_sql("r.route_type")} AS mode
         FROM {_csv(gtfs_dir, "trips.txt")} t
         LEFT JOIN service_days s USING (service_id)
         LEFT JOIN routes r USING (route_id)
     """)
-    n_dropped = _drop_non_road_modes(con)
+    n_dropped = _drop_unselected_modes(con, kept_modes)
     n_trips = db.scalar(con, "SELECT count(*) FROM trip")
-    log.info("%d trips on road modes, %d on other modes dropped", n_trips, n_dropped)
+    log.info(
+        "%d trips on the selected modes (%s), %d on other modes dropped",
+        n_trips,
+        ", ".join(sorted(kept_modes)),
+        n_dropped,
+    )
+    _report_kept_modes(con)
 
     _collapse_to_sequences(gtfs_dir, con)
 
@@ -204,12 +256,20 @@ def build_patterns(
                count(*)                       AS n_trips_raw,
                sum(t.days_per_week)           AS n_trips,
                -- Where only some trips on a pattern carry operator geometry, take
-               -- the most common shape_id rather than an arbitrary one.
+               -- the most common shape_id rather than an arbitrary one. This is
+               -- also what covers Tyne and Wear Metro and Metrolink, which are
+               -- 75.2% and 0.8% shapeless by trip and 0% by pattern: every one of
+               -- their patterns has a shaped trip to inherit from. Quote pattern
+               -- coverage rather than trip coverage, or the gap looks far worse.
                mode(t.shape_id) FILTER (WHERE t.shape_id IS NOT NULL
-                                        AND t.shape_id <> '') AS shape_id
+                                        AND t.shape_id <> '') AS shape_id,
+               -- Grouped rather than aggregated: mode is a function of route_id,
+               -- which is already in the key, so this cannot split a pattern. It is
+               -- `t.mode` and never a bare `mode`, which is the aggregate above.
+               t.mode                         AS mode
         FROM trip t
         JOIN trip_seq ts USING (trip_id)
-        GROUP BY t.route_id, t.direction, ts.stop_seq
+        GROUP BY t.route_id, t.direction, ts.stop_seq, t.mode
     """)
     _check_unique_ids(con)
 
@@ -226,9 +286,16 @@ def build_patterns(
 
     con.execute(
         """
-        INSERT INTO patterns
+        -- Columns are named rather than positional. They used to be positional,
+        -- which meant adding one to the middle of the table silently shifted every
+        -- value after it into the wrong column.
+        INSERT INTO patterns (
+            pattern_id, route_id, agency_id, short_name, direction, shape_id,
+            n_stops, n_trips, span_m, mode, first_seen, last_seen
+        )
         SELECT p.pattern_id, p.route_id, r.agency_id, r.short_name, p.direction,
-               p.shape_id, len(p.stop_seq), p.n_trips, 0.0, ?::VARCHAR, ?::VARCHAR
+               p.shape_id, len(p.stop_seq), p.n_trips, 0.0, p.mode,
+               ?::VARCHAR, ?::VARCHAR
         FROM pattern_raw p
         LEFT JOIN routes r ON r.route_id = p.route_id
         ON CONFLICT (pattern_id) DO UPDATE SET
@@ -238,6 +305,12 @@ def build_patterns(
             short_name = excluded.short_name,
             shape_id   = excluded.shape_id,
             n_trips    = excluded.n_trips,
+            -- Mode is not in the identity, so a route that changes mode between
+            -- feeds keeps its pattern_id and therefore its cached match_status.
+            -- Recording the new mode is still right; what it does not do is
+            -- re-match, and edges matched as a bus would survive the change. No
+            -- feed has been seen doing this -- see the guard in `patterns`.
+            mode       = excluded.mode,
             last_seen  = excluded.last_seen
         """,
         [feed, feed],

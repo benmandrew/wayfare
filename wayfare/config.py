@@ -7,6 +7,7 @@ pointed at a big volume and nothing escapes into the source tree.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -399,8 +400,54 @@ DETOUR_SLACK_M = 1_000.0
 #
 # Nothing else is added speculatively. A type nobody publishes is a line of code
 # that cannot be checked against a feed, and an unrecognised one is reported
-# rather than guessed at -- see gtfs._drop_non_road_modes.
-ROAD_ROUTE_TYPES = frozenset({3, 11, 800} | set(range(200, 210)) | set(range(700, 717)))
+# rather than guessed at -- see gtfs._drop_unselected_modes.
+#
+# `MODES` is the vocabulary and `ROAD_ROUTE_TYPES` is derived from it, so the two
+# cannot disagree. One entry per mode a feed actually publishes, keyed on the name
+# this project uses for it; nothing groups two GTFS types together unless they mean
+# the same vehicle, which is why trolleybus sits inside `bus` and a cable tram does
+# not sit inside `tram`.
+MODES: dict[str, frozenset[int]] = {
+    "bus": frozenset({3, 11, 800} | set(range(700, 717))),
+    "coach": frozenset(range(200, 210)),
+    "tram": frozenset({0}),
+    "metro": frozenset({1}),
+    "rail": frozenset({2}),
+    "ferry": frozenset({4}),
+    "cable_tram": frozenset({5}),
+    "aerial": frozenset({6}),
+    "funicular": frozenset({7}),
+    "monorail": frozenset({12}),
+}
+
+# The modes Valhalla can be asked about, because they run on ways in its graph.
+# Everything else is water, rail or wire, and `bus` costing has nothing to snap it
+# to: a ferry either fails outright or is snapped to whatever coast road happens to
+# be nearby, which is worse. Verified from Valhalla's own `lua/graph.lua`, which
+# admits `route=ferry` and `route=shuttle_train` and drops every `railway=*` way.
+ROAD_MODES = frozenset({"bus", "coach"})
+
+# What `patterns` keeps when nothing says otherwise. Road only, so a run that does
+# not ask for anything else behaves exactly as it did before modes existed.
+DEFAULT_MODES = ROAD_MODES
+
+
+def route_types(modes: Iterable[str]) -> frozenset[int]:
+    """The GTFS route_type values covered by a set of mode names.
+
+    Raises on a name that is not in the vocabulary rather than quietly selecting
+    nothing, because a typo in `--modes` would otherwise read as a feed that
+    happens to carry no trams.
+    """
+    unknown = sorted(set(modes) - set(MODES))
+    if unknown:
+        raise ValueError(
+            f"unknown mode(s) {', '.join(unknown)}; known: {', '.join(sorted(MODES))}"
+        )
+    return frozenset().union(*(MODES[m] for m in modes)) if modes else frozenset()
+
+
+ROAD_ROUTE_TYPES = route_types(ROAD_MODES)
 
 # Names for the log line that reports what was dropped, and nothing else. Only the
 # basic types, which is what a GB or Irish feed actually carries; anything outside
@@ -415,6 +462,11 @@ ROUTE_TYPE_NAMES = {
     7: "funicular",
     12: "monorail",
 }
+
+# route_type -> mode name, inverted from MODES so there is one source of truth.
+# Stored on `patterns` because mode decides how a pattern gets its geometry, and
+# joining back to `routes` for it at every read is how that gets forgotten.
+MODE_OF_TYPE: dict[int, str] = {t: name for name, ts in MODES.items() for t in ts}
 
 # --- Patterns --------------------------------------------------------------
 

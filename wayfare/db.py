@@ -59,6 +59,13 @@ CREATE TABLE IF NOT EXISTS patterns (
     n_stops     INTEGER,
     n_trips     INTEGER,   -- how many timetabled trips use this pattern
     span_m      DOUBLE,    -- straight-line length of the stop chain
+    -- config.MODES name, denormalised from routes.route_type. It decides how a
+    -- pattern gets its geometry -- map-matched for road, drawn from an operator
+    -- shape or an OSM relation otherwise -- so every stage after this one needs
+    -- it, and a join back to `routes` for it at every read is how that gets
+    -- forgotten. NULL means a database written before modes existed, where
+    -- everything stored was road-going by construction.
+    mode        VARCHAR,
     first_seen  VARCHAR,   -- feed version this pattern first appeared in
     last_seen   VARCHAR    -- feed version it was last present in
 );
@@ -191,6 +198,24 @@ def current_feed(alias: str = "p") -> str:
     return f"{alias}.last_seen = (SELECT value FROM meta WHERE key = 'feed_version')"
 
 
+def matchable(alias: str = "p") -> str:
+    """Predicate restricting `patterns` to the modes Valhalla can be asked about.
+
+    `patterns` may now hold trams, ferries and metros, which have no road under them
+    and must never reach the matcher -- a sea crossing handed to `bus` costing either
+    fails outright or snaps to the nearest coast road, which is worse. Their geometry
+    comes from an operator shape or an OpenStreetMap relation instead.
+
+    A NULL mode is matchable. That is not a default, it is what an older database
+    means: before `patterns.mode` existed the loader kept road modes and deleted
+    everything else, so every row already stored is road-going by construction. The
+    migration therefore leaves the column empty rather than asserting a mode nobody
+    recorded, and this predicate is what makes that safe.
+    """
+    keep = ", ".join(f"'{m}'" for m in sorted(config.ROAD_MODES))
+    return f"({alias}.mode IS NULL OR {alias}.mode IN ({keep}))"
+
+
 def connect(path: Path | None = None, read_only: bool = False) -> duckdb.DuckDBPyConnection:
     p = path or config.DB_PATH
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -288,6 +313,16 @@ def migrate(con: duckdb.DuckDBPyConnection) -> None:
         # its rows and its match_status exactly like any other departed pattern.
         con.execute("ALTER TABLE routes ADD COLUMN route_type VARCHAR")
         logs.get("db").info("added routes.route_type; run `wayfare patterns` to fill it")
+
+    if "mode" not in columns(con, "patterns"):
+        # Added empty for the same reason route_type was: nothing already stored can
+        # supply it. It is left NULL rather than backfilled to 'bus', because a
+        # database written before this column existed held road modes only -- that
+        # was the whole point of the filter -- and `matchable` reads NULL as
+        # matchable for exactly that reason. Backfilling would assert a mode the
+        # feed never told us.
+        con.execute("ALTER TABLE patterns ADD COLUMN mode VARCHAR")
+        logs.get("db").info("added patterns.mode; run `wayfare patterns` to fill it")
 
 
 def _migrate_pattern_ids(con: duckdb.DuckDBPyConnection) -> None:

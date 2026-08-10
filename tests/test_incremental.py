@@ -301,6 +301,9 @@ def _legacy_db(path: Path) -> None:
     con.execute(db.SCHEMA)
     con.execute("ALTER TABLE patterns DROP COLUMN first_seen")
     con.execute("ALTER TABLE patterns DROP COLUMN last_seen")
+    # `mode` postdates the ids becoming hashes, so a database this old has no such
+    # column either, and the migration has to add both.
+    con.execute("ALTER TABLE patterns DROP COLUMN mode")
     con.execute("""
         INSERT INTO patterns VALUES
           (1, 'R1', 'OP1', '42', 0, 'SH1', 4, 10, 1000.0),

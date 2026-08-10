@@ -61,6 +61,36 @@ def test_routes_gains_route_type_without_losing_its_rows(tmp_path: Path):
         con.close()
 
 
+def test_patterns_gains_mode_empty_rather_than_backfilled(tmp_path: Path):
+    """A database written before modes existed held road patterns only -- that was
+    the whole point of the filter -- so the column could be backfilled to 'bus'. It
+    is not. Backfilling asserts a mode the feed never told us, where NULL says only
+    that nobody recorded one, and `db.matchable` already reads NULL as matchable so
+    a national database keeps matching across the upgrade."""
+    path = tmp_path / "old.duckdb"
+    old = duckdb.connect(str(path))
+    old.execute(db.SCHEMA)
+    old.execute("ALTER TABLE patterns DROP COLUMN mode")
+    old.execute(
+        "INSERT INTO patterns "
+        "(pattern_id, route_id, short_name, n_stops, n_trips, first_seen, last_seen) "
+        "VALUES (1, 'R1', '42', 4, 10, 'F1', 'F1')"
+    )
+    old.close()
+
+    con = db.connect(path)
+    try:
+        assert "mode" in db.columns(con, "patterns")
+        assert db.scalar(con, "SELECT count(*) FROM patterns") == 1
+        assert con.execute("SELECT mode FROM patterns").fetchone() == (None,)
+        # NULL is matchable, so the upgrade does not quietly stall a match run.
+        assert (
+            db.scalar(con, f"SELECT count(*) FROM patterns p WHERE {db.matchable()}") == 1
+        )
+    finally:
+        con.close()
+
+
 def test_an_old_database_migrates_and_then_builds(gtfs_dir: Path, tmp_path: Path):
     """The migration on its own proves nothing; what matters is that the next run
     against the migrated file fills the column in and filters on it."""
@@ -82,9 +112,13 @@ def test_an_old_database_migrates_and_then_builds(gtfs_dir: Path, tmp_path: Path
 
 def _one_live_pattern(con) -> None:
     db.set_meta(con, "feed_version", "F1")
+    # Columns named rather than positional, so adding one to `patterns` does not
+    # silently shift every value here into the wrong place.
     con.execute(
         "INSERT INTO patterns "
-        "VALUES (1, 'R1', 'OP1', '42', 0, 'SH1', 4, 10, 1.0, 'F1', 'F1')"
+        "(pattern_id, route_id, agency_id, short_name, direction, shape_id, "
+        " n_stops, n_trips, span_m, mode, first_seen, last_seen) "
+        "VALUES (1, 'R1', 'OP1', '42', 0, 'SH1', 4, 10, 1.0, 'bus', 'F1', 'F1')"
     )
 
 

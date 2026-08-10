@@ -62,6 +62,36 @@ def test_absurd_detour_is_recorded_but_its_edges_are_dropped(loaded):
     assert loaded.execute("SELECT count(*) FROM pattern_edges").fetchone()[0] == 0
 
 
+def test_non_road_modes_are_never_handed_to_the_matcher(gtfs_dir: Path, con):
+    """Keeping a ferry and map-matching it are different decisions, and only the
+    first is `--modes`. A sea crossing given to `bus` costing either fails outright
+    or snaps to the nearest coast road, which is worse -- it was the largest single
+    error class in the GB run. Their geometry comes from the operator instead.
+    """
+    gtfs.build_patterns(
+        gtfs_dir, con, memory_limit="1GB", modes=frozenset({"bus", "ferry", "rail"})
+    )
+    assert con.execute("SELECT count(*) FROM patterns").fetchone()[0] == 4
+
+    assert match.pending_count(con) == 2  # the two bus patterns, not the four
+    match.run(con, client_=FakeClient())
+    matched = {
+        r[0]
+        for r in con.execute("""
+            SELECT p.mode FROM patterns p JOIN match_status m USING (pattern_id)
+        """).fetchall()
+    }
+    assert matched == {"bus"}
+
+
+def test_an_older_database_has_no_mode_and_is_still_matched(loaded):
+    """A NULL mode is what a database written before the column existed means. It
+    held road modes only -- that was the point of the filter -- so reading NULL as
+    unmatchable would silently stop a national database dead."""
+    loaded.execute("UPDATE patterns SET mode = NULL")
+    assert match.pending_count(loaded) == 2
+
+
 def test_unroutable_patterns_are_not_retried_forever(loaded):
     match.run(loaded, client_=FakeClient(fail=valhalla.NoRoute("no route")))
     assert match.pending_count(loaded) == 0
