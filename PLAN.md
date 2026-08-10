@@ -303,13 +303,6 @@ rest.
 two GraphId spaces, but nothing reuses matches across builds. `way_id` survives a
 rebuild, so re-anchoring on it is the obvious thing to try.
 
-**`publish` overwrites the served archive in place.** `_tile_join` runs `tile-join -o
-<out> --force`, writing the final `.pmtiles` directly, and the `web` service serves
-`/data/out` from the same volume `publish` writes to. A client pulling byte ranges
-through a republish can read across the rewrite. The window is short — seconds to a
-minute, once a month — but the fix is to write to a staging path and rename, since a
-rename within one filesystem is atomic.
-
 **`edges` has no spatial index.** A national window reads the whole table however it
 is asked for. `wayfare cluster` prunes it to a fraction, but the scan was never where
 a render's time went.
