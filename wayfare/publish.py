@@ -531,23 +531,36 @@ def build_tiles(
     with tempfile.TemporaryDirectory(dir=out.parent, prefix=".publish-") as scratch:
         tmp = Path(scratch)
         joined = tmp / out.name
-        far_floors = _cell_floors(geojsonl, config.OVERVIEW_CAP_FAR)
-        # Only the last band may extend past its own top zoom. `-z` is a ceiling that
-        # --extend-zooms-if-still-dropping is allowed to raise, which is harmless when
-        # there is nothing above it and silently wrong when there is: a far band that
-        # grew from z7 to z9 -- measured, on Great Britain -- overlaps the near band,
-        # and tile-join merges the two into tiles holding both copies of every road.
-        bands = [
-            ("far", config.MIN_ZOOM, config.FAR_ZOOM - 1, far_floors, _DETAIL_ONLY, False),
-            ("near", config.FAR_ZOOM, config.DETAIL_ZOOM - 1, {}, _DETAIL_ONLY, False),
-            ("detail", config.DETAIL_ZOOM, config.MAX_ZOOM, {}, (), True),
-        ]
         parts = []
-        for name, lo, hi, floors, exclude, extend in bands:
-            src = _hold_back(geojsonl, tmp / f"{name}.geojsonl", floors)
-            part = tmp / f"{name}.pmtiles"
-            _tippecanoe(src, part, lo, hi, exclude, attribution, extend)
-            parts.append(part)
+        # A region can have no matched edges at all -- Irish Rail on its own is 331
+        # patterns and not one of them is a road -- and tippecanoe exits 110 on an
+        # empty input rather than writing an empty archive. Skipping the road bands
+        # is the same rule the segments pass already follows, in the other direction.
+        if _has_features(geojsonl):
+            far_floors = _cell_floors(geojsonl, config.OVERVIEW_CAP_FAR)
+            # Only the last band may extend past its own top zoom. `-z` is a ceiling
+            # that --extend-zooms-if-still-dropping is allowed to raise, which is
+            # harmless when there is nothing above it and silently wrong when there
+            # is: a far band that grew from z7 to z9 -- measured, on Great Britain --
+            # overlaps the near band, and tile-join merges the two into tiles holding
+            # both copies of every road.
+            bands = [
+                (
+                    "far",
+                    config.MIN_ZOOM,
+                    config.FAR_ZOOM - 1,
+                    far_floors,
+                    _DETAIL_ONLY,
+                    False,
+                ),
+                ("near", config.FAR_ZOOM, config.DETAIL_ZOOM - 1, {}, _DETAIL_ONLY, False),
+                ("detail", config.DETAIL_ZOOM, config.MAX_ZOOM, {}, (), True),
+            ]
+            for name, lo, hi, floors, exclude, extend in bands:
+                src = _hold_back(geojsonl, tmp / f"{name}.geojsonl", floors)
+                part = tmp / f"{name}.pmtiles"
+                _tippecanoe(src, part, lo, hi, exclude, attribution, extend)
+                parts.append(part)
         # One pass over the whole zoom range rather than banded like the roads. The
         # bands exist to stop millions of edges paying for info-card attributes at
         # zooms nobody reads them at, and to thin the quietest roads out of the far
@@ -567,6 +580,14 @@ def build_tiles(
                 layer=LAYER_SEGMENTS,
             )
             parts.append(tiles)
+        if not parts:
+            # Louder than an empty archive. A published file with no features in it
+            # loads without complaint and shows a blank map, which reads as a broken
+            # viewer rather than as a stage that had nothing to write.
+            raise RuntimeError(
+                f"nothing to publish: {geojsonl} has no matched edges and there are "
+                "no segments. Run `wayfare match` and `wayfare aggregate` first."
+            )
         _tile_join(joined, parts)
         size = joined.stat().st_size
         # os.replace, not shutil.move: a rename within one filesystem is atomic, so
@@ -579,6 +600,16 @@ def build_tiles(
     log.info("tiles built: %.1f MB", size / 1e6)
     log.info("attribution: %s", attribution)
     return out
+
+
+def _has_features(geojsonl: Path) -> bool:
+    """Whether a GeoJSONL file holds anything worth handing to tippecanoe.
+
+    One feature per line, so a non-empty file has at least one. Size rather than a
+    line count because the national edge export is 1.6 GB and the question is only
+    ever "is this empty".
+    """
+    return geojsonl.exists() and geojsonl.stat().st_size > 0
 
 
 def _tippecanoe(

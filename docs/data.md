@@ -57,24 +57,53 @@ MB, 435k records. Budget ~40 GB of disk including the Valhalla graph.
 
 ## Mode filtering
 
-**Ferries are the largest single error class in the GB run, and `route_type` is
-what removes them.** All 52 `error` rows carrying Valhalla code 444 — 11,200 trips
-— are two-stop sea crossings on the `shape` path: CalMac, Orkney, the Shields
-ferry. `map_snap` is refusing to put water on a road, which is correct behaviour
-answering a question that should never have been asked. A further 41
-`low_confidence` rows, 8,867 trips, are the same crossings arriving through the
-`stops` path, and they are 63% of all low-confidence trip weight. `gtfs.py` drops
-every trip whose route is not road-going before patterns are built.
+**Ferries are the largest single error class in the GB run, and the matcher is not
+the way to draw them.** All 52 `error` rows carrying Valhalla code 444 — 11,200
+trips — are two-stop sea crossings on the `shape` path: CalMac, Orkney, the Shields
+ferry. A further 41 `low_confidence` rows, 8,867 trips, are the same crossings
+arriving through the `stops` path, and they are 63% of all low-confidence trip
+weight.
+
+**The reason given here used to be wrong, and the wrong reason is worth recording.**
+This file said `map_snap` was "refusing to put water on a road". It is not, and
+Valhalla's own source says so. `lua/graph.lua` admits exactly two non-`highway`
+route types — `route=ferry` and `route=shuttle_train` — so a ferry way *is* in the
+graph with a `way_id`. `class BusCost : public AutoCost` overrides only `Allowed`
+and `AllowedReverse`, neither of which rejects a ferry, and not `EdgeCost`, which
+handles `Use::kFerry` through `ferry_factor_`. So `bus` costing traverses ferries by
+inheritance. Error 444 is Meili failing to snap the trace to *any* edge — most
+likely because the supplied shape lies outside the search radius of the OSM ferry
+way, or because no such way exists for that crossing. Checked against `master` on
+2026-08-10. The conclusion held while the reasoning did not, which is the kind of
+entry that survives longest unexamined.
+
+**The decision, on the corrected reasoning: a ferry is drawn, never matched.** Not
+because Valhalla refuses, but because matching answers the wrong question. An OSM
+ferry way is, by the wiki's own description, a line drawn from one terminal to
+another — snapping to it would replace the operator's recorded course with a
+schematic, and it would put the crossing on shared "infrastructure" that two
+operators may or may not have in common. The feed's own geometry is better: 244 of
+the 416 GB ferry patterns carry a trace, coarse but real, CalMac at a median 8
+vertices. Those are copied into `segments` and drawn as they are. The other 172 are
+not drawn at all, because a straight line between two ports is a schematic this
+pipeline would be inventing rather than repeating.
+
+`gtfs.py` keeps a mode only if it was asked for — see `config.MODES` — and
+`db.matchable` is what keeps whatever it kept away from Valhalla. Selecting a mode
+and map-matching it are separate decisions, and for ferries the answers differ.
 
 **The trap is the kept set, not the filter.** GB `routes.txt` carries `3` on
 12,709 routes, `200` on 316, `4` on 119, `1` on 54, `0` on 43, `2` on 3 and `6` on
 1. `200` is the extended-GTFS code for coach, so those 316 are National Express and
 FlixBus — real long-distance road services, and already the bulk of the
 long-distance `skipped` patterns. A filter written as `route_type = '3'` deletes
-them and looks right. `config.ROAD_ROUTE_TYPES` therefore holds ranges rather than
-values: `3`, `11` and `800` for bus and trolleybus, `200`–`209` for coach,
-`700`–`716` for the extended bus codes. Nothing speculative is added beyond that —
-a mode nobody publishes is a line that cannot be checked against a feed.
+them and looks right. `config.MODES` therefore holds ranges rather than values:
+`3`, `11` and `800` plus `700`–`716` under `bus`, and `200`–`209` under `coach`.
+`ROAD_ROUTE_TYPES` is the union of the two, derived rather than written out, so the
+vocabulary and the road filter cannot drift apart. Nothing speculative is added
+beyond what a feed publishes — a mode nobody publishes is a line that cannot be
+checked against one — and each remaining GTFS type is its own mode rather than
+grouped by guess: a cable tram is not a tram, whatever the names suggest.
 
 Everything dropped is logged by type with its route and trip counts, and a type
 this codebase does not name is a warning rather than an info line, because the way
@@ -82,8 +111,14 @@ this goes wrong is a future feed publishing something road-going in a range nobo
 kept. A feed where *every* trip drops raises instead: that means the join to
 `routes.txt` failed, not that the timetable is all water.
 
-`routes` gained a `route_type` column; the migration adds it empty, since nothing
-already stored can supply it, and the next `patterns` run fills it in.
+`routes` gained a `route_type` column and `patterns` gained a `mode`; both
+migrations add the column empty, since nothing already stored can supply it, and the
+next `patterns` run fills it in. A NULL `mode` is deliberately *not* backfilled to
+`bus`: it means a database written before modes existed, which held road patterns
+only because that was what the filter left, and `db.matchable` reads NULL as
+matchable for exactly that reason. Backfilling would assert a mode the feed never
+recorded; leaving it empty keeps a national match run going across the upgrade.
+
 Already-matched ferry patterns are not deleted — they stop appearing in the current
 feed and become departed, keeping their `match_status` rows exactly as a withdrawn
 bus route does. So an existing database keeps its ferry edges until the next

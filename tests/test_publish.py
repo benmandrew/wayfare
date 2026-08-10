@@ -265,7 +265,7 @@ def kept_trips(path):
 def test_missing_tippecanoe_says_which_fork(monkeypatch, tmp_path):
     monkeypatch.setattr(publish.shutil, "which", lambda _: None)
     with pytest.raises(RuntimeError, match="felt/tippecanoe"):
-        publish.build_tiles(tmp_path / "edges.geojsonl")
+        publish.build_tiles(write_geojsonl(tmp_path / "edges.geojsonl", [1]))
 
 
 def test_a_file_under_its_cap_is_not_filtered_at_all(tmp_path):
@@ -1046,3 +1046,49 @@ def test_the_credit_follows_what_the_archive_actually_holds(con, tmp_path, monke
 
     _edge(con, 5, ["42"])
     assert publish.contents(con) == {"road": True, "operator": True}
+
+
+def _stub_tippecanoe(monkeypatch, calls):
+    import subprocess
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
+    monkeypatch.setattr(publish.subprocess, "run", fake_run)
+
+
+def test_a_region_with_no_matched_edges_skips_the_road_bands(monkeypatch, tmp_path):
+    """Irish Rail on its own is 331 patterns and not one of them is a road.
+    tippecanoe exits 110 on an empty input rather than writing an empty archive, so
+    the road bands are skipped -- the same rule the segments pass already follows,
+    in the other direction."""
+    calls = []
+    _stub_tippecanoe(monkeypatch, calls)
+    (tmp_path / "edges.geojsonl").write_text("")  # exported, but no features
+    (tmp_path / "segments.geojsonl").write_text('{"type":"Feature"}\n')
+
+    publish.build_tiles(
+        tmp_path / "edges.geojsonl",
+        tmp_path / "ireland.pmtiles",
+        segments=tmp_path / "segments.geojsonl",
+    )
+
+    seg, join = calls
+    assert seg[seg.index("-l") + 1] == publish.LAYER_SEGMENTS
+    assert join[0] == "tile-join"
+    # No `bus` layer at all, rather than an empty one.
+    assert not any(publish.LAYER in c and "-l" in c for c in [seg])
+
+
+def test_publishing_nothing_at_all_is_refused(monkeypatch, tmp_path):
+    """Louder than an empty archive, which loads without complaint and shows a
+    blank map -- that reads as a broken viewer rather than as a stage with nothing
+    to write."""
+    _stub_tippecanoe(monkeypatch, [])
+    (tmp_path / "edges.geojsonl").write_text("")
+
+    with pytest.raises(RuntimeError, match="nothing to publish"):
+        publish.build_tiles(tmp_path / "edges.geojsonl", tmp_path / "o.pmtiles")
