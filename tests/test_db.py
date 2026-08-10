@@ -284,3 +284,49 @@ def test_status_reports_clustering_going_stale(con):
 
     _edge(con, 2, -100000, 51500000)
     assert aggregate._clustered(con).startswith("stale (1 of 2 edges")
+
+
+# --- pruning with non-road patterns present -----------------------------------
+
+
+def _tram_pattern(con, pattern_id=2, shape_id="SH2") -> None:
+    con.execute(
+        "INSERT INTO patterns (pattern_id, route_id, short_name, shape_id, n_stops, "
+        "n_trips, mode, first_seen, last_seen) "
+        "VALUES (?, 'R2', 'T1', ?, 2, 5, 'tram', 'F1', 'F1')",
+        [pattern_id, shape_id],
+    )
+    con.execute(
+        "INSERT INTO shapes VALUES (?, [53480000, 53481000], [-2245000, -2240000])",
+        [shape_id],
+    )
+
+
+def test_prune_is_not_blocked_by_a_pattern_that_is_never_matched(con):
+    """A tram gets no match_status row, ever. Counting it as pending would make
+    `prune` refuse for good on any database that keeps one."""
+    _one_live_pattern(con)
+    con.execute(
+        "INSERT INTO match_status "
+        "VALUES (1, 'ok', 'shape', 0.9, 100.0, 1.0, 2, NULL, now())"
+    )
+    _tram_pattern(con)
+
+    db.prune_shapes(con)  # does not raise
+
+
+def test_prune_keeps_the_geometry_a_non_road_pattern_is_drawn_from(con):
+    """`shapes` used to be matcher input and nothing else, so it could go whole.
+    For a tram it is the picture itself, and deleting it would blank the mode
+    silently at the next publish."""
+    _one_live_pattern(con)
+    con.execute(
+        "INSERT INTO match_status "
+        "VALUES (1, 'ok', 'shape', 0.9, 100.0, 1.0, 2, NULL, now())"
+    )
+    con.execute("INSERT INTO shapes VALUES ('SH1', [53480000], [-2245000])")
+    _tram_pattern(con)
+
+    # The bus's shape goes; the tram's stays.
+    assert db.prune_shapes(con) == 1
+    assert [r[0] for r in con.execute("SELECT shape_id FROM shapes").fetchall()] == ["SH2"]

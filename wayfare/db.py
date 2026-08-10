@@ -147,6 +147,36 @@ CREATE TABLE IF NOT EXISTS edge_services (
     n_trips     INTEGER    -- timetabled trips per week over this edge
 );
 
+-- What a non-road pattern is drawn from, when nothing matched it to a road.
+--
+-- A tram, metro or ferry has no Valhalla edge and no OSM way id: its geometry is
+-- the operator's own trace, copied here from `shapes` so that publishing reads one
+-- table rather than reassembling a join, and so a later pruning of `shapes` cannot
+-- take the picture with it.
+--
+-- Keyed on pattern_id and nothing else, because there is exactly one trace per
+-- pattern. That is the whole reason this table can exist without inventing an
+-- identity space: `edges.edge_id` is a Valhalla GraphId and minting synthetic
+-- values into it would collide with the one invariant the pipeline rests on, where
+-- `pattern_id` is already an identity this codebase owns.
+--
+-- The consequence, accepted deliberately: geometry is per pattern rather than
+-- shared, so two trams over one street are two coincident lines and there is no
+-- edge->services inversion to ask "which services use this track". Getting that
+-- back means snapping these traces to OSM way ids, which is a separate decision.
+CREATE TABLE IF NOT EXISTS segments (
+    pattern_id  BIGINT PRIMARY KEY,
+    mode        VARCHAR,
+    -- Micro-degree integer lists and a bbox, exactly as `edges` stores geometry,
+    -- so a window test is an integer overlap and nothing has to parse WKT.
+    lon_e6      INTEGER[],
+    lat_e6      INTEGER[],
+    min_lon_e6  INTEGER,
+    min_lat_e6  INTEGER,
+    max_lon_e6  INTEGER,
+    max_lat_e6  INTEGER
+);
+
 -- Free-form key/value for provenance: feed version, OSM extract date, the Valhalla
 -- graph build id that edge_id values belong to.
 CREATE TABLE IF NOT EXISTS meta (
@@ -604,17 +634,28 @@ def cluster(path: Path | None = None) -> tuple[int, int, int]:
 
 
 def prune_shapes(con: duckdb.DuckDBPyConnection) -> int:
-    """Drop the operator geometry once every pattern has been matched.
+    """Drop the operator geometry that nothing needs any more.
 
-    ``shapes`` is input to ``match`` and nothing else reads it. It is the largest
-    table in the file by a wide margin, so on a national run it is worth reclaiming
-    -- but only once there is no pending work, because a resumed run needs it.
+    ``shapes`` was once input to ``match`` and nothing else, so it could go whole
+    once matching finished. It is now also the *only* geometry a non-road pattern
+    has: a tram is drawn from its operator trace rather than matched, so its shape
+    is the picture and not an input to making one. Both clauses below exist because
+    of that, and getting either wrong is silent.
+
+    The pending test counts only matchable patterns. A tram never gets a
+    ``match_status`` row, so counting it as pending would make this refuse for ever
+    on any database that keeps one.
+
+    The delete then spares every shape a live non-matchable pattern still points at.
+    Those rows are worth keeping even after ``segments`` has copied them, because
+    the copy is derived and this is the source.
     """
     pending = scalar(
         con,
         f"""
         SELECT count(*) FROM patterns p
         WHERE {current_feed()}
+          AND {matchable()}
           AND NOT EXISTS (SELECT 1 FROM match_status m WHERE m.pattern_id = p.pattern_id)
         """,
     )
@@ -623,10 +664,18 @@ def prune_shapes(con: duckdb.DuckDBPyConnection) -> int:
             f"{pending} patterns are still unmatched; shapes is still needed. "
             "Finish `wayfare match` first."
         )
-    n = scalar(con, "SELECT count(*) FROM shapes")
-    con.execute("DELETE FROM shapes")
+    before = scalar(con, "SELECT count(*) FROM shapes")
+    con.execute(f"""
+        DELETE FROM shapes WHERE shape_id NOT IN (
+            SELECT p.shape_id FROM patterns p
+            WHERE {current_feed()} AND NOT {matchable()} AND p.shape_id IS NOT NULL
+        )
+    """)
+    kept = scalar(con, "SELECT count(*) FROM shapes")
+    if kept:
+        logs.get("db").info("kept %d shapes drawn directly by non-road patterns", kept)
     con.execute("CHECKPOINT")
-    return int(n)
+    return int(before - kept)
 
 
 def row(

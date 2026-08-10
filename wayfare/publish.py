@@ -33,6 +33,12 @@ log = logs.get("publish")
 
 LAYER = "bus"
 
+# The non-road modes, drawn from operator geometry rather than matched. A layer of
+# its own rather than a `mode` attribute on `bus`, because the two carry different
+# attributes and the viewer styles them differently -- and because tile-join keeps
+# distinct layer names, so this costs one more tippecanoe pass and nothing else.
+LAYER_SEGMENTS = "segments"
+
 # The archive a publish writes when it is told neither a path nor to use the region's
 # name. Region-agnostic, and deliberately still the default -- see `default_out`.
 DEFAULT_ARCHIVE = "bus.pmtiles"
@@ -45,6 +51,72 @@ Point = tuple[int, int]  # (lon_e6, lat_e6)
 # Python objects, which at national scale is several million rows of tuples and
 # integer lists.
 FETCH_ROWS = 50_000
+
+
+def export_segments_geojsonl(
+    con: duckdb.DuckDBPyConnection, path: Path | None = None
+) -> Path | None:
+    """Write the non-road patterns as one GeoJSON feature per line, or None.
+
+    None rather than an empty file when there is nothing to draw, so a bus-only
+    region skips the extra tippecanoe pass entirely instead of joining an empty
+    layer into every archive.
+
+    No coalescing and no streaming, and neither is an oversight. A segment is a
+    whole pattern's trace rather than a fragment of one, so there is nothing to
+    merge with anything -- and Great Britain has 630 of them against 2.7M edges, so
+    the table fits in memory many times over. `ORDER BY pattern_id` is here for the
+    same reason the edge export sorts: a rebuild has to be byte-identical.
+    """
+    n = con.execute("SELECT count(*) FROM segments").fetchone()
+    if not n or not n[0]:
+        return None
+
+    path = path or (config.WORK / "segments.geojsonl")
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    rows = con.execute(
+        """
+        SELECT s.pattern_id, s.mode, s.lon_e6, s.lat_e6,
+               COALESCE(NULLIF(trim(p.short_name), ''), p.route_id) AS ref,
+               p.n_trips
+        FROM segments s
+        JOIN patterns p USING (pattern_id)
+        ORDER BY s.pattern_id
+        """
+    ).fetchall()
+
+    with path.open("w") as fh:
+        for pattern_id, mode, lon_e6, lat_e6, ref, trips in rows:
+            fh.write(
+                json.dumps(
+                    {
+                        "type": "Feature",
+                        "properties": {
+                            "id": pattern_id,
+                            "mode": mode,
+                            "ref": ref,
+                            "trips": trips,
+                        },
+                        "geometry": {
+                            "type": "LineString",
+                            "coordinates": [
+                                # strict: the two lists are one polyline stored as
+                                # parallel arrays, so a length mismatch is corrupt
+                                # geometry. Truncating to the shorter would draw a
+                                # confident line that stops halfway.
+                                [x / 1e6, y / 1e6]
+                                for x, y in zip(lon_e6, lat_e6, strict=True)
+                            ],
+                        },
+                    },
+                    separators=(",", ":"),
+                )
+            )
+            fh.write("\n")
+
+    log.info("%d non-road segments written to %s", len(rows), path)
+    return path
 
 
 def export_geojsonl(con: duckdb.DuckDBPyConnection, path: Path | None = None) -> Path:
@@ -401,7 +473,10 @@ def _hold_back(geojsonl: Path, out: Path, floors: Mapping[Cell, int]) -> Path:
 
 
 def build_tiles(
-    geojsonl: Path, out: Path | None = None, attribution: str | None = None
+    geojsonl: Path,
+    out: Path | None = None,
+    attribution: str | None = None,
+    segments: Path | None = None,
 ) -> Path:
     """Build the archive in three zoom bands and join them.
 
@@ -473,6 +548,25 @@ def build_tiles(
             part = tmp / f"{name}.pmtiles"
             _tippecanoe(src, part, lo, hi, exclude, attribution, extend)
             parts.append(part)
+        # One pass over the whole zoom range rather than banded like the roads. The
+        # bands exist to stop millions of edges paying for info-card attributes at
+        # zooms nobody reads them at, and to thin the quietest roads out of the far
+        # view; there are hundreds of segments, not millions, and a tram line thinned
+        # out of its own layer would just be missing. `extend` is off because the
+        # band already reaches MAX_ZOOM and there is nothing above it to grow into.
+        if segments:
+            tiles = tmp / "segments.pmtiles"
+            _tippecanoe(
+                segments,
+                tiles,
+                config.MIN_ZOOM,
+                config.MAX_ZOOM,
+                (),
+                attribution,
+                False,
+                layer=LAYER_SEGMENTS,
+            )
+            parts.append(tiles)
         _tile_join(joined, parts)
         size = joined.stat().st_size
         # os.replace, not shutil.move: a rename within one filesystem is atomic, so
@@ -495,6 +589,7 @@ def _tippecanoe(
     exclude: Sequence[str],
     attribution: str,
     extend: bool = True,
+    layer: str = LAYER,
 ) -> None:
     cmd = [
         "tippecanoe",
@@ -502,7 +597,7 @@ def _tippecanoe(
         str(out),
         "--force",
         "-l",
-        LAYER,
+        layer,
         "-Z",
         str(min_zoom),
         "-z",
@@ -642,8 +737,14 @@ def build(
             f"{from_export} is not there. --from-export names the GeoJSONL a previous "
             "publish wrote, and this data root has none."
         )
+    # Without a connection there is no `segments` table to read, so a build from an
+    # export is the road network and nothing else. The segments GeoJSONL is
+    # deliberately not rebuilt from the export instead: the export *is* the road
+    # network, and a rebuild that quietly dropped a region's trams would look like a
+    # successful publish.
     return build_tiles(
         from_export,
         out or default_out(region),
         attribution=config.credit_html(region),
+        segments=export_segments_geojsonl(con) if con is not None else None,
     )

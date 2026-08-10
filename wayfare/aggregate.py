@@ -53,6 +53,54 @@ def build(con: duckdb.DuckDBPyConnection) -> None:
         con, "SELECT count(DISTINCT edge_id), count(*) FROM edge_services"
     )
     log.info("%d edges carry %d edge-service pairs", n_edges, n_rows)
+    build_segments(con)
+
+
+def build_segments(con: duckdb.DuckDBPyConnection) -> None:
+    """Copy the operator trace of every live non-road pattern into `segments`.
+
+    This is the whole of "drawing" a tram. There is no matcher, no routing and no
+    snapping: the operator recorded where the vehicle goes, and for a mode with no
+    road under it that recording is the best geometry available and the only one.
+    Metrolink's traces run to a median 474 points, which is the same order as the
+    bus feed's 849 -- a survey rather than a schematic.
+
+    Rebuilt outright rather than merged. It is derived from `patterns` and `shapes`
+    and costs nothing to recompute, so it holds the current feed only, exactly like
+    `pattern_stops`. A departed tram stops being drawn on the next run, which is the
+    same rule `edge_services` follows.
+
+    A non-road pattern with no shape gets no row and is simply not drawn. That is
+    the "bad geometry is worse than missing geometry" rule applied to the one case
+    where inventing would be easy: the stops are known, and a straight line between
+    them would render perfectly happily down the wrong side of a river.
+    """
+    con.execute("DELETE FROM segments")
+    con.execute(f"""
+        INSERT INTO segments
+        SELECT p.pattern_id, p.mode, s.lon_e6, s.lat_e6,
+               list_min(s.lon_e6), list_min(s.lat_e6),
+               list_max(s.lon_e6), list_max(s.lat_e6)
+        FROM patterns p
+        JOIN shapes s ON s.shape_id = p.shape_id
+        WHERE {db.current_feed()} AND NOT {db.matchable()}
+    """)
+    drawn, missing = db.row(
+        con,
+        f"""
+        SELECT (SELECT count(*) FROM segments),
+               (SELECT count(*) FROM patterns p
+                WHERE {db.current_feed()} AND NOT {db.matchable()}
+                  AND p.shape_id IS NULL)
+        """,
+    )
+    if drawn or missing:
+        log.info(
+            "%d non-road patterns drawn from operator geometry, "
+            "%d have none and are not drawn",
+            drawn,
+            missing,
+        )
 
 
 def _clustered(con: duckdb.DuckDBPyConnection) -> str:

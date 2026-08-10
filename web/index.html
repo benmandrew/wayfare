@@ -304,7 +304,11 @@ let ARCHIVES = [];
 // is one archive, one tile pyramid, and there is no union source.
 let REGIONS = [];
 
-const LAYER_SRC = "bus";    // the single vector layer inside every archive
+const LAYER_SRC = "bus";    // the matched road network inside every archive
+// The modes that were never matched, drawn from operator geometry. A layer of its
+// own inside the same archive, absent from a bus-only region -- MapLibre tolerates
+// a layer whose source-layer is missing, so nothing has to ask first.
+const LAYER_SEG = "segments";
 
 // Sequential ramps over service count. Light goes pale-blue -> deep violet so
 // busy roads darken against the light basemap; dark goes the other way, into
@@ -318,6 +322,17 @@ const BASEMAP = {
   dark:  "dark_all",
 };
 const HOVER_COLOUR = { light: "#d64512", dark: "#ffffff" };
+
+// One colour per non-road mode, and deliberately outside the bus ramp rather than
+// an extension of it. The bus ramp encodes *how many* services use a road; a tram
+// line is one service on its own track, so a position on that ramp would be a
+// number nobody can read. These say "this is a different mode" and nothing else.
+const MODE_COLOUR = {
+  light: { tram: "#b5327a", metro: "#00695f", ferry: "#1f6fb2", rail: "#7a4b16" },
+  dark:  { tram: "#ff86c4", metro: "#4fd6c0", ferry: "#6ab7f0", rail: "#e0a566" },
+};
+const MODE_LABEL = { tram: "Tram", metro: "Metro", ferry: "Ferry", rail: "Rail" };
+const FALLBACK_MODE_COLOUR = { light: "#6b6b6b", dark: "#b9b9b9" };
 
 const $ = (id) => document.getElementById(id);
 let theme = localStorage.getItem("wayfare-theme")
@@ -348,6 +363,26 @@ const width = (bump) => [
 ];
 const HOVER_BUMP = ["case", ["boolean", ["feature-state", "hover"], false], 2, 0];
 
+// Colour by mode rather than by count. `match` falls through to grey for a mode
+// this page has no colour for, so a feed that starts publishing funiculars draws
+// them in grey rather than not at all.
+const modeColourExpr = (t) => [
+  "match", ["get", "mode"],
+  ...Object.entries(MODE_COLOUR[t]).flatMap(([m, c]) => [m, c]),
+  FALLBACK_MODE_COLOUR[t],
+];
+
+// A segment carries no service count, so its width ramps on zoom alone. Slightly
+// wider than a quiet road at every zoom: there is one tram line where there are
+// twenty streets, and it should read as infrastructure rather than as a lane.
+const segWidth = (bump) => [
+  "interpolate", ["linear"], ["zoom"],
+  6,  ["+", 0.8, bump],
+  9,  ["+", 1.6, bump],
+  12, ["+", 2.6, bump],
+  16, ["+", 4.5, bump],
+];
+
 // The hovered segment in the accent colour, everything else off the ramp. Shared
 // with the theme toggle, which rebuilds the same expression for every region.
 const hoverOr = (base) => [
@@ -368,6 +403,17 @@ const tokenFilter = (tokens) => [
     ["upcase", ["concat", ",", ["to-string", ["get", "refs"]], ","]],
   ]),
 ];
+// A segment carries one service in `ref`, not a comma-joined list in `refs`, so
+// it matches on equality rather than on substring-between-commas.
+const segTokenFilter = (tokens) => [
+  "any",
+  ...tokens.map((tok) => ["==", ["upcase", ["to-string", ["get", "ref"]]], tok]),
+];
+// Dimmed in place rather than given a match layer of its own. A segment is one
+// feature per service, so "the matching ones" is a property test on the layer
+// already drawn -- where a road carries many services and needs a second pass.
+const segOpacity = (tokens) =>
+  tokens.length ? ["case", segTokenFilter(tokens), 0.95, 0.1] : 0.95;
 const NEVER = ["==", ["id"], -1];
 
 /* ---------- boot ---------- */
@@ -421,6 +467,7 @@ async function openArchive(name, i) {
       src: `region-${i}`,
       layer: `bus-${i}`,
       match: `bus-match-${i}`,
+      seg: `seg-${i}`,
     };
   } catch (err) {
     console.error(`could not read ${url}`, err);
@@ -555,6 +602,21 @@ const busLayer = (r) => ({
   },
 });
 
+// Trams, metros and ferries, drawn from the operator's own trace because nothing
+// map-matched them. Same source, different layer inside the archive.
+const segLayer = (r) => ({
+  id: r.seg,
+  type: "line",
+  source: r.src,
+  "source-layer": LAYER_SEG,
+  layout: { "line-cap": "round", "line-join": "round" },
+  paint: {
+    "line-color": hoverOr(modeColourExpr(theme)),
+    "line-width": segWidth(HOVER_BUMP),
+    "line-opacity": 0.95,
+  },
+});
+
 // Drawn only while a filter is active: the matching services on top of the
 // dimmed network.
 const matchLayer = (r) => ({
@@ -613,11 +675,17 @@ function start(missing) {
   // on top of the neighbouring region's dimmed network too -- and the two parts
   // of Ireland genuinely overlap, because both were matched against the same
   // island graph, so a cross-border road is in both archives.
+  // Segments sit above every region's road network and below the match highlight.
+  // Above the roads because a tram on a street would otherwise be buried under the
+  // bus line sharing it; below the match highlight because a filtered service still
+  // has to be the brightest thing on screen.
   const layers = [{ id: "basemap", type: "raster", source: "basemap" }];
   for (const r of REGIONS) layers.push(busLayer(r));
+  for (const r of REGIONS) layers.push(segLayer(r));
   for (const r of REGIONS) layers.push(matchLayer(r));
 
   const BUS = REGIONS.map((r) => r.layer);
+  const SEG = REGIONS.map((r) => r.seg);
   const MATCH = REGIONS.map((r) => r.match);
 
   const map = new maplibregl.Map({
@@ -677,9 +745,14 @@ function start(missing) {
 
   // A feature is identified by its source as well as its id: the id is
   // tippecanoe's edge id, unique inside one archive and meaningless across them.
-  let hovered = null; // { src, id }
+  // The source-layer rides along because there are now two of them in one archive
+  // and setFeatureState addresses a feature by all three.
+  let hovered = null; // { src, sourceLayer, id }
   const setHover = (h, on) =>
-    map.setFeatureState({ source: h.src, sourceLayer: LAYER_SRC, id: h.id }, { hover: on });
+    map.setFeatureState(
+      { source: h.src, sourceLayer: h.sourceLayer, id: h.id },
+      { hover: on }
+    );
 
   // One query over every region's layer, rather than a handler bound to each.
   // Every hit goes to the card, because on a road two archives both hold, one
@@ -690,17 +763,23 @@ function start(missing) {
   // — the service lists run long and reading one shouldn't require holding the
   // cursor still. The highlight does not.
   map.on("mousemove", (e) => {
-    const hits = map.queryRenderedFeatures(e.point, { layers: BUS });
+    // Segments are queried first because they are drawn above the roads: a tram
+    // on a street should answer for the line the cursor is actually over. There
+    // is nothing to merge across regions -- a segment is one pattern's own trace,
+    // not a road two archives independently describe.
+    const segHits = map.queryRenderedFeatures(e.point, { layers: SEG });
+    const hits = segHits.length ? segHits : map.queryRenderedFeatures(e.point, { layers: BUS });
     const f = hits[0];
     map.getCanvas().style.cursor = f ? "pointer" : "";
     if (hovered && (!f || hovered.id !== f.id || hovered.src !== f.source)) {
       setHover(hovered, false);
       hovered = null;
     }
-    if (!f || hovered) return; // nothing under the cursor, or the same road still
-    hovered = { src: f.source, id: f.id };
+    if (!f || hovered) return; // nothing under the cursor, or the same line still
+    hovered = { src: f.source, sourceLayer: f.sourceLayer, id: f.id };
     setHover(hovered, true);
-    showFeature(mergeRegions(hits));
+    if (segHits.length) showSegment(f.properties);
+    else showFeature(mergeRegions(hits));
   });
 
   /* ---------- filter ---------- */
@@ -722,6 +801,7 @@ function start(missing) {
       map.setLayoutProperty(id, "visibility", on ? "visible" : "none");
     }
     for (const id of BUS) map.setPaintProperty(id, "line-opacity", on ? 0.12 : 0.85);
+    for (const id of SEG) map.setPaintProperty(id, "line-opacity", segOpacity(active));
 
     if (on) {
       countMatches();
@@ -789,6 +869,8 @@ function start(missing) {
     const colour = hoverOr(colourExpr(theme));
     for (const id of BUS) map.setPaintProperty(id, "line-color", colour);
     for (const id of MATCH) map.setPaintProperty(id, "line-color", HOVER_COLOUR[theme]);
+    const segColour = hoverOr(modeColourExpr(theme));
+    for (const id of SEG) map.setPaintProperty(id, "line-color", segColour);
   });
 
   /* ---------- info card ---------- */
@@ -818,6 +900,22 @@ function start(missing) {
       ? `Showing ${shown} of ${n} services.`
       : "Zoom in to see which services run here.";
     redrawChips();
+  }
+
+  // A segment is one service on its own alignment, so the card says what it is
+  // rather than how many things share it. There is no way id, because nothing
+  // matched it to an OpenStreetMap way -- which is the honest thing to show: this
+  // geometry is the operator's own trace, not a road the pipeline identified.
+  function showSegment(p) {
+    current = null; // no service list, so nothing for the chips to draw
+    const mode = MODE_LABEL[p.mode] || p.mode || "Other";
+    $("road").textContent = p.ref ? `${mode} ${p.ref}` : mode;
+    $("road").classList.remove("empty");
+    $("meta").innerHTML =
+      `<b>${Number(p.trips || 0).toLocaleString()}</b> trips/week · operator geometry`;
+    $("note").hidden = false;
+    $("note").textContent = `Drawn from the operator's own trace, not map-matched.`;
+    $("chips").innerHTML = "";
   }
 
   function redrawChips() {

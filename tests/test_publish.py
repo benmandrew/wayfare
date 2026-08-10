@@ -582,12 +582,13 @@ def test_publish_stamps_the_region_it_was_given(monkeypatch, tmp_path):
     licence is a property of the feed and not of the machine running the build."""
     seen = {}
 
-    def fake_build_tiles(path, out=None, attribution=None):
+    def fake_build_tiles(path, out=None, attribution=None, segments=None):
         seen["credit"] = attribution
         return tmp_path / "bus.pmtiles"
 
     monkeypatch.setattr(config, "OUT", tmp_path)
     monkeypatch.setattr(publish, "export_geojsonl", lambda con: tmp_path / "e.geojsonl")
+    monkeypatch.setattr(publish, "export_segments_geojsonl", lambda con: None)
     monkeypatch.setattr(publish, "build_tiles", fake_build_tiles)
     publish.build(_A_CONNECTION, region="ireland")
     assert seen["credit"] == config.credit_html("ireland")
@@ -604,11 +605,14 @@ def _built_out(monkeypatch, tmp_path, **kwargs) -> Path:
     """Run `build` against a stubbed tippecanoe and report the path it chose."""
     seen = {}
 
-    def fake_build_tiles(path, out=None, attribution=None):
+    def fake_build_tiles(path, out=None, attribution=None, segments=None):
         seen["out"] = out
         return out
 
     monkeypatch.setattr(publish, "export_geojsonl", lambda con: tmp_path / "e.geojsonl")
+    # Stubbed alongside the edge export: this helper is about which path `build`
+    # chooses, and it hands `build` a None connection to prove it never reads one.
+    monkeypatch.setattr(publish, "export_segments_geojsonl", lambda con: None)
     monkeypatch.setattr(publish, "build_tiles", fake_build_tiles)
     publish.build(_A_CONNECTION, **kwargs)
     return seen["out"]
@@ -852,3 +856,133 @@ def test_from_export_publishes_without_touching_the_database(monkeypatch, tmp_pa
     assert cli.main(["publish", "--from-export"]) == 0
     assert seen["con"] is None
     assert seen["from_export"] == tmp_path / "edges.geojsonl"
+
+
+# --- non-road segments --------------------------------------------------------
+
+
+def _tram(con, pattern_id, lon_e6, lat_e6, ref="T1", trips=50, mode="tram"):
+    con.execute(
+        "INSERT INTO patterns (pattern_id, route_id, short_name, n_stops, n_trips, "
+        "mode, first_seen, last_seen) VALUES (?, 'R9', ?, 2, ?, ?, 'F1', 'F1')",
+        [pattern_id, ref, trips, mode],
+    )
+    con.execute(
+        "INSERT INTO segments VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            pattern_id,
+            mode,
+            lon_e6,
+            lat_e6,
+            min(lon_e6),
+            min(lat_e6),
+            max(lon_e6),
+            max(lat_e6),
+        ],
+    )
+
+
+def test_a_region_with_no_segments_writes_no_file(con, tmp_path):
+    """None rather than an empty file, so a bus-only region skips the extra
+    tippecanoe pass instead of joining an empty layer into every archive."""
+    assert publish.export_segments_geojsonl(con, tmp_path / "s.geojsonl") is None
+    assert not (tmp_path / "s.geojsonl").exists()
+
+
+def test_a_segment_becomes_one_feature_carrying_its_mode(con, tmp_path):
+    """A segment is a whole pattern's trace, so it is one feature and there is
+    nothing to coalesce it with. The mode rides along because the viewer styles a
+    tram differently from a ferry."""
+    from wayfare import db
+
+    db.set_meta(con, "feed_version", "F1")
+    _tram(con, 1, [-2245000, -2240000], [53480000, 53481000], ref="Metrolink")
+
+    path = publish.export_segments_geojsonl(con, tmp_path / "s.geojsonl")
+    assert path is not None
+    features = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(features) == 1
+    assert features[0]["properties"] == {
+        "id": 1,
+        "mode": "tram",
+        "ref": "Metrolink",
+        "trips": 50,
+    }
+    assert features[0]["geometry"]["coordinates"] == [[-2.245, 53.48], [-2.24, 53.481]]
+
+
+def test_the_segment_export_is_deterministic(con, tmp_path):
+    """Two runs must be byte-identical, for the same reason the edge export must:
+    it is what makes tiles cacheable and two builds comparable."""
+    from wayfare import db
+
+    db.set_meta(con, "feed_version", "F1")
+    _tram(con, 7, [-2245000, -2240000], [53480000, 53481000])
+    _tram(con, 3, [-2240000, -2235000], [53481000, 53482000], mode="ferry")
+
+    a = publish.export_segments_geojsonl(con, tmp_path / "a.geojsonl")
+    b = publish.export_segments_geojsonl(con, tmp_path / "b.geojsonl")
+    assert a is not None and b is not None
+    assert a.read_bytes() == b.read_bytes()
+    # Ordered by pattern_id, so the order is defined rather than incidentally equal.
+    assert [json.loads(x)["properties"]["id"] for x in a.read_text().splitlines()] == [3, 7]
+
+
+def test_segments_are_one_more_pass_joined_into_the_same_archive(monkeypatch, tmp_path):
+    """A layer of its own rather than an attribute on `bus`: tile-join keeps
+    distinct layer names, so the whole cost is one more tippecanoe pass. One pass
+    over the full zoom range, not banded like the roads -- the bands thin the
+    quietest roads out of the far view, and a tram line thinned out of its own layer
+    would just be missing."""
+    import subprocess
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
+    monkeypatch.setattr(publish.subprocess, "run", fake_run)
+
+    publish.build_tiles(
+        write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3]),
+        tmp_path / "bus.pmtiles",
+        segments=tmp_path / "segments.geojsonl",
+    )
+
+    far, near, detail, seg, join = calls
+    assert seg[seg.index("-l") + 1] == publish.LAYER_SEGMENTS
+    assert far[far.index("-l") + 1] == publish.LAYER
+    assert seg[seg.index("-Z") + 1] == str(config.MIN_ZOOM)
+    assert seg[seg.index("-z") + 1] == str(config.MAX_ZOOM)
+    # Not extended: the band already reaches MAX_ZOOM, and only the last road band
+    # may grow past its own ceiling.
+    assert "--extend-zooms-if-still-dropping" not in seg
+    # Every input carries the credit, so a band inspected on its own still says
+    # where it came from.
+    assert join[0] == "tile-join"
+    assert sum(1 for a in seg if a.startswith("--attribution=")) == 1
+
+
+def test_a_bus_only_region_gets_no_segments_pass(monkeypatch, tmp_path):
+    """Passing None must skip the pass rather than join an empty layer into every
+    archive that has no trams."""
+    import subprocess
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
+    monkeypatch.setattr(publish.subprocess, "run", fake_run)
+
+    publish.build_tiles(
+        write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3]), tmp_path / "bus.pmtiles"
+    )
+    assert len(calls) == 4  # far, near, detail, join -- and nothing else
+    assert not any(publish.LAYER_SEGMENTS in c for c in calls)
