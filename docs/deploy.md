@@ -73,6 +73,16 @@ name is left to raise rather than being dropped, on the same reading as
 `--force-graph`: renaming a mode should break the timer and be dealt with by a
 person.
 
+**Deselecting a mode has to retire its patterns, because nothing else will.** A
+pattern normally leaves by not being seen in a *newer* feed. Narrowing `--modes` and
+rebuilding against the feed already on disk leaves `last_seen` at a version that is
+still current, so the deselected patterns stay live, keep their geometry and are
+published again, and turning a mode off appears to do nothing.
+`gtfs._retire_unselected_modes` deletes them after the merge. A NULL mode is never
+retired — it means a database written before modes existed, where everything stored
+is road-going by construction, and matching those against a name would delete a
+national match run.
+
 ## Installing it
 
 `refresh.sh` stays in the checkout and finds its own compose file, so it can be run

@@ -265,6 +265,19 @@ def test_the_selection_is_remembered_across_a_bare_rebuild(gtfs_dir: Path, con):
     ) == {"bus": 2, "ferry": 1}
 
 
+def test_an_explicit_selection_still_narrows_a_remembered_one(gtfs_dir: Path, con):
+    """Inheriting must not become a one-way door: going back to road only is a
+    thing a person does deliberately, and `--modes` is how they say so."""
+    gtfs.build_patterns(
+        gtfs_dir, con, memory_limit="1GB", modes=frozenset({"bus", "ferry"})
+    )
+    gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB", modes=frozenset({"bus"}))
+    assert {r[0] for r in con.execute("SELECT DISTINCT mode FROM patterns").fetchall()} == {
+        "bus"
+    }
+    assert db.get_meta(con, "modes") == "bus"
+
+
 def test_an_unknown_mode_name_is_refused(gtfs_dir: Path, con):
     """A typo in --modes would otherwise read as a feed that happens to carry no
     trams, which is the quiet-wrong-answer failure this codebase keeps hitting."""

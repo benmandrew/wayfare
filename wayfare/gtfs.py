@@ -169,6 +169,33 @@ def _report_kept_modes(con: duckdb.DuckDBPyConnection) -> None:
         log.info("keeping %s: %d routes, %d trips", mode, n_routes, n_trips)
 
 
+def _retire_unselected_modes(con: duckdb.DuckDBPyConnection, kept: frozenset[str]) -> int:
+    """Drop patterns of a mode this build no longer wants.
+
+    A pattern normally leaves by not being seen in a *newer* feed, and that is not
+    what happens here: narrowing `--modes` and rebuilding against the feed already
+    on disk leaves `last_seen` at a version that is still current, so the deselected
+    patterns stay live, keep their geometry and are published again. Turning a mode
+    off would appear to do nothing.
+
+    A NULL mode is never retired. It means a database written before modes existed,
+    where everything stored is road-going by construction -- the same reading
+    `db.matchable` takes -- and matching those against a name would delete a national
+    match run.
+    """
+    if not kept:  # a caller with an empty selection is refused long before this
+        return 0
+    keep = ", ".join(f"'{m}'" for m in sorted(kept))
+    n = db.scalar(
+        con,
+        f"SELECT count(*) FROM patterns WHERE mode IS NOT NULL AND mode NOT IN ({keep})",
+    )
+    if n:
+        con.execute(f"DELETE FROM patterns WHERE mode IS NOT NULL AND mode NOT IN ({keep})")
+        log.info("retired %d patterns whose mode is no longer selected", n)
+    return int(n)
+
+
 def stored_modes(con: duckdb.DuckDBPyConnection) -> frozenset[str]:
     """The mode selection this database was last built with, or the default.
 
@@ -334,6 +361,7 @@ def build_patterns(
         """,
         [feed, feed],
     )
+    _retire_unselected_modes(con, kept_modes)
     # Written only once the merge has succeeded. Every other stage reads this to
     # decide which patterns are live, so a crash part-way through leaves the
     # previous feed's dataset intact and usable rather than half-replaced.
