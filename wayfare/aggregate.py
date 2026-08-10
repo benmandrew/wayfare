@@ -124,15 +124,23 @@ def coverage(con: duckdb.DuckDBPyConnection) -> dict[str, object]:
 
     Reported as a funnel rather than a single number: a run that matched 95% of
     patterns but dropped the busiest ones is worse than the percentage suggests.
+
+    Every number in that funnel counts *matchable* patterns only. A tram will never
+    hold a `match_status` row, so counting it as unmatched would put a floor under
+    `patterns_pending` that no amount of matching could lift -- and `patterns_pending`
+    is half of what `deploy/refresh.sh` gates a publish on, so that floor would stop a
+    scheduled region publishing again, permanently. What the other modes are doing is
+    `patterns_by_mode` instead.
     """
     live = db.current_feed()
+    owed = f"{live} AND {db.matchable('p')}"
     matched, total = db.row(
         con,
         f"""
         SELECT
           (SELECT count(*) FROM patterns p JOIN match_status m USING (pattern_id)
-             WHERE m.status = 'ok' AND {live}),
-          (SELECT count(*) FROM patterns p WHERE {live})
+             WHERE m.status = 'ok' AND {owed}),
+          (SELECT count(*) FROM patterns p WHERE {owed})
         """,
     )
 
@@ -142,23 +150,35 @@ def coverage(con: duckdb.DuckDBPyConnection) -> dict[str, object]:
         SELECT
           (SELECT COALESCE(sum(p.n_trips), 0) FROM patterns p
              JOIN match_status m USING (pattern_id)
-             WHERE m.status = 'ok' AND {live}),
-          (SELECT COALESCE(sum(p.n_trips), 0) FROM patterns p WHERE {live})
+             WHERE m.status = 'ok' AND {owed}),
+          (SELECT COALESCE(sum(p.n_trips), 0) FROM patterns p WHERE {owed})
         """,
     )
 
     return {
         "feed_version": db.get_meta(con, "feed_version"),
         "graph_id": db.get_meta(con, "graph_id"),
+        "modes": db.get_meta(con, "modes"),
         "patterns_total": total,
         "patterns_matched": matched,
         "patterns_pct": round(100.0 * matched / max(total, 1), 1),
+        # Live patterns per mode, matchable or not. This is the only place a mode
+        # going missing is visible: `patterns` rebuilds from whatever selection it
+        # was given, so a refresh that lost its `--modes` drops every tram silently
+        # and every other number here stays healthy while it does.
+        "patterns_by_mode": {
+            row[0] or "unknown": row[1]
+            for row in con.execute(
+                f"SELECT p.mode, count(*) FROM patterns p WHERE {live} "
+                "GROUP BY p.mode ORDER BY p.mode"
+            ).fetchall()
+        },
         # What a scheduled run needs to know: how much of this feed is still owed
         # to the matcher, and therefore whether the tiles are complete yet.
         "patterns_pending": db.scalar(
             con,
             f"""
-            SELECT count(*) FROM patterns p WHERE {live}
+            SELECT count(*) FROM patterns p WHERE {owed}
               AND NOT EXISTS (SELECT 1 FROM match_status m
                               WHERE m.pattern_id = p.pattern_id)
             """,

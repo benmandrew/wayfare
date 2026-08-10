@@ -80,6 +80,15 @@ selectable. Do not pipeline across batch boundaries without an in-flight exclusi
 **Every consumer of `patterns` filters on `db.current_feed()`**, so departed patterns
 are never matched, aggregated or rendered.
 
+**The mode selection lives in `meta.modes`, not in the invocation.** `patterns` rebuilds
+the table from whatever selection it is handed and `deploy/refresh.sh` hands it none, so
+it defaults to `gtfs.stored_modes`, and narrowing the selection retires the deselected
+patterns because rebuilding against the feed already on disk leaves them live. Every
+number in the coverage funnel counts *matchable* patterns only: a tram never gets a
+`match_status` row, so counting it as unmatched puts a permanent floor under
+`patterns_pending`, which is half of what the scheduled refresh gates a publish on.
+`patterns_by_mode` is where the other modes are counted.
+
 **Migrations rewrite in place; they never re-run the pipeline.** A national match run
 costs a day or two, so a schema change it cannot survive is one nobody applies.
 
