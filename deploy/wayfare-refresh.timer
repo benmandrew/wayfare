@@ -1,0 +1,19 @@
+# Monthly, which is the largest sensible gap rather than the natural one: BODS
+# republishes far more often, and the two feeds churn was first measured against
+# were two days apart. A shorter period means less churn per run and a shorter
+# drain, so move this in once the monthly figure is known. See docs/deploy.md.
+
+[Unit]
+Description=wayfare monthly refresh
+
+[Timer]
+OnCalendar=monthly
+
+# Persistent so a refresh missed while the box was down runs when it comes back,
+# rather than being skipped until next month. RandomizedDelaySec keeps a fleet of
+# these off BODS at the same instant.
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target

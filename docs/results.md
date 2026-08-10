@@ -58,10 +58,39 @@ docs/pipeline.md, so the `skipped` and `error` counts are what those bounds cost
 rather than what the pipeline now achieves. Re-matching the 1,555 skipped and 462
 error patterns is a `wayfare match --retry skipped,error` away and has not been run.
 
-`patterns` holds exactly one feed version, so feed churn is still unmeasured — the
-number CLAUDE.md calls the one that decides everything. It costs one `acquire` and
-one `patterns` against a second national feed; the incremental machinery has been
-built and waiting since 2026-08-07.
+## Feed churn, Wales, 2026-08-08
+
+The first measurement of churn against two real consecutive feeds. Wales data root
+(`data`), previous stored feed `20260806_023912`, new feed `20260808_024504` — a
+two-day gap, not a month.
+
+| Measure | Result |
+|---|---|
+| patterns before -> after | 3,584 -> **3,541** |
+| `patterns` log | **30 new** · 0 carried over still unmatched · **73 departed** |
+| accounting | 3,584 − 73 + 30 = 3,541, exact |
+| `wayfare status` | `patterns_pending` 30, `patterns_departed` 73, 3,327 of 3,541 matched (94.0%) |
+| share of the live set | 30 patterns = 0.85%, carrying 2,741 of 146,433 trips = **1.87% of service** |
+| catch-up cost | 30 patterns at Wales's measured 3.6/s, **~8s** against 16m23s for the full run |
+
+New patterns run busier than average: 0.85% of the live set carries 1.87% of
+timetabled trips. The catch-up is roughly a 120x reduction in match time, which is
+what makes an incremental run a routine operation rather than a rebuild.
+
+All 73 departed patterns keep their `match_status` rows — 3,614 pattern rows against
+3,584 status rows, 73 of 73 departed still cached — so a seasonal service that
+returns is free.
+
+Three caveats travel with the number. Two days is not a month: scaling linearly to
+~12.8% over 30 days is an **upper bound**, not an estimate, because the same volatile
+patterns flipping in and out repeatedly make the union over 30 days far smaller than
+15 two-day windows. It is also Wales, at 85.2% operator geometry against the national
+48.3%, and one region rather than the nation. And the run also triggered
+`_migrate_pattern_ids`, because this database still held rank ids — that migration
+recomputes the identity hash from the stored `pattern_stops` with the same SQL
+expression `build_patterns` uses, and aborts on any unmapped pattern or hash
+collision, so old and new ids are directly comparable and the churn figure is not a
+migration artefact.
 
 ## Determinism
 

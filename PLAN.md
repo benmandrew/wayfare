@@ -282,6 +282,14 @@ covers before building it.
 
 ## Known gaps
 
+**Departed patterns are counted but never evicted.** `prune_shapes` drops operator
+geometry only; nothing removes a departed pattern's `pattern_edges` rows. Wales
+departed 73 of 3,584 patterns across a two-day feed gap, about 2%, and the edges of
+all 73 stay in the table, so `pattern_edges` grows monotonically however long a
+database is kept current. Keeping the `match_status` rows is deliberate — a seasonal
+service that returns is then free — but no policy decides when the edges of a pattern
+that is not coming back should go, and none has been written.
+
 **Northern Ireland's two halves are published on unrelated cadences.** The
 timetable is republished every few weeks and the road geometry has not moved since
 2025-09-23, so hundreds of timetabled stops exist that the geometry has never heard
@@ -294,6 +302,13 @@ rest.
 `edge_id` depends on the build. `match.pin_graph` refuses rather than silently mixing
 two GraphId spaces, but nothing reuses matches across builds. `way_id` survives a
 rebuild, so re-anchoring on it is the obvious thing to try.
+
+**`publish` overwrites the served archive in place.** `_tile_join` runs `tile-join -o
+<out> --force`, writing the final `.pmtiles` directly, and the `web` service serves
+`/data/out` from the same volume `publish` writes to. A client pulling byte ranges
+through a republish can read across the rewrite. The window is short — seconds to a
+minute, once a month — but the fix is to write to a staging path and rename, since a
+rename within one filesystem is atomic.
 
 **`edges` has no spatial index.** A national window reads the whole table however it
 is asked for. `wayfare cluster` prunes it to a fraction, but the scan was never where
