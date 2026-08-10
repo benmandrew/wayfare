@@ -252,6 +252,41 @@ def test_the_overview_band_drops_the_card_only_attributes(monkeypatch, tmp_path)
     assert join[0] == "tile-join"
 
 
+def test_a_publish_never_shows_a_half_built_archive(monkeypatch, tmp_path):
+    """The output directory is served. `server.archives` globs `*.pmtiles` there and
+    the viewer loads every archive it is offered, so a band built beside the archive
+    was advertised as a region for the length of a publish -- and the archive itself
+    was rewritten under clients reading it in byte ranges.
+
+    The glob is spelled out rather than imported so this stays a test of what is on
+    disk; it is the same one `server.archives` runs.
+    """
+    import subprocess
+
+    out = tmp_path / "out" / "great_britain.pmtiles"
+    out.parent.mkdir(parents=True)
+    out.write_bytes(b"the previous archive")
+    seen = []
+
+    def fake_run(cmd, **_):
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"the new one")
+        seen.append(
+            (sorted(p.name for p in out.parent.glob("*.pmtiles")), out.read_bytes())
+        )
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
+    monkeypatch.setattr(publish.subprocess, "run", fake_run)
+    publish.build_tiles(tmp_path / "edges.geojsonl", out)
+
+    # Both tippecanoe passes and the join: one archive on offer throughout, and it
+    # is the one that was there before, whole.
+    assert seen == [(["great_britain.pmtiles"], b"the previous archive")] * 3
+    # Swapped only at the end, and the scratch directory taken away with it.
+    assert out.read_bytes() == b"the new one"
+    assert [p.name for p in out.parent.iterdir()] == ["great_britain.pmtiles"]
+
+
 def test_dropping_is_reported_not_silent(caplog):
     """--drop-densest-as-needed sheds features to fit a tile. A build that kept a
     quarter of the network at low zoom must not read as full coverage."""

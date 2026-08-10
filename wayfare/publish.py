@@ -15,9 +15,11 @@ rather than the other way round.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
+import tempfile
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from pathlib import Path
@@ -325,9 +327,22 @@ def build_tiles(
                 "cannot write PMTiles."
             )
 
-    overview = out.with_name(out.stem + ".overview.pmtiles")
-    detail = out.with_name(out.stem + ".detail.pmtiles")
-    try:
+    # Every intermediate goes in a scratch directory, and only the finished archive
+    # is moved into place. The output directory is served: `wayfare serve` offers
+    # whatever `*.pmtiles` it globs there, and the viewer loads every archive it is
+    # offered onto one map. Bands built beside the archive under their own
+    # `.pmtiles` names were therefore advertised as regions for the length of a
+    # publish -- an overview band and a detail band appearing next to Great Britain
+    # as though they were two more countries.
+    #
+    # A subdirectory of the output rather than the system temp: glob does not
+    # descend, and `translate_path` refuses a name with a separator in it, so
+    # nothing here is reachable. It also keeps the rename below on one filesystem,
+    # which is the whole reason it is atomic.
+    with tempfile.TemporaryDirectory(dir=out.parent, prefix=".publish-") as scratch:
+        tmp = Path(scratch)
+        overview, detail = tmp / "overview.pmtiles", tmp / "detail.pmtiles"
+        joined = tmp / out.name
         _tippecanoe(
             geojsonl,
             overview,
@@ -337,12 +352,16 @@ def build_tiles(
             attribution,
         )
         _tippecanoe(geojsonl, detail, config.DETAIL_ZOOM, config.MAX_ZOOM, (), attribution)
-        _tile_join(out, [overview, detail])
-    finally:
-        for p in (overview, detail):
-            p.unlink(missing_ok=True)
+        _tile_join(joined, [overview, detail])
+        size = joined.stat().st_size
+        # os.replace, not shutil.move: a rename within one filesystem is atomic, so
+        # a reader either gets the whole old archive or the whole new one. Writing
+        # the final path directly left a window -- a republish is minutes of a file
+        # that PMTiles clients are reading in byte ranges, and a range served across
+        # the rewrite spans two different archives.
+        os.replace(joined, out)
 
-    log.info("tiles built: %.1f MB", out.stat().st_size / 1e6)
+    log.info("tiles built: %.1f MB", size / 1e6)
     log.info("attribution: %s", attribution)
     return out
 

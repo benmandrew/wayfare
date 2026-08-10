@@ -104,12 +104,15 @@ propagating, `patterns` runs next against the feed already on disk, recounts it,
 reports a churn of zero — a refresh that looks like a quiet month. This is not
 hypothetical: it happened on 2026-08-08 and the guard caught it.
 
-**`publish` overwrites the served archive in place.** `_tile_join` runs `tile-join
--o <out> --force` and writes the final `.pmtiles` directly, while `web` serves
-`/data/out` from the same volume. A client pulling byte ranges through a republish
-can read across the rewrite. The window is seconds to a minute, once a month, which
-is why this is a gap rather than an outage — the fix is to write to a staging path
-and rename, a rename within one filesystem being atomic.
+**A republish is atomic, and it has to stay that way.** `build_tiles` builds both
+bands and the joined archive in a scratch subdirectory of the output and moves the
+finished file into place with `os.replace`. That is not tidiness. `web` serves
+`/data/out` from the same volume `publish` writes to, so writing the final
+`.pmtiles` directly left minutes in which a client reading it in byte ranges could
+span two different archives — and the bands, which carried their own `.pmtiles`
+names, were globbed by `server.archives` and offered to the viewer as though an
+overview band were another region. Anything that moves this work back beside the
+archive brings both back.
 
 ## Cadence
 
