@@ -159,6 +159,7 @@ attribution code and carry no credit** — the image that wrote them was built 3
 before `93623bc` landed — so serving them breaches CC BY 4.0 and OGL v3.0 until each is
 republished. Nothing needs re-matching; see `PLAN.md`.
 
-Feed churn — how many patterns are new month to month — is still the unmeasured number
-that decides everything, and it is one `acquire` and one `patterns` away from being
-known. Full figures in `docs/results.md`, roadmap in `PLAN.md`.
+Feed churn is measured: two Wales feeds two days apart took 3,584 patterns to 3,541 — 30
+new, 73 departed, about 8 seconds of matching to catch up against 16m23s for the full run.
+That is a two-day delta on one region, so the linear scaling to ~12.8% a month is an upper
+bound and not the national figure. Full figures in `docs/results.md`, roadmap in `PLAN.md`.

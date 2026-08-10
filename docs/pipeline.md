@@ -42,11 +42,16 @@ rows already stored and renumbers `patterns`, `pattern_stops`, `match_status` an
 stops are missing. A national match run costs a day or two, so every migration must
 be a rewrite rather than a re-run.
 
-**The unmeasured number that decides everything is feed churn** — how many patterns
-are new month to month. `patterns` logs new / carried over still unmatched /
-departed every run, and `wayfare status` reports `patterns_pending` and
-`patterns_departed`. It has not yet been measured against two real consecutive BODS
-feeds.
+**The number that decides everything is *feed churn*** — how many patterns are new
+from one feed to the next — and it is now measured. Two Wales feeds two days apart,
+`20260806_023912` then `20260808_024504`, took 3,584 patterns to 3,541. `patterns`
+logs new / carried over still unmatched / departed every run: 30 new, 0 carried over
+still unmatched, 73 departed, and 3,584 − 73 + 30 = 3,541 closes the accounting
+exactly. `wayfare status` then reported `patterns_pending` 30 and
+`patterns_departed` 73. Catching up cost 30 patterns at Wales's measured 3.6/s,
+about 8 seconds, against 16m23s for the original full run. That is a two-day delta
+on one region rather than a month across the nation; the caveats are in
+docs/results.md.
 
 **GTFS ids stay strings.** Route "07" must not become 7, or the join silently loses
 every service with a leading zero. Hence `all_varchar=true` on every `read_csv`.
