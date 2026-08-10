@@ -1,0 +1,30 @@
+# Install to /etc/systemd/system/ alongside the timer, edit WorkingDirectory to
+# wherever the checkout lives, then:
+#
+#   systemctl daemon-reload
+#   systemctl enable --now wayfare-refresh.timer
+#   systemctl start wayfare-refresh.service    # run one now, without waiting
+#
+# Type=oneshot is doing real work here, not ceremony: DuckDB takes a single
+# writer, and oneshot is what stops a second refresh starting on top of one still
+# running. A timer that fires mid-drain becomes a no-op rather than a corruption.
+
+[Unit]
+Description=wayfare monthly refresh
+Documentation=file:///docs/deploy.md
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/srv/wayfare
+ExecStart=/srv/wayfare/deploy/refresh.sh
+
+# A drain is hours and has no business being killed halfway. It checkpoints per
+# batch so a kill is survivable, but there is nothing to gain by it.
+TimeoutStartSec=infinity
+
+# Nothing here is worth retrying immediately: a failed refresh is either BODS
+# down, Valhalla down, or a graph mismatch, and all three want a person or the
+# next timer rather than a tight loop.
+Restart=no
