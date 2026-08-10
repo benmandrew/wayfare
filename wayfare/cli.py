@@ -92,8 +92,11 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="which feed's credit to stamp into the archive (default: the "
         "WAYFARE_REGION this data root was acquired with). The licence is a "
-        "condition, not a label, so this has to match the data",
+        "condition, not a label, so this has to match the data. With "
+        "--name-by-region it also decides the filename, and therefore what the "
+        "viewer calls the region",
     )
+    _archive_args(p)
     sub.add_parser("status", help="show progress and coverage")
     sub.add_parser(
         "prune", help="drop operator geometry once matching is complete (reclaims space)"
@@ -171,6 +174,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("all", help="acquire, patterns, match, aggregate, publish")
     p.add_argument("--region", default=None)
     p.add_argument("--workers", type=int, default=None)
+    _archive_args(p)
 
     args = parser.parse_args(argv)
     logs.setup(args.log)
@@ -185,6 +189,40 @@ def main(argv: list[str] | None = None) -> int:
         # Every stage checkpoints, so an interrupt is a normal way to stop.
         log.info("interrupted; progress is saved -- re-run the same command to resume")
         return 130
+
+
+def _archive_args(p: argparse.ArgumentParser) -> None:
+    """Where the archive goes. Two ways to say it, and they are exclusive.
+
+    Naming by region is opt-in rather than the default because the filename is what
+    a deployment mounts, fetches and labels: moving it silently would leave whatever
+    is being served stale while the publish still reported success.
+    """
+    g = p.add_mutually_exclusive_group()
+    g.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=f"write the archive here (default: {publish.DEFAULT_ARCHIVE} in the "
+        "data root's out/)",
+    )
+    g.add_argument(
+        "--name-by-region",
+        action="store_true",
+        help="name the archive after --region instead: `--region ireland` writes "
+        "ireland.pmtiles, which is also the label the viewer gives it. Serving "
+        "several regions from one directory needs this, or they overwrite one "
+        "another",
+    )
+
+
+def _archive_out(args: argparse.Namespace) -> Path | None:
+    """The path the flags ask for, or None to let `publish.build` decide."""
+    if args.name_by_region:
+        return config.OUT / config.archive_name(args.region)
+    out: Path | None = args.out
+    return out
 
 
 def _require_db() -> Path:
@@ -255,8 +293,13 @@ def _dispatch(args: argparse.Namespace) -> int:
     if args.cmd == "publish":
         _require_db()
         con = db.connect(read_only=True)
-        out = publish.build(con, region=args.region)
-        con.close()
+        try:
+            out = publish.build(con, region=args.region, out=_archive_out(args))
+        except (RuntimeError, ValueError) as exc:
+            log.error("%s", exc)
+            return 1
+        finally:
+            con.close()
         log.info("done: %s", out)
         return 0
 
@@ -347,12 +390,19 @@ def _dispatch(args: argparse.Namespace) -> int:
         return 0
 
     if args.cmd == "all":
+        # Settle where the archive goes before anything expensive runs. A name that
+        # will be refused is refused just as well now as after a day of matching.
+        try:
+            out = _archive_out(args) or publish.default_out(args.region)
+        except (RuntimeError, ValueError) as exc:
+            log.error("%s", exc)
+            return 1
         acquire.acquire_all(region=args.region)
         con = db.connect()
         gtfs.build_patterns(config.WORK / "gtfs", con)
         match.run(con, workers=args.workers)
         aggregate.build(con)
-        publish.build(con, region=args.region)
+        publish.build(con, region=args.region, out=out)
         print(json.dumps(aggregate.coverage(con), indent=2))
         con.close()
         return 0

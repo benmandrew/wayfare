@@ -146,7 +146,7 @@ timestamp, no path, no version, or the byte-identical tests are a fiction.
 
 **Great Britain is complete end to end**, on the server, feed `20260807_022616`: 52,554
 patterns, 95.9% matched, 2,746,261 edges, 130 MB PMTiles. Wales and Greater London were
-the two rehearsals for it and both stand. 520 tests pass, ruff and mypy clean.
+the two rehearsals for it and both stand. 532 tests pass, ruff and mypy clean.
 
 **Both parts of Ireland are complete end to end**, on the server, against one shared
 Valhalla graph `3.8.3/1786309727` built from the 409 MB island extract. The Republic on

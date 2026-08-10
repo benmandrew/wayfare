@@ -389,14 +389,173 @@ def test_publish_stamps_the_region_it_was_given(monkeypatch, tmp_path):
     licence is a property of the feed and not of the machine running the build."""
     seen = {}
 
-    def fake_build_tiles(path, attribution=None):
+    def fake_build_tiles(path, out=None, attribution=None):
         seen["credit"] = attribution
         return tmp_path / "bus.pmtiles"
 
+    monkeypatch.setattr(config, "OUT", tmp_path)
     monkeypatch.setattr(publish, "export_geojsonl", lambda con: tmp_path / "e.geojsonl")
     monkeypatch.setattr(publish, "build_tiles", fake_build_tiles)
     publish.build(None, region="ireland")
     assert seen["credit"] == config.credit_html("ireland")
+
+
+# --- where the archive goes ---------------------------------------------------
+#
+# Three regions are served from one directory, and the viewer labels each of them
+# from its filename. So a name is a label as well as a destination, and a publish
+# that writes the wrong one is a publish that looks like it worked.
+
+
+def _built_out(monkeypatch, tmp_path, **kwargs) -> Path:
+    """Run `build` against a stubbed tippecanoe and report the path it chose."""
+    seen = {}
+
+    def fake_build_tiles(path, out=None, attribution=None):
+        seen["out"] = out
+        return out
+
+    monkeypatch.setattr(publish, "export_geojsonl", lambda con: tmp_path / "e.geojsonl")
+    monkeypatch.setattr(publish, "build_tiles", fake_build_tiles)
+    publish.build(None, **kwargs)
+    return seen["out"]
+
+
+def test_an_archive_is_named_after_its_region():
+    assert config.archive_name("ireland") == "ireland.pmtiles"
+    assert config.archive_name("northern_ireland") == "northern_ireland.pmtiles"
+    # `all` is the BODS scope for the whole of Great Britain rather than a place,
+    # and the viewer builds a region's label from the filename, so the archive is
+    # named for the place. An `all.pmtiles` would label a map "all".
+    assert config.archive_name("all") == "great_britain.pmtiles"
+
+
+def test_a_region_that_would_escape_the_output_directory_names_no_archive():
+    """The only place a region slug reaches the filesystem."""
+    for bad in ("../served", "out/wales", ".", ".."):
+        with pytest.raises(ValueError):
+            config.archive_name(bad)
+
+
+def test_the_default_archive_name_has_not_moved(monkeypatch, tmp_path):
+    """A filename is a deployment's contract -- a mount, an object key, the viewer's
+    own fallback. Deriving it from the region silently would leave whatever is being
+    served stale while the publish still reported success."""
+    monkeypatch.setattr(config, "OUT", tmp_path)
+    assert _built_out(monkeypatch, tmp_path, region="ireland") == tmp_path / "bus.pmtiles"
+
+
+def test_publish_writes_where_it_is_told(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "OUT", tmp_path)
+    named = tmp_path / "ireland.pmtiles"
+    assert _built_out(monkeypatch, tmp_path, region="ireland", out=named) == named
+
+
+def test_the_default_refuses_to_leave_a_region_archive_stale(monkeypatch, tmp_path):
+    """An archive already named for this region says the caller has published it by
+    name before and has left the flag off this time. Writing bus.pmtiles beside it
+    would update nothing anyone serves."""
+    monkeypatch.setattr(config, "OUT", tmp_path)
+    served = tmp_path / "ireland.pmtiles"
+    served.write_bytes(b"the archive being served")
+
+    with pytest.raises(RuntimeError, match="--name-by-region"):
+        _built_out(monkeypatch, tmp_path, region="ireland")
+
+    assert served.read_bytes() == b"the archive being served"
+    assert not (tmp_path / "bus.pmtiles").exists()
+
+
+def test_naming_a_region_replaces_that_regions_archive(monkeypatch, tmp_path):
+    """The guard is about publishing one region past another, not about republishing.
+    Asking for the region by name is asking for the file that region owns."""
+    monkeypatch.setattr(config, "OUT", tmp_path)
+    served = tmp_path / "ireland.pmtiles"
+    served.write_bytes(b"last month")
+    assert _built_out(monkeypatch, tmp_path, region="ireland", out=served) == served
+
+
+def test_another_regions_archive_does_not_block_the_default(monkeypatch, tmp_path):
+    """One data root holds one region, so a neighbour's archive sitting in the served
+    directory is not this region's business."""
+    monkeypatch.setattr(config, "OUT", tmp_path)
+    (tmp_path / "great_britain.pmtiles").write_bytes(b"")
+    assert _built_out(monkeypatch, tmp_path, region="ireland") == tmp_path / "bus.pmtiles"
+
+
+# --- the publish subcommand ----------------------------------------------------
+
+
+def _run_publish(monkeypatch, tmp_path, argv, build=None):
+    """Run the CLI with the database and the tile build stubbed out."""
+    import types
+
+    from wayfare import cli
+
+    for name in ("DATA", "RAW", "WORK", "OUT"):
+        monkeypatch.setattr(config, name, tmp_path)
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "wayfare.duckdb")
+    (tmp_path / "wayfare.duckdb").write_bytes(b"")
+    monkeypatch.setattr(
+        cli.db, "connect", lambda **_: types.SimpleNamespace(close=lambda: None)
+    )
+
+    seen = {}
+
+    def fake_build(con, region=None, out=None):
+        seen.update(region=region, out=out)
+        if build is not None:
+            return build(con, region=region, out=out)
+        return out or tmp_path / "bus.pmtiles"
+
+    monkeypatch.setattr(cli.publish, "build", fake_build)
+    return cli.main(argv), seen
+
+
+def test_the_publish_command_can_name_the_archive_after_the_region(monkeypatch, tmp_path):
+    """Which is what makes republishing three regions three commands and no renaming.
+    --region keeps its licence meaning; this adds the filename to it."""
+    code, seen = _run_publish(
+        monkeypatch, tmp_path, ["publish", "--region", "ireland", "--name-by-region"]
+    )
+    assert code == 0
+    assert seen["out"] == tmp_path / "ireland.pmtiles"
+    assert seen["region"] == "ireland"
+
+
+def test_the_publish_command_takes_an_explicit_path(monkeypatch, tmp_path):
+    where = tmp_path / "served" / "roi.pmtiles"
+    code, seen = _run_publish(monkeypatch, tmp_path, ["publish", "--out", str(where)])
+    assert code == 0
+    assert seen["out"] == where
+
+
+def test_the_publish_command_still_defaults_to_the_old_name(monkeypatch, tmp_path):
+    """No flag, no derivation: the path is left for `build` to decide, which is
+    bus.pmtiles and its guard."""
+    code, seen = _run_publish(monkeypatch, tmp_path, ["publish"])
+    assert code == 0
+    assert seen["out"] is None
+
+
+def test_a_path_and_a_region_name_are_not_given_together(monkeypatch, tmp_path):
+    with pytest.raises(SystemExit):
+        _run_publish(
+            monkeypatch, tmp_path, ["publish", "--out", "x.pmtiles", "--name-by-region"]
+        )
+
+
+def test_a_refused_name_is_an_error_not_a_traceback(monkeypatch, tmp_path):
+    """`build` raises when the default would leave a region archive stale, and the
+    command reports it the way every other stage reports a refusal."""
+
+    def refuse(con, region=None, out=None):
+        raise RuntimeError("ireland.pmtiles would be left stale")
+
+    code, _ = _run_publish(
+        monkeypatch, tmp_path, ["publish", "--region", "ireland"], build=refuse
+    )
+    assert code == 1
 
 
 def test_tippecanoe_failure_surfaces_stderr(monkeypatch, tmp_path):

@@ -29,7 +29,9 @@ data/out/wales.pmtiles
 data/out/london.pmtiles
 ```
 
-`wayfare publish` still writes `bus.pmtiles` every time, so this means renaming or copying the archives into one output directory. Wales was published to `data/out/` and then renamed; London's was copied in from its own data root.
+`wayfare publish --region ireland --name-by-region` writes `ireland.pmtiles` straight into the output directory, so a region's archive no longer has to be renamed afterwards. `--out` names a path outright, and the two options are mutually exclusive. The default has not moved: with neither option given, the archive is still `bus.pmtiles`. A filename is a deployment's contract — a Compose mount, a bucket object key, a `?tiles=` URL, this page's own `./bus.pmtiles` fallback — so moving it silently would leave the served file stale while the publish reported success. The mirror-image mistake is refused instead. Publishing the default into a directory that already holds this region's named archive would update nothing anyone serves, so it stops and names both flags.
+
+Under `--name-by-region`, `--region` decides the filename as well, and therefore what the viewer calls the region. The credit meaning is the one that matters: `--region` chooses whose attribution is stamped into the tileset metadata, which is what makes the archive lawful to serve. `--region all` writes `great_britain.pmtiles`, because the Bus Open Data Service (BODS) slug `all` is a scope rather than a place.
 
 `wayfare serve` answers `GET /archives.json` with a JavaScript Object Notation (JSON) list of the archive filenames it can see. The viewer is a static page and cannot list a directory, so without that request the region names would have to be compiled into it.
 

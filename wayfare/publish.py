@@ -31,6 +31,10 @@ log = logs.get("publish")
 
 LAYER = "bus"
 
+# The archive a publish writes when it is told neither a path nor to use the region's
+# name. Region-agnostic, and deliberately still the default -- see `default_out`.
+DEFAULT_ARCHIVE = "bus.pmtiles"
+
 Point = tuple[int, int]  # (lon_e6, lat_e6)
 
 
@@ -312,7 +316,7 @@ def build_tiles(
     inputs has one -- but a band that can be inspected on its own should say where
     it came from, and passing it twice costs nothing.
     """
-    out = out or (config.OUT / "bus.pmtiles")
+    out = out or (config.OUT / DEFAULT_ARCHIVE)
     attribution = attribution or config.credit_html()
     out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -449,6 +453,37 @@ def _tail(text: str, lines: int = 20) -> str:
     return "\n".join(text.strip().splitlines()[-lines:])
 
 
-def build(con: duckdb.DuckDBPyConnection, region: str | None = None) -> Path:
+def default_out(region: str | None = None) -> Path:
+    """Where a publish that was given no path writes -- and when it refuses to.
+
+    The default name has not moved. An archive filename is a deployment's contract:
+    a Compose mount, a bucket object key, a `?tiles=` URL, and the viewer's own
+    `./bus.pmtiles` fallback. Renaming it under a running deployment would leave the
+    served file untouched while the command still reported success, which is the one
+    failure this whole area exists to avoid.
+
+    The mirror image of that failure is visible from here, so it is caught here. An
+    archive already named after this region, in the directory about to receive a
+    `bus.pmtiles`, says the caller has published this region by name before and has
+    just left the flag off. Writing the default beside it would update nothing anyone
+    serves, so it stops instead of quietly succeeding.
+    """
+    named = config.OUT / config.archive_name(region)
+    if named.exists():
+        raise RuntimeError(
+            f"{named} is already here, so this data root publishes by region: "
+            f"writing {DEFAULT_ARCHIVE} beside it would leave {named.name} stale. "
+            "Pass --name-by-region to rewrite it, or --out to name an archive."
+        )
+    return config.OUT / DEFAULT_ARCHIVE
+
+
+def build(
+    con: duckdb.DuckDBPyConnection, region: str | None = None, out: Path | None = None
+) -> Path:
     config.ensure_dirs()
-    return build_tiles(export_geojsonl(con), attribution=config.credit_html(region))
+    return build_tiles(
+        export_geojsonl(con),
+        out or default_out(region),
+        attribution=config.credit_html(region),
+    )
