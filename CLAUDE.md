@@ -93,15 +93,21 @@ complete.
 **Never add a row-at-a-time insert loop on a table that grows with the network.**
 executemany is ~2,700 rows/s; staging to a file and reading it back is 1.6M/s.
 
-**What a low zoom holds is chosen before tippecanoe sees it, and only the last
-band may extend.** `--drop-densest-as-needed` picks by density, so it thins cities
-and spares a rural road carrying two buses a week; `publish` therefore holds the
-quietest roads back from the z5–z7 band by a `trips` floor, and a region under the
-cap is not filtered at all. Two silent failures guard this: tippecanoe applies `-x`
-before `-j`, so a filter naming an excluded attribute matches nothing and writes an
-empty band, and `--extend-zooms-if-still-dropping` treats `-z` as a ceiling it may
+**What a low zoom holds is chosen before tippecanoe sees it, and it is chosen
+per place.** `--drop-densest-as-needed` picks by density, so it thins cities and
+spares a rural road carrying two buses a week; `publish` therefore holds the quietest
+roads back from the z5–z7 band itself, and a region under `OVERVIEW_CAP_FAR` is not
+filtered at all. **The `trips` floor is per cell and never national.** `trips` is an
+absolute count, so one floor for a whole region ranks it by how urban it is: tried on
+Great Britain it emptied 310 of 655 populated cells and drew the cities with nothing
+between them. Each cell keeps the same fraction instead, so the floor runs from 1 trip
+to 5,600 across the country. Three silent failures guard the rest: tippecanoe applies
+`-x` before `-j`, so a filter naming an excluded attribute matches nothing and writes
+an empty band; `--extend-zooms-if-still-dropping` treats `-z` as a ceiling it may
 raise, which overlaps the next band and has `tile-join` merge both copies of every
-road. Counting features per zoom in the finished archive is what catches either.
+road; and a longitude near the prime meridian is written `-1.1e-05`, which a number
+pattern without an exponent skips without a word. Counting features per zoom, and per
+cell, in the finished archive is what catches any of them.
 
 **Nothing holds a whole window or a whole table.** `art` streams its window and
 `publish.export_geojsonl` streams by `way_id`. Anything statistical — weight
@@ -170,10 +176,12 @@ so a second region acquired into the first's database becomes the current feed a
 
 **All three were republished on 2026-08-10 and every one of them now carries its credit**,
 which closes the CC BY 4.0 and OGL v3.0 breach that serving the earlier archives was. The
-same republish carried the `far` band, so Great Britain's low zooms changed with it: z5
-holds 100,836 features against 55,998 before, z6 134,950 against 106,626 and z7 169,382
-against 157,209, chosen by service level rather than by which cities happened to be dense.
-z8 upwards is unchanged, and both parts of Ireland are under the cap and came back
+same republish carried the `far` band. Its first form ranked the whole country on one
+`trips` scale and emptied 310 of Great Britain's 655 populated cells, so GB was republished
+uncapped within the hour and again once the quota became per cell: z5 now holds 98,313
+features against 55,983 uncapped, z6 130,947 against 106,672 and z7 168,255 against
+157,193, with no cell emptied and the top tenth of cells holding 47.8% against the input's
+48.7%. z8 upwards is unchanged, and both parts of Ireland are under the cap and came back
 feature-for-feature identical at every zoom. Nothing was re-matched. The archives the
 republish replaced are on the server at `/home/ben/archive-backup-20260810/`.
 

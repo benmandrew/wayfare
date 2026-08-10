@@ -454,12 +454,28 @@ DETAIL_ZOOM = 11
 # ninth of the network, hit the limit at no zoom at all and drew a continuous map.
 #
 # Holding back the quietest roads before tippecanoe sees them puts that choice on
-# service level instead, where it belongs: what survives to z5 is the trunk network
-# by construction. The cap is a feature count rather than a `trips` threshold because
-# the threshold that fits depends on the region -- `publish` reads the cap back into
-# whatever `trips` floor the data needs, and a region already under its cap is not
-# filtered at all. Both parts of Ireland are under both caps, so this changes nothing
-# for them.
+# service level instead. The cap is a feature count rather than a `trips` threshold
+# because the threshold that fits depends on the region -- `publish` reads the cap
+# back into whatever `trips` floor the data needs, and a region already under its cap
+# is not filtered at all. Both parts of Ireland are under the cap, so this changes
+# nothing for them.
+#
+# **The floor is per cell of `OVERVIEW_CELL`, never one figure for the whole region.**
+# A single national floor was tried and it was worse than the problem: `trips` is an
+# absolute count, so ranking the country on one scale ranks it by how urban it is. At
+# the 703-trip floor that produced, 310 of Great Britain's 655 populated cells lost
+# every feature they had, the busiest ten cells held 45.9% of the survivors, and the
+# top tenth of cells went from 48.7% of the map to 81.7% of it. That draws the cities
+# and nothing between them.
+#
+# Each cell keeps the same *fraction* instead -- `cap` over the region's feature count
+# -- with at least one feature per populated cell, and `trips` decides which ones
+# within that cell. The spatial distribution therefore survives: measured on Great
+# Britain, 0 cells emptied and the top tenth holds 47.8% against the input's 48.7%,
+# while the floor itself ranges from 1 trip in the countryside to 5,600 in the busiest
+# cell, median 218. Cities stay dense, the country between them stays drawn, and what
+# is dropped anywhere is the least-served road in that place rather than the
+# least-served road in Britain.
 #
 # Only the far half is capped, because only the far half is in trouble. Measured on
 # the 2026-08-07 Great Britain archive, tippecanoe kept 5.1% of the network at z5 and
@@ -471,11 +487,20 @@ DETAIL_ZOOM = 11
 # feature count -- holding Great Britain to 33.0% of its features took the largest z5
 # tile from the 1.51 MB it wanted to 630 KB, an exponent of about 0.79, because what
 # survives a `trips` floor is the busy roads and those carry the longer geometry. At
-# 214,000 no z5-z7 tile reaches the 500 KB limit and tippecanoe drops nothing, which
+# 205,000 -- 209,493 features once ties at each cell's floor are kept, 24.1% of the
+# export -- no z5-z7 tile reaches the 500 KB limit and tippecanoe drops nothing, which
 # is the whole point: what is on the map is then chosen by service level rather than
-# by which cities happened to be dense.
+# by which cities happened to be dense. z5 carries 98,313 features, z6 130,947 and z7
+# 168,255, against 55,983, 106,672 and 157,193 with no cap at all.
 FAR_ZOOM = 8
-OVERVIEW_CAP_FAR = 214_000
+OVERVIEW_CAP_FAR = 205_000
+# The side of the cell the quota is shared out over, in degrees. 0.25 is about 28 km
+# by 17 km at this latitude, and puts 655 cells over Great Britain's network -- fine
+# enough that a town is not averaged in with the city forty miles away, coarse enough
+# that a cell holds a few hundred features rather than a handful. A cell is a bucket
+# for allocating the quota and nothing else: it never becomes a tile boundary, and
+# the geometry that crosses it is untouched.
+OVERVIEW_CELL = 0.25
 # A backstop against one pathological city-centre edge, not a routine truncation.
 #
 # The original 12 assumed a long service list would dominate tile size. It does not:

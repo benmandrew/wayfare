@@ -158,12 +158,15 @@ database would have produced.
 
     wayfare publish --region northern_ireland --from-export --out /served/northern_ireland.pmtiles
 
-The same republish carried the `far` band. Great Britain: z5 100,836 features against
-55,998 before, z6 134,950 against 106,626, z7 169,382 against 157,209, nothing thinned to
-fit in that band, and z8 upwards unchanged — 411,602 / 638,278 / 943,040 against 411,575 /
-638,292 / 943,040. 129.5 MB against 130.2 MB. Both parts of Ireland are under the cap and
-came back feature-for-feature identical at all ten zooms, credit aside. The replaced
-archives are at `/home/ben/archive-backup-20260810/` on the server, with checksums.
+The same republish carried the `far` band, and its first form was wrong: a single
+national `trips` floor emptied 310 of Great Britain's 655 populated cells and drew the
+cities with black between them. GB was republished uncapped as soon as that was seen, and
+again once the quota became per cell. Great Britain now: z5 98,313 features against 55,983
+uncapped, z6 130,947 against 106,672, z7 168,255 against 157,193, nothing thinned to fit in
+that band, no cell emptied, and z8 upwards unchanged. Both parts of Ireland are under the
+cap and came back feature-for-feature identical at all ten zooms, credit aside. The
+replaced archives are at `/home/ben/archive-backup-20260810/` on the server, with
+checksums.
 
 ## Next — the picture
 

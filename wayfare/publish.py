@@ -21,7 +21,7 @@ import shutil
 import subprocess
 import tempfile
 from collections import defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -306,69 +306,97 @@ _DETAIL_ONLY = ("way", "refs", "trips", "name")
 # matches nothing builds an empty band, and an empty band looks like a region that
 # lost its buses.
 _TRIPS = re.compile(rb'"trips":(\d+)')
+# A longitude within about a kilometre of the prime meridian is written in scientific
+# notation -- Great Britain has 63 such features, around Greenwich -- so the number
+# has to allow an exponent. `-?\d+\.?\d*` matches every other line in the file and
+# skips those, which is the kind of near miss that takes roads off a map quietly.
+_NUM = rb"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?"
+_FIRST_POINT = re.compile(rb'"coordinates":\[\[(' + _NUM + rb"),(" + _NUM + rb")\]")
+
+Cell = tuple[int, int]
 
 
-def _trips_floors(geojsonl: Path, caps: Sequence[int]) -> tuple[int, ...]:
-    """For each cap, the `trips` count a feature must reach to be one of that many.
-
-    Zero where the file already holds no more than its cap, which is what keeps this
-    a no-op for a region that never troubles the tile size limit -- both parts of
-    Ireland come through unfiltered.
-
-    A histogram rather than a sorted list of every feature's `trips`: the distinct
-    counts are a small fraction of the features, and nothing here should scale with
-    the network. Ties at the floor are kept, so the result can exceed its cap by the
-    width of one `trips` value; overshooting hands tippecanoe a few more features
-    than asked for, where undershooting would throw away roads that fit.
-    """
-    seen: defaultdict[int, int] = defaultdict(int)
-    total = 0
+def _features(geojsonl: Path) -> Iterator[tuple[bytes, Cell, int]]:
+    """Every feature as its line, the cell its first point falls in, and its `trips`."""
     with geojsonl.open("rb") as src:
         for line in src:
-            m = _TRIPS.search(line)
-            if m is None:
+            trips, point = _TRIPS.search(line), _FIRST_POINT.search(line)
+            if trips is None or point is None:
                 raise RuntimeError(
-                    f"{geojsonl} has a feature with no `trips`: {line[:120]!r}. "
+                    f"{geojsonl} has a feature this filter cannot read: {line[:120]!r}. "
                     "The export format and this filter have diverged."
                 )
-            seen[int(m[1])] += 1
-            total += 1
+            cell = (
+                round(float(point[1]) / config.OVERVIEW_CELL),
+                round(float(point[2]) / config.OVERVIEW_CELL),
+            )
+            yield line, cell, int(trips[1])
 
-    floors = []
-    for cap in caps:
-        if total <= cap:
-            floors.append(0)
-            continue
+
+def _cell_floors(geojsonl: Path, cap: int) -> dict[Cell, int]:
+    """The `trips` a feature must reach to be drawn, worked out for each cell.
+
+    Empty when the file already holds no more than `cap` features, which is what
+    keeps this a no-op for a region that never troubles the tile size limit -- both
+    parts of Ireland come through unfiltered and unchanged.
+
+    Every cell keeps the same *fraction* of what it holds, so the map's spatial
+    distribution survives the cut and the floor is a local one. See the cap in
+    `config` for what a single national floor did instead, which was to draw the
+    cities and nothing between them.
+
+    A histogram per cell rather than every feature's `trips`: the distinct counts are
+    a fraction of the features, and nothing here should scale with the network. Ties
+    at the floor are kept, so a cell can exceed its share by the width of one `trips`
+    value -- overshooting hands tippecanoe a few more features than asked for, where
+    undershooting would throw away roads that fit.
+    """
+    cells: defaultdict[Cell, defaultdict[int, int]] = defaultdict(lambda: defaultdict(int))
+    total = 0
+    for _, cell, trips in _features(geojsonl):
+        cells[cell][trips] += 1
+        total += 1
+    if total <= cap:
+        return {}
+
+    share = cap / total
+    floors: dict[Cell, int] = {}
+    for cell, hist in cells.items():
+        # At least one, so a cell that holds any road at all still draws one. Rounding
+        # alone empties the five sparsest cells in Great Britain.
+        quota = max(1, round(share * sum(hist.values())))
         kept = 0
-        for trips in sorted(seen, reverse=True):
-            kept += seen[trips]
-            if kept >= cap:
-                floors.append(trips)
+        for trips in sorted(hist, reverse=True):
+            kept += hist[trips]
+            if kept >= quota:
+                floors[cell] = trips
                 break
-    return tuple(floors)
+    return floors
 
 
-def _hold_back(geojsonl: Path, out: Path, floor: int) -> Path:
-    """Write out only the features whose `trips` reaches `floor`.
+def _hold_back(geojsonl: Path, out: Path, floors: Mapping[Cell, int]) -> Path:
+    """Write out only the features that reach their own cell's floor.
 
-    Returns the input unchanged when the floor is zero, so a region under its cap
+    Returns the input unchanged when there are no floors, so a region under its cap
     is handed the same file and pays for no copy.
     """
-    if floor <= 0:
+    if not floors:
         return geojsonl
     kept = 0
-    with geojsonl.open("rb") as src, out.open("wb") as dst:
-        for line in src:
-            m = _TRIPS.search(line)
-            if m is None:
-                raise RuntimeError(
-                    f"{geojsonl} has a feature with no `trips`: {line[:120]!r}. "
-                    "The export format and this filter have diverged."
-                )
-            if int(m[1]) >= floor:
+    with out.open("wb") as dst:
+        for line, cell, trips in _features(geojsonl):
+            if trips >= floors.get(cell, 0):
                 dst.write(line)
                 kept += 1
-    log.info("held back to %d features at %d trips or more", kept, floor)
+    grades = sorted(floors.values())
+    log.info(
+        "held back to %d features across %d cells; trips floor %d to %d, median %d",
+        kept,
+        len(floors),
+        grades[0],
+        grades[-1],
+        grades[len(grades) // 2],
+    )
     return out
 
 
@@ -428,20 +456,20 @@ def build_tiles(
     with tempfile.TemporaryDirectory(dir=out.parent, prefix=".publish-") as scratch:
         tmp = Path(scratch)
         joined = tmp / out.name
-        (far_floor,) = _trips_floors(geojsonl, (config.OVERVIEW_CAP_FAR,))
+        far_floors = _cell_floors(geojsonl, config.OVERVIEW_CAP_FAR)
         # Only the last band may extend past its own top zoom. `-z` is a ceiling that
         # --extend-zooms-if-still-dropping is allowed to raise, which is harmless when
         # there is nothing above it and silently wrong when there is: a far band that
         # grew from z7 to z9 -- measured, on Great Britain -- overlaps the near band,
         # and tile-join merges the two into tiles holding both copies of every road.
         bands = [
-            ("far", config.MIN_ZOOM, config.FAR_ZOOM - 1, far_floor, _DETAIL_ONLY, False),
-            ("near", config.FAR_ZOOM, config.DETAIL_ZOOM - 1, 0, _DETAIL_ONLY, False),
-            ("detail", config.DETAIL_ZOOM, config.MAX_ZOOM, 0, (), True),
+            ("far", config.MIN_ZOOM, config.FAR_ZOOM - 1, far_floors, _DETAIL_ONLY, False),
+            ("near", config.FAR_ZOOM, config.DETAIL_ZOOM - 1, {}, _DETAIL_ONLY, False),
+            ("detail", config.DETAIL_ZOOM, config.MAX_ZOOM, {}, (), True),
         ]
         parts = []
-        for name, lo, hi, floor, exclude, extend in bands:
-            src = _hold_back(geojsonl, tmp / f"{name}.geojsonl", floor)
+        for name, lo, hi, floors, exclude, extend in bands:
+            src = _hold_back(geojsonl, tmp / f"{name}.geojsonl", floors)
             part = tmp / f"{name}.pmtiles"
             _tippecanoe(src, part, lo, hi, exclude, attribution, extend)
             parts.append(part)
