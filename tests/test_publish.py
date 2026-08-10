@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from wayfare import config, publish
+from wayfare import cli, config, publish
 
 
 def _row(edge_id, pts, refs, way_id=1, name="Oxford Road", trips=100):
@@ -23,6 +24,11 @@ def _row(edge_id, pts, refs, way_id=1, name="Oxford Road", trips=100):
 
 
 A, B, C, D = (0, 0), (10, 0), (20, 0), (30, 0)
+
+# Stands in for a DuckDB connection where the test stubs out everything that would
+# touch it. `build` refuses a publish with neither a connection nor an export, so
+# passing None here would be testing that refusal rather than what the test means.
+_A_CONNECTION: Any = object()
 
 
 def test_edges_meeting_end_to_end_become_one_feature():
@@ -537,7 +543,7 @@ def test_publish_stamps_the_region_it_was_given(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "OUT", tmp_path)
     monkeypatch.setattr(publish, "export_geojsonl", lambda con: tmp_path / "e.geojsonl")
     monkeypatch.setattr(publish, "build_tiles", fake_build_tiles)
-    publish.build(None, region="ireland")
+    publish.build(_A_CONNECTION, region="ireland")
     assert seen["credit"] == config.credit_html("ireland")
 
 
@@ -558,7 +564,7 @@ def _built_out(monkeypatch, tmp_path, **kwargs) -> Path:
 
     monkeypatch.setattr(publish, "export_geojsonl", lambda con: tmp_path / "e.geojsonl")
     monkeypatch.setattr(publish, "build_tiles", fake_build_tiles)
-    publish.build(None, **kwargs)
+    publish.build(_A_CONNECTION, **kwargs)
     return seen["out"]
 
 
@@ -643,8 +649,8 @@ def _run_publish(monkeypatch, tmp_path, argv, build=None):
 
     seen = {}
 
-    def fake_build(con, region=None, out=None):
-        seen.update(region=region, out=out)
+    def fake_build(con, region=None, out=None, from_export=None):
+        seen.update(region=region, out=out, from_export=from_export)
         if build is not None:
             return build(con, region=region, out=out)
         return out or tmp_path / "bus.pmtiles"
@@ -735,3 +741,68 @@ def test_only_the_last_band_may_extend_past_its_top_zoom(monkeypatch, tmp_path):
     assert "--extend-zooms-if-still-dropping" not in far
     assert "--extend-zooms-if-still-dropping" not in near
     assert "--extend-zooms-if-still-dropping" in detail
+
+
+def test_building_from_an_existing_export_needs_no_connection(monkeypatch, tmp_path):
+    """A `prune` reclaims the tables `match` needed, so a data root can be left with
+    its export and nothing else. Northern Ireland's is exactly that."""
+    import subprocess
+
+    calls = []
+
+    def fake_run(cmd, **_):
+        calls.append(cmd)
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
+    monkeypatch.setattr(publish.subprocess, "run", fake_run)
+    monkeypatch.setattr(config, "OUT", tmp_path / "out")
+
+    def explode(*_a, **_k):
+        raise AssertionError("export_geojsonl was called with no connection to use")
+
+    monkeypatch.setattr(publish, "export_geojsonl", explode)
+
+    src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3])
+    out = publish.build(None, region="northern_ireland", from_export=src)
+    assert out.exists()
+    assert _attribution(calls[0]) == config.credit_html("northern_ireland")
+
+
+def test_a_missing_export_is_named_rather_than_silently_exported(monkeypatch, tmp_path):
+    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
+    monkeypatch.setattr(config, "OUT", tmp_path / "out")
+    with pytest.raises(RuntimeError, match="not there"):
+        publish.build(None, from_export=tmp_path / "gone.geojsonl")
+
+
+def test_publishing_without_a_connection_or_an_export_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "OUT", tmp_path / "out")
+    with pytest.raises(ValueError, match="needs a connection"):
+        publish.build(None)
+
+
+def test_from_export_publishes_without_touching_the_database(monkeypatch, tmp_path):
+    """The one publish that reaches for a data root whose database is gone must not
+    be stopped by the check that every other publish needs."""
+    monkeypatch.setattr(config, "WORK", tmp_path)
+    write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3])
+
+    def no_db():
+        raise AssertionError("_require_db ran for a publish that needs no database")
+
+    monkeypatch.setattr(cli, "_require_db", no_db)
+    monkeypatch.setattr(
+        cli.db, "connect", lambda **_: pytest.fail("a connection was opened")
+    )
+    seen = {}
+
+    def fake_build(con, region=None, out=None, from_export=None):
+        seen.update(con=con, from_export=from_export)
+        return tmp_path / "bus.pmtiles"
+
+    monkeypatch.setattr(cli.publish, "build", fake_build)
+    assert cli.main(["publish", "--from-export"]) == 0
+    assert seen["con"] is None
+    assert seen["from_export"] == tmp_path / "edges.geojsonl"

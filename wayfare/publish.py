@@ -589,11 +589,33 @@ def default_out(region: str | None = None) -> Path:
 
 
 def build(
-    con: duckdb.DuckDBPyConnection, region: str | None = None, out: Path | None = None
+    con: duckdb.DuckDBPyConnection | None = None,
+    region: str | None = None,
+    out: Path | None = None,
+    from_export: Path | None = None,
 ) -> Path:
+    """Export the matched network and build the archive from it.
+
+    `from_export` builds from a GeoJSONL that is already on disk and takes no
+    connection. That is for a data root whose database has been taken away -- a
+    `prune` reclaims the tables `match` needed, and the export is then the only
+    record of the network left in it. The tiles are the same tiles: the export is
+    deterministic, so rebuilding from one is rebuilding from the rows that wrote it.
+    It is not a way to refresh a region, because nothing here can tell how old the
+    file is.
+    """
     config.ensure_dirs()
+    if from_export is None:
+        if con is None:
+            raise ValueError("publish needs a connection unless it is given an export")
+        from_export = export_geojsonl(con)
+    elif not from_export.exists():
+        raise RuntimeError(
+            f"{from_export} is not there. --from-export names the GeoJSONL a previous "
+            "publish wrote, and this data root has none."
+        )
     return build_tiles(
-        export_geojsonl(con),
+        from_export,
         out or default_out(region),
         attribution=config.credit_html(region),
     )

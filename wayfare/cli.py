@@ -14,6 +14,8 @@ import sys
 import time
 from pathlib import Path
 
+import duckdb
+
 from . import acquire, aggregate, config, db, gtfs, logs, match, publish
 
 log = logs.get("cli")
@@ -95,6 +97,16 @@ def main(argv: list[str] | None = None) -> int:
         "condition, not a label, so this has to match the data. With "
         "--name-by-region it also decides the filename, and therefore what the "
         "viewer calls the region",
+    )
+    p.add_argument(
+        "--from-export",
+        nargs="?",
+        const=True,
+        default=None,
+        help="build the tiles from a GeoJSONL a previous publish wrote instead of "
+        "exporting one, for a data root whose database is gone. Defaults to "
+        "work/edges.geojsonl. This rebuilds the same tiles; it does not refresh "
+        "the region",
     )
     _archive_args(p)
     sub.add_parser("status", help="show progress and coverage")
@@ -291,15 +303,29 @@ def _dispatch(args: argparse.Namespace) -> int:
         return 0
 
     if args.cmd == "publish":
-        _require_db()
-        con = db.connect(read_only=True)
+        # --from-export is the one path here that needs no database, and a root whose
+        # database has been taken away is exactly when it is reached for -- so the
+        # `_require_db` that guards every other publish must not run for it.
+        export = args.from_export
+        if export is True:
+            export = config.WORK / "edges.geojsonl"
+        elif export is not None:
+            export = Path(export)
+
+        pub_con: duckdb.DuckDBPyConnection | None = None
+        if export is None:
+            _require_db()
+            pub_con = db.connect(read_only=True)
         try:
-            out = publish.build(con, region=args.region, out=_archive_out(args))
+            out = publish.build(
+                pub_con, region=args.region, out=_archive_out(args), from_export=export
+            )
         except (RuntimeError, ValueError) as exc:
             log.error("%s", exc)
             return 1
         finally:
-            con.close()
+            if pub_con is not None:
+                pub_con.close()
         log.info("done: %s", out)
         return 0
 

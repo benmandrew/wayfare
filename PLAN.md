@@ -163,9 +163,13 @@ publish against each of the three data roots, writing into that root's `out/`.
 Each archive is then copied into `/home/samba/sambashare/wayfare/out`, or written straight
 there with `--out` where the container can see that directory. The renaming step is gone.
 Northern Ireland's data root has no `wayfare.duckdb` — only the `edges.geojsonl` its last
-publish exported — so that region either re-acquires and re-matches against the Ireland
-graph, or its tiles are rebuilt from the export that is already there. This is the most
-urgent item in this file.
+publish exported — so that one takes `--from-export`, which builds the tiles from a
+GeoJSONL already on disk and opens no database at all:
+
+    wayfare publish --region northern_ireland --name-by-region --from-export
+
+The export is deterministic, so those are the same tiles the missing database would have
+produced. This is the most urgent item in this file.
 
 The same rebuild carries the `far` band, so Great Britain's low zooms change at the same
 time: z5 goes from 55,998 features to 100,836, chosen by service level rather than by
