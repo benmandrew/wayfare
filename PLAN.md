@@ -146,10 +146,16 @@ commit landed at 21:42Z, so all three archives now being served — Great Britai
 Republic and Northern Ireland — were written without it. The Republic's CC BY 4.0 and
 Translink's Open Government Licence v3.0 both make the credit a condition of publication,
 so this is a live breach for as long as those files are up. The code is done and nothing
-needs re-matching: rebuild the image, run `wayfare publish --region <region>` against each
-of the three data roots, and copy each archive back into
-`/home/samba/sambashare/wayfare/out` under its region name. This is the most urgent item
-in this file.
+needs re-matching: rebuild the image, then run one publish against each of the three data
+roots, writing into that root's `out/`.
+
+    wayfare publish --region all --name-by-region              # great_britain.pmtiles
+    wayfare publish --region ireland --name-by-region          # ireland.pmtiles
+    wayfare publish --region northern_ireland --name-by-region # northern_ireland.pmtiles
+
+Each archive is then copied into `/home/samba/sambashare/wayfare/out`, or written straight
+there with `--out` where the container can see that directory. The renaming step is gone.
+This is the most urgent item in this file.
 
 ## Next — the picture
 
@@ -324,11 +330,3 @@ only other measured collision, and NI already prefixes it `NI-`.
 **Northern Ireland has no Compose project.** It was driven by hand with `docker run`
 against the Ireland project's network, so `/home/ben/wayfare-ni` is host state that
 Ansible does not know about and that no committed file reproduces.
-
-**`publish.build_tiles` hardcodes `out/bus.pmtiles`** (`wayfare/publish.py:308`), and
-`publish.build` passes no path, so a second region's archive is renamed and copied into
-the served directory by hand. Nothing automates the step, and the viewer takes each
-region's label from the filename (`web/index.html:435`), so that hand step is also where
-the name in the viewer's "Go to…" list is decided. The viewer no longer chooses between
-the archives — it loads every one the server offers onto a single map — so a filename is
-now a label and a jump target rather than the thing that selects what is on screen.

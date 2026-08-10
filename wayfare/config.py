@@ -158,6 +158,29 @@ def feed(region: str | None = None) -> Feed:
     )
 
 
+# What a region's archive is called when it is named after its region. Only the
+# exceptions live here; a slug is its own name everywhere else. `all` is the BODS
+# scope for the whole of Great Britain rather than a place, and the viewer builds a
+# region's label out of the filename, so `all.pmtiles` would label a map "all".
+ARCHIVE_NAMES = {"all": "great_britain"}
+
+
+def archive_name(region: str | None = None) -> str:
+    """The filename an archive gets when it is named after its region.
+
+    The name is not only a destination. The viewer carries no list of regions -- it
+    labels each archive from its filename -- so this is also what the map calls the
+    region in its "Go to..." list.
+    """
+    region = region or BODS_REGION
+    name = ARCHIVE_NAMES.get(region, region)
+    # A region slug reaches the filesystem here and nowhere else in the pipeline. A
+    # slug carrying a separator would write outside OUT rather than fail.
+    if name in ("", ".", "..") or name != Path(name).name:
+        raise ValueError(f"region {region!r} does not name an archive")
+    return f"{name}.pmtiles"
+
+
 @dataclass(frozen=True)
 class Credit:
     """One thing that has to be acknowledged: what it is, whose it is, its licence."""
