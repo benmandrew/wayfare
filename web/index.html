@@ -645,7 +645,11 @@ function start(missing) {
   // for a map and keeps the credit one click from anywhere, which is what the
   // licences require. Every source's attribution lands in this one control,
   // deduplicated by MapLibre, so there is nothing to assemble here.
+  //
+  // `compact` gets the button but not the closed state -- see collapseCredit,
+  // which is what makes the line above true on load rather than after a drag.
   map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-left");
+  collapseCredit(map);
 
   /* ---------- hover ---------- */
 
