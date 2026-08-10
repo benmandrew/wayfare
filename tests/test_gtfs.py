@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from wayfare import gtfs
+from wayfare import db, gtfs
 
 
 def test_trips_collapse_to_patterns(gtfs_dir: Path, con):
@@ -247,6 +247,22 @@ def test_selecting_a_mode_does_not_move_any_other_pattern_id(gtfs_dir: Path, con
     )
     after = {r[0] for r in con.execute("SELECT pattern_id FROM patterns").fetchall()}
     assert road < after
+
+
+def test_the_selection_is_remembered_across_a_bare_rebuild(gtfs_dir: Path, con):
+    """`deploy/refresh.sh` runs `wayfare patterns` with no flags, monthly, with
+    nobody watching. Were the default a constant rather than what this database was
+    last built with, the first refresh after a multi-modal build would drop every
+    ferry -- and report a healthy run while doing it."""
+    gtfs.build_patterns(
+        gtfs_dir, con, memory_limit="1GB", modes=frozenset({"bus", "ferry"})
+    )
+    assert db.get_meta(con, "modes") == "bus,ferry"
+
+    gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB")
+    assert dict(
+        con.execute("SELECT mode, count(*) FROM patterns GROUP BY 1").fetchall()
+    ) == {"bus": 2, "ferry": 1}
 
 
 def test_an_unknown_mode_name_is_refused(gtfs_dir: Path, con):

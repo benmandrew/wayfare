@@ -169,6 +169,25 @@ def _report_kept_modes(con: duckdb.DuckDBPyConnection) -> None:
         log.info("keeping %s: %d routes, %d trips", mode, n_routes, n_trips)
 
 
+def stored_modes(con: duckdb.DuckDBPyConnection) -> frozenset[str]:
+    """The mode selection this database was last built with, or the default.
+
+    `patterns` rebuilds the table from whatever selection it is handed, so without
+    this a bare `wayfare patterns` -- which is exactly what `deploy/refresh.sh` runs,
+    every month, unattended -- would quietly narrow a multi-modal database back to
+    road on its next refresh. Every tram would disappear from the archive and every
+    other number the run reports would look healthy while it happened.
+
+    An unrecognised stored name is left to raise in `config.route_types` rather than
+    being dropped. Renaming a mode is a schema change, and a schema change should
+    break the timer and be dealt with by a person.
+    """
+    stored = db.get_meta(con, "modes")
+    if not stored:
+        return config.DEFAULT_MODES
+    return frozenset(m.strip() for m in stored.split(",") if m.strip())
+
+
 def build_patterns(
     gtfs_dir: Path,
     con: duckdb.DuckDBPyConnection,
@@ -179,7 +198,7 @@ def build_patterns(
 ) -> None:
     from . import acquire
 
-    kept_modes = modes if modes is not None else config.DEFAULT_MODES
+    kept_modes = modes if modes is not None else stored_modes(con)
     config.route_types(kept_modes)  # reject a bad name before any work is done
     feed = feed_version or acquire.feed_version(gtfs_dir)
     limit = memory_limit or os.environ.get("WAYFARE_MEM", "8GB")
@@ -319,6 +338,9 @@ def build_patterns(
     # decide which patterns are live, so a crash part-way through leaves the
     # previous feed's dataset intact and usable rather than half-replaced.
     db.set_meta(con, "feed_version", feed)
+    # Beside it, and for the same reason: the next run has to know what this one
+    # chose, or it reverts to the default and takes the other modes out with it.
+    db.set_meta(con, "modes", ",".join(sorted(kept_modes)))
 
     _fill_span(con)
     _load_shapes(gtfs_dir, con)

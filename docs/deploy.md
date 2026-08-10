@@ -60,6 +60,19 @@ attempt.** It clears the previous run's `transport_error` rows and puts them bac
 the queue. It is the only status safe to clear unattended: every other failure means
 impossible, and a matcher that retries the impossible never finishes.
 
+## The mode selection lives in the database
+
+**`refresh.sh` runs `wayfare patterns` with no flags, so the selection cannot live
+in the invocation.** `--modes` was persisted nowhere, and `build_patterns` fell back
+to `config.DEFAULT_MODES`, which is bus and coach. The first refresh after a
+multi-modal build would have rebuilt the table as road only and dropped every tram,
+and every other number the run reports would have stayed healthy while it did.
+`build_patterns` now writes the selection to `meta.modes` beside `feed_version` and
+defaults to `gtfs.stored_modes` rather than to a constant. An unrecognised stored
+name is left to raise rather than being dropped, on the same reading as
+`--force-graph`: renaming a mode should break the timer and be dealt with by a
+person.
+
 ## Installing it
 
 `refresh.sh` stays in the checkout and finds its own compose file, so it can be run

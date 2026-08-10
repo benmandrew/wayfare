@@ -57,8 +57,9 @@ def main(argv: list[str] | None = None) -> int:
         metavar="LIST",
         help="comma-separated modes to keep, from "
         f"{{{','.join(sorted(config.MODES))}}} "
-        f"(default: {','.join(sorted(config.DEFAULT_MODES))}). Only road modes are "
-        "ever map-matched; the rest are kept for their operator geometry.",
+        "(default: whatever this database was last built with, or "
+        f"{','.join(sorted(config.DEFAULT_MODES))} for a new one). Only road modes "
+        "are ever map-matched; the rest are kept for their operator geometry.",
     )
 
     p = sub.add_parser(
