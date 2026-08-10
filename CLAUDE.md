@@ -93,6 +93,16 @@ complete.
 **Never add a row-at-a-time insert loop on a table that grows with the network.**
 executemany is ~2,700 rows/s; staging to a file and reading it back is 1.6M/s.
 
+**What a low zoom holds is chosen before tippecanoe sees it, and only the last
+band may extend.** `--drop-densest-as-needed` picks by density, so it thins cities
+and spares a rural road carrying two buses a week; `publish` therefore holds the
+quietest roads back from the z5–z7 band by a `trips` floor, and a region under the
+cap is not filtered at all. Two silent failures guard this: tippecanoe applies `-x`
+before `-j`, so a filter naming an excluded attribute matches nothing and writes an
+empty band, and `--extend-zooms-if-still-dropping` treats `-z` as a ceiling it may
+raise, which overlaps the next band and has `tile-join` merge both copies of every
+road. Counting features per zoom in the finished archive is what catches either.
+
 **Nothing holds a whole window or a whole table.** `art` streams its window and
 `publish.export_geojsonl` streams by `way_id`. Anything statistical — weight
 percentiles, group stats — must read the *unsampled*, *unbanded* window, and only

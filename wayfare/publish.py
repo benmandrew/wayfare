@@ -300,18 +300,100 @@ def _chain(members: list[Member]) -> list[Member]:
 # Only `n` survives below DETAIL_ZOOM; it is what the colour and width ramps read.
 _DETAIL_ONLY = ("way", "refs", "trips", "name")
 
+# `export_geojsonl` writes with separators=(",", ":"), so this is the shape of every
+# line it produces. A line that does not match is a change to the export that this
+# has not caught up with, and is raised on rather than skipped: a filter that quietly
+# matches nothing builds an empty band, and an empty band looks like a region that
+# lost its buses.
+_TRIPS = re.compile(rb'"trips":(\d+)')
+
+
+def _trips_floors(geojsonl: Path, caps: Sequence[int]) -> tuple[int, ...]:
+    """For each cap, the `trips` count a feature must reach to be one of that many.
+
+    Zero where the file already holds no more than its cap, which is what keeps this
+    a no-op for a region that never troubles the tile size limit -- both parts of
+    Ireland come through unfiltered.
+
+    A histogram rather than a sorted list of every feature's `trips`: the distinct
+    counts are a small fraction of the features, and nothing here should scale with
+    the network. Ties at the floor are kept, so the result can exceed its cap by the
+    width of one `trips` value; overshooting hands tippecanoe a few more features
+    than asked for, where undershooting would throw away roads that fit.
+    """
+    seen: defaultdict[int, int] = defaultdict(int)
+    total = 0
+    with geojsonl.open("rb") as src:
+        for line in src:
+            m = _TRIPS.search(line)
+            if m is None:
+                raise RuntimeError(
+                    f"{geojsonl} has a feature with no `trips`: {line[:120]!r}. "
+                    "The export format and this filter have diverged."
+                )
+            seen[int(m[1])] += 1
+            total += 1
+
+    floors = []
+    for cap in caps:
+        if total <= cap:
+            floors.append(0)
+            continue
+        kept = 0
+        for trips in sorted(seen, reverse=True):
+            kept += seen[trips]
+            if kept >= cap:
+                floors.append(trips)
+                break
+    return tuple(floors)
+
+
+def _hold_back(geojsonl: Path, out: Path, floor: int) -> Path:
+    """Write out only the features whose `trips` reaches `floor`.
+
+    Returns the input unchanged when the floor is zero, so a region under its cap
+    is handed the same file and pays for no copy.
+    """
+    if floor <= 0:
+        return geojsonl
+    kept = 0
+    with geojsonl.open("rb") as src, out.open("wb") as dst:
+        for line in src:
+            m = _TRIPS.search(line)
+            if m is None:
+                raise RuntimeError(
+                    f"{geojsonl} has a feature with no `trips`: {line[:120]!r}. "
+                    "The export format and this filter have diverged."
+                )
+            if int(m[1]) >= floor:
+                dst.write(line)
+                kept += 1
+    log.info("held back to %d features at %d trips or more", kept, floor)
+    return out
+
 
 def build_tiles(
     geojsonl: Path, out: Path | None = None, attribution: str | None = None
 ) -> Path:
-    """Build the archive in two zoom bands and join them.
+    """Build the archive in three zoom bands and join them.
 
     tippecanoe stores attributes per feature per zoom, and -x is global to a run --
     there is no way to say "keep the road name only where someone might read it" in
-    a single pass. So the overview band is built without the four attributes that
-    exist purely for the info card, the detail band is built with everything, and
-    tile-join concatenates the two into one PMTiles file. The join is cheap; the
-    second tippecanoe pass is the real cost, and it only touches z5-z10.
+    a single pass. So the two overview bands are built without the four attributes
+    that exist purely for the info card, the detail band is built with everything,
+    and tile-join concatenates the three into one PMTiles file. The join is cheap.
+
+    The overview is two bands rather than one because only the far half needs the
+    quietest roads held back: below `FAR_ZOOM` the input is cut to
+    `OVERVIEW_CAP_FAR` features, and at `FAR_ZOOM` and above every road is handed
+    over and tippecanoe's own backstop is left to it. See the cap in `config` for
+    what it is measured against and why the choice is not left to tippecanoe.
+
+    The holding back is done to the *input* and not with tippecanoe's own `-j`.
+    That is not a style preference: `-x` runs first, so a `-j` filter naming an
+    attribute the same command excludes matches nothing and writes an empty band.
+    Measured on London -- `-x trips` with `-j` on `trips` built a 2.4 KB archive
+    holding no tiles at all, and said nothing about it.
 
     `attribution` goes into both passes. tile-join carries an input's attribution
     through to the joined archive -- measured, including where only one of the two
@@ -345,18 +427,25 @@ def build_tiles(
     # which is the whole reason it is atomic.
     with tempfile.TemporaryDirectory(dir=out.parent, prefix=".publish-") as scratch:
         tmp = Path(scratch)
-        overview, detail = tmp / "overview.pmtiles", tmp / "detail.pmtiles"
         joined = tmp / out.name
-        _tippecanoe(
-            geojsonl,
-            overview,
-            config.MIN_ZOOM,
-            config.DETAIL_ZOOM - 1,
-            _DETAIL_ONLY,
-            attribution,
-        )
-        _tippecanoe(geojsonl, detail, config.DETAIL_ZOOM, config.MAX_ZOOM, (), attribution)
-        _tile_join(joined, [overview, detail])
+        (far_floor,) = _trips_floors(geojsonl, (config.OVERVIEW_CAP_FAR,))
+        # Only the last band may extend past its own top zoom. `-z` is a ceiling that
+        # --extend-zooms-if-still-dropping is allowed to raise, which is harmless when
+        # there is nothing above it and silently wrong when there is: a far band that
+        # grew from z7 to z9 -- measured, on Great Britain -- overlaps the near band,
+        # and tile-join merges the two into tiles holding both copies of every road.
+        bands = [
+            ("far", config.MIN_ZOOM, config.FAR_ZOOM - 1, far_floor, _DETAIL_ONLY, False),
+            ("near", config.FAR_ZOOM, config.DETAIL_ZOOM - 1, 0, _DETAIL_ONLY, False),
+            ("detail", config.DETAIL_ZOOM, config.MAX_ZOOM, 0, (), True),
+        ]
+        parts = []
+        for name, lo, hi, floor, exclude, extend in bands:
+            src = _hold_back(geojsonl, tmp / f"{name}.geojsonl", floor)
+            part = tmp / f"{name}.pmtiles"
+            _tippecanoe(src, part, lo, hi, exclude, attribution, extend)
+            parts.append(part)
+        _tile_join(joined, parts)
         size = joined.stat().st_size
         # os.replace, not shutil.move: a rename within one filesystem is atomic, so
         # a reader either gets the whole old archive or the whole new one. Writing
@@ -377,6 +466,7 @@ def _tippecanoe(
     max_zoom: int,
     exclude: Sequence[str],
     attribution: str,
+    extend: bool = True,
 ) -> None:
     cmd = [
         "tippecanoe",
@@ -407,12 +497,13 @@ def _tippecanoe(
         # would otherwise be too large. Without this, dense cities lose whole areas
         # rather than losing their least-served streets.
         "--drop-densest-as-needed",
-        "--extend-zooms-if-still-dropping",
         # Line simplification is what makes national coverage tractable, but at max
         # zoom the geometry should be the real road.
         "--simplification=4",
         "--no-simplification-of-shared-nodes",
     ]
+    if extend:
+        cmd.append("--extend-zooms-if-still-dropping")
     for name in exclude:
         cmd += ["-x", name]
     cmd.append(str(geojsonl))

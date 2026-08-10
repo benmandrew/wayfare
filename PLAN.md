@@ -142,12 +142,19 @@ dropdown label from the filename; the default view is unchanged, because
 **The attribution code landed 38 minutes after the image that published these tiles was
 built.** `publish` now stamps the credit into the archive's own tileset metadata
 (`93623bc`), but `benmandrew/wayfare:latest` on the server was built at 21:04Z and the
-commit landed at 21:42Z, so all three archives now being served — Great Britain, the
-Republic and Northern Ireland — were written without it. The Republic's CC BY 4.0 and
-Translink's Open Government Licence v3.0 both make the credit a condition of publication,
-so this is a live breach for as long as those files are up. The code is done and nothing
-needs re-matching: rebuild the image, then run one publish against each of the three data
-roots, writing into that root's `out/`.
+commit landed at 21:42Z, so the archives were written without it. Inspecting the three
+served files on 2026-08-10 narrows that to two: `ireland.pmtiles`, republished at 22:21Z,
+carries the full NTA and OpenStreetMap credit in its tileset metadata. Northern Ireland
+was republished 35 minutes earlier, at 21:46Z, and its `generator_options` shows no
+`--attribution` flag at all — the image had not been rebuilt yet. Great Britain has not
+been republished since 7 August and carries none either. `config.credit_html` returns the
+right credit for all three regions, so nothing is wrong with the code and there is nothing
+to fix before republishing.
+
+The Republic's CC BY 4.0 and Translink's Open Government Licence v3.0 both make the credit
+a condition of publication, so Great Britain and Northern Ireland are a live breach for as
+long as those two files are up. Nothing needs re-matching: rebuild the image, then run one
+publish against each of the three data roots, writing into that root's `out/`.
 
     wayfare publish --region all --name-by-region              # great_britain.pmtiles
     wayfare publish --region ireland --name-by-region          # ireland.pmtiles
@@ -155,7 +162,15 @@ roots, writing into that root's `out/`.
 
 Each archive is then copied into `/home/samba/sambashare/wayfare/out`, or written straight
 there with `--out` where the container can see that directory. The renaming step is gone.
-This is the most urgent item in this file.
+Northern Ireland's data root has no `wayfare.duckdb` — only the `edges.geojsonl` its last
+publish exported — so that region either re-acquires and re-matches against the Ireland
+graph, or its tiles are rebuilt from the export that is already there. This is the most
+urgent item in this file.
+
+The same rebuild carries the `far` band, so Great Britain's low zooms change at the same
+time: z5 goes from 55,998 features to 100,836, chosen by service level rather than by
+which cities happened to be dense. Both parts of Ireland are under the cap and their tiles
+are unchanged apart from the credit.
 
 ## Next — the picture
 
