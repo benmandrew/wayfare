@@ -16,3 +16,28 @@
 const BASEMAP_CREDIT =
   '<a href="https://carto.com/attributions">CARTO</a> · ' +
   '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
+
+// Fold the credit down to its (i), which `compact: true` alone does not do.
+//
+// MapLibre's own _updateCompact adds `maplibregl-compact-show` alongside the
+// compact class the first time it runs against a non-empty credit, so the panel
+// loads *open* and folds away only on the first drag -- and a map nobody drags
+// never gets there. Removing the one class is the library's own collapse, the
+// body of the _updateCompactMinimize it binds to `drag`; the `open` attribute is
+// deliberately left alone, because the container is a <details> whose button
+// lives in the summary and stays open whichever way the panel is folded.
+//
+// On `idle` rather than straight after the control is added: until a source
+// reports a credit the container is `maplibregl-attrib-empty`, which
+// _updateCompact skips, and it then adds both classes when that source's
+// metadata lands. Idle is the point every source has reported in, so nothing
+// arrives afterwards to re-open what this closed. The user is not fought for it
+// -- the panel starts open, so the only click available before idle is the one
+// that agrees with us.
+function collapseCredit(map) {
+  map.once("idle", () => {
+    for (const el of map.getContainer().querySelectorAll(".maplibregl-ctrl-attrib")) {
+      el.classList.remove("maplibregl-compact-show");
+    }
+  });
+}

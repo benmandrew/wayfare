@@ -1274,6 +1274,12 @@ function initPicker() {
   pickMap.touchZoomRotate.disableRotation();
   pickMap.keyboard.disableRotation();
   pickMap.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
+  // Folded to its (i), which `compact` above does not do on its own. That is
+  // right on a full-page map and wrong here: expanded it is 226 x 104 of a
+  // 270 x 200 picker, so it covers the map you are meant to drag and swallows the
+  // pointer that would drag it. Collapsed it is the conventional affordance and
+  // one click from the full text.
+  collapseCredit(pickMap);
 
   pickMap.on("moveend", () => {
     if (syncing || !S) return;
@@ -1291,17 +1297,6 @@ function initPicker() {
 
   pickMap.on("load", () => {
     addNetwork(pickMap);
-    // MapLibre opens a compact credit expanded and collapses it on the first drag.
-    // That is right on a full-page map and wrong here: expanded it is 226 x 104 of
-    // a 270 x 200 picker, so it covers the map you are meant to drag and swallows
-    // the pointer that would drag it. Collapsed it is the (i) button, which is the
-    // conventional affordance and one click from the full text. Safe to do once --
-    // `_updateCompact` only adds the class to a control that is not already
-    // compact, so neither the later resize nor the network source reopens it.
-    pickMap
-      .getContainer()
-      .querySelector(".maplibregl-ctrl-attrib")
-      ?.classList.remove("maplibregl-compact-show");
   });
 
   let sizing = null;
