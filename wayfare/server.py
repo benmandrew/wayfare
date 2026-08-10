@@ -95,8 +95,9 @@ GZIP_CACHE_ENTRIES = 16
 # read as hundreds of separate ranges, and republishing it is a monthly event
 # with little change in between. Revalidating instead costs a round trip per
 # range, and a round trip is most of what a range request costs -- measured
-# against the deployed instance, a 16 KB range takes ~90 ms of which only ~15 ms
-# is transfer, because the tailnet path is relayed rather than direct.
+# against the deployed instance, a 16 KB range takes ~22 ms of which ~21 ms is the
+# round trip itself. Relaying accounts for about 1.6 ms of that, so a direct path
+# would not change the shape of this.
 #
 # A day rather than something nearer the publish interval, because the whole
 # benefit is already collected well inside one: a session lasts minutes and
@@ -766,8 +767,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     # connection and a fresh thread -- and MapLibre issues dozens of PMTiles range
     # requests per pan. On loopback that setup is 0.20 ms of a 0.56 ms request and
     # hardly matters; over the deployed tailnet path it is a full round trip each,
-    # which is most of what a range request costs (a 16 KB range takes ~90 ms of
-    # which ~15 ms is transfer, because the path is relayed rather than direct).
+    # which is most of what a range request costs -- 21 ms of it, measured from a
+    # laptop to the deployed instance. The relay the path takes is worth about 1.6 ms
+    # of that (21.7 ms round trip relayed, 20.1 ms direct to the same host), so it is
+    # the round trip itself that the connection reuse removes, not the relaying.
     #
     # Three things had to be true first, and all three are quiet under HTTP/1.0
     # because the connection dies after one response either way: an aborted body
@@ -777,6 +780,22 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     # `Content-Length: 0` for that reason), and a malformed Range must not raise
     # mid-connection (`bytes=-`, also below).
     protocol_version = "HTTP/1.1"
+
+    # Keep-alive is what makes this necessary, and it is why the cost arrived with
+    # the line above rather than before it. `BaseHTTPRequestHandler` flushes its
+    # headers and then writes the body as a second, smaller write. Nagle holds that
+    # second write until the peer acknowledges the first, and Linux delays that
+    # acknowledgement by 40 ms. Under HTTP/1.0 the close after each response flushed
+    # it immediately, so the stall could not appear; with the connection kept open it
+    # lands on every request after the first, which is every range request of a pan
+    # but one.
+    #
+    # Measured in the container on emel, on loopback with no network in the path:
+    # 41 ms a request against 0.3 ms with this set. Over the deployed tailnet path a
+    # warm 16 KB range was 62 ms against a 21 ms round trip -- the round trip, then
+    # the timer. Roughly three requests in four paid it, since a request that happens
+    # to arrive after the peer's acknowledgement does not.
+    disable_nagle_algorithm = True
 
     # A connection now holds a thread for its whole life rather than for one
     # request, and ThreadingTCPServer is thread-per-connection and unbounded, so an
