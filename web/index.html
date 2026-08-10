@@ -159,6 +159,9 @@ a.btn { text-decoration: none; }
 .legend-title { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
 .ramp { height: 8px; border-radius: 2px; margin: 7px 0 4px; }
 .ticks { display: flex; justify-content: space-between; color: var(--muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.modes { display: flex; flex-wrap: wrap; gap: 3px 12px; margin-top: 9px; }
+.mode { display: flex; align-items: center; gap: 6px; font-size: 11.5px; }
+.mode i { width: 14px; height: 3px; border-radius: 2px; flex: none; }
 
 /* --- help --- */
 .help { padding: 0 12px 11px; color: var(--muted); font-size: 11.5px; }
@@ -246,8 +249,9 @@ a.btn { text-decoration: none; }
       <div class="hint" id="hint" role="status" aria-live="polite">Press <b>/</b> to search.</div>
     </div>
     <div class="help" id="help" hidden>
-      <p>Each line is a road segment — a stretch of road between two junctions. Colour and thickness both show <b>how many distinct bus services</b> use it, so trunk corridors stand out from the tail.</p>
-      <p>Hover a segment for its service list. Filtering matches whole bus numbers, so <code>4</code> will not match <code>42</code>.</p>
+      <p>Most lines are a road segment — a stretch of road between two junctions. Colour and thickness both show <b>how many distinct bus services</b> use it, so trunk corridors stand out from the tail.</p>
+      <p>Trams, metros, trains and ferries have no road under them, so they are drawn from the operator's own trace and coloured by mode instead of by service count. The key below lists the ones on this map.</p>
+      <p>Hover a line for its service list. Filtering matches whole bus numbers, so <code>4</code> will not match <code>42</code>.</p>
       <p>Zoomed out, the map thins the densest areas to keep tiles small, so a
          quiet-looking city is not necessarily a city without buses. Zoom in for
          the complete picture.</p>
@@ -255,9 +259,13 @@ a.btn { text-decoration: none; }
   </div>
 
   <div class="panel legend">
-    <div class="legend-title">Services per segment</div>
+    <div class="legend-title">Bus services per road</div>
     <div class="ramp" id="ramp"></div>
     <div class="ticks"><span>1</span><span>6</span><span>12</span><span>24</span><span>40+</span></div>
+    <!-- Filled in from what is actually drawn, and hidden until something is.
+         A Great Britain archive holds no ferry, and a key to one would be a
+         promise the tiles do not keep. -->
+    <div class="modes" id="modes" hidden></div>
   </div>
 </div>
 
@@ -327,11 +335,29 @@ const HOVER_COLOUR = { light: "#d64512", dark: "#ffffff" };
 // an extension of it. The bus ramp encodes *how many* services use a road; a tram
 // line is one service on its own track, so a position on that ramp would be a
 // number nobody can read. These say "this is a different mode" and nothing else.
+// Hues are spread rather than shaded, because these are categories and not a
+// scale: nothing about a ferry is "more" than a tram. The four common modes come
+// first; the cable-hauled tail is rare enough in these islands to be one heritage
+// line each, but a mode sharing a colour with another mode is worse than a mode
+// nobody ever sees. Red is left alone -- it is the hover and match accent, and a
+// mode that looked selected would be the wrong kind of wrong.
 const MODE_COLOUR = {
-  light: { tram: "#b5327a", metro: "#00695f", ferry: "#1f6fb2", rail: "#7a4b16" },
-  dark:  { tram: "#ff86c4", metro: "#4fd6c0", ferry: "#6ab7f0", rail: "#e0a566" },
+  light: {
+    tram: "#b5327a", metro: "#00695f", rail: "#7a4b16", ferry: "#1f6fb2",
+    cable_tram: "#6a3fb5", funicular: "#0f7a3d", aerial: "#8a6d00",
+    monorail: "#37474f",
+  },
+  dark: {
+    tram: "#ff86c4", metro: "#4fd6c0", rail: "#e0a566", ferry: "#6ab7f0",
+    cable_tram: "#b79cf0", funicular: "#6fd08c", aerial: "#ddc067",
+    monorail: "#90a4ae",
+  },
 };
-const MODE_LABEL = { tram: "Tram", metro: "Metro", ferry: "Ferry", rail: "Rail" };
+const MODE_LABEL = {
+  tram: "Tram", metro: "Metro", rail: "Rail", ferry: "Ferry",
+  cable_tram: "Cable tram", funicular: "Funicular", aerial: "Cable car",
+  monorail: "Monorail",
+};
 const FALLBACK_MODE_COLOUR = { light: "#6b6b6b", dark: "#b9b9b9" };
 
 const $ = (id) => document.getElementById(id);
@@ -844,6 +870,9 @@ function start(missing) {
   };
   input.addEventListener("input", debounce(applyFilter, 120));
   map.on("idle", countMatches);
+  // On idle rather than on load: an archive's segments are not necessarily in the
+  // opening view, and the tiles holding them arrive whenever the user reaches them.
+  map.on("idle", () => noteRenderedModes(map, SEG));
   addEventListener("keydown", (e) => {
     if (e.key === "/" && document.activeElement !== input) {
       e.preventDefault();
@@ -871,6 +900,7 @@ function start(missing) {
     for (const id of MATCH) map.setPaintProperty(id, "line-color", HOVER_COLOUR[theme]);
     const segColour = hoverOr(modeColourExpr(theme));
     for (const id of SEG) map.setPaintProperty(id, "line-color", segColour);
+    paintModeLegend();
   });
 
   /* ---------- info card ---------- */
@@ -986,6 +1016,44 @@ function basemapTiles(t) {
   return ["a", "b", "c", "d"].map(
     (s) => `https://${s}.basemaps.cartocdn.com/${BASEMAP[t]}/{z}/{x}/{y}${r}.png`
   );
+}
+
+// Modes accumulate and are never removed. Panning away from the only tram line in
+// the window should not take the key to it off the page, and a mode drawn once has
+// been drawn -- the legend is a claim about the archives loaded, not about the
+// current viewport.
+const seenModes = new Set();
+
+function noteRenderedModes(map, ids) {
+  const live = ids.filter((id) => map.getLayer(id));
+  if (!live.length) return;
+  let added = false;
+  for (const f of map.queryRenderedFeatures({ layers: live })) {
+    const m = f.properties?.mode || "other";
+    if (!seenModes.has(m)) {
+      seenModes.add(m);
+      added = true;
+    }
+  }
+  if (added) paintModeLegend();
+}
+
+function paintModeLegend() {
+  if (!seenModes.size) return;
+  // Ordered by the palette rather than alphabetically, so the four common modes
+  // stay together at the front and an unrecognised one sorts to the end with the
+  // grey it is drawn in.
+  const order = Object.keys(MODE_COLOUR[theme]);
+  const rank = (m) => (order.indexOf(m) < 0 ? order.length : order.indexOf(m));
+  $("modes").innerHTML = [...seenModes]
+    .sort((a, b) => rank(a) - rank(b))
+    .map((m) => {
+      const colour = MODE_COLOUR[theme][m] || FALLBACK_MODE_COLOUR[theme];
+      const label = MODE_LABEL[m] || "Other";
+      return `<span class="mode"><i style="background:${colour}"></i>${escapeHtml(label)}</span>`;
+    })
+    .join("");
+  $("modes").hidden = false;
 }
 
 function paintRamp() {
