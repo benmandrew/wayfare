@@ -444,6 +444,38 @@ MAX_ZOOM = 14
 # appears on hover, and hovering a road is not a thing anyone does at that scale.
 # `n` stays everywhere because it drives the colour and width ramps.
 DETAIL_ZOOM = 11
+# Where the overview band is cut in two, and how many features each half may carry.
+#
+# Tippecanoe's `--drop-densest-as-needed` is the backstop when a tile will not fit,
+# and it chooses by *density*, so it thins cities hardest and leaves a rural road
+# carrying two buses a week untouched. On Great Britain that is what the low zooms
+# looked like: measured on the 2026-08-07 archive it shed 922,505 features at z5 and
+# 298,823 at z9, and the survivors were whatever happened to be sparse. Ireland, a
+# ninth of the network, hit the limit at no zoom at all and drew a continuous map.
+#
+# Holding back the quietest roads before tippecanoe sees them puts that choice on
+# service level instead, where it belongs: what survives to z5 is the trunk network
+# by construction. The cap is a feature count rather than a `trips` threshold because
+# the threshold that fits depends on the region -- `publish` reads the cap back into
+# whatever `trips` floor the data needs, and a region already under its cap is not
+# filtered at all. Both parts of Ireland are under both caps, so this changes nothing
+# for them.
+#
+# Only the far half is capped, because only the far half is in trouble. Measured on
+# the 2026-08-07 Great Britain archive, tippecanoe kept 5.1% of the network at z5 and
+# 14.3% at z7, against 37.6% at z8 and 86.1% at z10. Capping z8-z10 as well was tried
+# and withdrawn: the caps that stop the drops there take more roads off the map than
+# the drops did, and z10 was never under pressure at all.
+#
+# The number is measured rather than derived. Tile bytes do not fall as fast as the
+# feature count -- holding Great Britain to 33.0% of its features took the largest z5
+# tile from the 1.51 MB it wanted to 630 KB, an exponent of about 0.79, because what
+# survives a `trips` floor is the busy roads and those carry the longer geometry. At
+# 214,000 no z5-z7 tile reaches the 500 KB limit and tippecanoe drops nothing, which
+# is the whole point: what is on the map is then chosen by service level rather than
+# by which cities happened to be dense.
+FAR_ZOOM = 8
+OVERVIEW_CAP_FAR = 214_000
 # A backstop against one pathological city-centre edge, not a routine truncation.
 #
 # The original 12 assumed a long service list would dominate tile size. It does not:

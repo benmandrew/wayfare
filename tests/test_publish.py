@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from wayfare import config, publish
+from wayfare import cli, config, publish
 
 
 def _row(edge_id, pts, refs, way_id=1, name="Oxford Road", trips=100):
@@ -23,6 +24,11 @@ def _row(edge_id, pts, refs, way_id=1, name="Oxford Road", trips=100):
 
 
 A, B, C, D = (0, 0), (10, 0), (20, 0), (30, 0)
+
+# Stands in for a DuckDB connection where the test stubs out everything that would
+# touch it. `build` refuses a publish with neither a connection nor an export, so
+# passing None here would be testing that refusal rather than what the test means.
+_A_CONNECTION: Any = object()
 
 
 def test_edges_meeting_end_to_end_become_one_feature():
@@ -220,10 +226,81 @@ def test_edges_without_geometry_are_skipped(con, tmp_path, monkeypatch):
     assert path.read_text() == ""
 
 
+def write_geojsonl(path, trips):
+    """A GeoJSONL file in the shape `export_geojsonl` writes, one feature per count.
+
+    Only the attributes the band filter reads are worth spelling out; the geometry is
+    there so the line is a feature rather than a fragment.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "type": "Feature",
+                    "properties": {"id": i, "way": i, "n": 1, "trips": t},
+                    "geometry": {"type": "LineString", "coordinates": [[0, 0], [1, 1]]},
+                },
+                separators=(",", ":"),
+            )
+            + "\n"
+            for i, t in enumerate(trips)
+        )
+    )
+    return path
+
+
 def test_missing_tippecanoe_says_which_fork(monkeypatch, tmp_path):
     monkeypatch.setattr(publish.shutil, "which", lambda _: None)
     with pytest.raises(RuntimeError, match="felt/tippecanoe"):
         publish.build_tiles(tmp_path / "edges.geojsonl")
+
+
+def test_a_file_under_its_cap_gets_a_floor_of_zero(tmp_path):
+    src = write_geojsonl(tmp_path / "edges.geojsonl", [5, 900, 12, 40])
+    assert publish._trips_floors(src, (10, 4)) == (0, 0)
+
+
+def test_the_floor_is_the_count_that_keeps_at_most_the_cap(tmp_path):
+    src = write_geojsonl(tmp_path / "edges.geojsonl", [10, 20, 30, 40, 50])
+    # The two busiest are 50 and 40, so a cap of 2 asks for 40 or more.
+    assert publish._trips_floors(src, (2,)) == (40,)
+    assert publish._trips_floors(src, (4,)) == (20,)
+
+
+def test_ties_at_the_floor_are_kept_rather_than_cut(tmp_path):
+    """Overshooting hands tippecanoe a few more features than asked for. Undershooting
+    throws away roads that would have fitted."""
+    src = write_geojsonl(tmp_path / "edges.geojsonl", [7, 7, 7, 1])
+    assert publish._trips_floors(src, (2,)) == (7,)
+    kept = publish._hold_back(src, tmp_path / "far.geojsonl", 7)
+    assert len(kept.read_text().splitlines()) == 3
+
+
+def test_holding_back_keeps_the_busy_roads_and_drops_the_quiet_ones(tmp_path):
+    src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 500, 2, 900])
+    out = publish._hold_back(src, tmp_path / "far.geojsonl", 500)
+    assert [
+        json.loads(line)["properties"]["trips"] for line in out.read_text().splitlines()
+    ] == [
+        500,
+        900,
+    ]
+
+
+def test_a_zero_floor_hands_back_the_same_file_and_copies_nothing(tmp_path):
+    src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2])
+    assert publish._hold_back(src, tmp_path / "far.geojsonl", 0) is src
+    assert not (tmp_path / "far.geojsonl").exists()
+
+
+def test_an_export_without_trips_raises_rather_than_filtering_everything_out(tmp_path):
+    """A filter that quietly matches nothing builds an empty band, and an empty band
+    reads as a region that lost its buses rather than as a bug here."""
+    src = tmp_path / "edges.geojsonl"
+    src.write_text('{"type":"Feature","properties":{"n":1}}\n')
+    with pytest.raises(RuntimeError, match="diverged"):
+        publish._trips_floors(src, (1,))
 
 
 def test_the_overview_band_drops_the_card_only_attributes(monkeypatch, tmp_path):
@@ -241,15 +318,47 @@ def test_the_overview_band_drops_the_card_only_attributes(monkeypatch, tmp_path)
     monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
     monkeypatch.setattr(publish.subprocess, "run", fake_run)
 
-    publish.build_tiles(tmp_path / "edges.geojsonl", tmp_path / "bus.pmtiles")
+    src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3])
+    publish.build_tiles(src, tmp_path / "bus.pmtiles")
 
-    overview, detail, join = calls
-    assert overview[overview.index("-z") + 1] == str(config.DETAIL_ZOOM - 1)
+    far, near, detail, join = calls
+    assert far[far.index("-Z") + 1] == str(config.MIN_ZOOM)
+    assert far[far.index("-z") + 1] == str(config.FAR_ZOOM - 1)
+    assert near[near.index("-Z") + 1] == str(config.FAR_ZOOM)
+    assert near[near.index("-z") + 1] == str(config.DETAIL_ZOOM - 1)
     assert detail[detail.index("-Z") + 1] == str(config.DETAIL_ZOOM)
     for name in publish._DETAIL_ONLY:
-        assert name in overview
+        assert name in far
+        assert name in near
         assert name not in detail
     assert join[0] == "tile-join"
+
+
+def test_the_bands_cover_every_zoom_once_with_no_gap(monkeypatch, tmp_path):
+    """A gap between two bands is a zoom the archive simply does not answer, and a
+    viewer showing an empty map at one zoom looks like missing data, not a config
+    slip."""
+    import subprocess
+
+    calls = []
+
+    def fake_run(cmd, **_):
+        calls.append(cmd)
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
+    monkeypatch.setattr(publish.subprocess, "run", fake_run)
+    src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3])
+    publish.build_tiles(src, tmp_path / "bus.pmtiles")
+
+    spans = [
+        (int(c[c.index("-Z") + 1]), int(c[c.index("-z") + 1]))
+        for c in calls
+        if c[0] == "tippecanoe"
+    ]
+    covered = [z for lo, hi in spans for z in range(lo, hi + 1)]
+    assert covered == list(range(config.MIN_ZOOM, config.MAX_ZOOM + 1))
 
 
 def test_a_publish_never_shows_a_half_built_archive(monkeypatch, tmp_path):
@@ -277,11 +386,12 @@ def test_a_publish_never_shows_a_half_built_archive(monkeypatch, tmp_path):
 
     monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
     monkeypatch.setattr(publish.subprocess, "run", fake_run)
-    publish.build_tiles(tmp_path / "edges.geojsonl", out)
+    src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3])
+    publish.build_tiles(src, out)
 
-    # Both tippecanoe passes and the join: one archive on offer throughout, and it
-    # is the one that was there before, whole.
-    assert seen == [(["great_britain.pmtiles"], b"the previous archive")] * 3
+    # All three tippecanoe passes and the join: one archive on offer throughout, and
+    # it is the one that was there before, whole.
+    assert seen == [(["great_britain.pmtiles"], b"the previous archive")] * 4
     # Swapped only at the end, and the scratch directory taken away with it.
     assert out.read_bytes() == b"the new one"
     assert [p.name for p in out.parent.iterdir()] == ["great_britain.pmtiles"]
@@ -331,7 +441,8 @@ def _tippecanoe_calls(monkeypatch, tmp_path, **kwargs):
 
     monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
     monkeypatch.setattr(publish.subprocess, "run", fake_run)
-    publish.build_tiles(tmp_path / "edges.geojsonl", tmp_path / "bus.pmtiles", **kwargs)
+    src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3])
+    publish.build_tiles(src, tmp_path / "bus.pmtiles", **kwargs)
     return calls
 
 
@@ -400,10 +511,11 @@ def test_dropping_the_links_keeps_every_name_and_still_credits_both():
     assert " ".join(config.credit_lines("ireland")) == config.credit_text("ireland")
 
 
-def test_both_zoom_bands_are_stamped_with_the_credit(monkeypatch, tmp_path):
-    overview, detail, join = _tippecanoe_calls(monkeypatch, tmp_path)
-    assert _attribution(overview) == config.credit_html()
-    assert _attribution(detail) == config.credit_html()
+def test_every_zoom_band_is_stamped_with_the_credit(monkeypatch, tmp_path):
+    *bands, join = _tippecanoe_calls(monkeypatch, tmp_path)
+    assert len(bands) == 3
+    for band in bands:
+        assert _attribution(band) == config.credit_html()
     # tile-join carries an input's attribution through to the joined archive --
     # measured against tippecanoe 2.79.0, including where only one input has one --
     # so it needs no flag of its own.
@@ -412,11 +524,11 @@ def test_both_zoom_bands_are_stamped_with_the_credit(monkeypatch, tmp_path):
 
 def test_the_credit_follows_the_region_rather_than_the_call_site(monkeypatch, tmp_path):
     """Derived from `config.Feed`, so it cannot drift from what `acquire` fetched."""
-    overview, _, _ = _tippecanoe_calls(
+    far, *_ = _tippecanoe_calls(
         monkeypatch, tmp_path, attribution=config.credit_html("ireland")
     )
-    assert "National Transport Authority" in _attribution(overview)
-    assert config.OGL not in _attribution(overview)
+    assert "National Transport Authority" in _attribution(far)
+    assert config.OGL not in _attribution(far)
 
 
 def test_publish_stamps_the_region_it_was_given(monkeypatch, tmp_path):
@@ -431,7 +543,7 @@ def test_publish_stamps_the_region_it_was_given(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "OUT", tmp_path)
     monkeypatch.setattr(publish, "export_geojsonl", lambda con: tmp_path / "e.geojsonl")
     monkeypatch.setattr(publish, "build_tiles", fake_build_tiles)
-    publish.build(None, region="ireland")
+    publish.build(_A_CONNECTION, region="ireland")
     assert seen["credit"] == config.credit_html("ireland")
 
 
@@ -452,7 +564,7 @@ def _built_out(monkeypatch, tmp_path, **kwargs) -> Path:
 
     monkeypatch.setattr(publish, "export_geojsonl", lambda con: tmp_path / "e.geojsonl")
     monkeypatch.setattr(publish, "build_tiles", fake_build_tiles)
-    publish.build(None, **kwargs)
+    publish.build(_A_CONNECTION, **kwargs)
     return seen["out"]
 
 
@@ -537,8 +649,8 @@ def _run_publish(monkeypatch, tmp_path, argv, build=None):
 
     seen = {}
 
-    def fake_build(con, region=None, out=None):
-        seen.update(region=region, out=out)
+    def fake_build(con, region=None, out=None, from_export=None):
+        seen.update(region=region, out=out, from_export=from_export)
         if build is not None:
             return build(con, region=region, out=out)
         return out or tmp_path / "bus.pmtiles"
@@ -602,5 +714,95 @@ def test_tippecanoe_failure_surfaces_stderr(monkeypatch, tmp_path):
         "run",
         lambda *a, **k: subprocess.CompletedProcess(a[0], 1, "", "boom: out of memory"),
     )
+    src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3])
     with pytest.raises(subprocess.CalledProcessError):
-        publish.build_tiles(tmp_path / "edges.geojsonl", tmp_path / "o.pmtiles")
+        publish.build_tiles(src, tmp_path / "o.pmtiles")
+
+
+def test_only_the_last_band_may_extend_past_its_top_zoom(monkeypatch, tmp_path):
+    """`-z` is a ceiling --extend-zooms-if-still-dropping is allowed to raise. Above
+    the detail band there is nothing to collide with; below it, a band that grew into
+    the next one's zooms would have tile-join merge both copies of every road."""
+    import subprocess
+
+    calls = []
+
+    def fake_run(cmd, **_):
+        calls.append(cmd)
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
+    monkeypatch.setattr(publish.subprocess, "run", fake_run)
+    src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3])
+    publish.build_tiles(src, tmp_path / "bus.pmtiles")
+
+    far, near, detail, _ = calls
+    assert "--extend-zooms-if-still-dropping" not in far
+    assert "--extend-zooms-if-still-dropping" not in near
+    assert "--extend-zooms-if-still-dropping" in detail
+
+
+def test_building_from_an_existing_export_needs_no_connection(monkeypatch, tmp_path):
+    """A `prune` reclaims the tables `match` needed, so a data root can be left with
+    its export and nothing else. Northern Ireland's is exactly that."""
+    import subprocess
+
+    calls = []
+
+    def fake_run(cmd, **_):
+        calls.append(cmd)
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
+    monkeypatch.setattr(publish.subprocess, "run", fake_run)
+    monkeypatch.setattr(config, "OUT", tmp_path / "out")
+
+    def explode(*_a, **_k):
+        raise AssertionError("export_geojsonl was called with no connection to use")
+
+    monkeypatch.setattr(publish, "export_geojsonl", explode)
+
+    src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3])
+    out = publish.build(None, region="northern_ireland", from_export=src)
+    assert out.exists()
+    assert _attribution(calls[0]) == config.credit_html("northern_ireland")
+
+
+def test_a_missing_export_is_named_rather_than_silently_exported(monkeypatch, tmp_path):
+    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
+    monkeypatch.setattr(config, "OUT", tmp_path / "out")
+    with pytest.raises(RuntimeError, match="not there"):
+        publish.build(None, from_export=tmp_path / "gone.geojsonl")
+
+
+def test_publishing_without_a_connection_or_an_export_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "OUT", tmp_path / "out")
+    with pytest.raises(ValueError, match="needs a connection"):
+        publish.build(None)
+
+
+def test_from_export_publishes_without_touching_the_database(monkeypatch, tmp_path):
+    """The one publish that reaches for a data root whose database is gone must not
+    be stopped by the check that every other publish needs."""
+    monkeypatch.setattr(config, "WORK", tmp_path)
+    write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3])
+
+    def no_db():
+        raise AssertionError("_require_db ran for a publish that needs no database")
+
+    monkeypatch.setattr(cli, "_require_db", no_db)
+    monkeypatch.setattr(
+        cli.db, "connect", lambda **_: pytest.fail("a connection was opened")
+    )
+    seen = {}
+
+    def fake_build(con, region=None, out=None, from_export=None):
+        seen.update(con=con, from_export=from_export)
+        return tmp_path / "bus.pmtiles"
+
+    monkeypatch.setattr(cli.publish, "build", fake_build)
+    assert cli.main(["publish", "--from-export"]) == 0
+    assert seen["con"] is None
+    assert seen["from_export"] == tmp_path / "edges.geojsonl"

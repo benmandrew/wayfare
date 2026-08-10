@@ -434,8 +434,9 @@ attribute value.** MVT pools attribute values per layer per tile, so a feature p
 two varints to point into the pool. Long service lists are cheap; feature counts are
 not. A Valhalla directed edge averages 4.14 coordinates and tens of metres, so one
 feature per edge was the root cost — and at four points a feature `--simplification=4`
-had nothing to remove, so low zooms carried full-detail geometry and tippecanoe fell
-back on `--drop-densest-as-needed`, shedding whole roads.
+had nothing to remove, so low zooms carry full-detail geometry. What a low zoom holds
+is therefore decided by a `trips` floor applied to the input, not by
+`--drop-densest-as-needed` shedding whole roads.
 
 **Tile features are coalesced, and coalescing must stay lossless.** Runs of edges that
 share every tile attribute (`way_id`, road name, service set, trip count) and meet end
@@ -469,3 +470,47 @@ the densest tiles to 27% of their features.
 
 `publish.export_geojsonl` streams by `way_id` rather than materialising the table: 617
 -> 372 MB peak RSS on Wales.
+
+**The archive is three tippecanoe builds joined by `tile-join`, not two.** `far` covers
+z5-z7 and reads a filtered copy of the export, `near` covers z8-z10 and reads all of it,
+`detail` covers z11-z14. The first two exclude the card-only attributes, which is how the
+z11+ confinement above is implemented. Splitting the low zooms into their own *band* is
+what lets them take a different input from the rest.
+
+**`--drop-densest-as-needed` chooses by spatial density, so it thins cities hardest and
+leaves a rural road carrying two buses a week alone.** On the Great Britain archive
+published 2026-08-07, tippecanoe's own `strategies` metadata records it shedding 922,505
+features at z5, 841,401 at z6, 779,546 at z7, 538,485 at z8 and 298,823 at z9, and nothing
+from z10 up. Decoding the finished archive gives z5 holding 5.1% of what z14 held, z6
+9.7%, z7 14.3%, z8 37.6%, z9 58.3% and z10 86.1%. Ireland's archive carries no
+`strategies` key at all, and neither does Northern Ireland's, so nothing was thinned at any
+zoom in either, and Ireland holds 41.5% at z5 and 75.7% at z8. Great Britain carries
+1,095,684 features at z14 against Ireland's 115,853, 9.5x the network, but at z5 carried
+55,998 against 48,043, only 1.17x. Density was the wrong criterion.
+
+**The `far` band is filtered by a `trips` floor read out of a feature-count cap.**
+`config.OVERVIEW_CAP_FAR` is 214,000 features, and `publish` writes a filtered copy of the
+GeoJSONL holding only the features that clear the floor that cap implies. Great Britain's
+export is 870,136 features, the floor lands at 703 trips, and 214,143 features survive,
+24.6% of the input. No z5-z7 tile then reaches tippecanoe's 500 KB limit and nothing is
+dropped. z5 now carries 100,836 features against 55,998 before, z6 134,950 and z7 169,382.
+A region already under the cap gets a floor of zero and is not filtered at all, so both
+parts of Ireland are untouched. The filter pass costs 2.6 seconds over 870,136 features.
+
+**Capping z8-z10 as well was tried and withdrawn.** The caps needed to stop the drops
+there take more roads off the map than the drops did. A cap of 381,000 left z10 showing
+411,255 features where the unfiltered build showed 943,040, and z10 was never under
+pressure to begin with.
+
+**Tippecanoe applies `-x` before `-j`, so a feature filter naming an excluded attribute
+matches nothing.** Measured on London, `-x trips` with a `-j` filter on `trips` built a
+2.4 KB archive holding no tiles, and reported no error. Filtering the input file avoids the
+ordering entirely.
+
+**`--extend-zooms-if-still-dropping` treats `-z` as a ceiling it may raise.** A `far` band
+asked for z5-z7 came back covering z5-z9, which overlaps `near`, and `tile-join` would then
+merge both copies of every road into those tiles. The flag is passed to the last band only.
+
+Both of those failures produce an archive that builds, uploads and opens without complaint.
+Counting features per zoom in the finished archive is what catches them, and it is the
+measurement the whole banding rests on.
