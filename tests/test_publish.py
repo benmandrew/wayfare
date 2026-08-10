@@ -226,28 +226,40 @@ def test_edges_without_geometry_are_skipped(con, tmp_path, monkeypatch):
     assert path.read_text() == ""
 
 
-def write_geojsonl(path, trips):
+def write_geojsonl(path, trips, at=(0.0, 0.0)):
     """A GeoJSONL file in the shape `export_geojsonl` writes, one feature per count.
 
-    Only the attributes the band filter reads are worth spelling out; the geometry is
-    there so the line is a feature rather than a fragment.
+    `trips` may be a flat list, which puts every feature at `at`, or a mapping of
+    position to counts, which is how a test says two places rather than one.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "".join(
-            json.dumps(
-                {
-                    "type": "Feature",
-                    "properties": {"id": i, "way": i, "n": 1, "trips": t},
-                    "geometry": {"type": "LineString", "coordinates": [[0, 0], [1, 1]]},
-                },
-                separators=(",", ":"),
+    if not isinstance(trips, dict):
+        trips = {at: trips}
+    lines, i = [], 0
+    for (lon, lat), counts in trips.items():
+        for t in counts:
+            lines.append(
+                json.dumps(
+                    {
+                        "type": "Feature",
+                        "properties": {"id": i, "way": i, "n": 1, "trips": t},
+                        "geometry": {
+                            "type": "LineString",
+                            "coordinates": [[lon, lat], [lon + 1e-4, lat + 1e-4]],
+                        },
+                    },
+                    separators=(",", ":"),
+                )
             )
-            + "\n"
-            for i, t in enumerate(trips)
-        )
-    )
+            i += 1
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n")
     return path
+
+
+def kept_trips(path):
+    return sorted(
+        json.loads(line)["properties"]["trips"] for line in path.read_text().splitlines()
+    )
 
 
 def test_missing_tippecanoe_says_which_fork(monkeypatch, tmp_path):
@@ -256,51 +268,85 @@ def test_missing_tippecanoe_says_which_fork(monkeypatch, tmp_path):
         publish.build_tiles(tmp_path / "edges.geojsonl")
 
 
-def test_a_file_under_its_cap_gets_a_floor_of_zero(tmp_path):
+def test_a_file_under_its_cap_is_not_filtered_at_all(tmp_path):
+    """Both parts of Ireland are here, and a cap that thinned them would be throwing
+    away roads to solve a problem they do not have."""
     src = write_geojsonl(tmp_path / "edges.geojsonl", [5, 900, 12, 40])
-    assert publish._trips_floors(src, (10, 4)) == (0, 0)
+    assert publish._cell_floors(src, 10) == {}
+    assert publish._hold_back(src, tmp_path / "far.geojsonl", {}) is src
+    assert not (tmp_path / "far.geojsonl").exists()
 
 
-def test_the_floor_is_the_count_that_keeps_at_most_the_cap(tmp_path):
+def test_the_floor_is_the_count_that_keeps_a_cell_its_share(tmp_path):
     src = write_geojsonl(tmp_path / "edges.geojsonl", [10, 20, 30, 40, 50])
-    # The two busiest are 50 and 40, so a cap of 2 asks for 40 or more.
-    assert publish._trips_floors(src, (2,)) == (40,)
-    assert publish._trips_floors(src, (4,)) == (20,)
+    # One cell holding everything: a cap of 2 of 5 is a 40% share, so 2 features.
+    assert publish._cell_floors(src, 2) == {(0, 0): 40}
+    assert publish._cell_floors(src, 4) == {(0, 0): 20}
 
 
 def test_ties_at_the_floor_are_kept_rather_than_cut(tmp_path):
     """Overshooting hands tippecanoe a few more features than asked for. Undershooting
     throws away roads that would have fitted."""
     src = write_geojsonl(tmp_path / "edges.geojsonl", [7, 7, 7, 1])
-    assert publish._trips_floors(src, (2,)) == (7,)
-    kept = publish._hold_back(src, tmp_path / "far.geojsonl", 7)
-    assert len(kept.read_text().splitlines()) == 3
+    floors = publish._cell_floors(src, 2)
+    assert floors == {(0, 0): 7}
+    assert kept_trips(publish._hold_back(src, tmp_path / "far.geojsonl", floors)) == [
+        7,
+        7,
+        7,
+    ]
 
 
-def test_holding_back_keeps_the_busy_roads_and_drops_the_quiet_ones(tmp_path):
-    src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 500, 2, 900])
-    out = publish._hold_back(src, tmp_path / "far.geojsonl", 500)
-    assert [
-        json.loads(line)["properties"]["trips"] for line in out.read_text().splitlines()
-    ] == [
-        500,
+def test_a_quiet_place_is_not_ranked_against_a_busy_one(tmp_path):
+    """The whole point. `trips` is an absolute count, so one national floor ranks the
+    map by how urban it is: a 703-trip floor took every feature from 310 of Great
+    Britain's 655 populated cells. Each cell gets its own floor instead."""
+    src = write_geojsonl(
+        tmp_path / "edges.geojsonl",
+        {(0.0, 0.0): [900, 800, 700, 600], (10.0, 10.0): [9, 8, 7, 6]},
+    )
+    floors = publish._cell_floors(src, 4)
+    # A floor for each place, and the quiet one's is nowhere near the busy one's.
+    assert len(floors) == 2
+    assert floors[(0, 0)] == 800
+    assert floors[(40, 40)] == 8
+    # Both places still draw something, which a single national floor would not do.
+    assert kept_trips(publish._hold_back(src, tmp_path / "far.geojsonl", floors)) == [
+        8,
+        9,
+        800,
         900,
     ]
 
 
-def test_a_zero_floor_hands_back_the_same_file_and_copies_nothing(tmp_path):
-    src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2])
-    assert publish._hold_back(src, tmp_path / "far.geojsonl", 0) is src
-    assert not (tmp_path / "far.geojsonl").exists()
+def test_every_populated_cell_keeps_at_least_one_feature(tmp_path):
+    """Rounding alone empties the five sparsest cells in Great Britain, and an empty
+    cell is a hole in the map rather than a thinner patch of it."""
+    src = write_geojsonl(
+        tmp_path / "edges.geojsonl",
+        {(0.0, 0.0): [100] * 500, (10.0, 10.0): [3]},
+    )
+    floors = publish._cell_floors(src, 50)
+    assert floors[(40, 40)] == 3
+    assert 3 in kept_trips(publish._hold_back(src, tmp_path / "far.geojsonl", floors))
 
 
-def test_an_export_without_trips_raises_rather_than_filtering_everything_out(tmp_path):
+def test_a_road_on_the_prime_meridian_is_still_read(tmp_path):
+    """A longitude within about a kilometre of Greenwich is written in scientific
+    notation. Great Britain has 63 of them, and a number pattern that cannot read an
+    exponent takes them off the map without saying so."""
+    src = write_geojsonl(tmp_path / "edges.geojsonl", {(-1.1e-05, 52.219691): [500, 400]})
+    assert b"e-05" in src.read_bytes()
+    assert publish._cell_floors(src, 1) == {(0, 209): 500}
+
+
+def test_an_unreadable_export_raises_rather_than_filtering_everything_out(tmp_path):
     """A filter that quietly matches nothing builds an empty band, and an empty band
     reads as a region that lost its buses rather than as a bug here."""
     src = tmp_path / "edges.geojsonl"
     src.write_text('{"type":"Feature","properties":{"n":1}}\n')
     with pytest.raises(RuntimeError, match="diverged"):
-        publish._trips_floors(src, (1,))
+        publish._cell_floors(src, 1)
 
 
 def test_the_overview_band_drops_the_card_only_attributes(monkeypatch, tmp_path):

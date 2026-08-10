@@ -435,7 +435,7 @@ two varints to point into the pool. Long service lists are cheap; feature counts
 not. A Valhalla directed edge averages 4.14 coordinates and tens of metres, so one
 feature per edge was the root cost — and at four points a feature `--simplification=4`
 had nothing to remove, so low zooms carry full-detail geometry. What a low zoom holds
-is therefore decided by a `trips` floor applied to the input, not by
+is therefore decided by a feature quota applied to the input, not by
 `--drop-densest-as-needed` shedding whole roads.
 
 **Tile features are coalesced, and coalescing must stay lossless.** Runs of edges that
@@ -488,14 +488,34 @@ zoom in either, and Ireland holds 41.5% at z5 and 75.7% at z8. Great Britain car
 1,095,684 features at z14 against Ireland's 115,853, 9.5x the network, but at z5 carried
 55,998 against 48,043, only 1.17x. Density was the wrong criterion.
 
-**The `far` band is filtered by a `trips` floor read out of a feature-count cap.**
-`config.OVERVIEW_CAP_FAR` is 214,000 features, and `publish` writes a filtered copy of the
-GeoJSONL holding only the features that clear the floor that cap implies. Great Britain's
-export is 870,136 features, the floor lands at 703 trips, and 214,143 features survive,
-24.6% of the input. No z5-z7 tile then reaches tippecanoe's 500 KB limit and nothing is
-dropped. z5 now carries 100,836 features against 55,998 before, z6 134,950 and z7 169,382.
-A region already under the cap gets a floor of zero and is not filtered at all, so both
-parts of Ireland are untouched. The filter pass costs 2.6 seconds over 870,136 features.
+**One national `trips` floor emptied half the map, and it shipped.** The first answer
+ranked the whole region on `trips` and kept the highest 214,000 features. `trips` is an
+absolute count, so ranking a country on one scale ranks it by how urban it is. At the
+703-trip floor that produced, measured over 0.25-degree cells on Great Britain, 310 of the
+655 cells holding any bus road lost every feature they had, 47.3% of them. The ten busiest
+cells held 45.9% of the survivors, and the top tenth of cells went from 48.7% of the map's
+features to 81.7%. On the map that drew the dense cities with black between them. The
+archive was republished uncapped as soon as it was seen, so the fault was live only
+briefly.
+
+**The `far` band's feature cap is now shared out per cell, and every cell keeps the same
+fraction of what it holds.** `config.OVERVIEW_CAP_FAR` is 205,000 features and
+`config.OVERVIEW_CELL` is 0.25 degrees, about 28 km by 17 km at this latitude and 655
+populated *cells* over Great Britain. A cell's quota is the cap over the region's feature
+count, with a minimum of one feature per populated cell, and `trips` decides which features
+within that cell. The floor is therefore local — 1 trip in the countryside to 5,600 in the
+busiest cell, median 218 across Great Britain. 209,493 features survive out of 870,136,
+24.1%, once ties at each cell's floor are kept, and no cell is emptied. The top tenth of
+cells holds 47.8% of the output against 48.7% of the input, so the spatial distribution
+survives, and the worst-served cell holding 20 or more features keeps 22.8% against the
+24.1% average, so no area is singled out. No z5-z7 tile then reaches tippecanoe's 500 KB
+limit and nothing is dropped. z5 carries 98,313 features against 55,983 uncapped, z6
+130,947 against 106,672, z7 168,255 against 157,193. A region already under the cap keeps a
+fraction of one and is not filtered at all, so both parts of Ireland are untouched.
+
+214,000 is too large a cap once the quota goes per cell. At that cap the largest z5 tile
+wanted 509,293 bytes against the 500 KB limit, and tippecanoe shed 71,494 features. 205,000
+clears it.
 
 **Capping z8-z10 as well was tried and withdrawn.** The caps needed to stop the drops
 there take more roads off the map than the drops did. A cap of 381,000 left z10 showing
@@ -511,6 +531,12 @@ ordering entirely.
 asked for z5-z7 came back covering z5-z9, which overlaps `near`, and `tile-join` would then
 merge both copies of every road into those tiles. The flag is passed to the last band only.
 
-Both of those failures produce an archive that builds, uploads and opens without complaint.
-Counting features per zoom in the finished archive is what catches them, and it is the
-measurement the whole banding rests on.
+**A longitude within about a kilometre of the prime meridian is written in scientific
+notation.** It comes out as `-1.1e-05`, and Great Britain has 63 such features, around
+Greenwich. A number pattern of `-?\d+\.?\d*` matches every other line in the export and
+skips exactly those, so the filter would have put them in the wrong cell or dropped them
+without a word. The pattern now allows an exponent.
+
+All three failures produce an archive that builds, uploads and opens without complaint.
+Counting features, per zoom in the finished archive and per cell in the filtered export, is
+what catches them, and it is the measurement the whole banding rests on.

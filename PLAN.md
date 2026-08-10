@@ -137,44 +137,36 @@ Britain's archive was renamed from `bus.pmtiles` because `web/index.html:358` bu
 dropdown label from the filename; the default view is unchanged, because
 `web/index.html:315` takes `ARCHIVES[0]` and `great_britain` still sorts first.
 
-## Next — republish the three served archives with their credit
+## Done — the three served archives carry their credit
 
-**The attribution code landed 38 minutes after the image that published these tiles was
-built.** `publish` now stamps the credit into the archive's own tileset metadata
-(`93623bc`), but `benmandrew/wayfare:latest` on the server was built at 21:04Z and the
-commit landed at 21:42Z, so the archives were written without it. Inspecting the three
-served files on 2026-08-10 narrows that to two: `ireland.pmtiles`, republished at 22:21Z,
-carries the full NTA and OpenStreetMap credit in its tileset metadata. Northern Ireland
-was republished 35 minutes earlier, at 21:46Z, and its `generator_options` shows no
-`--attribution` flag at all — the image had not been rebuilt yet. Great Britain has not
-been republished since 7 August and carries none either. `config.credit_html` returns the
-right credit for all three regions, so nothing is wrong with the code and there is nothing
-to fix before republishing.
+**Republished on 2026-08-10, all three, against image `sha256:ace6d450`.** The attribution
+code (`93623bc`) had landed 38 minutes after the image that published the earlier tiles was
+built, so Great Britain and Northern Ireland were being served with no credit at all, which
+the Republic's CC BY 4.0 and Translink's Open Government Licence v3.0 both make a breach.
+Ireland had already picked the credit up in its 9 August republish. `config.credit_html`
+was right for all three regions throughout; nothing needed fixing before republishing, and
+nothing was re-matched.
 
-The Republic's CC BY 4.0 and Translink's Open Government Licence v3.0 both make the credit
-a condition of publication, so Great Britain and Northern Ireland are a live breach for as
-long as those two files are up. Nothing needs re-matching: rebuild the image, then run one
-publish against each of the three data roots, writing into that root's `out/`.
-
+    # from /home/ben/wayfare-build, /home/ben/wayfare-ireland
     wayfare publish --region all --name-by-region              # great_britain.pmtiles
-    wayfare publish --region ireland --name-by-region          # ireland.pmtiles
-    wayfare publish --region northern_ireland --name-by-region # northern_ireland.pmtiles
+    wayfare publish --region ireland --out /served/ireland.pmtiles
 
-Each archive is then copied into `/home/samba/sambashare/wayfare/out`, or written straight
-there with `--out` where the container can see that directory. The renaming step is gone.
-Northern Ireland's data root has no `wayfare.duckdb` — only the `edges.geojsonl` its last
-publish exported — so that one takes `--from-export`, which builds the tiles from a
-GeoJSONL already on disk and opens no database at all:
+Northern Ireland's data root has no `wayfare.duckdb`, only the `edges.geojsonl` its last
+publish exported, so it took `--from-export` — tiles built from a GeoJSONL already on disk,
+opening no database. The export is deterministic, so those are the tiles the missing
+database would have produced.
 
-    wayfare publish --region northern_ireland --name-by-region --from-export
+    wayfare publish --region northern_ireland --from-export --out /served/northern_ireland.pmtiles
 
-The export is deterministic, so those are the same tiles the missing database would have
-produced. This is the most urgent item in this file.
-
-The same rebuild carries the `far` band, so Great Britain's low zooms change at the same
-time: z5 goes from 55,998 features to 100,836, chosen by service level rather than by
-which cities happened to be dense. Both parts of Ireland are under the cap and their tiles
-are unchanged apart from the credit.
+The same republish carried the `far` band, and its first form was wrong: a single
+national `trips` floor emptied 310 of Great Britain's 655 populated cells and drew the
+cities with black between them. GB was republished uncapped as soon as that was seen, and
+again once the quota became per cell. Great Britain now: z5 98,313 features against 55,983
+uncapped, z6 130,947 against 106,672, z7 168,255 against 157,193, nothing thinned to fit in
+that band, no cell emptied, and z8 upwards unchanged. Both parts of Ireland are under the
+cap and came back feature-for-feature identical at all ten zooms, credit aside. The
+replaced archives are at `/home/ben/archive-backup-20260810/` on the server, with
+checksums.
 
 ## Next — the picture
 
