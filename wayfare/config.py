@@ -194,31 +194,50 @@ class Credit:
     who_url: str | None = None
 
 
-def credit_parts(region: str | None = None) -> tuple[Credit, ...]:
+def credit_parts(
+    region: str | None = None, *, road: bool = True, operator: bool = False
+) -> tuple[Credit, ...]:
     """Everything a picture of this region owes an acknowledgement to.
 
     Built from the `Feed` rather than from a table of its own, so a source added to
     `FEEDS` is credited by the act of describing it.
 
-    Two obligations, and the second is the one that is easy to miss. The timetable
-    is the publisher's, under their licence -- a condition rather than a courtesy
-    now that the Republic's feed is CC BY 4.0. The geometry is OpenStreetMap's,
-    under ODbL, whatever the timetable says: every edge is an OSM way that Valhalla
-    matched a route onto, so an archive is a derived database. The viewer's existing
-    OpenStreetMap line is about the *backdrop* and says nothing about the lines drawn
-    on top of it, which is why the wording here names what each credit covers.
+    The timetable is always the publisher's, under their licence -- a condition
+    rather than a courtesy now that the Republic's feed is CC BY 4.0.
+
+    The second credit is the one that is easy to miss, and it is *conditional*.
+    Where a route was map-matched, every edge is an OpenStreetMap way that Valhalla
+    matched onto, so the archive is a derived database and owes ODbL whatever the
+    timetable says. Where it was not -- a tram, metro or ferry drawn from the trace
+    in the feed -- no OpenStreetMap data was involved at all, and claiming ODbL over
+    the operator's own survey would be wrong in the opposite direction: asserting a
+    share-alike condition on data whose publisher never imposed one. `road` is what
+    tells the two apart, and it is the caller's to set because only the caller knows
+    what it built.
+
+    `operator` widens the first credit's noun rather than adding a third line. The
+    trace arrives in the same bundle as the timetable and is covered by the same
+    licence, so it needs naming rather than crediting separately -- and naming it
+    matters, because this is the wording that says what each credit covers.
 
     The basemap is not here. It belongs to the page that chooses it, not to the data,
     and a render carries no basemap at all.
     """
     f = feed(region)
-    return (
-        Credit("Bus routes", f.attribution, f.licence),
-        Credit("Road geometry", "OpenStreetMap contributors", ODBL, OSM_COPYRIGHT),
+    what = (
+        "Routes, timetables and operator geometry" if operator else "Routes and timetables"
     )
+    parts = [Credit(what, f.attribution, f.licence)]
+    if road:
+        parts.append(
+            Credit("Road geometry", "OpenStreetMap contributors", ODBL, OSM_COPYRIGHT)
+        )
+    return tuple(parts)
 
 
-def credit_html(region: str | None = None) -> str:
+def credit_html(
+    region: str | None = None, *, road: bool = True, operator: bool = False
+) -> str:
     """The credit as a map attribution control wants it.
 
     `publish` stamps this into the tileset metadata, which is the one place a licence
@@ -229,11 +248,17 @@ def credit_html(region: str | None = None) -> str:
     return " &middot; ".join(
         f"{c.what}: &copy; {_link(c.who, c.who_url)}, "
         f"{_link(c.licence, LICENCE_URLS[c.licence])}"
-        for c in credit_parts(region)
+        for c in credit_parts(region, road=road, operator=operator)
     )
 
 
-def credit_lines(region: str | None = None, *, links: bool = True) -> tuple[str, ...]:
+def credit_lines(
+    region: str | None = None,
+    *,
+    links: bool = True,
+    road: bool = True,
+    operator: bool = False,
+) -> tuple[str, ...]:
     """The credit as plain text, one line per thing being credited.
 
     `links=False` drops the URIs. That is for the one place they cost more than they
@@ -247,17 +272,19 @@ def credit_lines(region: str | None = None, *, links: bool = True) -> tuple[str,
         + (f" <{c.who_url}>" if c.who_url and links else "")
         + f", {c.licence}"
         + (f" <{LICENCE_URLS[c.licence]}>." if links else ".")
-        for c in credit_parts(region)
+        for c in credit_parts(region, road=road, operator=operator)
     )
 
 
-def credit_text(region: str | None = None) -> str:
+def credit_text(
+    region: str | None = None, *, road: bool = True, operator: bool = False
+) -> str:
     """The same credit with the links spelled out, for anywhere HTML is not read.
 
     A PNG `tEXt` chunk, an SVG `<metadata>` block, a log line. The copyright sign is
     deliberate and safe in all three: it is in Latin-1, which is what `tEXt` allows.
     """
-    return " ".join(credit_lines(region))
+    return " ".join(credit_lines(region, road=road, operator=operator))
 
 
 def _link(text: str, url: str | None) -> str:

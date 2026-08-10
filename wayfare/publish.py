@@ -711,6 +711,26 @@ def default_out(region: str | None = None) -> Path:
     return config.OUT / DEFAULT_ARCHIVE
 
 
+def contents(con: duckdb.DuckDBPyConnection) -> dict[str, bool]:
+    """What this archive actually holds, which is what decides its credits.
+
+    Read from the database rather than assumed, because both halves are now
+    optional: a region with no matched edges owes OpenStreetMap nothing, and one
+    with no segments has no operator geometry to name. Getting either wrong is a
+    licence statement that is false in one direction or the other, and neither is
+    visible in the picture.
+    """
+
+    def any_rows(sql: str) -> bool:
+        row = con.execute(sql).fetchone()
+        return bool(row and row[0])
+
+    return {
+        "road": any_rows("SELECT count(*) FROM edge_services"),
+        "operator": any_rows("SELECT count(*) FROM segments"),
+    }
+
+
 def build(
     con: duckdb.DuckDBPyConnection | None = None,
     region: str | None = None,
@@ -737,14 +757,16 @@ def build(
             f"{from_export} is not there. --from-export names the GeoJSONL a previous "
             "publish wrote, and this data root has none."
         )
-    # Without a connection there is no `segments` table to read, so a build from an
-    # export is the road network and nothing else. The segments GeoJSONL is
+    # Without a connection there is no `segments` table to read and no way to tell
+    # what the archive holds, so the credit falls back to what a road-only export
+    # owes -- which is what this path exists for. The segments GeoJSONL is
     # deliberately not rebuilt from the export instead: the export *is* the road
     # network, and a rebuild that quietly dropped a region's trams would look like a
     # successful publish.
+    held = contents(con) if con is not None else {"road": True, "operator": False}
     return build_tiles(
         from_export,
         out or default_out(region),
-        attribution=config.credit_html(region),
+        attribution=config.credit_html(region, **held),
         segments=export_segments_geojsonl(con) if con is not None else None,
     )

@@ -589,6 +589,7 @@ def test_publish_stamps_the_region_it_was_given(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "OUT", tmp_path)
     monkeypatch.setattr(publish, "export_geojsonl", lambda con: tmp_path / "e.geojsonl")
     monkeypatch.setattr(publish, "export_segments_geojsonl", lambda con: None)
+    monkeypatch.setattr(publish, "contents", lambda con: {"road": True, "operator": False})
     monkeypatch.setattr(publish, "build_tiles", fake_build_tiles)
     publish.build(_A_CONNECTION, region="ireland")
     assert seen["credit"] == config.credit_html("ireland")
@@ -613,6 +614,7 @@ def _built_out(monkeypatch, tmp_path, **kwargs) -> Path:
     # Stubbed alongside the edge export: this helper is about which path `build`
     # chooses, and it hands `build` a None connection to prove it never reads one.
     monkeypatch.setattr(publish, "export_segments_geojsonl", lambda con: None)
+    monkeypatch.setattr(publish, "contents", lambda con: {"road": True, "operator": False})
     monkeypatch.setattr(publish, "build_tiles", fake_build_tiles)
     publish.build(_A_CONNECTION, **kwargs)
     return seen["out"]
@@ -986,3 +988,61 @@ def test_a_bus_only_region_gets_no_segments_pass(monkeypatch, tmp_path):
     )
     assert len(calls) == 4  # far, near, detail, join -- and nothing else
     assert not any(publish.LAYER_SEGMENTS in c for c in calls)
+
+
+# --- what the credit claims, and what it must not ------------------------------
+
+
+def test_the_noun_is_not_bus_once_the_archive_holds_other_modes():
+    """ "Bus routes" was accurate while a bus was all there was. An archive holding
+    trams and ferries credited as bus routes misdescribes what it contains."""
+    assert "Bus routes" not in config.credit_html("wales")
+    assert "Routes and timetables" in config.credit_html("wales")
+
+
+def test_operator_geometry_is_named_in_the_publishers_credit_not_a_third_line():
+    """The trace arrives in the same bundle as the timetable and is covered by the
+    same licence, so it needs naming rather than crediting separately."""
+    credit = config.credit_html("wales", operator=True)
+    assert "Routes, timetables and operator geometry" in credit
+    # Still two parts, not three.
+    assert len(config.credit_parts("wales", operator=True)) == 2
+
+
+def test_an_archive_with_no_matched_edges_makes_no_odbl_claim():
+    """Claiming ODbL over an operator's own survey is wrong in the opposite
+    direction from omitting it: it asserts a share-alike condition on data whose
+    publisher never imposed one. No OSM way was involved, so no OSM credit."""
+    credit = config.credit_html("ireland", road=False, operator=True)
+    assert "OpenStreetMap" not in credit
+    assert config.LICENCE_URLS[config.ODBL] not in credit
+    # The publisher is still credited, and CC BY 4.0 makes that a condition.
+    assert "National Transport Authority" in credit
+    assert config.LICENCE_URLS[config.CC_BY_4] in credit
+
+
+def test_the_default_is_unchanged_for_a_road_only_archive():
+    """Every existing caller -- `art`, `/art/meta`, a bare `build_tiles` -- draws
+    matched edges and nothing else, so the flags default to exactly that."""
+    assert config.credit_parts("wales") == config.credit_parts(
+        "wales", road=True, operator=False
+    )
+    assert [c.what for c in config.credit_parts("wales")] == [
+        "Routes and timetables",
+        "Road geometry",
+    ]
+
+
+def test_the_credit_follows_what_the_archive_actually_holds(con, tmp_path, monkeypatch):
+    """The flags are read from the database rather than assumed, because getting
+    either wrong is a licence statement that is false and invisible in the picture."""
+    from wayfare import db
+
+    assert publish.contents(con) == {"road": False, "operator": False}
+
+    db.set_meta(con, "feed_version", "F1")
+    _tram(con, 1, [-2245000, -2240000], [53480000, 53481000])
+    assert publish.contents(con) == {"road": False, "operator": True}
+
+    _edge(con, 5, ["42"])
+    assert publish.contents(con) == {"road": True, "operator": True}

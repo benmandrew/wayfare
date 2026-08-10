@@ -246,16 +246,32 @@ Republic is matched, not after — see PLAN.md.
 
 ## Attribution
 
-**Every archive owes two credits, never one.** The timetable is the publisher's, under
-whatever licence that publisher chose: OGL v3.0 for BODS and Translink, CC BY 4.0 for
-the NTA. The road geometry is OpenStreetMap's under the Open Database License (ODbL,
-carrying the licence's own American spelling because that is its name). The second
-obligation is the one that is easy to miss. Every edge in the database is an OSM way
-that Valhalla matched a route onto, so an archive is a derived database whatever the
-timetable's licence says, and that holds for an OGL region as much as for the Irish
-one. The viewer's pre-existing OpenStreetMap line credits the *basemap tiles* and says
-nothing about the lines drawn on top of them, so the wording names what each credit
-covers — "Bus routes:" and "Road geometry:".
+**An archive owes the publisher always and OpenStreetMap conditionally.** The timetable
+is the publisher's, under whatever licence that publisher chose: OGL v3.0 for BODS and
+Translink, CC BY 4.0 for the NTA. Where a route was map-matched, the geometry is
+OpenStreetMap's under the Open Database License (ODbL, carrying the licence's own
+American spelling because that is its name). That second obligation is the one that is
+easy to miss: every matched edge is an OSM way that Valhalla matched a route onto, so
+such an archive is a derived database whatever the timetable's licence says, and that
+holds for an OGL region as much as for the Irish one. The viewer's pre-existing
+OpenStreetMap line credits the *basemap tiles* and says nothing about the lines drawn
+on top of them, so the wording names what each credit covers.
+
+**The ODbL claim is wrong for a mode that was never matched, and wrong in the direction
+that is harder to notice.** A tram, metro or ferry is drawn from the trace in the feed:
+no OSM way is involved, and asserting share-alike over an operator's own survey imposes
+a condition its publisher never chose. So `credit_parts` takes `road=` and `operator=`,
+and `publish.contents` reads both off the database — `road` from whether `edge_services`
+has rows, `operator` from whether `segments` does — because only the thing that built an
+archive knows what went into it. A region with no matched edges credits nobody but the
+publisher.
+
+**"Bus routes" was the other half of the same mistake.** It was accurate while a bus was
+all there was, and an archive holding trams and ferries credited as bus routes
+misdescribes its own contents. The noun is now "Routes and timetables", widening to
+"Routes, timetables and operator geometry" when a non-road trace is present — the trace
+arrives in the same bundle under the same licence, so it is named inside the publisher's
+credit rather than given a third line of its own.
 
 **The credit is derived from `config.Feed` rather than written out per region.** The
 feed already carried `licence` and `attribution`; `config` adds `ODBL`, a
