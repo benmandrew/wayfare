@@ -137,9 +137,31 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=None,
         metavar="DEGREES",
-        help=f"the cell to count over (default: {config.OVERVIEW_CELL}, the same one "
-        "publish shares its quota over)",
+        help=f"the cell to count over, in degrees (default: {config.COVERAGE_CELL})",
     )
+
+    p = sub.add_parser(
+        "draw",
+        help="rasterise a built archive to PNG -- what a zoom looks like, not how "
+        "much it holds",
+    )
+    p.add_argument("archive", type=Path, help="a .pmtiles file")
+    p.add_argument("out", type=Path, help="the .png to write")
+    p.add_argument("--zoom", type=int, required=True)
+    # Four values rather than one comma-separated string. Every window over these
+    # islands opens on a negative longitude, and argparse reads `-1.4,51.0,1.0,52.2`
+    # as an option because only a bare number matches its negative-number rule --
+    # so the comma form fails on essentially every real window.
+    p.add_argument(
+        "--window",
+        required=True,
+        nargs=4,
+        type=float,
+        metavar=("W", "S", "E", "N"),
+        help="the longitude/latitude box to draw, e.g. -1.4 51.0 1.0 52.2 for London "
+        "and the country around it",
+    )
+    p.add_argument("--width", type=int, default=1400, help="output width in pixels")
 
     sub.add_parser("status", help="show progress and coverage")
     sub.add_parser(
@@ -382,6 +404,17 @@ def _dispatch(args: argparse.Namespace) -> int:
         log.info("done: %s", out)
         return 0
 
+    if args.cmd == "draw":
+        try:
+            west, south, east, north = args.window
+            coverage.draw(
+                args.archive, args.zoom, (west, south, east, north), args.out, args.width
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            log.error("%s", exc)
+            return 1
+        return 0
+
     if args.cmd == "coverage":
         zooms = (
             [int(z) for z in args.zooms.split(",")]
@@ -389,6 +422,7 @@ def _dispatch(args: argparse.Namespace) -> int:
             else list(range(config.MIN_ZOOM, config.DETAIL_ZOOM))
         )
         try:
+            coverage.report_sizes(args.archive)
             coverage.report(args.archive, zooms, args.cell)
         except (OSError, RuntimeError, ValueError) as exc:
             log.error("%s", exc)

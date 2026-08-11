@@ -103,24 +103,21 @@ complete.
 **Never add a row-at-a-time insert loop on a table that grows with the network.**
 executemany is ~2,700 rows/s; staging to a file and reading it back is 1.6M/s.
 
-**What a low zoom holds is chosen before tippecanoe sees it, and it is chosen
-per place.** `--drop-densest-as-needed` picks by density, so it thins cities and
-spares a rural road carrying two buses a week; `publish` therefore holds the quietest
-roads back from the overview bands itself, and a region under the caps is not
-filtered at all. **The `trips` floor is per cell and never national, and a cell's
-quota goes as `size ** OVERVIEW_WEIGHT`, never as `size`.** Both of those have been
-live and both drew cities in a black field. One national floor emptied 310 of 655
-populated cells outright. Giving every cell the same *fraction* empties nothing and
-looks the same on the map, because the fraction is the wrong thing to hold constant:
-at 24% the countryside drew 15 features a cell at z6 where Ireland, which is under
-every cap and so is filtered not at all, drew 53. At `OVERVIEW_WEIGHT = 0.5` the
-countryside keeps everything it has and the cities pay 23.7% -> 21.2% for it.
-**Ireland is the control, so measure against it**: its retention is flat across the
-country, and a weighting that tilts is the bug either way round. **Feature counts and
-cell presence cannot see this** — only decoding the tile geometry back to lon/lat and
-counting drawn features per cell per zoom can, which is what `wayfare coverage` does.
-Run it on the archive a publish just wrote, and read the tilt. Three silent failures
-guard the rest: tippecanoe applies
+**What a low zoom holds is left to tippecanoe, and four attempts to take that
+decision away all made the map worse.** `--drop-densest-as-needed` picks by density
+rather than service level, which is a real fault — but it thins only the tiles that
+will not fit, 18 of them at z5–z7, where every cap tried thinned the whole country to
+spare those. `OVERVIEW_CAP_FAR` and `OVERVIEW_CAP_MID` are both `None`; the quota
+machinery under them is switched off and kept only because z5 is still thinner than
+Ireland. Read the block in `config` before reviving any of it.
+
+**Judge a low zoom by lit pixels, never by feature counts.** This is the mistake
+under all four attempts, and it is easy to make again. A cap keeps many short features
+spread over many cells; no cap keeps fewer, longer ones. Features per zoom, populated
+cells, features per cell and bins-holding-anything all reward the first, and only the
+second is visible — so every round shipped on numbers that went up while the map got
+worse. `wayfare coverage` counts the same way and inherits the same blind spot. Draw
+the geometry and look at it. Three silent failures guard the rest: tippecanoe applies
 `-x` before `-j`, so a filter naming an excluded attribute matches nothing and writes
 an empty band; `--extend-zooms-if-still-dropping` treats `-z` as a ceiling it may
 raise, which overlaps the next band and has `tile-join` merge both copies of every
@@ -201,15 +198,20 @@ a national `trips` floor emptied 310 of 655 cells, and a per-cell floor sharing 
 *in proportion to* cell size emptied none while still drawing 15 features per rural cell
 where Ireland drew 53.
 
-**Great Britain was republished on 2026-08-11 at `OVERVIEW_WEIGHT = 0.5` and four zoom
-bands** (z5-z7 capped at 190,000, z8-z9 at 450,000, z10 and z11-z14 uncapped), 126.6 MB,
-credit intact. No band reports a single tile over tippecanoe's size limit, so nothing in
-the archive is chosen by density any more. Measured with `wayfare coverage`: the emptiest
-quarter of cells draws 36 features at z5, 41 at z6 and 52 at z8 against the previous
-build's 15 at z6, cells drawing under five fell from 28 to 8, and z10 carries its full
-943,040 features. Ireland rebuilt feature-for-feature identical at every zoom, so both it
-and Northern Ireland were left alone. Nothing was re-matched. The archives from before
-2026-08-10 are on the server at `/home/ben/archive-backup-20260810/`.
+**Great Britain was republished on 2026-08-11 with the overview uncapped**, 130.4 MB,
+credit intact, carrying its non-road modes for the first time. It lights 6.3% of the
+country at z6 against the capped build's 4.8%, and around London at z8 8.1% against
+5.0%. Ireland was republished the same day at 18.1 MB with 371 rail and tram patterns;
+Northern Ireland has no non-bus routes and was not touched. Nothing was re-matched. The
+archive the capped build replaced is at `work/previous-great_britain.pmtiles`, and the
+pre-2026-08-10 set at `/home/ben/archive-backup-20260810/`.
+
+**Both regions' non-road modes are live**, drawn from operator geometry: 629 patterns
+for Great Britain, 371 for Ireland. Great Britain's had been map-matched onto roads
+before the mode filter existed — 1,726,822 `pattern_edges` for the Underground alone,
+and 16,833 edges reachable from no bus at all — because `aggregate` filtered on the
+live feed and never on `matchable`. Those are gone, which is why the edge count fell to
+2,729,428.
 
 **Great Britain's database is pre-multi-modal** — no `patterns.mode`, no `segments`, no
 `modes` in `meta` — because `connect` migrates only when it is not read-only and nothing

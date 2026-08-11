@@ -585,8 +585,10 @@ def build_tiles(
         # empty input rather than writing an empty archive. Skipping the road bands
         # is the same rule the segments pass already follows, in the other direction.
         if _has_features(geojsonl):
-            far_floors = _cell_floors(
-                geojsonl, config.OVERVIEW_CAP_FAR, config.OVERVIEW_WEIGHT
+            far_floors = (
+                _cell_floors(geojsonl, config.OVERVIEW_CAP_FAR, config.OVERVIEW_WEIGHT)
+                if config.OVERVIEW_CAP_FAR
+                else {}
             )
             mid_floors = (
                 _cell_floors(geojsonl, config.OVERVIEW_CAP_MID, config.OVERVIEW_WEIGHT)
@@ -716,9 +718,14 @@ def _tippecanoe(
         "--drop-densest-as-needed",
         # Line simplification is what makes national coverage tractable, but at max
         # zoom the geometry should be the real road.
-        "--simplification=4",
-        "--no-simplification-of-shared-nodes",
+        f"--simplification={config.SIMPLIFICATION}",
+        # Left at tippecanoe's default until it was measured. It is a Mapbox hosting
+        # limit rather than anything about the format, and this archive is served off
+        # a box over range requests, so it is ours to set.
+        f"--maximum-tile-bytes={config.MAX_TILE_BYTES}",
     ]
+    if config.SIMPLIFY_SHARED_NODES:
+        cmd.append("--no-simplification-of-shared-nodes")
     if extend:
         cmd.append("--extend-zooms-if-still-dropping")
     for name in exclude:

@@ -224,3 +224,80 @@ def test_the_tilt_is_what_a_hole_shows_up_in(monkeypatch, tmp_path):
     assert bands[0].quartiles[0][0] == 2
     assert bands[0].quartiles[-1][0] == 90
     assert bands[0].tilt == 45.0
+
+
+def _lit(path):
+    """The pixels a PNG has anything in, decoded back out of the IDAT."""
+    import struct as _struct
+    import zlib as _zlib
+
+    raw = path.read_bytes()
+    i, chunks, size = 8, [], None
+    while i < len(raw):
+        length = _struct.unpack_from(">I", raw, i)[0]
+        tag = raw[i + 4 : i + 8]
+        body = raw[i + 8 : i + 8 + length]
+        if tag == b"IHDR":
+            size = _struct.unpack_from(">II", body, 0)
+        elif tag == b"IDAT":
+            chunks.append(body)
+        i += 12 + length
+    width, height = size
+    data = _zlib.decompress(b"".join(chunks))
+    stride = width + 1
+    return sum(
+        1 for y in range(height) for x in range(width) if data[y * stride + 1 + x]
+    ), (width, height)
+
+
+def test_a_drawn_line_reaches_the_pixels_between_its_ends(tmp_path):
+    """The whole point of drawing rather than counting: a feature is a line, and what
+    reaches the screen is every pixel along it, not the one its first point lands in."""
+    path = archive(
+        tmp_path / "a.pmtiles",
+        {0: gzip.compress(_line_tile(at(-20.0, 20.0), at(20.0, -20.0)))},
+    )
+    out = tmp_path / "a.png"
+    fraction = coverage.draw(path, 0, (-40.0, -40.0, 40.0, 40.0), out, width=100)
+    lit, (w, h) = _lit(out)
+    # Taller than it is wide: Mercator stretches latitude, so a square box in degrees
+    # is not a square in pixels, and forcing it to be would skew every render.
+    assert w == 100
+    assert h > 100
+    # A diagonal across the window lights roughly its diagonal's worth of pixels, far
+    # more than the single pixel a first-point count would see.
+    assert lit > 50
+    assert fraction == lit / (w * h)
+
+
+def _line_tile(start, end, extent=4096):
+    """One layer, one two-point LineString from start to end, in tile units."""
+    sx, sy = start
+    ex, ey = end
+    geometry = b"".join(
+        varint(v)
+        for v in (
+            (1 << 3) | 1,
+            zigzag(sx),
+            zigzag(sy),
+            (1 << 3) | 2,
+            zigzag(ex - sx),
+            zigzag(ey - sy),
+        )
+    )
+    feature = blob(2, key(3, 0) + varint(1) + blob(4, geometry))
+    layer = blob(1, b"bus") + feature + key(5, 0) + varint(extent) + key(15, 0) + varint(2)
+    return blob(3, layer)
+
+
+def test_the_layers_are_drawn_in_different_shades(tmp_path):
+    """A tram line must not be mistaken for a road that survived a filter."""
+    assert coverage._SHADES["bus"] > coverage._SHADES["segments"]
+
+
+def test_an_empty_window_is_refused_rather_than_drawn(tmp_path):
+    """A flipped box silently produces a negative height and a blank image, which
+    reads as an archive holding nothing."""
+    path = archive(tmp_path / "a.pmtiles", {0: gzip.compress(mvt([at(0.0, 0.0)]))})
+    with pytest.raises(ValueError, match="empty"):
+        coverage.draw(path, 0, (10.0, 0.0, -10.0, 5.0), tmp_path / "a.png")

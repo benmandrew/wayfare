@@ -460,6 +460,55 @@ CHECKPOINT_EVERY = 200
 
 # --- Publishing ------------------------------------------------------------
 
+# How hard tippecanoe simplifies a line below the maximum zoom, in tile units. Lower
+# keeps more of the road's shape and costs bytes; the maximum zoom is never simplified,
+# so this is about z5-z13 only.
+#
+# 4 was tippecanoe's default. It has now been measured and it stays: building Great
+# Britain at 4, 2 and 1 gives 130.4 MB, 135.2 MB and 140.8 MB, and moves the ink in a
+# London window at z8 by 0.14 percentage points and at z12 by 0.05. There is very
+# little for simplification to remove -- the export is already short coalesced runs
+# along single ways, and `SIMPLIFY_SHARED_NODES` pins every junction -- so a lower
+# setting buys geometry nobody can see at 8% more bytes.
+SIMPLIFICATION = 4
+# Whether to keep a node shared between two features fixed while simplifying.
+#
+# On, and it should stay on: simplification is free to move a vertex, and moving one
+# that two roads meet at pulls them apart, which is a hole in the network at exactly
+# the zooms the network is what you can see.
+#
+# Off is a workaround for one thing only. tippecanoe 2.79.0 on macOS arm64 dies with
+# SIGTRAP on the national export -- 861,410 features -- with this flag on, while the
+# same command on the same version on Linux is what builds every published archive.
+# Isolated by bisecting the flags: no other flag, the zoom range, or `-P` does it, and
+# a small input with the flag is fine. So a local build on that machine needs this off,
+# and **an archive built with it off is not comparable to a published one**: it is a
+# different simplification, not a faster one.
+SIMPLIFY_SHARED_NODES = True
+# The per-tile ceiling that decides when `--drop-densest-as-needed` fires.
+#
+# tippecanoe's default is 500,000, which is a Mapbox hosted-service limit rather than
+# anything in the vector tile format -- the spec sets no size at all. This archive is
+# served off one machine over HTTP range requests, so nothing rejects a larger tile and
+# the number is a choice about fetch and decode time.
+#
+# It binds at the low zooms and only there, because those are the tiles tippecanoe had
+# to thin to fit. Measured on Great Britain by building the archive at both:
+#
+#   limit    archive   worst z5   worst z8   worst z10   worst z12
+#   500 KB   130.4 MB     406 KB     428 KB      366 KB      116 KB
+#     1 MB   137.9 MB     932 KB     776 KB      366 KB      116 KB
+#
+# z5 more than doubles and z8 goes from thinned to essentially complete -- it wanted
+# 790 KB -- for 7.5 MB, 5.7% of the archive, on about thirty tiles. z10 and below are
+# identical, correctly: they never reached the old limit, so the ceiling was never
+# what was holding them back.
+#
+# Judge a change to this on tile bytes rather than on `coverage draw`'s lit fraction.
+# The features a higher ceiling restores are in the densest tiles, where the pixels are
+# already lit, so the fraction moved 9.42% to 9.54% for content that doubled. Lit
+# pixels detect a missing network and saturate on added density.
+MAX_TILE_BYTES = 1_000_000
 MIN_ZOOM = 5
 MAX_ZOOM = 14
 # Below this zoom the archive carries geometry and `n` and nothing else.
@@ -470,55 +519,50 @@ MAX_ZOOM = 14
 # appears on hover, and hovering a road is not a thing anyone does at that scale.
 # `n` stays everywhere because it drives the colour and width ramps.
 DETAIL_ZOOM = 11
-# Where the overview band is cut in two, and how many features each half may carry.
+# How many features each overview band may carry, and **both are None: the overview
+# is not capped, and everything below is switched off.**
 #
-# Tippecanoe's `--drop-densest-as-needed` is the backstop when a tile will not fit,
-# and it chooses by *density*, so it thins cities hardest and leaves a rural road
-# carrying two buses a week untouched. On Great Britain that is what the low zooms
-# looked like: measured on the 2026-08-07 archive it shed 922,505 features at z5 and
-# 298,823 at z9, and the survivors were whatever happened to be sparse. Ireland, a
-# ninth of the network, hit the limit at no zoom at all and drew a continuous map.
+# It was capped four different ways and every one of them made the map worse. The
+# machinery is kept because z5 is still thinner than Ireland and is the one place a
+# selection might yet earn its keep; nothing else here is live.
 #
-# Holding back the quietest roads before tippecanoe sees them puts that choice on
-# service level instead. The cap is a feature count rather than a `trips` threshold
-# because the threshold that fits depends on the region -- `publish` reads the cap
-# back into whatever `trips` floor the data needs, and a region already under its cap
-# is not filtered at all. Both parts of Ireland are under the cap, so this changes
-# nothing for them.
+# What the four attempts were, in order, and what each did to Great Britain:
 #
-# **The floor is per cell of `OVERVIEW_CELL`, never one figure for the whole region.**
-# A single national floor was tried and it was worse than the problem: `trips` is an
-# absolute count, so ranking the country on one scale ranks it by how urban it is. At
-# the 703-trip floor that produced, 310 of Great Britain's 655 populated cells lost
-# every feature they had, the busiest ten cells held 45.9% of the survivors, and the
-# top tenth of cells went from 48.7% of the map to 81.7% of it. That draws the cities
-# and nothing between them.
+#   national `trips` floor  310 of 655 populated cells lost every feature they had.
+#   per-cell, proportional  no cell emptied, and the countryside drew 15 features a
+#                           cell at z6 where Ireland drew 53.
+#   per-cell, square root   the countryside recovered and the cities flattened, so
+#                           London stopped reading as denser than the fields.
+#   the same on a 0.02 grid 88.9% of 1.4 km bins drawn against 37.8%, and still worse
+#                           on the screen than no cap at all.
 #
-# Each cell gets its own quota instead, `trips` decides which of that cell's roads
-# fill it, and `OVERVIEW_WEIGHT` decides how big the quota is. Read that next: it is
-# where the second version of this same failure was.
+# The measurement that settled it counts lit pixels in a window, which is the closest
+# thing to what a reader sees. Every cap loses ink at every zoom in every window:
 #
-# Both halves of the overview are capped. Capping z8-z10 was tried once under the
-# proportional weight and withdrawn, correctly -- at that weight a near cap takes the
-# countryside's roads to buy the cities headroom, which is more damage than the drops
-# it prevents. Under a weight below 1 the objection goes away, because the countryside
-# saturates and cannot be charged for anything: every feature a near cap removes comes
-# out of a cell dense enough to lose it. What it buys is that tippecanoe stops
-# thinning. Measured on the deployed archive, `--drop-densest-as-needed` was cutting
-# z8 to 37.7% of full detail where Ireland, which never trips the size limit, sits at
-# 66.7% -- an even cut, but half the map.
+#   window                z5     z6     z7
+#   Ireland, Dublin      4.7%   4.6%   4.5%
+#   GB uncapped, London  3.8%   7.0%   9.3%
+#   GB capped, London    2.7%   3.7%   3.7%
+#   GB uncapped, Wales   1.1%   1.2%   1.3%
+#   GB capped, Wales     1.0%   1.0%   1.0%
 #
-# The number is measured rather than derived. Tile bytes do not fall as fast as the
-# feature count -- holding Great Britain to 33.0% of its features took the largest z5
-# tile from the 1.51 MB it wanted to 630 KB, an exponent of about 0.79, because what
-# survives a `trips` floor is the busy roads and those carry the longer geometry. At
-# 205,000 -- 209,493 features once ties at each cell's floor are kept, 24.1% of the
-# export -- no z5-z7 tile reaches the 500 KB limit and tippecanoe drops nothing, which
-# is the whole point: what is on the map is then chosen by service level rather than
-# by which cities happened to be dense. z5 carries 98,313 features, z6 130,947 and z7
-# 168,255, against 55,983, 106,672 and 157,193 with no cap at all.
+# At z8 around London the capped archive lit 5.0% against 8.2% uncapped, and the
+# render showed the city hollowed to a radial skeleton. That is what "speckly" was.
+#
+# The counting mistake underneath all four is worth keeping. A cap keeps many short
+# features spread over many cells; no cap keeps fewer, longer ones. Counting features,
+# or populated cells, or bins holding any feature, rewards the first -- and only the
+# second is visible. Four rounds were judged on measurements that could not see the
+# map. `wayfare coverage` counts the same way and has the same blind spot; the line
+# renderer in the working notes is what to reach for.
+#
+# tippecanoe's `--drop-densest-as-needed` chooses by density rather than by service
+# level, which is a real fault and is why this was attempted. On the 2026-08-07
+# archive it shed 922,505 features at z5. It is also, measured, better than anything
+# offered to replace it: it thins only the tiles that will not fit -- 18 at z5-z7 and
+# 4 at z8-z9 on Great Britain -- where a cap thins the whole country to spare them.
 FAR_ZOOM = 8
-OVERVIEW_CAP_FAR = 190_000
+OVERVIEW_CAP_FAR: int | None = None
 # Where the capped part of the overview ends. z10 is the only overview zoom that was
 # never under pressure -- tippecanoe kept 86.1% of the network there against 37.6% at
 # z8 -- so it is banded off and handed the export whole. Capping z8-z10 as one band
@@ -528,7 +572,7 @@ MID_ZOOM = 10
 # The cap on z8-z9, or None to hand tippecanoe everything and let
 # `--drop-densest-as-needed` be the only thing standing between the network and the
 # tile size limit. See the note above for why this exists and why it once did not.
-OVERVIEW_CAP_MID: int | None = 450_000
+OVERVIEW_CAP_MID: int | None = None
 # How the quota is shared out: a cell's share goes as its feature count to this power.
 #
 # This is the dial the low-zoom map kept swinging between the ends of, and both ends
@@ -552,14 +596,45 @@ OVERVIEW_CAP_MID: int | None = 450_000
 # against 52.8% in the busiest, all of it sub-pixel simplification. A weighting works
 # when Great Britain's profile is flat too; a weighting that tilts is the bug, whether
 # it tilts towards the cities or away from them.
-OVERVIEW_WEIGHT = 0.5
-# The side of the cell the quota is shared out over, in degrees. 0.25 is about 28 km
-# by 17 km at this latitude, and puts 655 cells over Great Britain's network -- fine
-# enough that a town is not averaged in with the city forty miles away, coarse enough
-# that a cell holds a few hundred features rather than a handful. A cell is a bucket
-# for allocating the quota and nothing else: it never becomes a tile boundary, and
-# the geometry that crosses it is untouched.
-OVERVIEW_CELL = 0.25
+OVERVIEW_WEIGHT = 0.7
+# The side of the cell the quota is shared out over, in degrees. A cell is a bucket for
+# allocating the quota and nothing else: it never becomes a tile boundary, and the
+# geometry that crosses it is untouched.
+#
+# Dormant along with the caps above, and kept with them. What follows is what it was
+# measured to do while the quota was live.
+#
+# Within a cell the
+# quota goes to the highest `trips`, and the highest `trips` in any cell are in that
+# cell's town centre -- so a cell spends its whole allowance on one spot and draws
+# nothing in between. How much "in between" there is depends entirely on how big the
+# cell is, and 0.25 degrees, at 28 km by 17 km, is 20x too big. Measured on Great
+# Britain against 0.02-degree bins of about 1.4 km, of which the export covers 33,435:
+#
+#   cell    bins drawn   of the export's
+#   0.25         12,626           37.8%
+#   0.05         24,475           73.2%
+#   0.02         30,608           91.5%
+#   0.01         32,673           97.7%
+#
+# At 0.25 nearly two thirds of the country drew nothing while every aggregate looked
+# healthy -- 655 populated cells, none of them empty, more features at z6 than the
+# uncapped build carried. Rendering the drawn geometry is what showed it: England came
+# out as speckle with voids through it where the uncapped archive was continuous, and
+# one 1.4 km bin held 188 features at a zoom where that is a fraction of a pixel.
+#
+# 0.02 puts 33,571 cells over Great Britain. The cap is read down to match, because a
+# finer grid keeps more than it is asked for -- every populated cell is guaranteed one
+# feature, and ties at each floor are kept -- so 130,000 comes out at 192,400, which is
+# what 190,000 over the coarse grid came out at. Same features, 2.4x the places.
+OVERVIEW_CELL = 0.02
+# The cell `wayfare coverage` counts over, which is a reading grain rather than an
+# allocation one and is deliberately not `OVERVIEW_CELL`. Tying the two together made
+# the report unreadable the moment the quota grid went fine: 33,545 cells over Great
+# Britain gives medians of 0 and 2 features and a busiest-to-emptiest ratio of
+# infinity, which says nothing about anything. 0.25 degrees is about 28 km and puts
+# 655 cells over the country, which is few enough for a median to mean something.
+COVERAGE_CELL = 0.25
 # A backstop against one pathological city-centre edge, not a routine truncation.
 #
 # The original 12 assumed a long service list would dominate tile size. It does not:

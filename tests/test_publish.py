@@ -256,6 +256,15 @@ def write_geojsonl(path, trips, at=(0.0, 0.0)):
     return path
 
 
+def cell_of(lon, lat):
+    """The cell a point falls in, derived rather than written down: `OVERVIEW_CELL` is
+    a tuning knob and a test that pins its value fails for the wrong reason."""
+    return (
+        round(lon / config.OVERVIEW_CELL),
+        round(lat / config.OVERVIEW_CELL),
+    )
+
+
 def kept_trips(path):
     return sorted(
         json.loads(line)["properties"]["trips"] for line in path.read_text().splitlines()
@@ -310,8 +319,8 @@ def test_a_quiet_place_is_not_ranked_against_a_busy_one(tmp_path):
     # A floor for each place -- the two cells are the same size, so the weighting
     # gives them the same quota -- and the quiet one's is nowhere near the busy one's.
     assert len(floors) == 2
-    assert floors[(0, 0)] == 800
-    assert floors[(40, 40)] == 8
+    assert floors[cell_of(0.0, 0.0)] == 800
+    assert floors[cell_of(10.0, 10.0)] == 8
     # Both places still draw something, which a single national floor would not do.
     assert kept_trips(publish._hold_back(src, tmp_path / "far.geojsonl", floors)) == [
         8,
@@ -343,8 +352,8 @@ def test_a_sparse_place_is_kept_whole_and_a_dense_one_pays_for_it(tmp_path):
     )
     floors = publish._cell_floors(src, 52, config.OVERVIEW_WEIGHT)
     # The sparse cell has no floor at all, which is how a cell says "all of it".
-    assert (40, 40) not in floors
-    assert (0, 0) in floors
+    assert cell_of(10.0, 10.0) not in floors
+    assert cell_of(0.0, 0.0) in floors
     kept = kept_trips(publish._hold_back(src, tmp_path / "far.geojsonl", floors))
     assert [t for t in kept if t <= 4] == [1, 2, 3, 4]
 
@@ -352,7 +361,7 @@ def test_a_sparse_place_is_kept_whole_and_a_dense_one_pays_for_it(tmp_path):
     # sparse cell is cut in half to buy the dense one a couple of dozen more roads it
     # cannot show.
     proportional = publish._cell_floors(src, 52, 1.0)
-    assert proportional[(40, 40)] == 3
+    assert proportional[cell_of(10.0, 10.0)] == 3
 
 
 def test_a_cell_that_cannot_use_its_quota_hands_it_back():
@@ -371,7 +380,9 @@ def test_a_road_on_the_prime_meridian_is_still_read(tmp_path):
     exponent takes them off the map without saying so."""
     src = write_geojsonl(tmp_path / "edges.geojsonl", {(-1.1e-05, 52.219691): [500, 400]})
     assert b"e-05" in src.read_bytes()
-    assert publish._cell_floors(src, 1, config.OVERVIEW_WEIGHT) == {(0, 209): 500}
+    assert publish._cell_floors(src, 1, config.OVERVIEW_WEIGHT) == {
+        cell_of(-1.1e-05, 52.219691): 500
+    }
 
 
 def test_an_unreadable_export_raises_rather_than_filtering_everything_out(tmp_path):

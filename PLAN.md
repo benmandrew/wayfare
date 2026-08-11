@@ -158,28 +158,33 @@ database would have produced.
 
     wayfare publish --region northern_ireland --from-export --out /served/northern_ireland.pmtiles
 
-The same republish carried the `far` band, and it took three attempts. A single national
-`trips` floor emptied 310 of Great Britain's 655 populated cells. A per-cell floor sharing
-the cap out in proportion to cell size emptied none, carried 1.76x the features of the
-uncapped build at z5, and still drew the cities with black between them — 15 features per
-rural cell at z6 where Ireland, which is under every cap and so is filtered not at all,
-drew 53.
+The same republish carried the `far` band, and it took four attempts and a revert.
+A single national `trips` floor emptied 310 of Great Britain's 655 populated cells. A
+per-cell floor sharing the cap out in proportion to cell size emptied none and drew 15
+features per rural cell at z6 where Ireland drew 53. Weighting it by the square root of
+cell size restored the countryside and flattened the cities. Moving to a 0.02-degree grid
+took coverage of 1.4 km bins from 37.8% to 88.9%.
 
-Great Britain was republished on 2026-08-11 at `OVERVIEW_WEIGHT = 0.5`, so a cell's quota
-goes as the square root of what it holds rather than as what it holds. The overview is
-three bands instead of two, each capped for its own pressure: z5-z7 at 190,000 features,
-z8-z9 at 450,000, z10 uncapped. Nothing in the archive is thinned by density at any zoom.
-The emptiest quarter of cells draws 36 features at z5, 41 at z6 and 52 at z8; cells drawing
-under five fell from 28 to 8; z10 carries its full 943,040 features; the archive is 126.6
-MB. Ireland rebuilt feature-for-feature identical at all ten zooms, so neither it nor
-Northern Ireland was touched. The replaced archives are at
-`/home/ben/archive-backup-20260810/` on the server, with checksums.
+None of them helped. Rasterising the tile geometry and counting lit pixels — what a
+reader actually sees — shows every cap losing ink at every zoom in every window, and at
+z8 around London the capped archive lit 5.0% against 8.2% uncapped, with the city
+hollowed to a radial skeleton. Great Britain was republished on 2026-08-11 with the
+overview uncapped: 130.4 MB, 6.3% lit nationally at z6 against 4.8% capped. Uncapped
+already exceeds Ireland's density at z6 and z7, and the deficit is z5 alone, 3.8% against
+Dublin's 4.7%.
 
-`wayfare coverage <archive>` is what settled it, and it exists because none of the checks
-being run could tell those three builds apart. Feature counts per zoom rose every time and
-no populated cell was ever empty. It decodes the tile geometry back to longitude and
-latitude and counts what is drawn per cell per zoom, split by how much the cell holds at
-z14. Run it on the archive a publish just wrote.
+The counting mistake is the lesson. A cap keeps many short features spread over many
+cells; no cap keeps fewer, longer ones. Feature counts, populated cells and bins holding
+anything all reward the first, and only the second reaches the screen, so four rounds
+were judged on numbers that rose while the map got worse.
+
+Both regions also carry their non-road modes now, drawn from operator geometry: 629
+patterns for Great Britain and 371 for Ireland. Great Britain's had been matched onto
+roads before the mode filter existed, 1,726,822 `pattern_edges` for the Underground
+alone and 16,833 edges reachable from no bus, because `aggregate` filtered on the live
+feed and never on `matchable`. Northern Ireland has no non-bus routes and was not
+touched. The replaced archives are at `work/previous-great_britain.pmtiles` and
+`/home/ben/archive-backup-20260810/` on the server.
 
 ## Next — the picture
 
