@@ -428,6 +428,37 @@ def test_the_overview_band_drops_the_card_only_attributes(monkeypatch, tmp_path)
     assert join[0] == "tile-join"
 
 
+def test_every_band_keeps_the_two_attributes_the_ramps_paint_from(monkeypatch, tmp_path):
+    """`n` and `trips` are the viewer's two colour modes, and an excluded attribute
+    is not an error the viewer can report: MapLibre reads the fallback and draws a
+    map of one flat colour, which looks like a region with no services rather than a
+    band built without the number. `trips` was in `_DETAIL_ONLY` while the info card
+    was its only reader, and it is the one that would go back there by accident."""
+    import subprocess
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
+    monkeypatch.setattr(publish.subprocess, "run", fake_run)
+
+    src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3])
+    publish.build_tiles(src, tmp_path / "bus.pmtiles")
+
+    assert "n" not in publish._DETAIL_ONLY
+    assert "trips" not in publish._DETAIL_ONLY
+    # Every band, not just the overview: -x is global to a tippecanoe run, so a
+    # band that excluded either would answer its whole zoom range with a flat map.
+    for cmd in calls[:-1]:
+        excluded = {cmd[i + 1] for i, arg in enumerate(cmd) if arg == "-x"}
+        assert "n" not in excluded
+        assert "trips" not in excluded
+
+
 def test_the_bands_cover_every_zoom_once_with_no_gap(monkeypatch, tmp_path):
     """A gap between two bands is a zoom the archive simply does not answer, and a
     viewer showing an empty map at one zoom looks like missing data, not a config
