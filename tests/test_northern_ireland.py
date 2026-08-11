@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from wayfare import acquire, config, db, gtfs, mapinfo, translink
+from wayfare import acquire, config, db, gtfs, licences, mapinfo, translink
 
 # --- MapInfo fixtures --------------------------------------------------------
 
@@ -505,7 +505,7 @@ def test_the_province_is_four_datasets_and_no_naptan(monkeypatch):
         "geometry",
     ]
     assert not feed.stop_register
-    assert feed.licence == config.OGL
+    assert feed.licence == licences.OGL
 
 
 def test_an_assembled_bundle_is_not_rebuilt_while_its_parts_stand(

@@ -7,8 +7,17 @@ pointed at a big volume and nothing escapes into the source tree.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+
+from . import licences
+
+# The licence names a `Feed` is declared with. Everything else about them -- their
+# URIs, the `Credit` type, and how a credit is rendered -- lives in `licences`,
+# because the list only grows and none of it is configuration. Imported by name so
+# that a feed reads as a description of a source rather than as a lookup.
+from .licences import CC_BY_4, OGL
 
 # --- Layout ----------------------------------------------------------------
 
@@ -34,25 +43,6 @@ NTA_GTFS_URL = "https://www.transportforireland.ie/transitData/Data/GTFS_All.zip
 # Resource ids and filenames move on every publication, so the datasets are named
 # by slug and resolved through CKAN at fetch time -- see `translink.resource`.
 OPENDATANI_API = "https://admin.opendatani.gov.uk/api/3/action/package_show"
-
-OGL = "Open Government Licence v3.0"
-CC_BY_4 = "Creative Commons Attribution 4.0"
-# Not a spelling mistake and not to be tidied to the British form the rest of this
-# codebase uses: "Open Database License" is the licence's own name.
-ODBL = "Open Database License"
-
-# CC BY 4.0 requires the licence to be *identified*, which in practice means a name
-# and a URI; OGL and ODbL ask for the same. A table keyed on the licence rather than
-# a field on `Feed`, so two publishers under one licence cannot disagree about where
-# it is, and a credit raises on a licence with no entry rather than quietly omitting
-# it.
-LICENCE_URLS = {
-    OGL: "https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/",
-    CC_BY_4: "https://creativecommons.org/licenses/by/4.0/",
-    ODBL: "https://opendatacommons.org/licenses/odbl/",
-}
-
-OSM_COPYRIGHT = "https://www.openstreetmap.org/copyright"
 
 
 @dataclass(frozen=True)
@@ -181,86 +171,71 @@ def archive_name(region: str | None = None) -> str:
     return f"{name}.pmtiles"
 
 
-@dataclass(frozen=True)
-class Credit:
-    """One thing that has to be acknowledged: what it is, whose it is, its licence."""
-
-    what: str
-    who: str
-    licence: str
-    # Where the work itself lives, where the publisher gives one. The licence's own
-    # URI is looked up from `LICENCE_URLS` and is not optional.
-    who_url: str | None = None
-
-
-def credit_parts(region: str | None = None) -> tuple[Credit, ...]:
+def credit_parts(
+    region: str | None = None, *, road: bool = True, operator: bool = False
+) -> tuple[licences.Credit, ...]:
     """Everything a picture of this region owes an acknowledgement to.
 
-    Built from the `Feed` rather than from a table of its own, so a source added to
-    `FEEDS` is credited by the act of describing it.
+    This is the only part of crediting that belongs here rather than in `licences`:
+    it needs the `Feed`, and a feed is configuration. What a licence is called and
+    how a credit is written are not.
 
-    Two obligations, and the second is the one that is easy to miss. The timetable
-    is the publisher's, under their licence -- a condition rather than a courtesy
-    now that the Republic's feed is CC BY 4.0. The geometry is OpenStreetMap's,
-    under ODbL, whatever the timetable says: every edge is an OSM way that Valhalla
-    matched a route onto, so an archive is a derived database. The viewer's existing
-    OpenStreetMap line is about the *backdrop* and says nothing about the lines drawn
-    on top of it, which is why the wording here names what each credit covers.
+    Built from the `Feed` rather than from a table of its own, so a source added to
+    `FEEDS` is credited by the act of describing it. The timetable is always the
+    publisher's, under their licence -- a condition rather than a courtesy now that
+    the Republic's feed is CC BY 4.0.
+
+    The second credit is the one that is easy to miss, and it is *conditional*.
+    Where a route was map-matched, every edge is an OpenStreetMap way that Valhalla
+    matched onto, so the archive is a derived database and owes ODbL whatever the
+    timetable says. Where it was not -- a tram, metro or ferry drawn from the trace
+    in the feed -- no OpenStreetMap data was involved at all, and claiming ODbL over
+    the operator's own survey would be wrong in the opposite direction: asserting a
+    share-alike condition on data whose publisher never imposed one. `road` is what
+    tells the two apart, and it is the caller's to set because only the caller knows
+    what it built.
+
+    `operator` widens the first credit's noun rather than adding a third line. The
+    trace arrives in the same bundle as the timetable and is covered by the same
+    licence, so it needs naming rather than crediting separately -- and naming it
+    matters, because this is the wording that says what each credit covers.
 
     The basemap is not here. It belongs to the page that chooses it, not to the data,
     and a render carries no basemap at all.
     """
     f = feed(region)
-    return (
-        Credit("Bus routes", f.attribution, f.licence),
-        Credit("Road geometry", "OpenStreetMap contributors", ODBL, OSM_COPYRIGHT),
+    what = (
+        "Routes, timetables and operator geometry" if operator else "Routes and timetables"
     )
+    parts = [licences.Credit(what, f.attribution, f.licence)]
+    if road:
+        parts.append(licences.OPENSTREETMAP)
+    return tuple(parts)
 
 
-def credit_html(region: str | None = None) -> str:
-    """The credit as a map attribution control wants it.
-
-    `publish` stamps this into the tileset metadata, which is the one place a licence
-    condition travels with the data: an archive copied to a bucket takes its credit
-    with it, where a line in the viewer or a field in `/archives.json` would be left
-    behind.
-    """
-    return " &middot; ".join(
-        f"{c.what}: &copy; {_link(c.who, c.who_url)}, "
-        f"{_link(c.licence, LICENCE_URLS[c.licence])}"
-        for c in credit_parts(region)
-    )
+def credit_html(
+    region: str | None = None, *, road: bool = True, operator: bool = False
+) -> str:
+    """This region's credit, rendered for a map attribution control."""
+    return licences.html(credit_parts(region, road=road, operator=operator))
 
 
-def credit_lines(region: str | None = None, *, links: bool = True) -> tuple[str, ...]:
-    """The credit as plain text, one line per thing being credited.
-
-    `links=False` drops the URIs. That is for the one place they cost more than they
-    carry: a credit burned into the corner of a picture, where a URI is unclickable,
-    doubles the length of a line that has to fit across the canvas, and is spelled
-    out in full in the same file's metadata anyway. Everywhere else keeps them,
-    because identifying the licence is what the licence asks for.
-    """
-    return tuple(
-        f"{c.what}: \N{COPYRIGHT SIGN} {c.who}"
-        + (f" <{c.who_url}>" if c.who_url and links else "")
-        + f", {c.licence}"
-        + (f" <{LICENCE_URLS[c.licence]}>." if links else ".")
-        for c in credit_parts(region)
-    )
+def credit_lines(
+    region: str | None = None,
+    *,
+    links: bool = True,
+    road: bool = True,
+    operator: bool = False,
+) -> tuple[str, ...]:
+    """This region's credit as plain text, one line per thing being credited."""
+    return licences.lines(credit_parts(region, road=road, operator=operator), links=links)
 
 
-def credit_text(region: str | None = None) -> str:
-    """The same credit with the links spelled out, for anywhere HTML is not read.
-
-    A PNG `tEXt` chunk, an SVG `<metadata>` block, a log line. The copyright sign is
-    deliberate and safe in all three: it is in Latin-1, which is what `tEXt` allows.
-    """
-    return " ".join(credit_lines(region))
-
-
-def _link(text: str, url: str | None) -> str:
-    return f'<a href="{url}">{text}</a>' if url else text
+def credit_text(
+    region: str | None = None, *, road: bool = True, operator: bool = False
+) -> str:
+    """This region's credit with the links spelled out, for anywhere HTML is not read."""
+    return licences.text(credit_parts(region, road=road, operator=operator))
 
 
 # Geofabrik rebuilds these daily. Valhalla downloads its own copy at graph-build
@@ -399,8 +374,54 @@ DETOUR_SLACK_M = 1_000.0
 #
 # Nothing else is added speculatively. A type nobody publishes is a line of code
 # that cannot be checked against a feed, and an unrecognised one is reported
-# rather than guessed at -- see gtfs._drop_non_road_modes.
-ROAD_ROUTE_TYPES = frozenset({3, 11, 800} | set(range(200, 210)) | set(range(700, 717)))
+# rather than guessed at -- see gtfs._drop_unselected_modes.
+#
+# `MODES` is the vocabulary and `ROAD_ROUTE_TYPES` is derived from it, so the two
+# cannot disagree. One entry per mode a feed actually publishes, keyed on the name
+# this project uses for it; nothing groups two GTFS types together unless they mean
+# the same vehicle, which is why trolleybus sits inside `bus` and a cable tram does
+# not sit inside `tram`.
+MODES: dict[str, frozenset[int]] = {
+    "bus": frozenset({3, 11, 800} | set(range(700, 717))),
+    "coach": frozenset(range(200, 210)),
+    "tram": frozenset({0}),
+    "metro": frozenset({1}),
+    "rail": frozenset({2}),
+    "ferry": frozenset({4}),
+    "cable_tram": frozenset({5}),
+    "aerial": frozenset({6}),
+    "funicular": frozenset({7}),
+    "monorail": frozenset({12}),
+}
+
+# The modes Valhalla can be asked about, because they run on ways in its graph.
+# Everything else is water, rail or wire, and `bus` costing has nothing to snap it
+# to: a ferry either fails outright or is snapped to whatever coast road happens to
+# be nearby, which is worse. Verified from Valhalla's own `lua/graph.lua`, which
+# admits `route=ferry` and `route=shuttle_train` and drops every `railway=*` way.
+ROAD_MODES = frozenset({"bus", "coach"})
+
+# What `patterns` keeps when nothing says otherwise. Road only, so a run that does
+# not ask for anything else behaves exactly as it did before modes existed.
+DEFAULT_MODES = ROAD_MODES
+
+
+def route_types(modes: Iterable[str]) -> frozenset[int]:
+    """The GTFS route_type values covered by a set of mode names.
+
+    Raises on a name that is not in the vocabulary rather than quietly selecting
+    nothing, because a typo in `--modes` would otherwise read as a feed that
+    happens to carry no trams.
+    """
+    unknown = sorted(set(modes) - set(MODES))
+    if unknown:
+        raise ValueError(
+            f"unknown mode(s) {', '.join(unknown)}; known: {', '.join(sorted(MODES))}"
+        )
+    return frozenset().union(*(MODES[m] for m in modes)) if modes else frozenset()
+
+
+ROAD_ROUTE_TYPES = route_types(ROAD_MODES)
 
 # Names for the log line that reports what was dropped, and nothing else. Only the
 # basic types, which is what a GB or Irish feed actually carries; anything outside
@@ -415,6 +436,11 @@ ROUTE_TYPE_NAMES = {
     7: "funicular",
     12: "monorail",
 }
+
+# route_type -> mode name, inverted from MODES so there is one source of truth.
+# Stored on `patterns` because mode decides how a pattern gets its geometry, and
+# joining back to `routes` for it at every read is how that gets forgotten.
+MODE_OF_TYPE: dict[int, str] = {t: name for name, ts in MODES.items() for t in ts}
 
 # --- Patterns --------------------------------------------------------------
 

@@ -59,6 +59,13 @@ CREATE TABLE IF NOT EXISTS patterns (
     n_stops     INTEGER,
     n_trips     INTEGER,   -- how many timetabled trips use this pattern
     span_m      DOUBLE,    -- straight-line length of the stop chain
+    -- config.MODES name, denormalised from routes.route_type. It decides how a
+    -- pattern gets its geometry -- map-matched for road, drawn from an operator
+    -- shape or an OSM relation otherwise -- so every stage after this one needs
+    -- it, and a join back to `routes` for it at every read is how that gets
+    -- forgotten. NULL means a database written before modes existed, where
+    -- everything stored was road-going by construction.
+    mode        VARCHAR,
     first_seen  VARCHAR,   -- feed version this pattern first appeared in
     last_seen   VARCHAR    -- feed version it was last present in
 );
@@ -140,6 +147,36 @@ CREATE TABLE IF NOT EXISTS edge_services (
     n_trips     INTEGER    -- timetabled trips per week over this edge
 );
 
+-- What a non-road pattern is drawn from, when nothing matched it to a road.
+--
+-- A tram, metro or ferry has no Valhalla edge and no OSM way id: its geometry is
+-- the operator's own trace, copied here from `shapes` so that publishing reads one
+-- table rather than reassembling a join, and so a later pruning of `shapes` cannot
+-- take the picture with it.
+--
+-- Keyed on pattern_id and nothing else, because there is exactly one trace per
+-- pattern. That is the whole reason this table can exist without inventing an
+-- identity space: `edges.edge_id` is a Valhalla GraphId and minting synthetic
+-- values into it would collide with the one invariant the pipeline rests on, where
+-- `pattern_id` is already an identity this codebase owns.
+--
+-- The consequence, accepted deliberately: geometry is per pattern rather than
+-- shared, so two trams over one street are two coincident lines and there is no
+-- edge->services inversion to ask "which services use this track". Getting that
+-- back means snapping these traces to OSM way ids, which is a separate decision.
+CREATE TABLE IF NOT EXISTS segments (
+    pattern_id  BIGINT PRIMARY KEY,
+    mode        VARCHAR,
+    -- Micro-degree integer lists and a bbox, exactly as `edges` stores geometry,
+    -- so a window test is an integer overlap and nothing has to parse WKT.
+    lon_e6      INTEGER[],
+    lat_e6      INTEGER[],
+    min_lon_e6  INTEGER,
+    min_lat_e6  INTEGER,
+    max_lon_e6  INTEGER,
+    max_lat_e6  INTEGER
+);
+
 -- Free-form key/value for provenance: feed version, OSM extract date, the Valhalla
 -- graph build id that edge_id values belong to.
 CREATE TABLE IF NOT EXISTS meta (
@@ -189,6 +226,24 @@ def current_feed(alias: str = "p") -> str:
     meta rather than a parameter so the answer cannot drift between stages.
     """
     return f"{alias}.last_seen = (SELECT value FROM meta WHERE key = 'feed_version')"
+
+
+def matchable(alias: str = "p") -> str:
+    """Predicate restricting `patterns` to the modes Valhalla can be asked about.
+
+    `patterns` may now hold trams, ferries and metros, which have no road under them
+    and must never reach the matcher -- a sea crossing handed to `bus` costing either
+    fails outright or snaps to the nearest coast road, which is worse. Their geometry
+    comes from an operator shape or an OpenStreetMap relation instead.
+
+    A NULL mode is matchable. That is not a default, it is what an older database
+    means: before `patterns.mode` existed the loader kept road modes and deleted
+    everything else, so every row already stored is road-going by construction. The
+    migration therefore leaves the column empty rather than asserting a mode nobody
+    recorded, and this predicate is what makes that safe.
+    """
+    keep = ", ".join(f"'{m}'" for m in sorted(config.ROAD_MODES))
+    return f"({alias}.mode IS NULL OR {alias}.mode IN ({keep}))"
 
 
 def connect(path: Path | None = None, read_only: bool = False) -> duckdb.DuckDBPyConnection:
@@ -288,6 +343,16 @@ def migrate(con: duckdb.DuckDBPyConnection) -> None:
         # its rows and its match_status exactly like any other departed pattern.
         con.execute("ALTER TABLE routes ADD COLUMN route_type VARCHAR")
         logs.get("db").info("added routes.route_type; run `wayfare patterns` to fill it")
+
+    if "mode" not in columns(con, "patterns"):
+        # Added empty for the same reason route_type was: nothing already stored can
+        # supply it. It is left NULL rather than backfilled to 'bus', because a
+        # database written before this column existed held road modes only -- that
+        # was the whole point of the filter -- and `matchable` reads NULL as
+        # matchable for exactly that reason. Backfilling would assert a mode the
+        # feed never told us.
+        con.execute("ALTER TABLE patterns ADD COLUMN mode VARCHAR")
+        logs.get("db").info("added patterns.mode; run `wayfare patterns` to fill it")
 
 
 def _migrate_pattern_ids(con: duckdb.DuckDBPyConnection) -> None:
@@ -569,17 +634,28 @@ def cluster(path: Path | None = None) -> tuple[int, int, int]:
 
 
 def prune_shapes(con: duckdb.DuckDBPyConnection) -> int:
-    """Drop the operator geometry once every pattern has been matched.
+    """Drop the operator geometry that nothing needs any more.
 
-    ``shapes`` is input to ``match`` and nothing else reads it. It is the largest
-    table in the file by a wide margin, so on a national run it is worth reclaiming
-    -- but only once there is no pending work, because a resumed run needs it.
+    ``shapes`` was once input to ``match`` and nothing else, so it could go whole
+    once matching finished. It is now also the *only* geometry a non-road pattern
+    has: a tram is drawn from its operator trace rather than matched, so its shape
+    is the picture and not an input to making one. Both clauses below exist because
+    of that, and getting either wrong is silent.
+
+    The pending test counts only matchable patterns. A tram never gets a
+    ``match_status`` row, so counting it as pending would make this refuse for ever
+    on any database that keeps one.
+
+    The delete then spares every shape a live non-matchable pattern still points at.
+    Those rows are worth keeping even after ``segments`` has copied them, because
+    the copy is derived and this is the source.
     """
     pending = scalar(
         con,
         f"""
         SELECT count(*) FROM patterns p
         WHERE {current_feed()}
+          AND {matchable()}
           AND NOT EXISTS (SELECT 1 FROM match_status m WHERE m.pattern_id = p.pattern_id)
         """,
     )
@@ -588,10 +664,18 @@ def prune_shapes(con: duckdb.DuckDBPyConnection) -> int:
             f"{pending} patterns are still unmatched; shapes is still needed. "
             "Finish `wayfare match` first."
         )
-    n = scalar(con, "SELECT count(*) FROM shapes")
-    con.execute("DELETE FROM shapes")
+    before = scalar(con, "SELECT count(*) FROM shapes")
+    con.execute(f"""
+        DELETE FROM shapes WHERE shape_id NOT IN (
+            SELECT p.shape_id FROM patterns p
+            WHERE {current_feed()} AND NOT {matchable()} AND p.shape_id IS NOT NULL
+        )
+    """)
+    kept = scalar(con, "SELECT count(*) FROM shapes")
+    if kept:
+        logs.get("db").info("kept %d shapes drawn directly by non-road patterns", kept)
     con.execute("CHECKPOINT")
-    return int(n)
+    return int(before - kept)
 
 
 def row(

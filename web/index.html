@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Wayfare — bus routes on the road network</title>
+<title>Wayfare — public transport routes</title>
 <!-- The basemap is on another origin, so its first tile pays a DNS lookup, a TCP
      handshake and a TLS handshake before a byte of it moves. None of that needs
      anything from this page, so it can overlap the 803 KB library download
@@ -159,6 +159,9 @@ a.btn { text-decoration: none; }
 .legend-title { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
 .ramp { height: 8px; border-radius: 2px; margin: 7px 0 4px; }
 .ticks { display: flex; justify-content: space-between; color: var(--muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.modes { display: flex; flex-wrap: wrap; gap: 3px 12px; margin-top: 9px; }
+.mode { display: flex; align-items: center; gap: 6px; font-size: 11.5px; }
+.mode i { width: 14px; height: 3px; border-radius: 2px; flex: none; }
 
 /* --- help --- */
 .help { padding: 0 12px 11px; color: var(--muted); font-size: 11.5px; }
@@ -219,7 +222,7 @@ a.btn { text-decoration: none; }
 </head>
 <body>
 
-<div id="map" role="application" aria-label="Map of bus services by road segment"></div>
+<div id="map" role="application" aria-label="Map of public transport services"></div>
 
 <div class="stack stack--tl">
   <div class="panel">
@@ -229,7 +232,7 @@ a.btn { text-decoration: none; }
         <!-- Not "UK": the Republic of Ireland is one of the regions, and every
              region on the map shares this line. A single named region overwrites
              it with its own name. -->
-        <div class="sub" id="sub">Bus services by road segment</div>
+        <div class="sub" id="sub">Services by road, and by route where there is no road</div>
       </div>
       <a class="btn" href="art.html" title="Draw the network as a picture">Art</a>
       <button class="btn" id="theme" title="Toggle light/dark" aria-label="Toggle light or dark theme">Dark</button>
@@ -239,31 +242,36 @@ a.btn { text-decoration: none; }
       <select class="btn" id="region" title="Jump to a region" aria-label="Jump to a region" hidden></select>
     </div>
     <div class="search">
-      <label class="sr-only" for="q">Filter by bus number</label>
-      <input id="q" type="search" placeholder="Filter by bus number, e.g. 42, X57" autocomplete="off" spellcheck="false" aria-describedby="hint">
+      <label class="sr-only" for="q">Filter by service number</label>
+      <input id="q" type="search" placeholder="Filter by service number, e.g. 42, X57" autocomplete="off" spellcheck="false" aria-describedby="hint">
       <!-- The match count is written here as you type, so it has to be announced
            rather than merely updated. Polite: it should not interrupt a keystroke. -->
       <div class="hint" id="hint" role="status" aria-live="polite">Press <b>/</b> to search.</div>
     </div>
     <div class="help" id="help" hidden>
-      <p>Each line is a road segment — a stretch of road between two junctions. Colour and thickness both show <b>how many distinct bus services</b> use it, so trunk corridors stand out from the tail.</p>
-      <p>Hover a segment for its service list. Filtering matches whole bus numbers, so <code>4</code> will not match <code>42</code>.</p>
+      <p>Most lines are a road segment — a stretch of road between two junctions. Colour and thickness both show <b>how many distinct bus and coach services</b> use it, so trunk corridors stand out from the tail.</p>
+      <p>Trams, metros, trains and ferries have no road under them, so they are drawn from the operator's own trace and coloured by mode instead of by service count. The key below lists the ones on this map.</p>
+      <p>Hover a line for its service list. Filtering matches whole service numbers, so <code>4</code> will not match <code>42</code>.</p>
       <p>Zoomed out, the map thins the densest areas to keep tiles small, so a
-         quiet-looking city is not necessarily a city without buses. Zoom in for
+         quiet-looking city is not necessarily a city without services. Zoom in for
          the complete picture.</p>
     </div>
   </div>
 
   <div class="panel legend">
-    <div class="legend-title">Services per segment</div>
+    <div class="legend-title">Services per road</div>
     <div class="ramp" id="ramp"></div>
     <div class="ticks"><span>1</span><span>6</span><span>12</span><span>24</span><span>40+</span></div>
+    <!-- Filled in from what is actually drawn, and hidden until something is.
+         A Great Britain archive holds no ferry, and a key to one would be a
+         promise the tiles do not keep. -->
+    <div class="modes" id="modes" hidden></div>
   </div>
 </div>
 
 <div class="stack stack--tr">
   <div class="panel card" id="card">
-    <p class="road empty" id="road">Hover a road to see its bus services.</p>
+    <p class="road empty" id="road">Hover a line to see what runs on it.</p>
     <div class="meta" id="meta"></div>
     <div class="chips" id="chips"></div>
     <div class="note" id="note" hidden></div>
@@ -304,7 +312,11 @@ let ARCHIVES = [];
 // is one archive, one tile pyramid, and there is no union source.
 let REGIONS = [];
 
-const LAYER_SRC = "bus";    // the single vector layer inside every archive
+const LAYER_SRC = "bus";    // the matched road network inside every archive
+// The modes that were never matched, drawn from operator geometry. A layer of its
+// own inside the same archive, absent from a bus-only region -- MapLibre tolerates
+// a layer whose source-layer is missing, so nothing has to ask first.
+const LAYER_SEG = "segments";
 
 // Sequential ramps over service count. Light goes pale-blue -> deep violet so
 // busy roads darken against the light basemap; dark goes the other way, into
@@ -318,6 +330,35 @@ const BASEMAP = {
   dark:  "dark_all",
 };
 const HOVER_COLOUR = { light: "#d64512", dark: "#ffffff" };
+
+// One colour per non-road mode, and deliberately outside the bus ramp rather than
+// an extension of it. The bus ramp encodes *how many* services use a road; a tram
+// line is one service on its own track, so a position on that ramp would be a
+// number nobody can read. These say "this is a different mode" and nothing else.
+// Hues are spread rather than shaded, because these are categories and not a
+// scale: nothing about a ferry is "more" than a tram. The four common modes come
+// first; the cable-hauled tail is rare enough in these islands to be one heritage
+// line each, but a mode sharing a colour with another mode is worse than a mode
+// nobody ever sees. Red is left alone -- it is the hover and match accent, and a
+// mode that looked selected would be the wrong kind of wrong.
+const MODE_COLOUR = {
+  light: {
+    tram: "#b5327a", metro: "#00695f", rail: "#7a4b16", ferry: "#1f6fb2",
+    cable_tram: "#6a3fb5", funicular: "#0f7a3d", aerial: "#8a6d00",
+    monorail: "#37474f",
+  },
+  dark: {
+    tram: "#ff86c4", metro: "#4fd6c0", rail: "#e0a566", ferry: "#6ab7f0",
+    cable_tram: "#b79cf0", funicular: "#6fd08c", aerial: "#ddc067",
+    monorail: "#90a4ae",
+  },
+};
+const MODE_LABEL = {
+  tram: "Tram", metro: "Metro", rail: "Rail", ferry: "Ferry",
+  cable_tram: "Cable tram", funicular: "Funicular", aerial: "Cable car",
+  monorail: "Monorail",
+};
+const FALLBACK_MODE_COLOUR = { light: "#6b6b6b", dark: "#b9b9b9" };
 
 const $ = (id) => document.getElementById(id);
 let theme = localStorage.getItem("wayfare-theme")
@@ -348,6 +389,26 @@ const width = (bump) => [
 ];
 const HOVER_BUMP = ["case", ["boolean", ["feature-state", "hover"], false], 2, 0];
 
+// Colour by mode rather than by count. `match` falls through to grey for a mode
+// this page has no colour for, so a feed that starts publishing funiculars draws
+// them in grey rather than not at all.
+const modeColourExpr = (t) => [
+  "match", ["get", "mode"],
+  ...Object.entries(MODE_COLOUR[t]).flatMap(([m, c]) => [m, c]),
+  FALLBACK_MODE_COLOUR[t],
+];
+
+// A segment carries no service count, so its width ramps on zoom alone. Slightly
+// wider than a quiet road at every zoom: there is one tram line where there are
+// twenty streets, and it should read as infrastructure rather than as a lane.
+const segWidth = (bump) => [
+  "interpolate", ["linear"], ["zoom"],
+  6,  ["+", 0.8, bump],
+  9,  ["+", 1.6, bump],
+  12, ["+", 2.6, bump],
+  16, ["+", 4.5, bump],
+];
+
 // The hovered segment in the accent colour, everything else off the ramp. Shared
 // with the theme toggle, which rebuilds the same expression for every region.
 const hoverOr = (base) => [
@@ -368,6 +429,17 @@ const tokenFilter = (tokens) => [
     ["upcase", ["concat", ",", ["to-string", ["get", "refs"]], ","]],
   ]),
 ];
+// A segment carries one service in `ref`, not a comma-joined list in `refs`, so
+// it matches on equality rather than on substring-between-commas.
+const segTokenFilter = (tokens) => [
+  "any",
+  ...tokens.map((tok) => ["==", ["upcase", ["to-string", ["get", "ref"]]], tok]),
+];
+// Dimmed in place rather than given a match layer of its own. A segment is one
+// feature per service, so "the matching ones" is a property test on the layer
+// already drawn -- where a road carries many services and needs a second pass.
+const segOpacity = (tokens) =>
+  tokens.length ? ["case", segTokenFilter(tokens), 0.95, 0.1] : 0.95;
 const NEVER = ["==", ["id"], -1];
 
 /* ---------- boot ---------- */
@@ -421,6 +493,7 @@ async function openArchive(name, i) {
       src: `region-${i}`,
       layer: `bus-${i}`,
       match: `bus-match-${i}`,
+      seg: `seg-${i}`,
     };
   } catch (err) {
     console.error(`could not read ${url}`, err);
@@ -468,9 +541,9 @@ function offerRegions(map, missing) {
   if (missing) {
     $("sub").textContent =
       `${REGIONS.length} region${REGIONS.length === 1 ? "" : "s"}, ${missing} unavailable` +
-      ` — bus services by road segment`;
+      ` — public transport services`;
   } else if (REGIONS.length === 1 && here.length === 1) {
-    $("sub").textContent = `${regionLabel(here[0].name)} — bus services by road segment`;
+    $("sub").textContent = `${regionLabel(here[0].name)} — public transport services`;
   }
   if (here.length < 2) return; // nowhere to jump to
 
@@ -555,6 +628,21 @@ const busLayer = (r) => ({
   },
 });
 
+// Trams, metros and ferries, drawn from the operator's own trace because nothing
+// map-matched them. Same source, different layer inside the archive.
+const segLayer = (r) => ({
+  id: r.seg,
+  type: "line",
+  source: r.src,
+  "source-layer": LAYER_SEG,
+  layout: { "line-cap": "round", "line-join": "round" },
+  paint: {
+    "line-color": hoverOr(modeColourExpr(theme)),
+    "line-width": segWidth(HOVER_BUMP),
+    "line-opacity": 0.95,
+  },
+});
+
 // Drawn only while a filter is active: the matching services on top of the
 // dimmed network.
 const matchLayer = (r) => ({
@@ -613,11 +701,17 @@ function start(missing) {
   // on top of the neighbouring region's dimmed network too -- and the two parts
   // of Ireland genuinely overlap, because both were matched against the same
   // island graph, so a cross-border road is in both archives.
+  // Segments sit above every region's road network and below the match highlight.
+  // Above the roads because a tram on a street would otherwise be buried under the
+  // bus line sharing it; below the match highlight because a filtered service still
+  // has to be the brightest thing on screen.
   const layers = [{ id: "basemap", type: "raster", source: "basemap" }];
   for (const r of REGIONS) layers.push(busLayer(r));
+  for (const r of REGIONS) layers.push(segLayer(r));
   for (const r of REGIONS) layers.push(matchLayer(r));
 
   const BUS = REGIONS.map((r) => r.layer);
+  const SEG = REGIONS.map((r) => r.seg);
   const MATCH = REGIONS.map((r) => r.match);
 
   const map = new maplibregl.Map({
@@ -631,7 +725,7 @@ function start(missing) {
     // Take the floor from the archives themselves, not a constant: a hardcoded
     // 4.6 sat *below* z5, and MapLibre floors the map zoom to pick a tile level,
     // so every view between 4.6 and 5 asked for z4, got nothing, and drew the
-    // basemap alone. That reads as "this region has no buses", not as a limit.
+    // basemap alone. That reads as "this region has no services", not as a limit.
     //
     // The deepest floor of the several, not the shallowest: at a zoom one archive
     // cannot answer, its region alone goes blank, which is the same lie told about
@@ -677,9 +771,14 @@ function start(missing) {
 
   // A feature is identified by its source as well as its id: the id is
   // tippecanoe's edge id, unique inside one archive and meaningless across them.
-  let hovered = null; // { src, id }
+  // The source-layer rides along because there are now two of them in one archive
+  // and setFeatureState addresses a feature by all three.
+  let hovered = null; // { src, sourceLayer, id }
   const setHover = (h, on) =>
-    map.setFeatureState({ source: h.src, sourceLayer: LAYER_SRC, id: h.id }, { hover: on });
+    map.setFeatureState(
+      { source: h.src, sourceLayer: h.sourceLayer, id: h.id },
+      { hover: on }
+    );
 
   // One query over every region's layer, rather than a handler bound to each.
   // Every hit goes to the card, because on a road two archives both hold, one
@@ -690,17 +789,23 @@ function start(missing) {
   // — the service lists run long and reading one shouldn't require holding the
   // cursor still. The highlight does not.
   map.on("mousemove", (e) => {
-    const hits = map.queryRenderedFeatures(e.point, { layers: BUS });
+    // Segments are queried first because they are drawn above the roads: a tram
+    // on a street should answer for the line the cursor is actually over. There
+    // is nothing to merge across regions -- a segment is one pattern's own trace,
+    // not a road two archives independently describe.
+    const segHits = map.queryRenderedFeatures(e.point, { layers: SEG });
+    const hits = segHits.length ? segHits : map.queryRenderedFeatures(e.point, { layers: BUS });
     const f = hits[0];
     map.getCanvas().style.cursor = f ? "pointer" : "";
     if (hovered && (!f || hovered.id !== f.id || hovered.src !== f.source)) {
       setHover(hovered, false);
       hovered = null;
     }
-    if (!f || hovered) return; // nothing under the cursor, or the same road still
-    hovered = { src: f.source, id: f.id };
+    if (!f || hovered) return; // nothing under the cursor, or the same line still
+    hovered = { src: f.source, sourceLayer: f.sourceLayer, id: f.id };
     setHover(hovered, true);
-    showFeature(mergeRegions(hits));
+    if (segHits.length) showSegment(f.properties);
+    else showFeature(mergeRegions(hits));
   });
 
   /* ---------- filter ---------- */
@@ -722,6 +827,7 @@ function start(missing) {
       map.setLayoutProperty(id, "visibility", on ? "visible" : "none");
     }
     for (const id of BUS) map.setPaintProperty(id, "line-opacity", on ? 0.12 : 0.85);
+    for (const id of SEG) map.setPaintProperty(id, "line-opacity", segOpacity(active));
 
     if (on) {
       countMatches();
@@ -764,6 +870,9 @@ function start(missing) {
   };
   input.addEventListener("input", debounce(applyFilter, 120));
   map.on("idle", countMatches);
+  // On idle rather than on load: an archive's segments are not necessarily in the
+  // opening view, and the tiles holding them arrive whenever the user reaches them.
+  map.on("idle", () => noteRenderedModes(map, SEG));
   addEventListener("keydown", (e) => {
     if (e.key === "/" && document.activeElement !== input) {
       e.preventDefault();
@@ -789,6 +898,9 @@ function start(missing) {
     const colour = hoverOr(colourExpr(theme));
     for (const id of BUS) map.setPaintProperty(id, "line-color", colour);
     for (const id of MATCH) map.setPaintProperty(id, "line-color", HOVER_COLOUR[theme]);
+    const segColour = hoverOr(modeColourExpr(theme));
+    for (const id of SEG) map.setPaintProperty(id, "line-color", segColour);
+    paintModeLegend();
   });
 
   /* ---------- info card ---------- */
@@ -818,6 +930,22 @@ function start(missing) {
       ? `Showing ${shown} of ${n} services.`
       : "Zoom in to see which services run here.";
     redrawChips();
+  }
+
+  // A segment is one service on its own alignment, so the card says what it is
+  // rather than how many things share it. There is no way id, because nothing
+  // matched it to an OpenStreetMap way -- which is the honest thing to show: this
+  // geometry is the operator's own trace, not a road the pipeline identified.
+  function showSegment(p) {
+    current = null; // no service list, so nothing for the chips to draw
+    const mode = MODE_LABEL[p.mode] || p.mode || "Other";
+    $("road").textContent = p.ref ? `${mode} ${p.ref}` : mode;
+    $("road").classList.remove("empty");
+    $("meta").innerHTML =
+      `<b>${Number(p.trips || 0).toLocaleString()}</b> trips/week · operator geometry`;
+    $("note").hidden = false;
+    $("note").textContent = `Drawn from the operator's own trace, not map-matched.`;
+    $("chips").innerHTML = "";
   }
 
   function redrawChips() {
@@ -888,6 +1016,44 @@ function basemapTiles(t) {
   return ["a", "b", "c", "d"].map(
     (s) => `https://${s}.basemaps.cartocdn.com/${BASEMAP[t]}/{z}/{x}/{y}${r}.png`
   );
+}
+
+// Modes accumulate and are never removed. Panning away from the only tram line in
+// the window should not take the key to it off the page, and a mode drawn once has
+// been drawn -- the legend is a claim about the archives loaded, not about the
+// current viewport.
+const seenModes = new Set();
+
+function noteRenderedModes(map, ids) {
+  const live = ids.filter((id) => map.getLayer(id));
+  if (!live.length) return;
+  let added = false;
+  for (const f of map.queryRenderedFeatures({ layers: live })) {
+    const m = f.properties?.mode || "other";
+    if (!seenModes.has(m)) {
+      seenModes.add(m);
+      added = true;
+    }
+  }
+  if (added) paintModeLegend();
+}
+
+function paintModeLegend() {
+  if (!seenModes.size) return;
+  // Ordered by the palette rather than alphabetically, so the four common modes
+  // stay together at the front and an unrecognised one sorts to the end with the
+  // grey it is drawn in.
+  const order = Object.keys(MODE_COLOUR[theme]);
+  const rank = (m) => (order.indexOf(m) < 0 ? order.length : order.indexOf(m));
+  $("modes").innerHTML = [...seenModes]
+    .sort((a, b) => rank(a) - rank(b))
+    .map((m) => {
+      const colour = MODE_COLOUR[theme][m] || FALLBACK_MODE_COLOUR[theme];
+      const label = MODE_LABEL[m] || "Other";
+      return `<span class="mode"><i style="background:${colour}"></i>${escapeHtml(label)}</span>`;
+    })
+    .join("");
+  $("modes").hidden = false;
 }
 
 function paintRamp() {

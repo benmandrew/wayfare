@@ -62,6 +62,36 @@ def test_absurd_detour_is_recorded_but_its_edges_are_dropped(loaded):
     assert loaded.execute("SELECT count(*) FROM pattern_edges").fetchone()[0] == 0
 
 
+def test_non_road_modes_are_never_handed_to_the_matcher(gtfs_dir: Path, con):
+    """Keeping a ferry and map-matching it are different decisions, and only the
+    first is `--modes`. A sea crossing given to `bus` costing either fails outright
+    or snaps to the nearest coast road, which is worse -- it was the largest single
+    error class in the GB run. Their geometry comes from the operator instead.
+    """
+    gtfs.build_patterns(
+        gtfs_dir, con, memory_limit="1GB", modes=frozenset({"bus", "ferry", "rail"})
+    )
+    assert con.execute("SELECT count(*) FROM patterns").fetchone()[0] == 4
+
+    assert match.pending_count(con) == 2  # the two bus patterns, not the four
+    match.run(con, client_=FakeClient())
+    matched = {
+        r[0]
+        for r in con.execute("""
+            SELECT p.mode FROM patterns p JOIN match_status m USING (pattern_id)
+        """).fetchall()
+    }
+    assert matched == {"bus"}
+
+
+def test_an_older_database_has_no_mode_and_is_still_matched(loaded):
+    """A NULL mode is what a database written before the column existed means. It
+    held road modes only -- that was the point of the filter -- so reading NULL as
+    unmatchable would silently stop a national database dead."""
+    loaded.execute("UPDATE patterns SET mode = NULL")
+    assert match.pending_count(loaded) == 2
+
+
 def test_unroutable_patterns_are_not_retried_forever(loaded):
     match.run(loaded, client_=FakeClient(fail=valhalla.NoRoute("no route")))
     assert match.pending_count(loaded) == 0
@@ -283,3 +313,69 @@ def test_retry_leaves_shared_edges_alone(loaded):
     match.retry(loaded, ["ok"])
     assert loaded.execute("SELECT count(*) FROM edges").fetchone()[0] == 2
     assert loaded.execute("SELECT count(*) FROM pattern_edges").fetchone()[0] == 0
+
+
+# --- drawing the modes that are never matched ---------------------------------
+
+
+def _with_ferry_geometry(con) -> None:
+    """Give the mini feed's ferry an operator trace, as two thirds of GB's real
+    ferry trips have. The fixture ships it without one, and the shape is the whole
+    input to drawing a non-road mode."""
+    con.execute(
+        "INSERT INTO shapes VALUES ('SHF', [53405000, 53320000], [-2996000, -3180000])"
+    )
+    con.execute("UPDATE patterns SET shape_id = 'SHF' WHERE mode = 'ferry'")
+
+
+def test_segments_are_built_from_operator_geometry_only(gtfs_dir: Path, con):
+    """The whole of "drawing" a tram or a ferry: copy the trace, run no matcher."""
+    gtfs.build_patterns(
+        gtfs_dir, con, memory_limit="1GB", modes=frozenset({"bus", "ferry", "rail"})
+    )
+    _with_ferry_geometry(con)
+    aggregate.build_segments(con)
+
+    rows = con.execute(
+        "SELECT mode, lon_e6, min_lon_e6, max_lat_e6 FROM segments"
+    ).fetchall()
+    assert len(rows) == 1
+    mode, lon_e6, min_lon, max_lat = rows[0]
+    assert mode == "ferry"
+    assert lon_e6 == [-2996000, -3180000]
+    # The bbox is computed from the trace rather than copied from anywhere.
+    assert (min_lon, max_lat) == (-3180000, 53405000)
+
+
+def test_a_non_road_pattern_with_no_shape_is_not_drawn(gtfs_dir: Path, con):
+    """ "Bad geometry is worse than missing geometry", applied to the case where
+    inventing would be easy: the stops are known, and a straight line between them
+    renders perfectly happily down the wrong side of a river."""
+    gtfs.build_patterns(
+        gtfs_dir, con, memory_limit="1GB", modes=frozenset({"bus", "ferry", "rail"})
+    )
+    aggregate.build_segments(con)
+    assert con.execute("SELECT count(*) FROM segments").fetchone()[0] == 0
+
+
+def test_no_matched_pattern_is_ever_a_segment(gtfs_dir: Path, con):
+    """A bus is drawn from its matched edges. Drawing it from its shape as well
+    would put a second line under the first, off the road network."""
+    gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB")
+    aggregate.build_segments(con)
+    assert con.execute("SELECT count(*) FROM segments").fetchone()[0] == 0
+
+
+def test_segments_hold_the_current_feed_only(gtfs_dir: Path, con):
+    """Derived and cheap, so it is rebuilt outright like pattern_stops rather than
+    merged like patterns. A departed ferry stops being drawn on the next run."""
+    gtfs.build_patterns(
+        gtfs_dir, con, memory_limit="1GB", modes=frozenset({"bus", "ferry"})
+    )
+    _with_ferry_geometry(con)
+    aggregate.build_segments(con)
+    assert con.execute("SELECT count(*) FROM segments").fetchone()[0] == 1
+
+    con.execute("UPDATE patterns SET last_seen = 'GONE'")
+    aggregate.build_segments(con)
+    assert con.execute("SELECT count(*) FROM segments").fetchone()[0] == 0

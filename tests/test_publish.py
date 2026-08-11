@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from wayfare import cli, config, publish
+from wayfare import cli, config, licences, publish
 
 
 def _row(edge_id, pts, refs, way_id=1, name="Oxford Road", trips=100):
@@ -265,7 +265,7 @@ def kept_trips(path):
 def test_missing_tippecanoe_says_which_fork(monkeypatch, tmp_path):
     monkeypatch.setattr(publish.shutil, "which", lambda _: None)
     with pytest.raises(RuntimeError, match="felt/tippecanoe"):
-        publish.build_tiles(tmp_path / "edges.geojsonl")
+        publish.build_tiles(write_geojsonl(tmp_path / "edges.geojsonl", [1]))
 
 
 def test_a_file_under_its_cap_is_not_filtered_at_all(tmp_path):
@@ -501,7 +501,7 @@ def test_every_licence_names_where_to_find_it():
     added with a licence nobody wrote a URL for must fail loudly at publish rather
     than ship an archive crediting a licence it does not link to."""
     for region in ("all", *config.FEEDS):
-        assert config.LICENCE_URLS[config.feed(region).licence].startswith("https://")
+        assert licences.URLS[config.feed(region).licence].startswith("https://")
 
 
 def test_the_credit_names_the_publisher_the_licence_and_openstreetmap():
@@ -510,10 +510,10 @@ def test_the_credit_names_the_publisher_the_licence_and_openstreetmap():
     timetable's licence says."""
     credit = config.credit_html("wales")
     assert "Department for Transport" in credit
-    assert config.OGL in credit
-    assert config.LICENCE_URLS[config.OGL] in credit
+    assert licences.OGL in credit
+    assert licences.URLS[licences.OGL] in credit
     assert "OpenStreetMap" in credit
-    assert config.LICENCE_URLS[config.ODBL] in credit
+    assert licences.URLS[licences.ODBL] in credit
     # And it says which half OSM covers, since the viewer's existing OSM line is
     # about the backdrop and this one is about the lines drawn on it.
     assert "Road geometry" in credit
@@ -524,7 +524,7 @@ def test_a_region_on_a_different_licence_gets_a_different_credit():
     would be wrong for whichever region is not showing."""
     assert config.credit_html("ireland") != config.credit_html("all")
     assert "National Transport Authority" in config.credit_html("ireland")
-    assert config.LICENCE_URLS[config.CC_BY_4] in config.credit_html("ireland")
+    assert licences.URLS[licences.CC_BY_4] in config.credit_html("ireland")
     assert "Department for Transport" not in config.credit_html("ireland")
     # Northern Ireland is OGL like GB but a different publisher, so the licence
     # alone does not decide the string.
@@ -537,8 +537,8 @@ def test_the_plain_text_credit_says_the_same_thing_without_markup():
     text = config.credit_text("ireland")
     assert "<a href" not in text and "&copy;" not in text
     assert "National Transport Authority" in text
-    assert config.LICENCE_URLS[config.CC_BY_4] in text
-    assert config.OSM_COPYRIGHT in text
+    assert licences.URLS[licences.CC_BY_4] in text
+    assert licences.OSM_COPYRIGHT in text
     # tEXt is Latin-1, so the sign has to be one of the 256 characters it allows.
     text.encode("latin-1")
 
@@ -552,8 +552,8 @@ def test_dropping_the_links_keeps_every_name_and_still_credits_both():
     joined = " ".join(lines)
     assert "http" not in joined
     assert "National Transport Authority" in joined
-    assert config.CC_BY_4 in joined
-    assert "OpenStreetMap contributors" in joined and config.ODBL in joined
+    assert licences.CC_BY_4 in joined
+    assert "OpenStreetMap contributors" in joined and licences.ODBL in joined
     assert " ".join(config.credit_lines("ireland")) == config.credit_text("ireland")
 
 
@@ -574,7 +574,7 @@ def test_the_credit_follows_the_region_rather_than_the_call_site(monkeypatch, tm
         monkeypatch, tmp_path, attribution=config.credit_html("ireland")
     )
     assert "National Transport Authority" in _attribution(far)
-    assert config.OGL not in _attribution(far)
+    assert licences.OGL not in _attribution(far)
 
 
 def test_publish_stamps_the_region_it_was_given(monkeypatch, tmp_path):
@@ -582,12 +582,14 @@ def test_publish_stamps_the_region_it_was_given(monkeypatch, tmp_path):
     licence is a property of the feed and not of the machine running the build."""
     seen = {}
 
-    def fake_build_tiles(path, out=None, attribution=None):
+    def fake_build_tiles(path, out=None, attribution=None, segments=None):
         seen["credit"] = attribution
         return tmp_path / "bus.pmtiles"
 
     monkeypatch.setattr(config, "OUT", tmp_path)
     monkeypatch.setattr(publish, "export_geojsonl", lambda con: tmp_path / "e.geojsonl")
+    monkeypatch.setattr(publish, "export_segments_geojsonl", lambda con: None)
+    monkeypatch.setattr(publish, "contents", lambda con: {"road": True, "operator": False})
     monkeypatch.setattr(publish, "build_tiles", fake_build_tiles)
     publish.build(_A_CONNECTION, region="ireland")
     assert seen["credit"] == config.credit_html("ireland")
@@ -604,11 +606,15 @@ def _built_out(monkeypatch, tmp_path, **kwargs) -> Path:
     """Run `build` against a stubbed tippecanoe and report the path it chose."""
     seen = {}
 
-    def fake_build_tiles(path, out=None, attribution=None):
+    def fake_build_tiles(path, out=None, attribution=None, segments=None):
         seen["out"] = out
         return out
 
     monkeypatch.setattr(publish, "export_geojsonl", lambda con: tmp_path / "e.geojsonl")
+    # Stubbed alongside the edge export: this helper is about which path `build`
+    # chooses, and it hands `build` a None connection to prove it never reads one.
+    monkeypatch.setattr(publish, "export_segments_geojsonl", lambda con: None)
+    monkeypatch.setattr(publish, "contents", lambda con: {"road": True, "operator": False})
     monkeypatch.setattr(publish, "build_tiles", fake_build_tiles)
     publish.build(_A_CONNECTION, **kwargs)
     return seen["out"]
@@ -852,3 +858,237 @@ def test_from_export_publishes_without_touching_the_database(monkeypatch, tmp_pa
     assert cli.main(["publish", "--from-export"]) == 0
     assert seen["con"] is None
     assert seen["from_export"] == tmp_path / "edges.geojsonl"
+
+
+# --- non-road segments --------------------------------------------------------
+
+
+def _tram(con, pattern_id, lon_e6, lat_e6, ref="T1", trips=50, mode="tram"):
+    con.execute(
+        "INSERT INTO patterns (pattern_id, route_id, short_name, n_stops, n_trips, "
+        "mode, first_seen, last_seen) VALUES (?, 'R9', ?, 2, ?, ?, 'F1', 'F1')",
+        [pattern_id, ref, trips, mode],
+    )
+    con.execute(
+        "INSERT INTO segments VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            pattern_id,
+            mode,
+            lon_e6,
+            lat_e6,
+            min(lon_e6),
+            min(lat_e6),
+            max(lon_e6),
+            max(lat_e6),
+        ],
+    )
+
+
+def test_a_region_with_no_segments_writes_no_file(con, tmp_path):
+    """None rather than an empty file, so a bus-only region skips the extra
+    tippecanoe pass instead of joining an empty layer into every archive."""
+    assert publish.export_segments_geojsonl(con, tmp_path / "s.geojsonl") is None
+    assert not (tmp_path / "s.geojsonl").exists()
+
+
+def test_a_segment_becomes_one_feature_carrying_its_mode(con, tmp_path):
+    """A segment is a whole pattern's trace, so it is one feature and there is
+    nothing to coalesce it with. The mode rides along because the viewer styles a
+    tram differently from a ferry."""
+    from wayfare import db
+
+    db.set_meta(con, "feed_version", "F1")
+    _tram(con, 1, [-2245000, -2240000], [53480000, 53481000], ref="Metrolink")
+
+    path = publish.export_segments_geojsonl(con, tmp_path / "s.geojsonl")
+    assert path is not None
+    features = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(features) == 1
+    assert features[0]["properties"] == {
+        "id": 1,
+        "mode": "tram",
+        "ref": "Metrolink",
+        "trips": 50,
+    }
+    assert features[0]["geometry"]["coordinates"] == [[-2.245, 53.48], [-2.24, 53.481]]
+
+
+def test_the_segment_export_is_deterministic(con, tmp_path):
+    """Two runs must be byte-identical, for the same reason the edge export must:
+    it is what makes tiles cacheable and two builds comparable."""
+    from wayfare import db
+
+    db.set_meta(con, "feed_version", "F1")
+    _tram(con, 7, [-2245000, -2240000], [53480000, 53481000])
+    _tram(con, 3, [-2240000, -2235000], [53481000, 53482000], mode="ferry")
+
+    a = publish.export_segments_geojsonl(con, tmp_path / "a.geojsonl")
+    b = publish.export_segments_geojsonl(con, tmp_path / "b.geojsonl")
+    assert a is not None and b is not None
+    assert a.read_bytes() == b.read_bytes()
+    # Ordered by pattern_id, so the order is defined rather than incidentally equal.
+    assert [json.loads(x)["properties"]["id"] for x in a.read_text().splitlines()] == [3, 7]
+
+
+def test_segments_are_one_more_pass_joined_into_the_same_archive(monkeypatch, tmp_path):
+    """A layer of its own rather than an attribute on `bus`: tile-join keeps
+    distinct layer names, so the whole cost is one more tippecanoe pass. One pass
+    over the full zoom range, not banded like the roads -- the bands thin the
+    quietest roads out of the far view, and a tram line thinned out of its own layer
+    would just be missing."""
+    import subprocess
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
+    monkeypatch.setattr(publish.subprocess, "run", fake_run)
+
+    publish.build_tiles(
+        write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3]),
+        tmp_path / "bus.pmtiles",
+        segments=tmp_path / "segments.geojsonl",
+    )
+
+    far, near, detail, seg, join = calls
+    assert seg[seg.index("-l") + 1] == publish.LAYER_SEGMENTS
+    assert far[far.index("-l") + 1] == publish.LAYER
+    assert seg[seg.index("-Z") + 1] == str(config.MIN_ZOOM)
+    assert seg[seg.index("-z") + 1] == str(config.MAX_ZOOM)
+    # Not extended: the band already reaches MAX_ZOOM, and only the last road band
+    # may grow past its own ceiling.
+    assert "--extend-zooms-if-still-dropping" not in seg
+    # Every input carries the credit, so a band inspected on its own still says
+    # where it came from.
+    assert join[0] == "tile-join"
+    assert sum(1 for a in seg if a.startswith("--attribution=")) == 1
+
+
+def test_a_bus_only_region_gets_no_segments_pass(monkeypatch, tmp_path):
+    """Passing None must skip the pass rather than join an empty layer into every
+    archive that has no trams."""
+    import subprocess
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
+    monkeypatch.setattr(publish.subprocess, "run", fake_run)
+
+    publish.build_tiles(
+        write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3]), tmp_path / "bus.pmtiles"
+    )
+    assert len(calls) == 4  # far, near, detail, join -- and nothing else
+    assert not any(publish.LAYER_SEGMENTS in c for c in calls)
+
+
+# --- what the credit claims, and what it must not ------------------------------
+
+
+def test_the_noun_is_not_bus_once_the_archive_holds_other_modes():
+    """ "Bus routes" was accurate while a bus was all there was. An archive holding
+    trams and ferries credited as bus routes misdescribes what it contains."""
+    assert "Bus routes" not in config.credit_html("wales")
+    assert "Routes and timetables" in config.credit_html("wales")
+
+
+def test_operator_geometry_is_named_in_the_publishers_credit_not_a_third_line():
+    """The trace arrives in the same bundle as the timetable and is covered by the
+    same licence, so it needs naming rather than crediting separately."""
+    credit = config.credit_html("wales", operator=True)
+    assert "Routes, timetables and operator geometry" in credit
+    # Still two parts, not three.
+    assert len(config.credit_parts("wales", operator=True)) == 2
+
+
+def test_an_archive_with_no_matched_edges_makes_no_odbl_claim():
+    """Claiming ODbL over an operator's own survey is wrong in the opposite
+    direction from omitting it: it asserts a share-alike condition on data whose
+    publisher never imposed one. No OSM way was involved, so no OSM credit."""
+    credit = config.credit_html("ireland", road=False, operator=True)
+    assert "OpenStreetMap" not in credit
+    assert licences.URLS[licences.ODBL] not in credit
+    # The publisher is still credited, and CC BY 4.0 makes that a condition.
+    assert "National Transport Authority" in credit
+    assert licences.URLS[licences.CC_BY_4] in credit
+
+
+def test_the_default_is_unchanged_for_a_road_only_archive():
+    """Every existing caller -- `art`, `/art/meta`, a bare `build_tiles` -- draws
+    matched edges and nothing else, so the flags default to exactly that."""
+    assert config.credit_parts("wales") == config.credit_parts(
+        "wales", road=True, operator=False
+    )
+    assert [c.what for c in config.credit_parts("wales")] == [
+        "Routes and timetables",
+        "Road geometry",
+    ]
+
+
+def test_the_credit_follows_what_the_archive_actually_holds(con, tmp_path, monkeypatch):
+    """The flags are read from the database rather than assumed, because getting
+    either wrong is a licence statement that is false and invisible in the picture."""
+    from wayfare import db
+
+    assert publish.contents(con) == {"road": False, "operator": False}
+
+    db.set_meta(con, "feed_version", "F1")
+    _tram(con, 1, [-2245000, -2240000], [53480000, 53481000])
+    assert publish.contents(con) == {"road": False, "operator": True}
+
+    _edge(con, 5, ["42"])
+    assert publish.contents(con) == {"road": True, "operator": True}
+
+
+def _stub_tippecanoe(monkeypatch, calls):
+    import subprocess
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
+    monkeypatch.setattr(publish.subprocess, "run", fake_run)
+
+
+def test_a_region_with_no_matched_edges_skips_the_road_bands(monkeypatch, tmp_path):
+    """Irish Rail on its own is 331 patterns and not one of them is a road.
+    tippecanoe exits 110 on an empty input rather than writing an empty archive, so
+    the road bands are skipped -- the same rule the segments pass already follows,
+    in the other direction."""
+    calls = []
+    _stub_tippecanoe(monkeypatch, calls)
+    (tmp_path / "edges.geojsonl").write_text("")  # exported, but no features
+    (tmp_path / "segments.geojsonl").write_text('{"type":"Feature"}\n')
+
+    publish.build_tiles(
+        tmp_path / "edges.geojsonl",
+        tmp_path / "ireland.pmtiles",
+        segments=tmp_path / "segments.geojsonl",
+    )
+
+    seg, join = calls
+    assert seg[seg.index("-l") + 1] == publish.LAYER_SEGMENTS
+    assert join[0] == "tile-join"
+    # No `bus` layer at all, rather than an empty one.
+    assert not any(publish.LAYER in c and "-l" in c for c in [seg])
+
+
+def test_publishing_nothing_at_all_is_refused(monkeypatch, tmp_path):
+    """Louder than an empty archive, which loads without complaint and shows a
+    blank map -- that reads as a broken viewer rather than as a stage with nothing
+    to write."""
+    _stub_tippecanoe(monkeypatch, [])
+    (tmp_path / "edges.geojsonl").write_text("")
+
+    with pytest.raises(RuntimeError, match="nothing to publish"):
+        publish.build_tiles(tmp_path / "edges.geojsonl", tmp_path / "o.pmtiles")

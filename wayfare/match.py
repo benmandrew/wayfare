@@ -91,6 +91,7 @@ def pending_count(con: duckdb.DuckDBPyConnection) -> int:
             f"""
             SELECT count(*) FROM patterns p
             WHERE {db.current_feed()}
+              AND {db.matchable()}
               AND NOT EXISTS (
                 SELECT 1 FROM match_status m WHERE m.pattern_id = p.pattern_id
             )
@@ -198,6 +199,7 @@ def load_batch(con: duckdb.DuckDBPyConnection, limit: int) -> list[Pattern]:
         SELECT p.pattern_id, p.short_name, p.span_m, p.shape_id
         FROM patterns p
         WHERE {db.current_feed()}
+          AND {db.matchable()}
           AND NOT EXISTS (SELECT 1 FROM match_status m WHERE m.pattern_id = p.pattern_id)
         ORDER BY p.n_trips DESC, p.pattern_id
         LIMIT ?

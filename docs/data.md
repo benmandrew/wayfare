@@ -57,24 +57,53 @@ MB, 435k records. Budget ~40 GB of disk including the Valhalla graph.
 
 ## Mode filtering
 
-**Ferries are the largest single error class in the GB run, and `route_type` is
-what removes them.** All 52 `error` rows carrying Valhalla code 444 — 11,200 trips
-— are two-stop sea crossings on the `shape` path: CalMac, Orkney, the Shields
-ferry. `map_snap` is refusing to put water on a road, which is correct behaviour
-answering a question that should never have been asked. A further 41
-`low_confidence` rows, 8,867 trips, are the same crossings arriving through the
-`stops` path, and they are 63% of all low-confidence trip weight. `gtfs.py` drops
-every trip whose route is not road-going before patterns are built.
+**Ferries are the largest single error class in the GB run, and the matcher is not
+the way to draw them.** All 52 `error` rows carrying Valhalla code 444 — 11,200
+trips — are two-stop sea crossings on the `shape` path: CalMac, Orkney, the Shields
+ferry. A further 41 `low_confidence` rows, 8,867 trips, are the same crossings
+arriving through the `stops` path, and they are 63% of all low-confidence trip
+weight.
+
+**The reason given here used to be wrong, and the wrong reason is worth recording.**
+This file said `map_snap` was "refusing to put water on a road". It is not, and
+Valhalla's own source says so. `lua/graph.lua` admits exactly two non-`highway`
+route types — `route=ferry` and `route=shuttle_train` — so a ferry way *is* in the
+graph with a `way_id`. `class BusCost : public AutoCost` overrides only `Allowed`
+and `AllowedReverse`, neither of which rejects a ferry, and not `EdgeCost`, which
+handles `Use::kFerry` through `ferry_factor_`. So `bus` costing traverses ferries by
+inheritance. Error 444 is Meili failing to snap the trace to *any* edge — most
+likely because the supplied shape lies outside the search radius of the OSM ferry
+way, or because no such way exists for that crossing. Checked against `master` on
+2026-08-10. The conclusion held while the reasoning did not, which is the kind of
+entry that survives longest unexamined.
+
+**The decision, on the corrected reasoning: a ferry is drawn, never matched.** Not
+because Valhalla refuses, but because matching answers the wrong question. An OSM
+ferry way is, by the wiki's own description, a line drawn from one terminal to
+another — snapping to it would replace the operator's recorded course with a
+schematic, and it would put the crossing on shared "infrastructure" that two
+operators may or may not have in common. The feed's own geometry is better: 244 of
+the 416 GB ferry patterns carry a trace, coarse but real, CalMac at a median 8
+vertices. Those are copied into `segments` and drawn as they are. The other 172 are
+not drawn at all, because a straight line between two ports is a schematic this
+pipeline would be inventing rather than repeating.
+
+`gtfs.py` keeps a mode only if it was asked for — see `config.MODES` — and
+`db.matchable` is what keeps whatever it kept away from Valhalla. Selecting a mode
+and map-matching it are separate decisions, and for ferries the answers differ.
 
 **The trap is the kept set, not the filter.** GB `routes.txt` carries `3` on
 12,709 routes, `200` on 316, `4` on 119, `1` on 54, `0` on 43, `2` on 3 and `6` on
 1. `200` is the extended-GTFS code for coach, so those 316 are National Express and
 FlixBus — real long-distance road services, and already the bulk of the
 long-distance `skipped` patterns. A filter written as `route_type = '3'` deletes
-them and looks right. `config.ROAD_ROUTE_TYPES` therefore holds ranges rather than
-values: `3`, `11` and `800` for bus and trolleybus, `200`–`209` for coach,
-`700`–`716` for the extended bus codes. Nothing speculative is added beyond that —
-a mode nobody publishes is a line that cannot be checked against a feed.
+them and looks right. `config.MODES` therefore holds ranges rather than values:
+`3`, `11` and `800` plus `700`–`716` under `bus`, and `200`–`209` under `coach`.
+`ROAD_ROUTE_TYPES` is the union of the two, derived rather than written out, so the
+vocabulary and the road filter cannot drift apart. Nothing speculative is added
+beyond what a feed publishes — a mode nobody publishes is a line that cannot be
+checked against one — and each remaining GTFS type is its own mode rather than
+grouped by guess: a cable tram is not a tram, whatever the names suggest.
 
 Everything dropped is logged by type with its route and trip counts, and a type
 this codebase does not name is a warning rather than an info line, because the way
@@ -82,8 +111,14 @@ this goes wrong is a future feed publishing something road-going in a range nobo
 kept. A feed where *every* trip drops raises instead: that means the join to
 `routes.txt` failed, not that the timetable is all water.
 
-`routes` gained a `route_type` column; the migration adds it empty, since nothing
-already stored can supply it, and the next `patterns` run fills it in.
+`routes` gained a `route_type` column and `patterns` gained a `mode`; both
+migrations add the column empty, since nothing already stored can supply it, and the
+next `patterns` run fills it in. A NULL `mode` is deliberately *not* backfilled to
+`bus`: it means a database written before modes existed, which held road patterns
+only because that was what the filter left, and `db.matchable` reads NULL as
+matchable for exactly that reason. Backfilling would assert a mode the feed never
+recorded; leaving it empty keeps a national match run going across the upgrade.
+
 Already-matched ferry patterns are not deleted — they stop appearing in the current
 feed and become departed, keeping their `match_status` rows exactly as a withdrawn
 bus route does. So an existing database keeps its ferry edges until the next
@@ -246,26 +281,53 @@ Republic is matched, not after — see PLAN.md.
 
 ## Attribution
 
-**Every archive owes two credits, never one.** The timetable is the publisher's, under
-whatever licence that publisher chose: OGL v3.0 for BODS and Translink, CC BY 4.0 for
-the NTA. The road geometry is OpenStreetMap's under the Open Database License (ODbL,
-carrying the licence's own American spelling because that is its name). The second
-obligation is the one that is easy to miss. Every edge in the database is an OSM way
-that Valhalla matched a route onto, so an archive is a derived database whatever the
-timetable's licence says, and that holds for an OGL region as much as for the Irish
-one. The viewer's pre-existing OpenStreetMap line credits the *basemap tiles* and says
-nothing about the lines drawn on top of them, so the wording names what each credit
-covers — "Bus routes:" and "Road geometry:".
+**An archive owes the publisher always and OpenStreetMap conditionally.** The timetable
+is the publisher's, under whatever licence that publisher chose: OGL v3.0 for BODS and
+Translink, CC BY 4.0 for the NTA. Where a route was map-matched, the geometry is
+OpenStreetMap's under the Open Database License (ODbL, carrying the licence's own
+American spelling because that is its name). That second obligation is the one that is
+easy to miss: every matched edge is an OSM way that Valhalla matched a route onto, so
+such an archive is a derived database whatever the timetable's licence says, and that
+holds for an OGL region as much as for the Irish one. The viewer's pre-existing
+OpenStreetMap line credits the *basemap tiles* and says nothing about the lines drawn
+on top of them, so the wording names what each credit covers.
 
-**The credit is derived from `config.Feed` rather than written out per region.** The
-feed already carried `licence` and `attribution`; `config` adds `ODBL`, a
-`LICENCE_URLS` table from each licence constant to its URI, `OSM_COPYRIGHT`, and a
-frozen `Credit` dataclass of `what`, `who`, `licence` and `who_url`. Three functions
-read them: `credit_parts(region)` returns a region's credits, `credit_html(region)`
-renders them for a map attribution control, and `credit_text(region)` renders them with
-the links spelled out for anywhere HTML is not read. Adding a source to `FEEDS` credits
-it. A licence with no entry in `LICENCE_URLS` raises a `KeyError` at publish time rather
-than dropping the URI and publishing anyway.
+**The ODbL claim is wrong for a mode that was never matched, and wrong in the direction
+that is harder to notice.** A tram, metro or ferry is drawn from the trace in the feed:
+no OSM way is involved, and asserting share-alike over an operator's own survey imposes
+a condition its publisher never chose. So `credit_parts` takes `road=` and `operator=`,
+and `publish.contents` reads both off the database — `road` from whether `edge_services`
+has rows, `operator` from whether `segments` does — because only the thing that built an
+archive knows what went into it. A region with no matched edges credits nobody but the
+publisher.
+
+**"Bus routes" was the other half of the same mistake.** It was accurate while a bus was
+all there was, and an archive holding trams and ferries credited as bus routes
+misdescribes its own contents. The noun is now "Routes and timetables", widening to
+"Routes, timetables and operator geometry" when a non-road trace is present — the trace
+arrives in the same bundle under the same licence, so it is named inside the publisher's
+credit rather than given a third line of its own.
+
+**The licences live in `wayfare/licences.py`, and nothing else does.** The names, the
+`URLS` table from each name to its URI, `OSM_COPYRIGHT`, the frozen `Credit` dataclass
+of `what`, `who`, `licence` and `who_url`, the one `OPENSTREETMAP` credit that is the
+same for every region, and the three renderers — `html`, `lines` and `text`. The list
+only grows: Transport for London publishes under an amended Open Government Licence
+v2.0 with three attribution strings of its own, and Network Rail's feeds are not open
+at all, so this stopped being something to keep beside paths and tunables. A licence
+with no entry in `URLS` raises a `KeyError` at publish time rather than dropping the
+URI and publishing anyway.
+
+**The credit is still derived from `config.Feed` rather than written out per region.**
+`config.credit_parts(region)` is the one part of crediting that belongs in `config`,
+because it needs the feed and a feed is configuration — what a licence is called and
+how a credit is written are not. `credit_html`, `credit_lines` and `credit_text` are
+thin wrappers that hand its result to the matching renderer. Adding a source to
+`FEEDS` credits it.
+
+The dependency runs one way and has to: `config` imports `licences` for the two names
+it declares feeds with, and `licences` imports nothing of ours. Putting `credit_parts`
+in `licences` would have needed `Feed`, and `Feed` needs the licence names.
 
 **The credit lives in the tiles because that is the one place it travels with the
 data.** `publish.py` passes `--attribution=<credit_html>` to both tippecanoe passes,

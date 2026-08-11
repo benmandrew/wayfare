@@ -60,6 +60,51 @@ attempt.** It clears the previous run's `transport_error` rows and puts them bac
 the queue. It is the only status safe to clear unattended: every other failure means
 impossible, and a matcher that retries the impossible never finishes.
 
+**Both counts are mode-aware, because a tram never gets a `match_status` row.**
+`db.matchable` keeps non-road patterns away from the matcher, and their geometry
+comes from the operator's own General Transit Feed Specification (GTFS) shapes
+instead. Counting them as unmatched put a floor under `patterns_pending` equal to
+the non-road pattern count, so the drain reported work still owed after the queue
+was empty. Measured on a synthetic four-pattern database (two bus patterns matched,
+one metro, one tram), `match.pending_count` returned 0 while
+`status.patterns_pending` returned 2 and `patterns_pct` read 50.0 against a true
+100.0. `refresh.sh` exits 1 on a non-zero pending count, so a multi-modal region
+would have stopped publishing for ever, reporting a drain that never finished.
+
+Every number in that funnel now counts *matchable* patterns only, and what the other
+modes are doing is a separate field. `patterns_by_mode` counts live patterns per
+mode, matchable or not, beside a `modes` field echoing the selection the database
+was built with. The gate then reads one thing, work still owed to the matcher, and
+the mode census sits where a person reads it. It is also the only place a mode going
+missing is visible.
+
+## The mode selection lives in the database
+
+**`refresh.sh` runs `wayfare patterns` with no flags, so the selection cannot live
+in the invocation.** `--modes` was persisted nowhere, and `build_patterns` fell back
+to `config.DEFAULT_MODES`, which is bus and coach. The first refresh after a
+multi-modal build would have rebuilt the table as road only and dropped every tram,
+and every other number the run reports would have stayed healthy while it did.
+`build_patterns` now writes the selection to `meta.modes` beside `feed_version` and
+defaults to `gtfs.stored_modes` rather than to a constant. An unrecognised stored
+name is left to raise rather than being dropped, on the same reading as
+`--force-graph`: renaming a mode should break the timer and be dealt with by a
+person.
+
+**Deselecting a mode has to retire its patterns, because nothing else will.** A
+pattern normally leaves by not being seen in a *newer* feed. Narrowing `--modes` and
+rebuilding against the feed already on disk leaves `last_seen` at a version that is
+still current, so the deselected patterns stay live, keep their geometry and are
+published again, and turning a mode off appears to do nothing.
+`gtfs._retire_unselected_modes` deletes them after the merge. A NULL mode is never
+retired — it means a database written before modes existed, where everything stored
+is road-going by construction, and matching those against a name would delete a
+national match run.
+
+`refresh.sh`, the unit and the timer need no change for any of this. The database
+carries the selection, so a refresh inherits whatever the region was last built
+with, and a multi-modal region is scheduled exactly as a road-only one is.
+
 ## Installing it
 
 `refresh.sh` stays in the checkout and finds its own compose file, so it can be run

@@ -209,6 +209,23 @@ def test_departed_patterns_keep_their_edges_but_leave_the_map(gtfs_dir: Path, co
     assert cov["patterns_pending"] == 0
 
 
+def test_an_unmatchable_mode_never_counts_as_pending(gtfs_dir: Path, con):
+    """`deploy/refresh.sh` refuses to publish while `patterns_pending` is non-zero.
+    A ferry will never hold a `match_status` row, so counting it as pending would
+    put a floor under that number no drain could lift, and a scheduled region would
+    stop publishing for ever -- reporting a drain that never finished."""
+    _build(gtfs_dir, con, modes=frozenset({"bus", "ferry"}))
+    match.run(con, client_=FakeClient())
+    assert match.pending_count(con) == 0
+
+    cov = aggregate.coverage(con)
+    assert cov["patterns_pending"] == 0
+    assert cov["patterns_pct"] == 100.0
+    # ...and the ferry is still visible, so losing one is not silent either.
+    assert cov["patterns_by_mode"] == {"bus": 2, "ferry": 1}
+    assert cov["modes"] == "bus,ferry"
+
+
 def test_departed_patterns_do_not_block_pruning(gtfs_dir: Path, con):
     """An unmatched pattern that has left the timetable will never be matched, so
     it must not hold the operator geometry in the file for ever."""
@@ -301,6 +318,9 @@ def _legacy_db(path: Path) -> None:
     con.execute(db.SCHEMA)
     con.execute("ALTER TABLE patterns DROP COLUMN first_seen")
     con.execute("ALTER TABLE patterns DROP COLUMN last_seen")
+    # `mode` postdates the ids becoming hashes, so a database this old has no such
+    # column either, and the migration has to add both.
+    con.execute("ALTER TABLE patterns DROP COLUMN mode")
     con.execute("""
         INSERT INTO patterns VALUES
           (1, 'R1', 'OP1', '42', 0, 'SH1', 4, 10, 1000.0),

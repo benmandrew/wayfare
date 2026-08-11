@@ -53,6 +53,54 @@ def build(con: duckdb.DuckDBPyConnection) -> None:
         con, "SELECT count(DISTINCT edge_id), count(*) FROM edge_services"
     )
     log.info("%d edges carry %d edge-service pairs", n_edges, n_rows)
+    build_segments(con)
+
+
+def build_segments(con: duckdb.DuckDBPyConnection) -> None:
+    """Copy the operator trace of every live non-road pattern into `segments`.
+
+    This is the whole of "drawing" a tram. There is no matcher, no routing and no
+    snapping: the operator recorded where the vehicle goes, and for a mode with no
+    road under it that recording is the best geometry available and the only one.
+    Metrolink's traces run to a median 474 points, which is the same order as the
+    bus feed's 849 -- a survey rather than a schematic.
+
+    Rebuilt outright rather than merged. It is derived from `patterns` and `shapes`
+    and costs nothing to recompute, so it holds the current feed only, exactly like
+    `pattern_stops`. A departed tram stops being drawn on the next run, which is the
+    same rule `edge_services` follows.
+
+    A non-road pattern with no shape gets no row and is simply not drawn. That is
+    the "bad geometry is worse than missing geometry" rule applied to the one case
+    where inventing would be easy: the stops are known, and a straight line between
+    them would render perfectly happily down the wrong side of a river.
+    """
+    con.execute("DELETE FROM segments")
+    con.execute(f"""
+        INSERT INTO segments
+        SELECT p.pattern_id, p.mode, s.lon_e6, s.lat_e6,
+               list_min(s.lon_e6), list_min(s.lat_e6),
+               list_max(s.lon_e6), list_max(s.lat_e6)
+        FROM patterns p
+        JOIN shapes s ON s.shape_id = p.shape_id
+        WHERE {db.current_feed()} AND NOT {db.matchable()}
+    """)
+    drawn, missing = db.row(
+        con,
+        f"""
+        SELECT (SELECT count(*) FROM segments),
+               (SELECT count(*) FROM patterns p
+                WHERE {db.current_feed()} AND NOT {db.matchable()}
+                  AND p.shape_id IS NULL)
+        """,
+    )
+    if drawn or missing:
+        log.info(
+            "%d non-road patterns drawn from operator geometry, "
+            "%d have none and are not drawn",
+            drawn,
+            missing,
+        )
 
 
 def _clustered(con: duckdb.DuckDBPyConnection) -> str:
@@ -76,15 +124,23 @@ def coverage(con: duckdb.DuckDBPyConnection) -> dict[str, object]:
 
     Reported as a funnel rather than a single number: a run that matched 95% of
     patterns but dropped the busiest ones is worse than the percentage suggests.
+
+    Every number in that funnel counts *matchable* patterns only. A tram will never
+    hold a `match_status` row, so counting it as unmatched would put a floor under
+    `patterns_pending` that no amount of matching could lift -- and `patterns_pending`
+    is half of what `deploy/refresh.sh` gates a publish on, so that floor would stop a
+    scheduled region publishing again, permanently. What the other modes are doing is
+    `patterns_by_mode` instead.
     """
     live = db.current_feed()
+    owed = f"{live} AND {db.matchable('p')}"
     matched, total = db.row(
         con,
         f"""
         SELECT
           (SELECT count(*) FROM patterns p JOIN match_status m USING (pattern_id)
-             WHERE m.status = 'ok' AND {live}),
-          (SELECT count(*) FROM patterns p WHERE {live})
+             WHERE m.status = 'ok' AND {owed}),
+          (SELECT count(*) FROM patterns p WHERE {owed})
         """,
     )
 
@@ -94,23 +150,35 @@ def coverage(con: duckdb.DuckDBPyConnection) -> dict[str, object]:
         SELECT
           (SELECT COALESCE(sum(p.n_trips), 0) FROM patterns p
              JOIN match_status m USING (pattern_id)
-             WHERE m.status = 'ok' AND {live}),
-          (SELECT COALESCE(sum(p.n_trips), 0) FROM patterns p WHERE {live})
+             WHERE m.status = 'ok' AND {owed}),
+          (SELECT COALESCE(sum(p.n_trips), 0) FROM patterns p WHERE {owed})
         """,
     )
 
     return {
         "feed_version": db.get_meta(con, "feed_version"),
         "graph_id": db.get_meta(con, "graph_id"),
+        "modes": db.get_meta(con, "modes"),
         "patterns_total": total,
         "patterns_matched": matched,
         "patterns_pct": round(100.0 * matched / max(total, 1), 1),
+        # Live patterns per mode, matchable or not. This is the only place a mode
+        # going missing is visible: `patterns` rebuilds from whatever selection it
+        # was given, so a refresh that lost its `--modes` drops every tram silently
+        # and every other number here stays healthy while it does.
+        "patterns_by_mode": {
+            row[0] or "unknown": row[1]
+            for row in con.execute(
+                f"SELECT p.mode, count(*) FROM patterns p WHERE {live} "
+                "GROUP BY p.mode ORDER BY p.mode"
+            ).fetchall()
+        },
         # What a scheduled run needs to know: how much of this feed is still owed
         # to the matcher, and therefore whether the tiles are complete yet.
         "patterns_pending": db.scalar(
             con,
             f"""
-            SELECT count(*) FROM patterns p WHERE {live}
+            SELECT count(*) FROM patterns p WHERE {owed}
               AND NOT EXISTS (SELECT 1 FROM match_status m
                               WHERE m.pattern_id = p.pattern_id)
             """,

@@ -1,10 +1,11 @@
 # wayfare
 
-Dataset of bus routes snapped to the road network across these islands: Great
-Britain from DfT BODS, the Republic of Ireland from the National Transport
-Authority, and Northern Ireland from Translink through OpenDataNI. Two consumers:
-an interactive web map (hover a road, see which buses use it) and artistic
-renderings of areas.
+Dataset of public transport routes across these islands: Great Britain from
+DfT BODS, the Republic of Ireland from the National Transport Authority, and
+Northern Ireland from Translink through OpenDataNI. Bus and coach are snapped
+to the road network; tram, metro, rail and ferry are drawn from the operator's
+own shape. Two consumers: an interactive web map (hover a road, see which
+services use it) and artistic renderings of areas.
 
 ## Where the detail lives
 
@@ -80,6 +81,15 @@ selectable. Do not pipeline across batch boundaries without an in-flight exclusi
 **Every consumer of `patterns` filters on `db.current_feed()`**, so departed patterns
 are never matched, aggregated or rendered.
 
+**The mode selection lives in `meta.modes`, not in the invocation.** `patterns` rebuilds
+the table from whatever selection it is handed and `deploy/refresh.sh` hands it none, so
+it defaults to `gtfs.stored_modes`, and narrowing the selection retires the deselected
+patterns because rebuilding against the feed already on disk leaves them live. Every
+number in the coverage funnel counts *matchable* patterns only: a tram never gets a
+`match_status` row, so counting it as unmatched puts a permanent floor under
+`patterns_pending`, which is half of what the scheduled refresh gates a publish on.
+`patterns_by_mode` is where the other modes are counted.
+
 **Migrations rewrite in place; they never re-run the pipeline.** A national match run
 costs a day or two, so a schema change it cannot survive is one nobody applies.
 
@@ -127,8 +137,9 @@ are never retried, but their edges are dropped.
 credit into the archive's own tileset metadata, derived from `config.Feed`, so a copied
 archive keeps it and the viewer, which loads every archive it is offered onto one
 map, shows all of their credits together in the one control.
-Every region owes two credits: the timetable's publisher, and OpenStreetMap under ODbL
-for the geometry. `pmtiles.Protocol` needs `{ metadata: true }` or MapLibre never sees
+Every archive owes the timetable's publisher, and owes OpenStreetMap under ODbL only
+where a route was matched onto its ways, which `publish.contents` reads off the
+database. `pmtiles.Protocol` needs `{ metadata: true }` or MapLibre never sees
 any of it, which looks like a viewer crediting only its basemap rather than an error.
 Every render stamps the same credit into its own PNG or SVG metadata, unconditionally,
 and nothing that varies between two renders of one request may join it there — no

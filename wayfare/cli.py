@@ -51,6 +51,16 @@ def main(argv: list[str] | None = None) -> int:
         help="re-match patterns that were matched from bare stops and have since "
         "gained operator geometry",
     )
+    p.add_argument(
+        "--modes",
+        default=None,
+        metavar="LIST",
+        help="comma-separated modes to keep, from "
+        f"{{{','.join(sorted(config.MODES))}}} "
+        "(default: whatever this database was last built with, or "
+        f"{','.join(sorted(config.DEFAULT_MODES))} for a new one). Only road modes "
+        "are ever map-matched; the rest are kept for their operator geometry.",
+    )
 
     p = sub.add_parser(
         "match", help="map-match patterns onto the road graph (the long one)"
@@ -251,6 +261,21 @@ def _require_db() -> Path:
     return config.DB_PATH
 
 
+def _parse_modes(spec: str | None) -> frozenset[str] | None:
+    """`--modes` as a set of names, or None to take the default.
+
+    An empty selection is refused rather than treated as "everything": `--modes ''`
+    would otherwise build a database with no patterns in it and report success.
+    """
+    if spec is None:
+        return None
+    names = frozenset(m.strip() for m in spec.split(",") if m.strip())
+    if not names:
+        raise ValueError("--modes was given no mode names")
+    config.route_types(names)  # raises on an unknown name
+    return names
+
+
 def _dispatch(args: argparse.Namespace) -> int:
     if args.cmd == "acquire":
         acquire.acquire_all(region=args.region, force=args.force, with_osm=args.with_osm)
@@ -262,11 +287,17 @@ def _dispatch(args: argparse.Namespace) -> int:
         if not (gtfs_dir / "stop_times.txt").exists():
             log.error("no unpacked feed at %s -- run `wayfare acquire` first", gtfs_dir)
             return 1
+        try:
+            modes = _parse_modes(args.modes)
+        except ValueError as e:
+            log.error("%s", e)
+            return 1
         gtfs.build_patterns(
             gtfs_dir,
             con,
             memory_limit=args.memory,
             upgrade_shapes=args.upgrade_shapes,
+            modes=modes,
         )
         con.close()
         return 0
