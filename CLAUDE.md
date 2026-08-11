@@ -191,7 +191,7 @@ timestamp, no path, no version, or the byte-identical tests are a fiction.
 
 **Great Britain is complete end to end**, on the server, feed `20260807_022616`: 52,554
 patterns, 95.9% matched, 2,746,261 edges, 129.5 MB PMTiles. Wales and Greater London were
-the two rehearsals for it and both stand. 546 tests pass, ruff and mypy clean.
+the two rehearsals for it and both stand. 655 tests pass, ruff and mypy clean.
 
 **Both parts of Ireland are complete end to end**, on the server, against one shared
 Valhalla graph `3.8.3/1786309727` built from the 409 MB island extract. The Republic on
@@ -223,13 +223,15 @@ and 16,833 edges reachable from no bus at all — because `aggregate` filtered o
 live feed and never on `matchable`. Those are gone, which is why the edge count fell to
 2,729,428.
 
-**Great Britain's database is pre-multi-modal** — no `patterns.mode`, no `segments`, no
-`modes` in `meta` — because `connect` migrates only when it is not read-only and nothing
-has opened it for writing since. `status` and `publish` both connect read-only, and both
-failed against it until `db.matchable` was given a connection and `publish` learnt to read
-a missing table as an empty one. Its archive therefore carries no `segments` layer and a
-road-only credit, both correct for what the database holds. Re-running `patterns` would
-migrate it and give Great Britain its trams, rail and ferries.
+**Great Britain's database is multi-modal**: `patterns.mode`, a `segments` table and all
+ten modes in `meta.modes`. An earlier note here said otherwise and was stale.
+
+**`trace` has run nationally** (2026-08-12), on a copy of the server's database, so
+production is untouched. 1,127 of 1,737 geometry-less patterns are drawn from OSM route
+relations, 23,134 km of track, 86.9% of Underground trips and 60.6% of the DLR's;
+`segments` goes 629 rows to 1,756. One Overpass query costs 131 MB and 27 seconds
+nationally. Ferries resolve to nothing by design. 440 patterns still find no stop match,
+and trams are the weakest mode at 34.2% of trips.
 
 Feed churn is measured: two Wales feeds two days apart took 3,584 patterns to 3,541 — 30
 new, 73 departed, about 8 seconds of matching to catch up against 16m23s for the full run.

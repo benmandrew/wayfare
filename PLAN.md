@@ -223,11 +223,35 @@ normalised name with a coordinate check: 16 of 16 Victoria line stops match, 15 
 within 150 m, the worst being Highbury & Islington at 216 m where the timetable's point
 is the National Rail entrance and the node is the tube platform.
 
-**It has not been run against real data.** 641 tests pass, ruff and mypy are clean, and
-the numbers above measure the feeds and OSM rather than this code. The GB database is on
-the server and this branch was written without a data root, so what the stage resolves,
-refuses and draws nationally is unknown. Running it against Great Britain is the next
-thing, followed by a republish and figures in `docs/results.md`.
+**Run against Great Britain** (2026-08-12), feed `20260807_022616`, on a copy of the
+server's database so that production stayed untouched. 1,737 live non-road patterns
+carry no `shape_id`, and one Overpass query over their bounding box returned 131 MB and
+1,022 route relations in 27 seconds — the whole national fetch cost. 861 of those
+relations chain cleanly. The fit resolved 1,127 patterns in 182 seconds, 23,134 km of
+track, and took `segments` from 629 rows to 1,756: metro 1,040 of 1,417 patterns and
+86.9% of its trips, the DLR 42 of 71 and 60.6%, tram 43 of 77 and 34.2%, the cable car
+2 of 2. Ferries draw nothing, which is 166 of the 170 `no_relation` rows and is correct
+— `route=ferry` is deliberately outside `config.OSM_ROUTE_VALUES`, because an OSM ferry
+way is a schematic between terminals. All eleven Underground lines come out within a
+few percent of published length, and the archive built from the scratch root is 138.8
+MB against production's 137.9 MB, credit widened to "Road and track geometry". It has
+not been deployed. 655 tests pass, ruff and mypy are clean. Figures in
+`docs/results.md`.
+
+The run found two naming conventions, both now fixed in `5cd1435`. A stop member is a
+node on the platform, so OSM writes "Lewisham Platform 6" where BODS qualifies by mode,
+"Lewisham DLR Station"; that cost all 71 DLR patterns and took the total from 713 to
+755. And a station needs more than one spelling, because BODS disambiguates the two
+Edgware Roads in the name where OSM lets the relation do it; offering both the
+bracketed and the unbracketed form took the total from 755 to 1,127.
+
+**What the run leaves open.** 440 `no_stop_match` and 4 `no_relation` rows remain, and
+only one cause is diagnosed: the Northern line pattern via Bank calls at Kennington and
+the relation's stop members omit it, so the run is not contiguous and is refused. That
+is an OSM gap rather than a naming problem, and whether the other 439 are the same
+shape is unmeasured. Trams are the weakest mode at 34.2% of trips and nothing has been
+looked into there. 117 relations do not chain, 94 of them `route=train`, which is the
+mode where they will matter.
 
 ## Next — National Rail
 

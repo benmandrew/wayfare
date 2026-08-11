@@ -433,13 +433,28 @@ station node sitting slightly behind its neighbour's projection and far short of
 turn. This is "bad geometry is worse than missing geometry" applied to a stage with
 no confidence score to fall back on.
 
-**Four traps, and each one looks like missing data rather than a mistake.**
+**Six traps, and each one looks like missing data rather than a mistake.**
 
 - **Platform members must leave the way chain.** Leaving `role=platform`,
   `platform_entry_only` and `platform_exit_only` in produces 11 to 25 spurious
   breaks per relation, which reads as broken mapping across the whole of London.
   `config.OSM_STOP_ROLES` names the three roles that are calling points, and the
   chain takes `role=""` and nothing else.
+- **The two publishers qualify a station name in different ways, and neither
+  qualifier appears on the other side.** A Public Transport version 2 (PTv2) stop
+  member is a node on the platform, so OpenStreetMap writes "Lewisham Platform 6"
+  and "Canary Wharf Platforms 5 & 6"; BODS qualifies the same station by mode,
+  "Lewisham DLR Station" and "Shadwell DLR". One mismatched stop refuses the whole
+  contiguous run, so this cost every one of the 71 DLR patterns against relations
+  that chain with zero breaks. `osm.normalise` strips both forms.
+- **A station needs more than one spelling.** Two Edgware Road stations sit a few
+  hundred metres apart, so BODS disambiguates in the name — "Edgware Road (Bakerloo)"
+  — where OpenStreetMap writes "Edgware Road" twice and lets the relation say which is
+  which. Flattening the brackets matches neither, so `osm.spellings` offers the
+  bracketed and the unbracketed form and a stop matches if any spelling agrees. The
+  looser join is safe because the matched node still has to sit within
+  `TRACE_STOP_MAX_M` of the timetable's coordinate, which is what keeps Edgware Road
+  apart from Edgware, 8 km up the Northern line.
 - **The Elizabeth line is `route=train`, not `route=subway`.** A mode filter written
   from the obvious names misses it outright. `config.OSM_ROUTE_VALUES` is therefore
   deliberately wide — subway, light rail, tram, train, monorail, funicular and
@@ -493,12 +508,19 @@ next `wayfare trace` picks them up unchanged. Trace failures also stay out of th
 publish gate, which counts matchable patterns only; docs/deploy.md has that
 reasoning.
 
-**None of the numbers above came from running this stage.** The census of the feed
-and the survey of the relations were both taken before it was written, against BODS
-`20260806_022608` and one Overpass query over Greater London. The stage is built and
-tested and has not yet run against the national database, which lives on the server.
-What it resolves, refuses and draws nationally belongs in docs/results.md, once
-there is a run to report.
+**The stage has now run nationally, and it resolved 1,127 of 1,737 patterns.**
+Against BODS `20260807_022616`, on a copy of the server's database: one Overpass query
+over the pending patterns' bounding box returned 131 MB and 1,022 relations in 27
+seconds, and fitting took 182 seconds. 86.9% of Underground trips and 60.6% of the
+DLR's are drawn, trams 34.2%, and ferries nothing at all — 166 of the 170
+`no_relation` rows are ferries, which is `route=ferry` sitting outside
+`config.OSM_ROUTE_VALUES` on purpose rather than a failure. The two naming traps above
+are what that run found; before they were fixed the total was 713. The chain also
+turns out to need no detour guard of the kind `match` carries: 1,102 of the 1,127
+traces draw between 1.0 and 1.3 times the straight-line chain through their own stops,
+and the four over 2.5 are all the Piccadilly line's Heathrow Terminal 4 loop, which is
+genuinely one-way. Figures, correctness checks and the 440 patterns still refused are
+in docs/results.md.
 
 ## aggregate
 
