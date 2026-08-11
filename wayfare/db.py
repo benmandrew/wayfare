@@ -228,7 +228,7 @@ def current_feed(alias: str = "p") -> str:
     return f"{alias}.last_seen = (SELECT value FROM meta WHERE key = 'feed_version')"
 
 
-def matchable(alias: str = "p") -> str:
+def matchable(alias: str = "p", con: duckdb.DuckDBPyConnection | None = None) -> str:
     """Predicate restricting `patterns` to the modes Valhalla can be asked about.
 
     `patterns` may now hold trams, ferries and metros, which have no road under them
@@ -241,7 +241,16 @@ def matchable(alias: str = "p") -> str:
     everything else, so every row already stored is road-going by construction. The
     migration therefore leaves the column empty rather than asserting a mode nobody
     recorded, and this predicate is what makes that safe.
+
+    Pass `con` from anywhere that reads a database it has not written to, and a
+    database with no `mode` column at all gets the same answer for the same reason.
+    `connect` runs `migrate` only when it is not read-only, so a data root that has not
+    been opened for writing since the column landed still has the old schema -- Great
+    Britain's had, three days later -- and every read-only consumer of this predicate
+    failed to bind against it rather than degrading.
     """
+    if con is not None and "mode" not in columns(con, "patterns"):
+        return "TRUE"
     keep = ", ".join(f"'{m}'" for m in sorted(config.ROAD_MODES))
     return f"({alias}.mode IS NULL OR {alias}.mode IN ({keep}))"
 
@@ -259,6 +268,20 @@ def connect(path: Path | None = None, read_only: bool = False) -> duckdb.DuckDBP
 def index(con: duckdb.DuckDBPyConnection) -> None:
     for stmt in INDICES:
         con.execute(stmt)
+
+
+def table_exists(con: duckdb.DuckDBPyConnection, table: str) -> bool:
+    """Whether a table is in this database at all.
+
+    `segments` post-dates Great Britain's database and `prune` reclaims tables once
+    matching is done, so a data root that is missing one is a normal thing to be
+    handed rather than a corrupt one.
+    """
+    row = con.execute(
+        "SELECT count(*) FROM information_schema.tables WHERE table_name = ?",
+        [table],
+    ).fetchone()
+    return bool(row and row[0])
 
 
 def columns(con: duckdb.DuckDBPyConnection, table: str) -> set[str]:

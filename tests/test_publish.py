@@ -272,23 +272,24 @@ def test_a_file_under_its_cap_is_not_filtered_at_all(tmp_path):
     """Both parts of Ireland are here, and a cap that thinned them would be throwing
     away roads to solve a problem they do not have."""
     src = write_geojsonl(tmp_path / "edges.geojsonl", [5, 900, 12, 40])
-    assert publish._cell_floors(src, 10) == {}
+    assert publish._cell_floors(src, 10, config.OVERVIEW_WEIGHT) == {}
     assert publish._hold_back(src, tmp_path / "far.geojsonl", {}) is src
     assert not (tmp_path / "far.geojsonl").exists()
 
 
 def test_the_floor_is_the_count_that_keeps_a_cell_its_share(tmp_path):
     src = write_geojsonl(tmp_path / "edges.geojsonl", [10, 20, 30, 40, 50])
-    # One cell holding everything: a cap of 2 of 5 is a 40% share, so 2 features.
-    assert publish._cell_floors(src, 2) == {(0, 0): 40}
-    assert publish._cell_floors(src, 4) == {(0, 0): 20}
+    # One cell holding everything, so the weighting has nothing to weigh: a cap of 2
+    # of 5 is 2 features whatever it is set to.
+    assert publish._cell_floors(src, 2, config.OVERVIEW_WEIGHT) == {(0, 0): 40}
+    assert publish._cell_floors(src, 4, config.OVERVIEW_WEIGHT) == {(0, 0): 20}
 
 
 def test_ties_at_the_floor_are_kept_rather_than_cut(tmp_path):
     """Overshooting hands tippecanoe a few more features than asked for. Undershooting
     throws away roads that would have fitted."""
     src = write_geojsonl(tmp_path / "edges.geojsonl", [7, 7, 7, 1])
-    floors = publish._cell_floors(src, 2)
+    floors = publish._cell_floors(src, 2, config.OVERVIEW_WEIGHT)
     assert floors == {(0, 0): 7}
     assert kept_trips(publish._hold_back(src, tmp_path / "far.geojsonl", floors)) == [
         7,
@@ -305,8 +306,9 @@ def test_a_quiet_place_is_not_ranked_against_a_busy_one(tmp_path):
         tmp_path / "edges.geojsonl",
         {(0.0, 0.0): [900, 800, 700, 600], (10.0, 10.0): [9, 8, 7, 6]},
     )
-    floors = publish._cell_floors(src, 4)
-    # A floor for each place, and the quiet one's is nowhere near the busy one's.
+    floors = publish._cell_floors(src, 4, config.OVERVIEW_WEIGHT)
+    # A floor for each place -- the two cells are the same size, so the weighting
+    # gives them the same quota -- and the quiet one's is nowhere near the busy one's.
     assert len(floors) == 2
     assert floors[(0, 0)] == 800
     assert floors[(40, 40)] == 8
@@ -326,9 +328,41 @@ def test_every_populated_cell_keeps_at_least_one_feature(tmp_path):
         tmp_path / "edges.geojsonl",
         {(0.0, 0.0): [100] * 500, (10.0, 10.0): [3]},
     )
-    floors = publish._cell_floors(src, 50)
-    assert floors[(40, 40)] == 3
+    floors = publish._cell_floors(src, 50, config.OVERVIEW_WEIGHT)
     assert 3 in kept_trips(publish._hold_back(src, tmp_path / "far.geojsonl", floors))
+
+
+def test_a_sparse_place_is_kept_whole_and_a_dense_one_pays_for_it(tmp_path):
+    """The failure this weighting exists for. A quarter of a city is still a city; a
+    quarter of a country lane is nothing. Under the proportional weight Great
+    Britain's rural cells drew 15 features at z6 where Ireland's, holding the same
+    number of roads, drew 53."""
+    src = write_geojsonl(
+        tmp_path / "edges.geojsonl",
+        {(0.0, 0.0): list(range(1, 101)), (10.0, 10.0): [4, 3, 2, 1]},
+    )
+    floors = publish._cell_floors(src, 52, config.OVERVIEW_WEIGHT)
+    # The sparse cell has no floor at all, which is how a cell says "all of it".
+    assert (40, 40) not in floors
+    assert (0, 0) in floors
+    kept = kept_trips(publish._hold_back(src, tmp_path / "far.geojsonl", floors))
+    assert [t for t in kept if t <= 4] == [1, 2, 3, 4]
+
+    # The same input at the proportional weight, which is what was deployed: the
+    # sparse cell is cut in half to buy the dense one a couple of dozen more roads it
+    # cannot show.
+    proportional = publish._cell_floors(src, 52, 1.0)
+    assert proportional[(40, 40)] == 3
+
+
+def test_a_cell_that_cannot_use_its_quota_hands_it_back():
+    """Otherwise the cap undershoots by whatever the countryside had no roads to
+    spend it on, and the cities are thinned to pay for features that do not exist."""
+    sizes = {(0, 0): 1000, (1, 1): 2}
+    quotas = publish._quotas(sizes, 500, 0.5)
+    assert quotas[(1, 1)] == 2
+    assert quotas[(0, 0)] == 498
+    assert sum(quotas.values()) == 500
 
 
 def test_a_road_on_the_prime_meridian_is_still_read(tmp_path):
@@ -337,7 +371,7 @@ def test_a_road_on_the_prime_meridian_is_still_read(tmp_path):
     exponent takes them off the map without saying so."""
     src = write_geojsonl(tmp_path / "edges.geojsonl", {(-1.1e-05, 52.219691): [500, 400]})
     assert b"e-05" in src.read_bytes()
-    assert publish._cell_floors(src, 1) == {(0, 209): 500}
+    assert publish._cell_floors(src, 1, config.OVERVIEW_WEIGHT) == {(0, 209): 500}
 
 
 def test_an_unreadable_export_raises_rather_than_filtering_everything_out(tmp_path):
@@ -346,7 +380,7 @@ def test_an_unreadable_export_raises_rather_than_filtering_everything_out(tmp_pa
     src = tmp_path / "edges.geojsonl"
     src.write_text('{"type":"Feature","properties":{"n":1}}\n')
     with pytest.raises(RuntimeError, match="diverged"):
-        publish._cell_floors(src, 1)
+        publish._cell_floors(src, 1, config.OVERVIEW_WEIGHT)
 
 
 def test_the_overview_band_drops_the_card_only_attributes(monkeypatch, tmp_path):
@@ -367,14 +401,17 @@ def test_the_overview_band_drops_the_card_only_attributes(monkeypatch, tmp_path)
     src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3])
     publish.build_tiles(src, tmp_path / "bus.pmtiles")
 
-    far, near, detail, join = calls
+    far, mid, near, detail, join = calls
     assert far[far.index("-Z") + 1] == str(config.MIN_ZOOM)
     assert far[far.index("-z") + 1] == str(config.FAR_ZOOM - 1)
-    assert near[near.index("-Z") + 1] == str(config.FAR_ZOOM)
+    assert mid[mid.index("-Z") + 1] == str(config.FAR_ZOOM)
+    assert mid[mid.index("-z") + 1] == str(config.MID_ZOOM - 1)
+    assert near[near.index("-Z") + 1] == str(config.MID_ZOOM)
     assert near[near.index("-z") + 1] == str(config.DETAIL_ZOOM - 1)
     assert detail[detail.index("-Z") + 1] == str(config.DETAIL_ZOOM)
     for name in publish._DETAIL_ONLY:
         assert name in far
+        assert name in mid
         assert name in near
         assert name not in detail
     assert join[0] == "tile-join"
@@ -435,9 +472,9 @@ def test_a_publish_never_shows_a_half_built_archive(monkeypatch, tmp_path):
     src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3])
     publish.build_tiles(src, out)
 
-    # All three tippecanoe passes and the join: one archive on offer throughout, and
+    # All four tippecanoe passes and the join: one archive on offer throughout, and
     # it is the one that was there before, whole.
-    assert seen == [(["great_britain.pmtiles"], b"the previous archive")] * 4
+    assert seen == [(["great_britain.pmtiles"], b"the previous archive")] * 5
     # Swapped only at the end, and the scratch directory taken away with it.
     assert out.read_bytes() == b"the new one"
     assert [p.name for p in out.parent.iterdir()] == ["great_britain.pmtiles"]
@@ -559,7 +596,7 @@ def test_dropping_the_links_keeps_every_name_and_still_credits_both():
 
 def test_every_zoom_band_is_stamped_with_the_credit(monkeypatch, tmp_path):
     *bands, join = _tippecanoe_calls(monkeypatch, tmp_path)
-    assert len(bands) == 3
+    assert len(bands) == 4
     for band in bands:
         assert _attribution(band) == config.credit_html()
     # tile-join carries an input's attribution through to the joined archive --
@@ -789,10 +826,76 @@ def test_only_the_last_band_may_extend_past_its_top_zoom(monkeypatch, tmp_path):
     src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3])
     publish.build_tiles(src, tmp_path / "bus.pmtiles")
 
-    far, near, detail, _ = calls
-    assert "--extend-zooms-if-still-dropping" not in far
-    assert "--extend-zooms-if-still-dropping" not in near
+    *overview, detail, _ = calls
+    for band in overview:
+        assert "--extend-zooms-if-still-dropping" not in band
     assert "--extend-zooms-if-still-dropping" in detail
+
+
+def test_a_database_without_a_segments_table_still_publishes():
+    """`segments` post-dates Great Britain's database, and `prune` reclaims tables once
+    matching is done. A missing one used to raise out of the credit calculation, which
+    failed the publish over a mode the region has none of."""
+    import duckdb
+
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE edge_services (edge_id BIGINT)")
+    con.execute("INSERT INTO edge_services VALUES (1)")
+
+    assert publish.contents(con) == {"road": True, "operator": False}
+    assert publish.export_segments_geojsonl(con) is None
+
+
+def test_only_the_bands_with_a_cap_read_a_filtered_file(monkeypatch, tmp_path):
+    """z10 has never troubled the size limit, and neither has the detail band. Banding
+    them in with z8 would cap the loosest zoom at whatever the tightest one needs --
+    which is how a cap of 381,000 once took z10 from 943,040 features to 411,255."""
+    import subprocess
+
+    calls = []
+
+    def fake_run(cmd, **_):
+        calls.append(cmd)
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
+    monkeypatch.setattr(publish.subprocess, "run", fake_run)
+    monkeypatch.setattr(config, "OVERVIEW_CAP_FAR", 1)
+    monkeypatch.setattr(config, "OVERVIEW_CAP_MID", 2)
+
+    src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3, 4])
+    publish.build_tiles(src, tmp_path / "bus.pmtiles")
+
+    far, mid, near, detail, _ = calls
+    assert Path(far[-1]).name == "far.geojsonl"
+    assert Path(mid[-1]).name == "mid.geojsonl"
+    # The same file object the caller passed, not a copy of it.
+    assert near[-1] == str(src)
+    assert detail[-1] == str(src)
+
+
+def test_an_uncapped_band_is_handed_the_export_itself(monkeypatch, tmp_path):
+    """None means no cap, which is not the same as a cap nothing reaches: it must not
+    cost a pass over the 1.6 GB national export either."""
+    import subprocess
+
+    calls = []
+
+    def fake_run(cmd, **_):
+        calls.append(cmd)
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
+    monkeypatch.setattr(publish.subprocess, "run", fake_run)
+    monkeypatch.setattr(config, "OVERVIEW_CAP_MID", None)
+
+    src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3, 4])
+    publish.build_tiles(src, tmp_path / "bus.pmtiles")
+
+    assert calls[1][-1] == str(src)
+    assert not (tmp_path / "mid.geojsonl").exists()
 
 
 def test_building_from_an_existing_export_needs_no_connection(monkeypatch, tmp_path):
@@ -954,7 +1057,7 @@ def test_segments_are_one_more_pass_joined_into_the_same_archive(monkeypatch, tm
         segments=tmp_path / "segments.geojsonl",
     )
 
-    far, near, detail, seg, join = calls
+    far, *_roads, seg, join = calls
     assert seg[seg.index("-l") + 1] == publish.LAYER_SEGMENTS
     assert far[far.index("-l") + 1] == publish.LAYER
     assert seg[seg.index("-Z") + 1] == str(config.MIN_ZOOM)
@@ -986,7 +1089,7 @@ def test_a_bus_only_region_gets_no_segments_pass(monkeypatch, tmp_path):
     publish.build_tiles(
         write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3]), tmp_path / "bus.pmtiles"
     )
-    assert len(calls) == 4  # far, near, detail, join -- and nothing else
+    assert len(calls) == 5  # far, mid, near, detail, join -- and nothing else
     assert not any(publish.LAYER_SEGMENTS in c for c in calls)
 
 
