@@ -359,16 +359,30 @@ const HOVER_COLOUR = { light: "#d64512", dark: "#ffffff" };
 // scale: nothing about a ferry is "more" than a tram. The four common modes come
 // first; the cable-hauled tail is rare enough in these islands to be one heritage
 // line each, but a mode sharing a colour with another mode is worse than a mode
-// nobody ever sees. Red is left alone -- it is the hover and match accent, and a
-// mode that looked selected would be the wrong kind of wrong.
+// nobody ever sees.
+//
+// "Outside the ramp" has to be measured against *both* ramps, and the first
+// version of this palette was not. The metro's teal and the ferry's blue each sat
+// inside one of them: in OKLab the metro was 0.043 from the dark ramp at six
+// services, which is where that ramp turns cyan, and the ferry 0.036 from the
+// light ramp, which is blue for its whole lower half. Both drew as a road
+// carrying a handful of buses. They are now 0.145 and 0.154 from the nearest ramp
+// stop in light, 0.227 and 0.293 in dark.
+//
+// The ferry is crimson because nothing else was left: the light ramp is blue
+// through violet and the dark one sweeps blue, cyan, green and yellow, so between
+// them the two ramps own everything cool. Red was held back for the hover and
+// match accent, and that was the wrong shape of reservation -- the accent is one
+// orange-red at high lightness (#d64512), not the red half of the wheel, and a
+// deep crimson is 0.223 from it. In dark the accent is white, so nothing is owed.
 const MODE_COLOUR = {
   light: {
-    tram: "#b5327a", metro: "#00695f", rail: "#7a4b16", ferry: "#1f6fb2",
+    tram: "#b5327a", metro: "#7a169b", rail: "#7a4b16", ferry: "#800732",
     cable_tram: "#6a3fb5", funicular: "#0f7a3d", aerial: "#8a6d00",
     monorail: "#37474f",
   },
   dark: {
-    tram: "#ff86c4", metro: "#4fd6c0", rail: "#e0a566", ferry: "#6ab7f0",
+    tram: "#ff86c4", metro: "#c56aeb", rail: "#e0a566", ferry: "#f54874",
     cable_tram: "#b79cf0", funicular: "#6fd08c", aerial: "#ddc067",
     monorail: "#90a4ae",
   },
@@ -418,15 +432,23 @@ const modeColourExpr = (t) => [
   FALLBACK_MODE_COLOUR[t],
 ];
 
-// A segment carries no service count, so its width ramps on zoom alone. Slightly
-// wider than a quiet road at every zoom: there is one tram line where there are
-// twenty streets, and it should read as infrastructure rather than as a lane.
+// A segment carries no service count -- two trams over one street are two
+// coincident lines, not one edge that knows about both -- so `trips` is the only
+// weight it has, and it means trips per week on this one pattern rather than
+// summed over everything on the track. The stops sit where the modes do: a ferry
+// runs tens of times a week, a metro over a thousand.
+const byTrips = (a, b, c, bump) => [
+  "+",
+  ["interpolate", ["linear"], ["to-number", ["get", "trips"], 20],
+   20, a, 200, b, 1200, c],
+  bump,
+];
 const segWidth = (bump) => [
   "interpolate", ["linear"], ["zoom"],
-  6,  ["+", 0.8, bump],
-  9,  ["+", 1.6, bump],
-  12, ["+", 2.6, bump],
-  16, ["+", 4.5, bump],
+  6,  byTrips(0.25, 0.45, 0.75, bump),
+  9,  byTrips(0.45, 0.85, 1.35, bump),
+  12, byTrips(0.75, 1.35, 2.10, bump),
+  16, byTrips(1.30, 2.30, 3.60, bump),
 ];
 
 // The hovered segment in the accent colour, everything else off the ramp. Shared
