@@ -42,9 +42,15 @@ Each stage reads what the last one wrote, and each re-runs on its own.
 - **match** (`match.py`, `valhalla.py`). Each pattern becomes an ordered list of road
   edges. Road modes only; `db.matchable` keeps the rest away from Valhalla. This is the
   long stage. It is interruption-safe and resumes from its last committed batch.
+- **trace** (`trace.py`, `osm.py`). The non-road patterns that publish no operator shape,
+  chiefly the London Underground and the Docklands Light Railway (DLR), drawn from OSM
+  route relations. One Overpass query per run, cached to the data root. A relation's ways
+  are already in route order, so a pattern's geometry is a cut of its line's chain and
+  nothing is snapped.
 - **aggregate** (`aggregate.py`). Pattern-to-edges inverted to edge-to-services, keyed on
   the public service number rather than the GTFS `route_id`. Every non-road pattern's
-  operator shape is copied into `segments`, which is how a tram or a ferry gets drawn.
+  geometry is copied into `segments` — the operator's shape where there is one, the
+  traced relation track where there is not — which is how a tram or a ferry gets drawn.
 - **publish** (`publish.py`). One GeoJSON feature per line, then tippecanoe to
   `bus.pmtiles`. The roads are one tile layer and the segments another.
 - **art** (`art.py`). A bounding box or named preset to PNG or SVG, in one of three
@@ -54,7 +60,7 @@ Each stage reads what the last one wrote, and each re-runs on its own.
   `WAYFARE_RENDER_WORKERS` sets it for a deployment, and the default follows the
   container's CPU quota.
 
-`cli.py` fronts all six, plus `serve`, `status`, `prune`, `cluster` and `all`. `serve`
+`cli.py` fronts all seven, plus `serve`, `status`, `prune`, `cluster` and `all`. `serve`
 (`server.py`) answers the viewer, the archives and `GET /art`, which renders a window on
 demand instead of only to a file. Two self-contained pages sit in `web/`: the viewer
 `index.html`, and `art.html`, a studio for iterating on a render's design.
@@ -151,7 +157,7 @@ under `WAYFARE_DATA`.
 
 - `CLAUDE.md` — the architecture in brief, and the rules a change has to hold to.
 - `docs/data.md` — the feeds, their sizes and traps, mode filtering, coverage gaps.
-- `docs/pipeline.md` — the five stages, storage, DuckDB lessons, clustering, tiles.
+- `docs/pipeline.md` — the stages, storage, DuckDB lessons, clustering, tiles.
 - `docs/rendering.md` — how `art` draws, and where a render's time goes.
 - `docs/results.md` — measured runs: Wales, Greater London, Great Britain.
 - `PLAN.md` — roadmap, what is next, known gaps.

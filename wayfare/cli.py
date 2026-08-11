@@ -16,7 +16,7 @@ from pathlib import Path
 
 import duckdb
 
-from . import acquire, aggregate, config, coverage, db, gtfs, logs, match, publish
+from . import acquire, aggregate, config, coverage, db, gtfs, logs, match, publish, trace
 
 log = logs.get("cli")
 
@@ -95,6 +95,35 @@ def main(argv: list[str] | None = None) -> int:
         help="one-off repair for a database matched before transport faults had "
         "their own status: move the `error` rows that were connection failures to "
         "transport_error. Combine with --retry transient to redo them",
+    )
+
+    p = sub.add_parser(
+        "trace",
+        help="draw the non-road patterns with no operator geometry, from OSM "
+        "route relations (the Underground, the DLR, London Trams)",
+    )
+    p.add_argument("--limit", type=int, default=None, help="stop after N patterns")
+    p.add_argument(
+        "--relations",
+        type=Path,
+        default=None,
+        help="where the Overpass response is cached (default: "
+        "raw/osm_relations.json in the data root)",
+    )
+    p.add_argument(
+        "--refresh",
+        action="store_true",
+        help="re-query Overpass even though a cached response is present. A "
+        "national window is a minutes-long metered query, so it is cached and "
+        "reused; this is for after the relations themselves have moved",
+    )
+    p.add_argument(
+        "--retry",
+        default=None,
+        help="comma-separated statuses to forget and redo. `transient` is the "
+        "alias for the ones that are safe unattended (transport_error). A literal "
+        "status such as no_relation or chain_break is for after fixing the tracer "
+        "itself, or after re-querying Overpass",
     )
 
     sub.add_parser("aggregate", help="invert to edge -> services")
@@ -371,6 +400,26 @@ def _dispatch(args: argparse.Namespace) -> int:
         con.close()
         return 0
 
+    if args.cmd == "trace":
+        _require_db()
+        con = db.connect()
+        try:
+            # Before the run, never during: work is selected by the absence of a
+            # status row, so clearing one mid-run hands the pattern out twice.
+            if args.retry:
+                trace.retry(con, [s.strip() for s in args.retry.split(",") if s.strip()])
+            trace.run(con, cache=args.relations, refresh=args.refresh, limit=args.limit)
+            for status, n, km, worst in trace.summary(con):
+                log.info(
+                    "  %-16s n=%-6d track=%-8.1fkm worst stop=%.0fm", status, n, km, worst
+                )
+        except RuntimeError as exc:
+            log.error("%s", exc)
+            return 1
+        finally:
+            con.close()
+        return 0
+
     if args.cmd == "aggregate":
         con = db.connect()
         aggregate.build(con)
@@ -527,6 +576,13 @@ def _dispatch(args: argparse.Namespace) -> int:
         con = db.connect()
         gtfs.build_patterns(config.WORK / "gtfs", con)
         match.run(con, workers=args.workers)
+        try:
+            trace.run(con)
+        except RuntimeError as exc:
+            # Overpass being unreachable must not throw away a match run that has
+            # just cost a day or two. The patterns it would have drawn keep no
+            # status row, so the next `wayfare trace` picks them up unchanged.
+            log.warning("skipping trace: %s", exc)
         aggregate.build(con)
         publish.build(con, region=args.region, out=out)
         print(json.dumps(aggregate.coverage(con), indent=2))

@@ -4,8 +4,9 @@ Dataset of public transport routes across these islands: Great Britain from
 DfT BODS, the Republic of Ireland from the National Transport Authority, and
 Northern Ireland from Translink through OpenDataNI. Bus and coach are snapped
 to the road network; tram, metro, rail and ferry are drawn from the operator's
-own shape. Two consumers: an interactive web map (hover a road, see which
-services use it) and artistic renderings of areas.
+own shape, or from an OSM route relation where the operator publishes none. Two
+consumers: an interactive web map (hover a road, see which services use it) and
+artistic renderings of areas.
 
 ## Where the detail lives
 
@@ -15,7 +16,7 @@ the area they cover — most of them record something that was a bug first.
 
 - `docs/data.md` — the feeds, their sizes and traps, mode filtering, coverage gaps,
   attribution.
-- `docs/pipeline.md` — the five stages, storage, DuckDB lessons, clustering, tiles.
+- `docs/pipeline.md` — the stages, storage, DuckDB lessons, clustering, tiles.
 - `docs/rendering.md` — `art`: the style/spec split, streaming, banding, coalescing,
   where a render's time actually goes, the `/art` endpoint and the studio page.
 - `docs/results.md` — measured runs: Wales, Greater London, Great Britain, feed churn.
@@ -25,11 +26,12 @@ the area they cover — most of them record something that was a bug first.
 
 ## Architecture
 
-Five stages, each reading what the last wrote, each independently re-runnable:
+Six stages, each reading what the last wrote, each independently re-runnable:
 
     acquire  -> raw downloads
     patterns -> 1.55M trips collapse to distinct ordered stop sequences
     match    -> Valhalla; the stage that runs for a day or two
+    trace    -> OSM route relations for the modes with no road and no shape
     aggregate-> invert pattern->edges into edge->services
     publish  -> GeoJSONL -> tippecanoe -> PMTiles
 
@@ -138,6 +140,14 @@ check that looks at pixels. Test that the order is *defined*, not that two runs 
 **Bad geometry is worse than missing geometry.** A wrong match draws a
 confident-looking line down a road no bus uses. `low_confidence` rows are kept so they
 are never retried, but their edges are dropped.
+
+**`trace` refuses a relation that does not chain, or stops that do not run in order
+along it.** It cuts a pattern's geometry out of an OSM route relation's own chain, so
+it snaps nothing and has no confidence score to fall back on. A break in the chain and
+a sequence that turns round partway both draw confident track no service runs — a loop
+takes the wrong branch — so both end as an outcome in `trace_status` and write nothing
+to `traces`. That table is a permanent cache like `match_status`, `transport_error` is
+its one retryable status, and trace failures never gate a publish.
 
 **A licence condition travels with the data, not with the page.** `publish` stamps the
 credit into the archive's own tileset metadata, derived from `config.Feed`, so a copied

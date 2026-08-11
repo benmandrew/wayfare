@@ -815,17 +815,41 @@ def default_out(region: str | None = None) -> Path:
 def contents(con: duckdb.DuckDBPyConnection) -> dict[str, bool]:
     """What this archive actually holds, which is what decides its credits.
 
-    Read from the database rather than assumed, because both halves are now
-    optional: a region with no matched edges owes OpenStreetMap nothing, and one
-    with no segments has no operator geometry to name. Getting either wrong is a
-    licence statement that is false in one direction or the other, and neither is
-    visible in the picture.
+    Read from the database rather than assumed, because every part is optional: a
+    region with no matched edges owes OpenStreetMap nothing, and one with no segments
+    has no operator geometry to name. Getting any of them wrong is a licence statement
+    that is false in one direction or the other, and none of it is visible in the
+    picture.
+
+    `track` is the third, and it is the one that is easy to get backwards. A pattern
+    drawn by `wayfare trace` carries OpenStreetMap geometry without any edge in
+    `edge_services` -- nothing routed it -- so an archive of nothing but Underground
+    track would read as owing ODbL nothing while being wholly derived from OSM.
     """
 
     return {
         "road": _has_rows(con, "edge_services"),
         "operator": _has_rows(con, "segments"),
+        "track": _has_traced_segments(con),
     }
+
+
+def _has_traced_segments(con: duckdb.DuckDBPyConnection) -> bool:
+    """Whether anything actually drawn came from an OSM route relation.
+
+    The join is the point. `traces` is a cache keyed on pattern identity and keeps
+    its rows when a service leaves the timetable, exactly as `match_status` does, so
+    its being non-empty says what was once resolved rather than what this archive
+    holds. `segments` is rebuilt against the current feed every `aggregate`, so the
+    intersection is the honest answer -- and a credit has to describe the bytes
+    being published, not the database they came out of.
+    """
+    if not (db.table_exists(con, "traces") and db.table_exists(con, "segments")):
+        return False
+    row = con.execute(
+        "SELECT count(*) FROM segments s JOIN traces t USING (pattern_id)"
+    ).fetchone()
+    return bool(row and row[0])
 
 
 def _has_rows(con: duckdb.DuckDBPyConnection, table: str) -> bool:

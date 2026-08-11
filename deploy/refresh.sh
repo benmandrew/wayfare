@@ -60,6 +60,18 @@ if [ "$pending" -ne 0 ] || [ "$faults" -ne 0 ]; then
   exit 1
 fi
 
+# The modes with no road under them and no operator trace -- the Underground, the
+# DLR, London Trams. Deliberately after the publish gate rather than before it, and
+# deliberately allowed to fail: Overpass is a third party's metered service, and a
+# refresh that dropped a whole region's buses because a public API was busy would be
+# the wrong trade entirely. What it does not draw keeps no status row, so the next
+# run picks it up unchanged.
+#
+# `--retry transient` for the same reason `match` gets it: a request that never
+# arrived taught us nothing, and it is the only status safe to clear unattended.
+wayfare trace --retry transient || \
+  echo "refresh: trace did not finish; the relations it missed stay pending" >&2
+
 wayfare aggregate
 # Before publish, not after: clustering goes stale rather than off, and the rows
 # this run matched land unsorted on the end where no zonemap can help.

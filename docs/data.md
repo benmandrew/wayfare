@@ -141,6 +141,35 @@ database and nothing prevents it: the island can share a data root.
 818 `route_master` relations, and Greater London alone is 13% of the total. BODS is
 the authority for what services exist; OSM is only the geometry substrate.
 
+**OSM `route=subway` and `route=train` relations *are* viable, and the coverage
+argument above reverses.** A Public Transport version 2 (PTv2) route relation holds
+the ways a service runs over, in the order it runs them, plus its calling points as
+node members with roles. Buses fail on population, at 12,968 relations and 818 route
+masters against tens of thousands of registered services. Rail inverts every term of
+that. Roughly 1,000 relations cover roughly 1,000 GB rail services, and they are
+among the best-maintained relations in the country, because a railway is a fixed and
+publicly documented alignment that does not move between timetables. The Greater
+London bounding box holds 556 route relations, and every one of the eleven
+Underground lines has a `route_master`, as do the Docklands Light Railway (DLR, 5),
+London Trams (3) and the Elizabeth line (5).
+
+**The tagging traps sit in the ways and the nodes rather than in the relations.**
+The relation's `route` tag is the only reliable mode handle, and it does not say what
+the obvious names suggest — the Elizabeth line is `route=train`. Way tags do not help
+either. `ref` is on 2.4% of subway ways and carries signalling codes rather than line
+names, and `line` reaches 62.1% and is multi-valued on shared track with inconsistent
+separators. On the stop side there is no `naptan:AtcoCode` on any Underground stop
+node, so the timetable's stop identifiers do not reach OSM at all and the join is by
+normalised station name with a coordinate check. `docs/pipeline.md` covers the stage
+that does it and `wayfare/osm.py` the parsing.
+
+**Transport for London (TfL) publishes no track geometry, so the relations are the
+only survey there is.** `api.tfl.gov.uk/Line/{id}/Route/Sequence/{dir}` returns a
+`lineStrings` field whose vertex count equals the station count, which is a straight
+line between consecutive stations rather than an alignment. The only geographic asset
+on the portal is a station point layer. The operator's own open data therefore cannot
+draw the Underground, and OSM is the first source rather than the fallback.
+
 ## Beyond Great Britain
 
 **Northern Ireland has no GTFS, and since 2026-08-06 it has no ATCO.CIF either.**
@@ -378,6 +407,25 @@ somebody, and a flag nobody knows about does not discharge it. The line is serve
 `/art/meta` rather than written into the page, so it follows whichever region the
 server's database holds — the same reason the tiles carry theirs in the archive rather
 than in `web/index.html`.
+
+**Track drawn from a route relation owes ODbL, and it owes it with no matched edge
+anywhere in the archive.** `wayfare trace` copies an OSM relation's own geometry, so
+an archive of nothing but Underground track is wholly derived from OpenStreetMap
+while `edge_services` is empty. `publish.contents` therefore returns a third flag,
+`track`, and `credit_parts` widens the ODbL noun to "Road geometry", "Track geometry"
+or "Road and track geometry" from the two flags together. The flag is computed from
+`segments JOIN traces` rather than from `traces` alone, because `traces` is a cache
+that keeps its rows when a service leaves the timetable, and a credit has to describe
+the bytes being published rather than the database they came out of.
+
+**Transport for London's licence is the one `licences.Credit` cannot express, and
+nothing here uses it.** Everything this project ingests is OGL v3.0 or CC BY 4.0, and
+both fit the four fields `Credit` carries. TfL publishes under Open Government Licence
+v2.0 *with amendments for Transport for London*, which requires three verbatim
+attribution strings rather than a name, a licence and a URI. The Underground work
+touches no TfL data at all: the timetable is BODS and the geometry is OpenStreetMap.
+The note is here so that the first change reaching for the TfL portal knows what it
+costs before it writes any code.
 
 The credit travels with the bytes. That is the whole design, and the reason to keep
 testing it by copying an archive somewhere the page it was built against cannot reach,

@@ -78,6 +78,26 @@ was built with. The gate then reads one thing, work still owed to the matcher, a
 the mode census sits where a person reads it. It is also the only place a mode going
 missing is visible.
 
+## Tracing runs after the gate, and may fail
+
+**`wayfare trace --retry transient` is one line in `refresh.sh`, placed after the
+publish gate and allowed to fail.** It draws the modes with no road under them and no
+operator trace — the Underground, the Docklands Light Railway (DLR), London Trams —
+from OpenStreetMap route relations, and it depends on Overpass, which is a third
+party's metered public service.
+A refresh that dropped a whole region's buses because a public API was busy would be
+the wrong trade, so the command is followed by `|| echo` and the run carries on.
+Nothing is lost by that: a pattern it does not draw keeps no `trace_status` row, so
+the next refresh selects it again unchanged.
+
+**Its failures stay out of the gate deliberately.** `patterns_pending` counts
+matchable patterns, and a metro never gets a `match_status` row. Folding an
+unresolvable relation into that number would put a permanent floor under the count
+the gate reads, which is the mistake the mode filter already made once, described in
+the section above. `wayfare status` reports a separate `traced` block instead —
+patterns owed, patterns pending, and a count per status — and a database written
+before the stage existed reports nothing there rather than raising.
+
 ## The mode selection lives in the database
 
 **`refresh.sh` runs `wayfare patterns` with no flags, so the selection cannot live

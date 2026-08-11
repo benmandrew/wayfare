@@ -1,10 +1,11 @@
 # Pipeline
 
-Five stages, each reading what the last wrote, each independently re-runnable:
+Six stages, each reading what the last wrote, each independently re-runnable:
 
     acquire  -> raw downloads
     patterns -> 1.55M trips collapse to distinct ordered stop sequences
     match    -> Valhalla; the stage that runs for a day or two
+    trace    -> OSM route relations for the modes with no road and no shape
     aggregate-> invert pattern->edges into edge->services
     publish  -> GeoJSONL -> tippecanoe -> PMTiles
 
@@ -328,6 +329,176 @@ indistinguishable from one that was killed. Combined with `ORDER BY n_trips DESC
 a nightly job with a half-hour budget spends it on the busiest roads first, so a
 partially drained queue degrades gracefully. `publish` can be spread by rebuilding
 one region's PMTiles per night, which the multi-region viewer already supports.
+
+## trace
+
+**A mode can publish a complete stop sequence and no geometry at all, and the
+largest one in the country does.** Great Britain's `routes.txt` carries
+`route_type=1` on 54 routes, 61,288 trips over 1,525 patterns, and 1,417 of those
+patterns (92.9%) have no `shape_id`. `route_type=2` is three routes, all of them
+the Docklands Light Railway (DLR), 71 patterns, not one with a shape. Seventeen
+named lines arrive this way. The London Underground contributes 41 line records
+over 11 named lines and 58,560 trips, the DLR 6,630 trips, and beside them sit
+London Trams, West Midlands Metro, Blackpool, the Air-Rail Link and the IFS Cloud
+Cable Car. Measured against Bus Open Data Service (BODS) feed `20260806_022608`.
+
+**Both of the other geometry paths refuse them.** `db.matchable` keeps a metro away
+from Valhalla, because there is no road under a tube tunnel to match onto, and
+`aggregate.build_segments` copies an operator trace that the feed does not carry.
+Those patterns were counted by mode and drawn nowhere. `wayfare trace` is the third
+path, and its source is OpenStreetMap *route relations*.
+
+**A route relation is already ordered, which makes this an ingestion job.** Its
+`role=""` way members chain end to end into one continuous path in the order the
+service runs them, so a pattern's geometry is a cut of that chain between the first
+stop it calls at and the last. Nothing is snapped. There is no shortest path, no
+*hidden Markov model* and nothing to disambiguate, and `wayfare/osm.py` is a fetch, a
+walk and a projection.
+
+**The relations exist and the chains are clean.** The Greater London bounding box
+holds 556 route relations. Each of the eleven Underground lines has a
+`route_master`, as do the DLR (5), London Trams (3) and the Elizabeth line (5).
+Walking the `role=""` ways in member order breaks nowhere on any line tested:
+Victoria 24 ways over 21.69 km against an official 21 km, Central 125 ways over
+54.75 km, Jubilee 59 ways over 37.15 km, and the DLR's Lewisham to Stratford
+relation 81 ways over 11.02 km.
+
+**Work selection is `match`'s, and its three conditions are each load-bearing.** A
+pattern is owed a trace when it is in the current feed, when `db.matchable` is false
+for it, and when its `shape_id` is NULL. The first keeps departed journeys out, the
+second leaves the road to Valhalla, and the third keeps the operator's own recording
+ahead of anything reassembled from OpenStreetMap — a feed trace records where the
+vehicle goes, a relation records where the track is, and the two differ at a depot
+or a turnback. Work is then selected by the absence of a `trace_status` row, exactly
+as `match` selects on the absence of a `match_status` row. Patterns are handed out
+busiest first, so a run cut short leaves the busiest lines drawn.
+
+**Overpass rather than the OpenStreetMap application programming interface (API),
+because the stage has to *discover* relations over an area.** The API answers for an
+id that is already known, and nothing in a timetable carries a relation id. One
+request per run is enough. The first `out body geom` statement inlines every member
+way's coordinates, which is what replaces thousands of per-way fetches, and a second
+`out` statement returns the member nodes with their tags. That second statement is
+not redundant. A relation member carries a role and an id, never the tags of the
+thing it points at, and the station names are the join key. The window asked for is
+the pending patterns' stop extent padded by 0.2 degrees, about 22 km, because a line
+runs well past the box its stops sit in — the Central line reaches Epping. The
+response body is cached to `raw/osm_relations.json` as raw bytes, so a parser fix
+applies to bytes already paid for.
+
+**The fit is a subsequence search over normalised station names.** Great Britain's
+1,417 Underground patterns come from 459 distinct station sequences over 11 lines,
+and every one of them is a contiguous sub-path of its line, since a short working of
+the Northern line still runs on Northern line track. A pattern is therefore tested
+against the relations calling at either of its ends, its stop names are looked for
+as a contiguous run through the relation's, and the reverse order is tried as well
+because a relation is per direction. Every placement is tried rather than the first.
+A relation calling at one station twice offers more than one, and only one of them
+projects in order along the track.
+
+**There is no `naptan:AtcoCode` on an Underground stop node, so the join is by name
+with a coordinate check.** The identifier that would settle it is absent, which
+leaves the station name, and the two publishers spell it differently. BODS writes
+"Blackhorse Road Station", "Pimlico Station" and "King's Cross St. Pancras
+Underground Station" where OpenStreetMap has "Blackhorse Road station", "Pimlico"
+and "King's Cross St Pancras". `osm.normalise` folds case, expands the ampersand,
+deletes apostrophes, turns the remaining punctuation into spaces and strips a
+station suffix twice — twice, because "Edgware Road Station Station" is in one
+feed's stop register. Measured on the Victoria line, that takes the join from
+partial to 16 of 16.
+
+**The coordinate check is what stops a name matching the wrong line, and it is set
+at 400 m.** 15 of the Victoria line's 16 stops sit within 150 m of the node they
+matched. The exception is Highbury & Islington at 216 m, where the timetable's point
+is the National Rail entrance and the OpenStreetMap node is the tube platform. A
+large interchange is where the two publishers disagree most, so `TRACE_STOP_MAX_M`
+has to clear that case, and 400 m does while staying well under the roughly 1.2 km
+spacing between Underground stations.
+
+**What gets projected onto the chain is the relation's own stop nodes.** The node is
+on the track by construction, where the feed's point can be a station entrance 216 m
+away on the National Rail side of an interchange. Projecting the further of the two
+risks landing on a parallel line and cutting the chain in the wrong place. The
+feed's coordinate does the other job, which is checking that the name join found the
+right station.
+
+**A sequence that turns round partway is refused rather than drawn.** The matched
+stops must project one way along the chain, and either way will do, since a relation
+is per direction and half a line's patterns run from its far end back towards its
+first way. What is refused is a sequence that reverses in the middle, which is a
+loop — the New Addington branch is one — or a placement that doubles back. Slicing
+between the two ends of such a sequence takes the wrong branch and draws confident
+track no service runs on. `TRACE_MONOTONIC_SLACK_M` is 250 m, wide enough for a
+station node sitting slightly behind its neighbour's projection and far short of a
+turn. This is "bad geometry is worse than missing geometry" applied to a stage with
+no confidence score to fall back on.
+
+**Four traps, and each one looks like missing data rather than a mistake.**
+
+- **Platform members must leave the way chain.** Leaving `role=platform`,
+  `platform_entry_only` and `platform_exit_only` in produces 11 to 25 spurious
+  breaks per relation, which reads as broken mapping across the whole of London.
+  `config.OSM_STOP_ROLES` names the three roles that are calling points, and the
+  chain takes `role=""` and nothing else.
+- **The Elizabeth line is `route=train`, not `route=subway`.** A mode filter written
+  from the obvious names misses it outright. `config.OSM_ROUTE_VALUES` is therefore
+  deliberately wide — subway, light rail, tram, train, monorail, funicular and
+  aerialway — and the stop-sequence join is what decides which relation a pattern
+  belongs to. A few thousand extra relations in one request is the cheaper mistake.
+- **Way tags are not a join key.** `ref` is on 2.4% of subway ways and carries
+  signalling codes rather than line names. `line` reaches 62.1% and is multi-valued
+  on shared track, with separators that vary by mapper. Ways are reached through the
+  relation in member order, never through their own tags.
+- **The coverage argument against OpenStreetMap bus relations does not transfer.**
+  docs/data.md rejects `route=bus` as a source on 12,968 relations and 818 route
+  masters against the whole bus network. Rail inverts every term of it: roughly
+  1,000 relations cover roughly 1,000 GB rail services, every London line carries a
+  `route_master`, and they are among the best-maintained relations in the country.
+
+**`segments` now has two sources, and they are disjoint by construction.**
+`aggregate.build_segments` unions the operator shape of every live non-road pattern
+with the `traces` row of every live non-road pattern whose `shape_id` is NULL. That
+NULL is what keeps the two arms from overlapping, and it is what lets `segments`
+keep its primary key on `pattern_id`. A non-road pattern with neither source still
+gets no row and is still not drawn, so the log line reports all three counts and a
+region drawing fewer segments than it has patterns says so.
+
+**Every pattern gets a `trace_status` row, and one status is retryable.** The
+vocabulary is `match_status`'s for the reason the stage's shape is. A tracer that
+re-fetches every unresolvable pattern on every run never finishes, which needs
+"failed" to mean "impossible".
+
+    ok               the relation chained and carried the pattern's stop sequence
+    no_relation      nothing fetched calls at either of this pattern's ends
+    chain_break      the relation's ways do not form one continuous path
+    no_stop_match    a relation shares a terminus and not the sequence
+    not_monotonic    the stops matched and project out of order along the chain
+    skipped          fewer than two stops to fit
+    error            a bug or a malformed response, permanent until the code moves
+    transport_error  the request never got an answer, so nothing was learned
+
+`chain_break` describes a relation rather than a pattern, and the run reports it as
+a count. `trace.prepare` chains every relation once and drops the ones that break
+before any pattern is fitted, so a pattern whose only candidate broke is recorded
+`no_relation`. `wayfare trace --retry transient` clears `transport_error` and
+nothing else, exactly as `match --retry transient` does, and both must land before
+the first work is selected: a row deleted while its pattern is in flight hands that
+pattern out twice.
+
+**A failure to reach Overpass at all is deliberately not written down.** Nothing was
+learned about any pattern, so a permanent row would be a lie about all of them at
+once. `wayfare all` logs a warning and carries on rather than throwing away a match
+run that has just cost a day or two, and the patterns keep no status row, so the
+next `wayfare trace` picks them up unchanged. Trace failures also stay out of the
+publish gate, which counts matchable patterns only; docs/deploy.md has that
+reasoning.
+
+**None of the numbers above came from running this stage.** The census of the feed
+and the survey of the relations were both taken before it was written, against BODS
+`20260806_022608` and one Overpass query over Greater London. The stage is built and
+tested and has not yet run against the national database, which lives on the server.
+What it resolves, refuses and draws nationally belongs in docs/results.md, once
+there is a run to report.
 
 ## aggregate
 
