@@ -464,11 +464,27 @@ CHECKPOINT_EVERY = 200
 # keeps more of the road's shape and costs bytes; the maximum zoom is never simplified,
 # so this is about z5-z13 only.
 #
-# 4 was tippecanoe's default and was never measured. The archive has room for less at
-# the zooms where anyone looks closely: the largest z12 tile is 116 KB against the
-# 500 KB limit, z13 50 KB and z14 18 KB, so those bands are using a fraction of what
-# they may. z10 and z11 have less to give, at 366 KB and 308 KB.
+# 4 was tippecanoe's default. It has now been measured and it stays: building Great
+# Britain at 4, 2 and 1 gives 130.4 MB, 135.2 MB and 140.8 MB, and moves the ink in a
+# London window at z8 by 0.14 percentage points and at z12 by 0.05. There is very
+# little for simplification to remove -- the export is already short coalesced runs
+# along single ways, and `SIMPLIFY_SHARED_NODES` pins every junction -- so a lower
+# setting buys geometry nobody can see at 8% more bytes.
 SIMPLIFICATION = 4
+# Whether to keep a node shared between two features fixed while simplifying.
+#
+# On, and it should stay on: simplification is free to move a vertex, and moving one
+# that two roads meet at pulls them apart, which is a hole in the network at exactly
+# the zooms the network is what you can see.
+#
+# Off is a workaround for one thing only. tippecanoe 2.79.0 on macOS arm64 dies with
+# SIGTRAP on the national export -- 861,410 features -- with this flag on, while the
+# same command on the same version on Linux is what builds every published archive.
+# Isolated by bisecting the flags: no other flag, the zoom range, or `-P` does it, and
+# a small input with the flag is fine. So a local build on that machine needs this off,
+# and **an archive built with it off is not comparable to a published one**: it is a
+# different simplification, not a faster one.
+SIMPLIFY_SHARED_NODES = True
 # The per-tile ceiling that decides when `--drop-densest-as-needed` fires.
 #
 # tippecanoe's default is 500,000, which is a Mapbox hosted-service limit rather than
@@ -476,11 +492,23 @@ SIMPLIFICATION = 4
 # served off one machine over HTTP range requests, so nothing rejects a larger tile and
 # the number is a choice about fetch and decode time.
 #
-# It binds hard at the low zooms and only there. Measured on Great Britain, the largest
-# z5 tile wanted 1.50 MB and was cut to 406 KB, z8 wanted 0.79 MB and z9 0.55 MB, while
-# nothing at z10 or above reached the limit at all. Raising it is the only way to give
-# z5-z9 more detail, because they are already at the ceiling rather than under it.
-MAX_TILE_BYTES = 500_000
+# It binds at the low zooms and only there, because those are the tiles tippecanoe had
+# to thin to fit. Measured on Great Britain by building the archive at both:
+#
+#   limit    archive   worst z5   worst z8   worst z10   worst z12
+#   500 KB   130.4 MB     406 KB     428 KB      366 KB      116 KB
+#     1 MB   137.9 MB     932 KB     776 KB      366 KB      116 KB
+#
+# z5 more than doubles and z8 goes from thinned to essentially complete -- it wanted
+# 790 KB -- for 7.5 MB, 5.7% of the archive, on about thirty tiles. z10 and below are
+# identical, correctly: they never reached the old limit, so the ceiling was never
+# what was holding them back.
+#
+# Judge a change to this on tile bytes rather than on `coverage draw`'s lit fraction.
+# The features a higher ceiling restores are in the densest tiles, where the pixels are
+# already lit, so the fraction moved 9.42% to 9.54% for content that doubled. Lit
+# pixels detect a missing network and saturate on added density.
+MAX_TILE_BYTES = 1_000_000
 MIN_ZOOM = 5
 MAX_ZOOM = 14
 # Below this zoom the archive carries geometry and `n` and nothing else.
