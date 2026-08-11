@@ -6,7 +6,7 @@
 # The suite needs no datasets and no Valhalla: tests/conftest.py holds a mini
 # GTFS feed, and anything wanting the real thing is marked `slow` or `valhalla`.
 #
-# `image.yml` calls this workflow as the gate on its build, so this file no
+# `image.yml` calls this workflow as the gate on its publish, so this file no
 # longer answers `push` or `pull_request` itself. It would otherwise run twice
 # on every event that reaches both -- a second full nix build and test suite for
 # a result already known. The status check is therefore named `image / check`.
@@ -33,6 +33,25 @@ jobs:
 
       - uses: cachix/install-nix-action@v31
 
+      # Without this the devShell closure -- python, cairo, tippecanoe, duckdb,
+      # a gcc -- is fetched from cache.nixos.org on every run, measured at 14.5s
+      # of a 127s run and the largest cost after the test suite itself. A cached
+      # store still has to be unpacked, so it comes back at around 4s rather
+      # than disappearing.
+      #
+      # Split into restore and save, rather than the one step that does both,
+      # for the reason the Docker layer cache is split in `image.yml`: an entry
+      # written from a pull request lands in that request's own ref scope, where
+      # nothing else can read it, and still counts against the repository's
+      # 10 GB quota. A nix store is around 1 GB, so a few open requests would
+      # evict the entry that main and every other branch reads from. Reading
+      # stays unconditional -- any ref can read the default branch's entry.
+      - id: nix-cache
+        uses: nix-community/cache-nix-action/restore@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+
       # The devShell installs into .venv with uv on first entry, and pycairo
       # has no wheel -- it compiles every time this cache misses. Keyed on
       # flake.lock as well as pyproject.toml because the interpreter moving
@@ -42,6 +61,20 @@ jobs:
           path: ~/.cache/uv
           key: uv-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'flake.lock') }}
           restore-keys: uv-${{ runner.os }}-
+
+      # mypy from cold is 6s here and 0.2s warm, the smallest of the three
+      # caches and the cheapest to keep. The key carries the commit sha because
+      # `actions/cache` never overwrites a key that already exists: a key moving
+      # only with pyproject.toml would freeze at whatever the first run wrote and
+      # decay from there. mypy revalidates what it restores, so an entry from an
+      # older commit is a speed-up and never a wrong answer.
+      - uses: actions/cache@v4
+        with:
+          path: .mypy_cache
+          key: mypy-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}-${{ github.sha }}
+          restore-keys: |
+            mypy-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}-
+            mypy-${{ runner.os }}-
 
       # Separate steps so a failure names itself in the run summary, and
       # `!cancelled()` so one failing check does not hide the other three --
@@ -62,6 +95,33 @@ jobs:
         name: types
         run: nix develop --command mypy
 
+      # `-n auto` here rather than in pyproject.toml addopts: xdist takes 50s of
+      # runner time down to around 25s, and costs a local run the per-test
+      # progress and the readable traceback a failure gets debugged from. Only
+      # the runner is worth that trade.
+      #
+      # The suite parallelises because nothing in it shares state: every fixture
+      # is tmp_path-scoped, and the one module-scoped fixture, in
+      # test_query_spec.py, is read-only. The tests to look at first if this
+      # ever turns flaky are the byte-identical render comparisons in
+      # test_art.py, which are what the ORDER BY tiebreak rule in CLAUDE.md
+      # exists to protect.
       - if: ${{ !cancelled() }}
         name: tests
-        run: nix develop --command pytest -q
+        run: nix develop --command pytest -q -n auto
+
+      # After the checks, so a store that failed them is never the one the next
+      # run starts from, and only from main for the quota reason above. The
+      # primary-key hit is excluded because saving over an existing key is a
+      # warning rather than a write. Garbage collection is what bounds the
+      # entry: the store at this point holds the build-time closure as well as
+      # the runtime one, and only the runtime one is worth carrying forward.
+      - if: >-
+          ${{ !cancelled()
+          && github.ref == 'refs/heads/main'
+          && steps.nix-cache.outputs.hit-primary-key != 'true' }}
+        name: save nix store
+        uses: nix-community/cache-nix-action/save@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          gc-max-store-size-linux: 1G
