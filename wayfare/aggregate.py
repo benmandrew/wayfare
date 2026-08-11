@@ -33,6 +33,15 @@ def build(con: duckdb.DuckDBPyConnection) -> None:
     # matched geometry of a pattern that has left the timetable -- it is a cache, and
     # a seasonal service that returns should not be paid for twice -- but a road
     # nobody runs on any more must not still be drawn as if buses used it.
+    #
+    # `matchable` is the same rule in the other direction, and it is about the past
+    # rather than the future. A database matched before the mode filter existed holds
+    # `pattern_edges` for patterns that should never have reached the matcher: Great
+    # Britain's held 1,726,822 of them for the Underground alone, plus ferries snapped
+    # to coast roads, and 16,833 edges were reachable from nothing else -- roads drawn
+    # as though buses used them, weighted by trips no bus runs. Those patterns are
+    # drawn from operator geometry by `build_segments` now, and drawing them twice, one
+    # of the copies wrong, is worse than either.
     con.execute(f"""
         INSERT INTO edge_services
         SELECT edge_id, short_name, agency_id,
@@ -43,7 +52,7 @@ def build(con: duckdb.DuckDBPyConnection) -> None:
                    COALESCE(NULLIF(trim(p.short_name), ''), p.route_id) AS short_name
             FROM (SELECT DISTINCT pattern_id, edge_id FROM pattern_edges) pe
             JOIN patterns p USING (pattern_id)
-            WHERE {db.current_feed()}
+            WHERE {db.current_feed()} AND {db.matchable("p", con)}
         )
         GROUP BY edge_id, short_name, agency_id
     """)

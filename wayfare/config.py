@@ -508,17 +508,17 @@ DETAIL_ZOOM = 11
 # z8 to 37.7% of full detail where Ireland, which never trips the size limit, sits at
 # 66.7% -- an even cut, but half the map.
 #
-# The number is measured rather than derived. Tile bytes do not fall as fast as the
-# feature count -- holding Great Britain to 33.0% of its features took the largest z5
-# tile from the 1.51 MB it wanted to 630 KB, an exponent of about 0.79, because what
-# survives a `trips` floor is the busy roads and those carry the longer geometry. At
-# 205,000 -- 209,493 features once ties at each cell's floor are kept, 24.1% of the
-# export -- no z5-z7 tile reaches the 500 KB limit and tippecanoe drops nothing, which
-# is the whole point: what is on the map is then chosen by service level rather than
-# by which cities happened to be dense. z5 carries 98,313 features, z6 130,947 and z7
-# 168,255, against 55,983, 106,672 and 157,193 with no cap at all.
+# The number is measured rather than derived, and it is a cap on the *quota*, not on
+# what comes out: every populated cell is guaranteed one feature and ties at each floor
+# are kept, so a finer `OVERVIEW_CELL` overshoots further. 130,000 comes out at 192,400
+# on Great Britain. Tile bytes do not fall as fast as the feature count -- holding it to
+# 33.0% took the largest z5 tile from the 1.51 MB it wanted to 630 KB, an exponent of
+# about 0.79, because what survives a `trips` floor is the busy roads and those carry
+# the longer geometry. Around 190,000 features out is where no z5-z7 tile reaches the
+# 500 KB limit, which is the whole point: what is on the map is then chosen by service
+# level rather than by which cities happened to be dense.
 FAR_ZOOM = 8
-OVERVIEW_CAP_FAR = 190_000
+OVERVIEW_CAP_FAR = 130_000
 # Where the capped part of the overview ends. z10 is the only overview zoom that was
 # never under pressure -- tippecanoe kept 86.1% of the network there against 37.6% at
 # z8 -- so it is banded off and handed the export whole. Capping z8-z10 as one band
@@ -528,7 +528,7 @@ MID_ZOOM = 10
 # The cap on z8-z9, or None to hand tippecanoe everything and let
 # `--drop-densest-as-needed` be the only thing standing between the network and the
 # tile size limit. See the note above for why this exists and why it once did not.
-OVERVIEW_CAP_MID: int | None = 450_000
+OVERVIEW_CAP_MID: int | None = 380_000
 # How the quota is shared out: a cell's share goes as its feature count to this power.
 #
 # This is the dial the low-zoom map kept swinging between the ends of, and both ends
@@ -553,13 +553,34 @@ OVERVIEW_CAP_MID: int | None = 450_000
 # when Great Britain's profile is flat too; a weighting that tilts is the bug, whether
 # it tilts towards the cities or away from them.
 OVERVIEW_WEIGHT = 0.5
-# The side of the cell the quota is shared out over, in degrees. 0.25 is about 28 km
-# by 17 km at this latitude, and puts 655 cells over Great Britain's network -- fine
-# enough that a town is not averaged in with the city forty miles away, coarse enough
-# that a cell holds a few hundred features rather than a handful. A cell is a bucket
-# for allocating the quota and nothing else: it never becomes a tile boundary, and
-# the geometry that crosses it is untouched.
-OVERVIEW_CELL = 0.25
+# The side of the cell the quota is shared out over, in degrees. A cell is a bucket for
+# allocating the quota and nothing else: it never becomes a tile boundary, and the
+# geometry that crosses it is untouched.
+#
+# **This is the setting that decides whether the map is covered.** Within a cell the
+# quota goes to the highest `trips`, and the highest `trips` in any cell are in that
+# cell's town centre -- so a cell spends its whole allowance on one spot and draws
+# nothing in between. How much "in between" there is depends entirely on how big the
+# cell is, and 0.25 degrees, at 28 km by 17 km, is 20x too big. Measured on Great
+# Britain against 0.02-degree bins of about 1.4 km, of which the export covers 33,435:
+#
+#   cell    bins drawn   of the export's
+#   0.25         12,626           37.8%
+#   0.05         24,475           73.2%
+#   0.02         30,608           91.5%
+#   0.01         32,673           97.7%
+#
+# At 0.25 nearly two thirds of the country drew nothing while every aggregate looked
+# healthy -- 655 populated cells, none of them empty, more features at z6 than the
+# uncapped build carried. Rendering the drawn geometry is what showed it: England came
+# out as speckle with voids through it where the uncapped archive was continuous, and
+# one 1.4 km bin held 188 features at a zoom where that is a fraction of a pixel.
+#
+# 0.02 puts 33,571 cells over Great Britain. The cap is read down to match, because a
+# finer grid keeps more than it is asked for -- every populated cell is guaranteed one
+# feature, and ties at each floor are kept -- so 130,000 comes out at 192,400, which is
+# what 190,000 over the coarse grid came out at. Same features, 2.4x the places.
+OVERVIEW_CELL = 0.02
 # A backstop against one pathological city-centre edge, not a routine truncation.
 #
 # The original 12 assumed a long service list would dominate tile size. It does not:
