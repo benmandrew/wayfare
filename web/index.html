@@ -418,15 +418,23 @@ const modeColourExpr = (t) => [
   FALLBACK_MODE_COLOUR[t],
 ];
 
-// A segment carries no service count, so its width ramps on zoom alone. Slightly
-// wider than a quiet road at every zoom: there is one tram line where there are
-// twenty streets, and it should read as infrastructure rather than as a lane.
+// A segment carries no service count -- two trams over one street are two
+// coincident lines, not one edge that knows about both -- so `trips` is the only
+// weight it has, and it means trips per week on this one pattern rather than
+// summed over everything on the track. The stops sit where the modes do: a ferry
+// runs tens of times a week, a metro over a thousand.
+const byTrips = (a, b, c, bump) => [
+  "+",
+  ["interpolate", ["linear"], ["to-number", ["get", "trips"], 20],
+   20, a, 200, b, 1200, c],
+  bump,
+];
 const segWidth = (bump) => [
   "interpolate", ["linear"], ["zoom"],
-  6,  ["+", 0.8, bump],
-  9,  ["+", 1.6, bump],
-  12, ["+", 2.6, bump],
-  16, ["+", 4.5, bump],
+  6,  byTrips(0.25, 0.45, 0.75, bump),
+  9,  byTrips(0.45, 0.85, 1.35, bump),
+  12, byTrips(0.75, 1.35, 2.10, bump),
+  16, byTrips(1.30, 2.30, 3.60, bump),
 ];
 
 // The hovered segment in the accent colour, everything else off the ramp. Shared
