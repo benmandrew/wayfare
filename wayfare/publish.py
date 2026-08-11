@@ -585,8 +585,10 @@ def build_tiles(
         # empty input rather than writing an empty archive. Skipping the road bands
         # is the same rule the segments pass already follows, in the other direction.
         if _has_features(geojsonl):
-            far_floors = _cell_floors(
-                geojsonl, config.OVERVIEW_CAP_FAR, config.OVERVIEW_WEIGHT
+            far_floors = (
+                _cell_floors(geojsonl, config.OVERVIEW_CAP_FAR, config.OVERVIEW_WEIGHT)
+                if config.OVERVIEW_CAP_FAR
+                else {}
             )
             mid_floors = (
                 _cell_floors(geojsonl, config.OVERVIEW_CAP_MID, config.OVERVIEW_WEIGHT)

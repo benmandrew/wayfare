@@ -534,44 +534,44 @@ features to 81.7%. On the map that drew the dense cities with black between them
 archive was republished uncapped as soon as it was seen, so the fault was live only
 briefly.
 
-**A cap is shared out per cell, and a cell's share goes as its feature count to the power
-of `config.OVERVIEW_WEIGHT`.** `config.OVERVIEW_CELL` is 0.25 degrees, about 28 km by 17 km
-at this latitude and 655 populated *cells* over Great Britain. Within a cell `trips` decides
-which roads fill the quota, so the floor is local: 1 trip in the countryside to 12,287 in
-the busiest cell, median 180. Every populated cell keeps at least one feature. A cell whose
-quota exceeds what it holds is given exactly what it holds and the others re-share the
-surplus, without which the cap undershoots by whatever the countryside had no roads to
-spend it on.
+**The overview is not capped, and four attempts to cap it all made the map worse.**
+`config.OVERVIEW_CAP_FAR` and `config.OVERVIEW_CAP_MID` are both `None`. The quota
+machinery beneath them — a per-cell `trips` floor, a weighting exponent and a cell size
+— is switched off and kept only because z5 is still thinner than Ireland, which is the
+one place a selection might still earn its keep.
 
-**Sharing the cap out in proportion to cell size was the second version of the first
-failure, and it also shipped.** A weight of 1.0 gives every cell the same fraction, which
-is the wrong quantity to hold constant: a quarter of a city is still a city and a quarter of
-a country lane is nothing. Measured on the deployed archive, Great Britain's emptiest
-quarter of cells drew 15 features each at z6 and 28 of them drew fewer than five, against
-Ireland's equally-sized rural cells drawing 53. A weight of 0.0 gives every cell the same
-count and fails the other way, taking the busiest tenth of cells to 7.0% of full detail.
-0.5 is what is here. Rural cells go from 32.1% of their features kept to 100%, urban cells
-from 23.7% to 21.2%, and on the map rural cells draw 41 features at z6 against urban cells'
-323.
+The attempts, in order, were a single national `trips` floor, which took every feature
+from 310 of Great Britain's 655 populated cells; a per-cell floor sharing the cap out in
+proportion to cell size, which emptied nothing and drew 15 features per rural cell at z6
+where Ireland drew 53; the same weighted by the square root of cell size, which restored
+the countryside and flattened the cities; and the same again on a 0.02-degree grid, which
+took coverage of 1.4 km bins from 37.8% to 88.9% and was still worse on screen than no cap.
 
-Ireland is the reference for what the result should look like, and it is one because none
-of this touches it. At 87,179 features it is under every cap, `_cell_floors` returns
-nothing, and the export goes to tippecanoe whole. Its retention is flat across the country —
-51.8% in the emptiest quarter of cells against 52.8% in the busiest at z6, all of it
-sub-pixel simplification. A weighting that tilts is the bug, in either direction.
+**Lit pixels are what a reader sees, and every cap loses them at every zoom.** Measured
+by rasterising the tile geometry into a window and counting:
 
-**The three overview bands are capped separately, because they are under different
-pressure.** `far` covers z5-z7 at a cap of 190,000 features, `mid` covers z8-z9 at 450,000,
-and `near` is z10 alone with no cap at all. Banding them together caps the loosest zoom at
-whatever the tightest one needs: a single z8-z10 cap of 381,000 left z10 drawing 411,255
-features where the uncapped build drew 943,040, and z10 has never reached the size limit.
-Great Britain now builds with no band reporting a single tile over that limit, which is the
-whole point — every road that is missing from a zoom is missing on service level.
+| window              | z5   | z6   | z7   |
+| ------------------- | ---- | ---- | ---- |
+| Ireland, Dublin     | 4.7% | 4.6% | 4.5% |
+| GB uncapped, London | 3.8% | 7.0% | 9.3% |
+| GB capped, London   | 2.7% | 3.7% | 3.7% |
+| GB uncapped, Wales  | 1.1% | 1.2% | 1.3% |
+| GB capped, Wales    | 1.0% | 1.0% | 1.0% |
 
-205,000 is too large a cap for `far` once the quota is weighted. The heavier rural share
-carries the longer geometry, and one z5 tile went over the limit at that cap and was thinned
-to 79.3% by density. 190,000 clears it, at 194,021 features once ties at each cell's floor
-are kept.
+At z8 around London the capped archive lit 5.0% against 8.2% uncapped, and the render
+showed the city hollowed into a radial skeleton. Uncapped Great Britain already exceeds
+Ireland's density at z6 and z7; the deficit is z5 alone, 3.8% against 4.7%.
+
+**The counting mistake is the part worth keeping.** A cap keeps many short features
+spread over many cells, and no cap keeps fewer, longer ones. Features per zoom, populated
+cells, features per cell, and bins holding any feature all reward the first, and only the
+second reaches the screen — so four rounds shipped on numbers that rose while the map got
+worse. `wayfare coverage` counts features and inherits the same blind spot.
+
+`--drop-densest-as-needed` remains the only thing thinning a low zoom. It chooses by
+density rather than by service level, which is a genuine fault: on the 2026-08-07 archive
+it shed 922,505 features at z5. It thins only the tiles that will not fit, 18 at z5-z7 and
+4 at z8-z9, where a cap thins the whole country to spare them.
 
 **Tippecanoe applies `-x` before `-j`, so a feature filter naming an excluded attribute
 matches nothing.** Measured on London, `-x trips` with a `-j` filter on `trips` built a
