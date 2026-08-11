@@ -133,7 +133,7 @@ def coverage(con: duckdb.DuckDBPyConnection) -> dict[str, object]:
     `patterns_by_mode` instead.
     """
     live = db.current_feed()
-    owed = f"{live} AND {db.matchable('p')}"
+    owed = f"{live} AND {db.matchable('p', con)}"
     matched, total = db.row(
         con,
         f"""
@@ -166,11 +166,15 @@ def coverage(con: duckdb.DuckDBPyConnection) -> dict[str, object]:
         # going missing is visible: `patterns` rebuilds from whatever selection it
         # was given, so a refresh that lost its `--modes` drops every tram silently
         # and every other number here stays healthy while it does.
+        # A database from before the column reports one bucket rather than nothing, so
+        # the total still reconciles with the rest of the funnel.
         "patterns_by_mode": {
             row[0] or "unknown": row[1]
             for row in con.execute(
                 f"SELECT p.mode, count(*) FROM patterns p WHERE {live} "
                 "GROUP BY p.mode ORDER BY p.mode"
+                if "mode" in db.columns(con, "patterns")
+                else f"SELECT 'unknown', count(*) FROM patterns p WHERE {live}"
             ).fetchall()
         },
         # What a scheduled run needs to know: how much of this feed is still owed

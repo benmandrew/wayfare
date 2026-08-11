@@ -158,15 +158,28 @@ database would have produced.
 
     wayfare publish --region northern_ireland --from-export --out /served/northern_ireland.pmtiles
 
-The same republish carried the `far` band, and its first form was wrong: a single
-national `trips` floor emptied 310 of Great Britain's 655 populated cells and drew the
-cities with black between them. GB was republished uncapped as soon as that was seen, and
-again once the quota became per cell. Great Britain now: z5 98,313 features against 55,983
-uncapped, z6 130,947 against 106,672, z7 168,255 against 157,193, nothing thinned to fit in
-that band, no cell emptied, and z8 upwards unchanged. Both parts of Ireland are under the
-cap and came back feature-for-feature identical at all ten zooms, credit aside. The
-replaced archives are at `/home/ben/archive-backup-20260810/` on the server, with
-checksums.
+The same republish carried the `far` band, and it took three attempts. A single national
+`trips` floor emptied 310 of Great Britain's 655 populated cells. A per-cell floor sharing
+the cap out in proportion to cell size emptied none, carried 1.76x the features of the
+uncapped build at z5, and still drew the cities with black between them — 15 features per
+rural cell at z6 where Ireland, which is under every cap and so is filtered not at all,
+drew 53.
+
+Great Britain was republished on 2026-08-11 at `OVERVIEW_WEIGHT = 0.5`, so a cell's quota
+goes as the square root of what it holds rather than as what it holds. The overview is
+three bands instead of two, each capped for its own pressure: z5-z7 at 190,000 features,
+z8-z9 at 450,000, z10 uncapped. Nothing in the archive is thinned by density at any zoom.
+The emptiest quarter of cells draws 36 features at z5, 41 at z6 and 52 at z8; cells drawing
+under five fell from 28 to 8; z10 carries its full 943,040 features; the archive is 126.6
+MB. Ireland rebuilt feature-for-feature identical at all ten zooms, so neither it nor
+Northern Ireland was touched. The replaced archives are at
+`/home/ben/archive-backup-20260810/` on the server, with checksums.
+
+`wayfare coverage <archive>` is what settled it, and it exists because none of the checks
+being run could tell those three builds apart. Feature counts per zoom rose every time and
+no populated cell was ever empty. It decodes the tile geometry back to longitude and
+latitude and counts what is drawn per cell per zoom, split by how much the cell holds at
+z14. Run it on the archive a publish just wrote.
 
 ## Next — the picture
 

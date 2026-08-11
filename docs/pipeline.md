@@ -534,29 +534,44 @@ features to 81.7%. On the map that drew the dense cities with black between them
 archive was republished uncapped as soon as it was seen, so the fault was live only
 briefly.
 
-**The `far` band's feature cap is now shared out per cell, and every cell keeps the same
-fraction of what it holds.** `config.OVERVIEW_CAP_FAR` is 205,000 features and
-`config.OVERVIEW_CELL` is 0.25 degrees, about 28 km by 17 km at this latitude and 655
-populated *cells* over Great Britain. A cell's quota is the cap over the region's feature
-count, with a minimum of one feature per populated cell, and `trips` decides which features
-within that cell. The floor is therefore local — 1 trip in the countryside to 5,600 in the
-busiest cell, median 218 across Great Britain. 209,493 features survive out of 870,136,
-24.1%, once ties at each cell's floor are kept, and no cell is emptied. The top tenth of
-cells holds 47.8% of the output against 48.7% of the input, so the spatial distribution
-survives, and the worst-served cell holding 20 or more features keeps 22.8% against the
-24.1% average, so no area is singled out. No z5-z7 tile then reaches tippecanoe's 500 KB
-limit and nothing is dropped. z5 carries 98,313 features against 55,983 uncapped, z6
-130,947 against 106,672, z7 168,255 against 157,193. A region already under the cap keeps a
-fraction of one and is not filtered at all, so both parts of Ireland are untouched.
+**A cap is shared out per cell, and a cell's share goes as its feature count to the power
+of `config.OVERVIEW_WEIGHT`.** `config.OVERVIEW_CELL` is 0.25 degrees, about 28 km by 17 km
+at this latitude and 655 populated *cells* over Great Britain. Within a cell `trips` decides
+which roads fill the quota, so the floor is local: 1 trip in the countryside to 12,287 in
+the busiest cell, median 180. Every populated cell keeps at least one feature. A cell whose
+quota exceeds what it holds is given exactly what it holds and the others re-share the
+surplus, without which the cap undershoots by whatever the countryside had no roads to
+spend it on.
 
-214,000 is too large a cap once the quota goes per cell. At that cap the largest z5 tile
-wanted 509,293 bytes against the 500 KB limit, and tippecanoe shed 71,494 features. 205,000
-clears it.
+**Sharing the cap out in proportion to cell size was the second version of the first
+failure, and it also shipped.** A weight of 1.0 gives every cell the same fraction, which
+is the wrong quantity to hold constant: a quarter of a city is still a city and a quarter of
+a country lane is nothing. Measured on the deployed archive, Great Britain's emptiest
+quarter of cells drew 15 features each at z6 and 28 of them drew fewer than five, against
+Ireland's equally-sized rural cells drawing 53. A weight of 0.0 gives every cell the same
+count and fails the other way, taking the busiest tenth of cells to 7.0% of full detail.
+0.5 is what is here. Rural cells go from 32.1% of their features kept to 100%, urban cells
+from 23.7% to 21.2%, and on the map rural cells draw 41 features at z6 against urban cells'
+323.
 
-**Capping z8-z10 as well was tried and withdrawn.** The caps needed to stop the drops
-there take more roads off the map than the drops did. A cap of 381,000 left z10 showing
-411,255 features where the unfiltered build showed 943,040, and z10 was never under
-pressure to begin with.
+Ireland is the reference for what the result should look like, and it is one because none
+of this touches it. At 87,179 features it is under every cap, `_cell_floors` returns
+nothing, and the export goes to tippecanoe whole. Its retention is flat across the country —
+51.8% in the emptiest quarter of cells against 52.8% in the busiest at z6, all of it
+sub-pixel simplification. A weighting that tilts is the bug, in either direction.
+
+**The three overview bands are capped separately, because they are under different
+pressure.** `far` covers z5-z7 at a cap of 190,000 features, `mid` covers z8-z9 at 450,000,
+and `near` is z10 alone with no cap at all. Banding them together caps the loosest zoom at
+whatever the tightest one needs: a single z8-z10 cap of 381,000 left z10 drawing 411,255
+features where the uncapped build drew 943,040, and z10 has never reached the size limit.
+Great Britain now builds with no band reporting a single tile over that limit, which is the
+whole point — every road that is missing from a zoom is missing on service level.
+
+205,000 is too large a cap for `far` once the quota is weighted. The heavier rural share
+carries the longer geometry, and one z5 tile went over the limit at that cap and was thinned
+to 79.3% by density. 190,000 clears it, at 194,021 features once ties at each cell's floor
+are kept.
 
 **Tippecanoe applies `-x` before `-j`, so a feature filter naming an excluded attribute
 matches nothing.** Measured on London, `-x trips` with a `-j` filter on `trips` built a
@@ -576,3 +591,27 @@ without a word. The pattern now allows an exponent.
 All three failures produce an archive that builds, uploads and opens without complaint.
 Counting features, per zoom in the finished archive and per cell in the filtered export, is
 what catches them, and it is the measurement the whole banding rests on.
+
+**A feature count cannot see a hole, and neither can a cell that draws anything at all.**
+Both weightings above passed the checks that were being run. The proportional one drew every
+one of Great Britain's 655 populated cells and carried 1.76x the features of the uncapped
+build at z5, and it still looked like cities in a black field, because a cell holding one
+road counts the same as a cell holding eighty. What separates them is decoding the *Mapbox
+Vector Tile* geometry back to longitude and latitude and counting drawn features per cell
+per zoom, split by how much the cell holds at z14. Under the proportional weight that
+measurement reads 15 features per rural cell against 407 per urban one; under the square
+root it reads 41 against 323.
+
+`wayfare coverage <archive>` is that measurement, and it needs the archive and nothing
+else — no database, no export — so a published file can be checked wherever it ended up.
+It reports features per cell for each quarter of the country, ranked by how much the cell
+holds at z14.
+
+The figure to read is the emptiest quarter's, in features, against a region that is not
+filtered. Great Britain draws 36 features per rural cell at z5 and 52 at z8, and Ireland
+draws 44 and 62. The proportional weight drew 15 at z6 where Ireland drew 53, with 28 rural
+cells under five features against Ireland's 6. The ratio between the busiest quarter and
+the emptiest is reported beside it and is the weaker signal of the two: Great Britain's
+cities are dense enough that its unfiltered z10 sits at 52.2x where Ireland's sits at 10.8x,
+so the two regions cannot be compared on it, and the build that put black between the
+cities read 27.1x at z6 — lower than its own z10, and no worse than what replaced it.

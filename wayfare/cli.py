@@ -16,7 +16,7 @@ from pathlib import Path
 
 import duckdb
 
-from . import acquire, aggregate, config, db, gtfs, logs, match, publish
+from . import acquire, aggregate, config, coverage, db, gtfs, logs, match, publish
 
 log = logs.get("cli")
 
@@ -119,6 +119,28 @@ def main(argv: list[str] | None = None) -> int:
         "the region",
     )
     _archive_args(p)
+
+    p = sub.add_parser(
+        "coverage", help="measure what a built archive actually draws, per cell per zoom"
+    )
+    p.add_argument("archive", type=Path, help="a .pmtiles file")
+    p.add_argument(
+        "--zooms",
+        default=None,
+        metavar="Z,Z,...",
+        help=f"which zooms to measure (default: {config.MIN_ZOOM} up to "
+        f"{config.DETAIL_ZOOM - 1}, the banded overview). Each is measured against "
+        f"z{config.MAX_ZOOM}, which carries the complete network",
+    )
+    p.add_argument(
+        "--cell",
+        type=float,
+        default=None,
+        metavar="DEGREES",
+        help=f"the cell to count over (default: {config.OVERVIEW_CELL}, the same one "
+        "publish shares its quota over)",
+    )
+
     sub.add_parser("status", help="show progress and coverage")
     sub.add_parser(
         "prune", help="drop operator geometry once matching is complete (reclaims space)"
@@ -358,6 +380,19 @@ def _dispatch(args: argparse.Namespace) -> int:
             if pub_con is not None:
                 pub_con.close()
         log.info("done: %s", out)
+        return 0
+
+    if args.cmd == "coverage":
+        zooms = (
+            [int(z) for z in args.zooms.split(",")]
+            if args.zooms
+            else list(range(config.MIN_ZOOM, config.DETAIL_ZOOM))
+        )
+        try:
+            coverage.report(args.archive, zooms, args.cell)
+        except (OSError, RuntimeError, ValueError) as exc:
+            log.error("%s", exc)
+            return 1
         return 0
 
     if args.cmd == "prune":

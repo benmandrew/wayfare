@@ -91,6 +91,42 @@ def test_patterns_gains_mode_empty_rather_than_backfilled(tmp_path: Path):
         con.close()
 
 
+def test_a_read_only_connection_never_migrates_so_the_predicate_must_degrade(
+    tmp_path: Path,
+):
+    """`connect` migrates only when it can write, so a data root that has not been
+    opened for writing since `patterns.mode` landed still has the old schema. Great
+    Britain's did, three days later, and `wayfare status` failed to bind against it --
+    which is the number `deploy/refresh.sh` gates a publish on."""
+    path = tmp_path / "old.duckdb"
+    old = duckdb.connect(str(path))
+    old.execute(db.SCHEMA)
+    old.execute("ALTER TABLE patterns DROP COLUMN mode")
+    old.execute(
+        "INSERT INTO patterns "
+        "(pattern_id, route_id, short_name, n_stops, n_trips, first_seen, last_seen) "
+        "VALUES (1, 'R1', '42', 4, 10, 'F1', 'F1')"
+    )
+    old.close()
+
+    con = db.connect(path, read_only=True)
+    try:
+        assert "mode" not in db.columns(con, "patterns")
+        # Without the connection the predicate names a column that is not there.
+        with pytest.raises(duckdb.Error):
+            db.scalar(con, f"SELECT count(*) FROM patterns p WHERE {db.matchable()}")
+        # With it, every stored row counts as matchable, which is what an old database
+        # means: its loader deleted everything that was not road-going.
+        assert (
+            db.scalar(
+                con, f"SELECT count(*) FROM patterns p WHERE {db.matchable('p', con)}"
+            )
+            == 1
+        )
+    finally:
+        con.close()
+
+
 def test_an_old_database_migrates_and_then_builds(gtfs_dir: Path, tmp_path: Path):
     """The migration on its own proves nothing; what matters is that the next run
     against the migrated file fills the column in and filters on it."""

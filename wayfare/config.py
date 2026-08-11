@@ -494,20 +494,19 @@ DETAIL_ZOOM = 11
 # top tenth of cells went from 48.7% of the map to 81.7% of it. That draws the cities
 # and nothing between them.
 #
-# Each cell keeps the same *fraction* instead -- `cap` over the region's feature count
-# -- with at least one feature per populated cell, and `trips` decides which ones
-# within that cell. The spatial distribution therefore survives: measured on Great
-# Britain, 0 cells emptied and the top tenth holds 47.8% against the input's 48.7%,
-# while the floor itself ranges from 1 trip in the countryside to 5,600 in the busiest
-# cell, median 218. Cities stay dense, the country between them stays drawn, and what
-# is dropped anywhere is the least-served road in that place rather than the
-# least-served road in Britain.
+# Each cell gets its own quota instead, `trips` decides which of that cell's roads
+# fill it, and `OVERVIEW_WEIGHT` decides how big the quota is. Read that next: it is
+# where the second version of this same failure was.
 #
-# Only the far half is capped, because only the far half is in trouble. Measured on
-# the 2026-08-07 Great Britain archive, tippecanoe kept 5.1% of the network at z5 and
-# 14.3% at z7, against 37.6% at z8 and 86.1% at z10. Capping z8-z10 as well was tried
-# and withdrawn: the caps that stop the drops there take more roads off the map than
-# the drops did, and z10 was never under pressure at all.
+# Both halves of the overview are capped. Capping z8-z10 was tried once under the
+# proportional weight and withdrawn, correctly -- at that weight a near cap takes the
+# countryside's roads to buy the cities headroom, which is more damage than the drops
+# it prevents. Under a weight below 1 the objection goes away, because the countryside
+# saturates and cannot be charged for anything: every feature a near cap removes comes
+# out of a cell dense enough to lose it. What it buys is that tippecanoe stops
+# thinning. Measured on the deployed archive, `--drop-densest-as-needed` was cutting
+# z8 to 37.7% of full detail where Ireland, which never trips the size limit, sits at
+# 66.7% -- an even cut, but half the map.
 #
 # The number is measured rather than derived. Tile bytes do not fall as fast as the
 # feature count -- holding Great Britain to 33.0% of its features took the largest z5
@@ -519,7 +518,41 @@ DETAIL_ZOOM = 11
 # by which cities happened to be dense. z5 carries 98,313 features, z6 130,947 and z7
 # 168,255, against 55,983, 106,672 and 157,193 with no cap at all.
 FAR_ZOOM = 8
-OVERVIEW_CAP_FAR = 205_000
+OVERVIEW_CAP_FAR = 190_000
+# Where the capped part of the overview ends. z10 is the only overview zoom that was
+# never under pressure -- tippecanoe kept 86.1% of the network there against 37.6% at
+# z8 -- so it is banded off and handed the export whole. Capping z8-z10 as one band
+# was tried and withdrawn for exactly this: the cap that quietens z8 takes z10 from
+# 943,040 features to 411,255, which is paying for a fixed zoom with a working one.
+MID_ZOOM = 10
+# The cap on z8-z9, or None to hand tippecanoe everything and let
+# `--drop-densest-as-needed` be the only thing standing between the network and the
+# tile size limit. See the note above for why this exists and why it once did not.
+OVERVIEW_CAP_MID: int | None = 450_000
+# How the quota is shared out: a cell's share goes as its feature count to this power.
+#
+# This is the dial the low-zoom map kept swinging between the ends of, and both ends
+# are wrong in a way that looks like the other one's fix.
+#
+#   1.0  every cell keeps the same fraction. The obvious answer, and the one that put
+#        black gaps between Britain's cities: a quarter of a city is still a city, a
+#        quarter of a country lane is nothing. Deployed briefly. Rural cells drew 15
+#        features at z6 where Ireland's equally-sized rural cells drew 53, and 28 of
+#        them held fewer than 5.
+#   0.0  every cell keeps the same count. The correction taken too far -- the cities
+#        go to speckle, the busiest tenth of cells falling to 7.0% of full detail.
+#   0.5  what is here. The countryside keeps everything it has and the cities pay for
+#        it out of density nobody can see: measured on Great Britain, rural cells go
+#        from 32.1% kept to 100%, urban from 23.7% to 21.2%.
+#
+# Ireland is the reference for what the result should look like, and it is a reference
+# precisely because none of this touches it. At 87,179 features it is under every cap,
+# so `_cell_floors` returns nothing and the file goes to tippecanoe whole. Its
+# retention is flat across the country -- 51.8% in the emptiest quarter of cells
+# against 52.8% in the busiest, all of it sub-pixel simplification. A weighting works
+# when Great Britain's profile is flat too; a weighting that tilts is the bug, whether
+# it tilts towards the cities or away from them.
+OVERVIEW_WEIGHT = 0.5
 # The side of the cell the quota is shared out over, in degrees. 0.25 is about 28 km
 # by 17 km at this latitude, and puts 655 cells over Great Britain's network -- fine
 # enough that a town is not averaged in with the city forty miles away, coarse enough

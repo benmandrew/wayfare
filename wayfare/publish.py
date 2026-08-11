@@ -27,7 +27,7 @@ from typing import Any
 
 import duckdb
 
-from . import config, logs
+from . import config, db, logs
 
 log = logs.get("publish")
 
@@ -68,8 +68,7 @@ def export_segments_geojsonl(
     the table fits in memory many times over. `ORDER BY pattern_id` is here for the
     same reason the edge export sorts: a rebuild has to be byte-identical.
     """
-    n = con.execute("SELECT count(*) FROM segments").fetchone()
-    if not n or not n[0]:
+    if not _has_rows(con, "segments"):
         return None
 
     path = path or (config.WORK / "segments.geojsonl")
@@ -405,17 +404,55 @@ def _features(geojsonl: Path) -> Iterator[tuple[bytes, Cell, int]]:
             yield line, cell, int(trips[1])
 
 
-def _cell_floors(geojsonl: Path, cap: int) -> dict[Cell, int]:
+def _quotas(sizes: Mapping[Cell, int], cap: int, weight: float) -> dict[Cell, int]:
+    """Share `cap` features out over the cells, in proportion to size ** weight.
+
+    `weight` is the one dial between the two ways of getting this wrong, and both
+    ends of it have been on the map. At 1 every cell keeps the same *fraction*, which
+    sounds like the fair answer and is not: a quarter of a city is still a city and a
+    quarter of a country lane is nothing. At 0 every cell keeps the same *count*, and
+    the cities go to speckle. See `config.OVERVIEW_WEIGHT` for what each measured.
+
+    A cell can never keep more than it holds, so cells that saturate are given exactly
+    their size and the rest re-share what they did not use. Without that the cap
+    undershoots by whatever the countryside had no features to spend it on, and the
+    cities are thinned to pay for roads that do not exist.
+    """
+    free = set(sizes)
+    quotas: dict[Cell, int] = {}
+    budget = float(cap)
+    # Each pass either settles every remaining cell or retires at least one saturated
+    # one, so this runs at most once per cell.
+    while free:
+        weighted = sum(sizes[c] ** weight for c in free)
+        if weighted <= 0:
+            break
+        scale = budget / weighted
+        full = [c for c in free if scale * sizes[c] ** weight >= sizes[c]]
+        if not full:
+            for c in free:
+                # At least one, so a cell that holds any road at all still draws one.
+                # Rounding alone empties the five sparsest cells in Great Britain.
+                quotas[c] = max(1, round(scale * sizes[c] ** weight))
+            break
+        for c in full:
+            quotas[c] = sizes[c]
+            budget -= sizes[c]
+            free.discard(c)
+    return quotas
+
+
+def _cell_floors(geojsonl: Path, cap: int, weight: float) -> dict[Cell, int]:
     """The `trips` a feature must reach to be drawn, worked out for each cell.
 
     Empty when the file already holds no more than `cap` features, which is what
     keeps this a no-op for a region that never troubles the tile size limit -- both
-    parts of Ireland come through unfiltered and unchanged.
+    parts of Ireland come through unfiltered and unchanged, and are the reference for
+    what an unfiltered map looks like.
 
-    Every cell keeps the same *fraction* of what it holds, so the map's spatial
-    distribution survives the cut and the floor is a local one. See the cap in
-    `config` for what a single national floor did instead, which was to draw the
-    cities and nothing between them.
+    A cell that is allowed to keep everything it holds gets no floor at all rather
+    than a floor of zero, so `_hold_back` waves it through on the `.get` default.
+    Under a `weight` below 1 that is most of the countryside.
 
     A histogram per cell rather than every feature's `trips`: the distinct counts are
     a fraction of the features, and nothing here should scale with the network. Ties
@@ -431,12 +468,13 @@ def _cell_floors(geojsonl: Path, cap: int) -> dict[Cell, int]:
     if total <= cap:
         return {}
 
-    share = cap / total
+    sizes = {cell: sum(hist.values()) for cell, hist in cells.items()}
+    quotas = _quotas(sizes, cap, weight)
     floors: dict[Cell, int] = {}
     for cell, hist in cells.items():
-        # At least one, so a cell that holds any road at all still draws one. Rounding
-        # alone empties the five sparsest cells in Great Britain.
-        quota = max(1, round(share * sum(hist.values())))
+        quota = quotas.get(cell, 0)
+        if quota >= sizes[cell]:
+            continue
         kept = 0
         for trips in sorted(hist, reverse=True):
             kept += hist[trips]
@@ -455,16 +493,24 @@ def _hold_back(geojsonl: Path, out: Path, floors: Mapping[Cell, int]) -> Path:
     if not floors:
         return geojsonl
     kept = 0
+    seen: set[Cell] = set()
     with out.open("wb") as dst:
         for line, cell, trips in _features(geojsonl):
+            seen.add(cell)
             if trips >= floors.get(cell, 0):
                 dst.write(line)
                 kept += 1
     grades = sorted(floors.values())
+    # How many cells were left whole is the number worth watching. It is the
+    # countryside, and the failure this filter keeps being rebuilt around is the
+    # countryside being thinned in proportion to cities that can spare it.
     log.info(
-        "held back to %d features across %d cells; trips floor %d to %d, median %d",
+        "held back to %d features; %d of %d cells thinned, %d kept whole; "
+        "trips floor %d to %d, median %d",
         kept,
         len(floors),
+        len(seen),
+        len(seen) - len(floors),
         grades[0],
         grades[-1],
         grades[len(grades) // 2],
@@ -478,19 +524,21 @@ def build_tiles(
     attribution: str | None = None,
     segments: Path | None = None,
 ) -> Path:
-    """Build the archive in three zoom bands and join them.
+    """Build the archive in four zoom bands and join them.
 
     tippecanoe stores attributes per feature per zoom, and -x is global to a run --
     there is no way to say "keep the road name only where someone might read it" in
-    a single pass. So the two overview bands are built without the four attributes
+    a single pass. So the three overview bands are built without the four attributes
     that exist purely for the info card, the detail band is built with everything,
-    and tile-join concatenates the three into one PMTiles file. The join is cheap.
+    and tile-join concatenates the four into one PMTiles file. The join is cheap.
 
-    The overview is two bands rather than one because only the far half needs the
-    quietest roads held back: below `FAR_ZOOM` the input is cut to
-    `OVERVIEW_CAP_FAR` features, and at `FAR_ZOOM` and above every road is handed
-    over and tippecanoe's own backstop is left to it. See the cap in `config` for
-    what it is measured against and why the choice is not left to tippecanoe.
+    The overview is three bands because the three parts of it are under different
+    amounts of pressure, and a band is the only place a cap can be applied. z5-z7 is
+    cut to `OVERVIEW_CAP_FAR`, z8-z9 to `OVERVIEW_CAP_MID`, and z10 -- which has
+    never troubled the size limit -- is handed the export whole. Banding them
+    together means capping the loosest at whatever the tightest needs. See the caps
+    in `config` for what they are measured against and why the choice is not left to
+    tippecanoe's `--drop-densest-as-needed`.
 
     The holding back is done to the *input* and not with tippecanoe's own `-j`.
     That is not a style preference: `-x` runs first, so a `-j` filter naming an
@@ -537,7 +585,14 @@ def build_tiles(
         # empty input rather than writing an empty archive. Skipping the road bands
         # is the same rule the segments pass already follows, in the other direction.
         if _has_features(geojsonl):
-            far_floors = _cell_floors(geojsonl, config.OVERVIEW_CAP_FAR)
+            far_floors = _cell_floors(
+                geojsonl, config.OVERVIEW_CAP_FAR, config.OVERVIEW_WEIGHT
+            )
+            mid_floors = (
+                _cell_floors(geojsonl, config.OVERVIEW_CAP_MID, config.OVERVIEW_WEIGHT)
+                if config.OVERVIEW_CAP_MID
+                else {}
+            )
             # Only the last band may extend past its own top zoom. `-z` is a ceiling
             # that --extend-zooms-if-still-dropping is allowed to raise, which is
             # harmless when there is nothing above it and silently wrong when there
@@ -553,7 +608,15 @@ def build_tiles(
                     _DETAIL_ONLY,
                     False,
                 ),
-                ("near", config.FAR_ZOOM, config.DETAIL_ZOOM - 1, {}, _DETAIL_ONLY, False),
+                (
+                    "mid",
+                    config.FAR_ZOOM,
+                    config.MID_ZOOM - 1,
+                    mid_floors,
+                    _DETAIL_ONLY,
+                    False,
+                ),
+                ("near", config.MID_ZOOM, config.DETAIL_ZOOM - 1, {}, _DETAIL_ONLY, False),
                 ("detail", config.DETAIL_ZOOM, config.MAX_ZOOM, {}, (), True),
             ]
             for name, lo, hi, floors, exclude, extend in bands:
@@ -752,14 +815,25 @@ def contents(con: duckdb.DuckDBPyConnection) -> dict[str, bool]:
     visible in the picture.
     """
 
-    def any_rows(sql: str) -> bool:
-        row = con.execute(sql).fetchone()
-        return bool(row and row[0])
-
     return {
-        "road": any_rows("SELECT count(*) FROM edge_services"),
-        "operator": any_rows("SELECT count(*) FROM segments"),
+        "road": _has_rows(con, "edge_services"),
+        "operator": _has_rows(con, "segments"),
     }
+
+
+def _has_rows(con: duckdb.DuckDBPyConnection, table: str) -> bool:
+    """Whether a table exists and holds anything.
+
+    A table that is not there reads as empty rather than raising. `segments` post-dates
+    Great Britain's database and `prune` reclaims tables once matching is done, so an
+    older or pruned data root is a normal thing to be handed -- and the exception it
+    used to throw came out of the credit calculation, which failed the publish over a
+    mode the region does not have.
+    """
+    if not db.table_exists(con, table):
+        return False
+    row = con.execute(f"SELECT count(*) FROM {table}").fetchone()  # noqa: S608
+    return bool(row and row[0])
 
 
 def build(

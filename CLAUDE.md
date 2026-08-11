@@ -106,12 +106,21 @@ executemany is ~2,700 rows/s; staging to a file and reading it back is 1.6M/s.
 **What a low zoom holds is chosen before tippecanoe sees it, and it is chosen
 per place.** `--drop-densest-as-needed` picks by density, so it thins cities and
 spares a rural road carrying two buses a week; `publish` therefore holds the quietest
-roads back from the z5–z7 band itself, and a region under `OVERVIEW_CAP_FAR` is not
-filtered at all. **The `trips` floor is per cell and never national.** `trips` is an
-absolute count, so one floor for a whole region ranks it by how urban it is: tried on
-Great Britain it emptied 310 of 655 populated cells and drew the cities with nothing
-between them. Each cell keeps the same fraction instead, so the floor runs from 1 trip
-to 5,600 across the country. Three silent failures guard the rest: tippecanoe applies
+roads back from the overview bands itself, and a region under the caps is not
+filtered at all. **The `trips` floor is per cell and never national, and a cell's
+quota goes as `size ** OVERVIEW_WEIGHT`, never as `size`.** Both of those have been
+live and both drew cities in a black field. One national floor emptied 310 of 655
+populated cells outright. Giving every cell the same *fraction* empties nothing and
+looks the same on the map, because the fraction is the wrong thing to hold constant:
+at 24% the countryside drew 15 features a cell at z6 where Ireland, which is under
+every cap and so is filtered not at all, drew 53. At `OVERVIEW_WEIGHT = 0.5` the
+countryside keeps everything it has and the cities pay 23.7% -> 21.2% for it.
+**Ireland is the control, so measure against it**: its retention is flat across the
+country, and a weighting that tilts is the bug either way round. **Feature counts and
+cell presence cannot see this** — only decoding the tile geometry back to lon/lat and
+counting drawn features per cell per zoom can, which is what `wayfare coverage` does.
+Run it on the archive a publish just wrote, and read the tilt. Three silent failures
+guard the rest: tippecanoe applies
 `-x` before `-j`, so a filter naming an excluded attribute matches nothing and writes
 an empty band; `--extend-zooms-if-still-dropping` treats `-z` as a ceiling it may
 raise, which overlaps the next band and has `tile-join` merge both copies of every
@@ -187,14 +196,28 @@ so a second region acquired into the first's database becomes the current feed a
 
 **All three were republished on 2026-08-10 and every one of them now carries its credit**,
 which closes the CC BY 4.0 and OGL v3.0 breach that serving the earlier archives was. The
-same republish carried the `far` band. Its first form ranked the whole country on one
-`trips` scale and emptied 310 of Great Britain's 655 populated cells, so GB was republished
-uncapped within the hour and again once the quota became per cell: z5 now holds 98,313
-features against 55,983 uncapped, z6 130,947 against 106,672 and z7 168,255 against
-157,193, with no cell emptied and the top tenth of cells holding 47.8% against the input's
-48.7%. z8 upwards is unchanged, and both parts of Ireland are under the cap and came back
-feature-for-feature identical at every zoom. Nothing was re-matched. The archives the
-republish replaced are on the server at `/home/ben/archive-backup-20260810/`.
+same republish carried the `far` band, which then took three more goes to get right —
+a national `trips` floor emptied 310 of 655 cells, and a per-cell floor sharing the cap out
+*in proportion to* cell size emptied none while still drawing 15 features per rural cell
+where Ireland drew 53.
+
+**Great Britain was republished on 2026-08-11 at `OVERVIEW_WEIGHT = 0.5` and four zoom
+bands** (z5-z7 capped at 190,000, z8-z9 at 450,000, z10 and z11-z14 uncapped), 126.6 MB,
+credit intact. No band reports a single tile over tippecanoe's size limit, so nothing in
+the archive is chosen by density any more. Measured with `wayfare coverage`: the emptiest
+quarter of cells draws 36 features at z5, 41 at z6 and 52 at z8 against the previous
+build's 15 at z6, cells drawing under five fell from 28 to 8, and z10 carries its full
+943,040 features. Ireland rebuilt feature-for-feature identical at every zoom, so both it
+and Northern Ireland were left alone. Nothing was re-matched. The archives from before
+2026-08-10 are on the server at `/home/ben/archive-backup-20260810/`.
+
+**Great Britain's database is pre-multi-modal** — no `patterns.mode`, no `segments`, no
+`modes` in `meta` — because `connect` migrates only when it is not read-only and nothing
+has opened it for writing since. `status` and `publish` both connect read-only, and both
+failed against it until `db.matchable` was given a connection and `publish` learnt to read
+a missing table as an empty one. Its archive therefore carries no `segments` layer and a
+road-only credit, both correct for what the database holds. Re-running `patterns` would
+migrate it and give Great Britain its trams, rail and ferries.
 
 Feed churn is measured: two Wales feeds two days apart took 3,584 patterns to 3,541 — 30
 new, 73 departed, about 8 seconds of matching to catch up against 16m23s for the full run.
