@@ -601,7 +601,10 @@ OVERVIEW_WEIGHT = 0.7
 # allocating the quota and nothing else: it never becomes a tile boundary, and the
 # geometry that crosses it is untouched.
 #
-# **This is the setting that decides whether the map is covered.** Within a cell the
+# Dormant along with the caps above, and kept with them. What follows is what it was
+# measured to do while the quota was live.
+#
+# Within a cell the
 # quota goes to the highest `trips`, and the highest `trips` in any cell are in that
 # cell's town centre -- so a cell spends its whole allowance on one spot and draws
 # nothing in between. How much "in between" there is depends entirely on how big the
@@ -625,6 +628,13 @@ OVERVIEW_WEIGHT = 0.7
 # feature, and ties at each floor are kept -- so 130,000 comes out at 192,400, which is
 # what 190,000 over the coarse grid came out at. Same features, 2.4x the places.
 OVERVIEW_CELL = 0.02
+# The cell `wayfare coverage` counts over, which is a reading grain rather than an
+# allocation one and is deliberately not `OVERVIEW_CELL`. Tying the two together made
+# the report unreadable the moment the quota grid went fine: 33,545 cells over Great
+# Britain gives medians of 0 and 2 features and a busiest-to-emptiest ratio of
+# infinity, which says nothing about anything. 0.25 degrees is about 28 km and puts
+# 655 cells over the country, which is few enough for a median to mean something.
+COVERAGE_CELL = 0.25
 # A backstop against one pathological city-centre edge, not a routine truncation.
 #
 # The original 12 assumed a long service list would dominate tile size. It does not:

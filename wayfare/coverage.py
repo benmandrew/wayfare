@@ -279,7 +279,7 @@ def drawn(archive: Path, zoom: int, cell_size: float | None = None) -> dict[Cell
     Counting is the measurement with the blind spot -- see the module docstring. Use
     `draw` to judge how a zoom looks.
     """
-    cell_size = cell_size or config.OVERVIEW_CELL
+    cell_size = cell_size or config.COVERAGE_CELL
     counts: dict[Cell, int] = defaultdict(int)
     with archive.open("rb") as fh:
         tiles, tile_offset = _tiles_at(fh, zoom)
@@ -317,7 +317,7 @@ def bands(
     archive: Path, zooms: list[int], cell_size: float | None = None
 ) -> tuple[dict[Cell, int], list[Band]]:
     """Measure each zoom against `config.MAX_ZOOM`, which is the complete network."""
-    cell_size = cell_size or config.OVERVIEW_CELL
+    cell_size = cell_size or config.COVERAGE_CELL
     reference = drawn(archive, config.MAX_ZOOM, cell_size)
     if not reference:
         raise RuntimeError(

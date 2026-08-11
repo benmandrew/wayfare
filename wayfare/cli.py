@@ -137,8 +137,7 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=None,
         metavar="DEGREES",
-        help=f"the cell to count over (default: {config.OVERVIEW_CELL}, the same one "
-        "publish shares its quota over)",
+        help=f"the cell to count over, in degrees (default: {config.COVERAGE_CELL})",
     )
 
     p = sub.add_parser(
