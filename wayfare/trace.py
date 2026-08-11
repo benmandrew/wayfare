@@ -64,6 +64,10 @@ class Pattern:
     mode: str | None
     short_name: str | None
     names: list[str] = field(default_factory=list)  # normalised, in calling order
+    # Every spelling of each stop the other publisher might have used. Only the
+    # pattern side carries alternates: OSM writes one name per node, and it is
+    # the timetable that qualifies a station by its line -- see `osm.spellings`.
+    spellings: list[frozenset[str]] = field(default_factory=list)
     points: list[tuple[float, float]] = field(default_factory=list)
 
 
@@ -199,6 +203,7 @@ def load_pending(con: duckdb.DuckDBPyConnection, limit: int | None = None) -> li
         p = by_id.get(pattern_id)
         if p is not None and lat is not None and lon is not None:
             p.names.append(osm.normalise(name))
+            p.spellings.append(osm.spellings(name))
             p.points.append((float(lat), float(lon)))
     return [by_id[pid] for pid in ids]
 
@@ -323,7 +328,10 @@ def resolve(p: Pattern, prepared: Prepared, index: dict[str, list[int]]) -> Outc
     if not p.names[0]:
         return Outcome(p.pattern_id, "no_stop_match", detail="first stop has no name")
 
-    seen = set(index.get(p.names[0], [])) | set(index.get(p.names[-1], []))
+    ends = p.spellings[0] | p.spellings[-1] if p.spellings else {p.names[0], p.names[-1]}
+    seen: set[int] = set()
+    for spelling in ends:
+        seen.update(index.get(spelling, []))
 
     best: Outcome | None = None
     reasons: set[str] = set()
@@ -345,7 +353,7 @@ def resolve(p: Pattern, prepared: Prepared, index: dict[str, list[int]]) -> Outc
     # A line that is mapped and does not chain is a different problem from one nobody
     # has mapped, and only this tells them apart -- the broken relation was dropped
     # before any pattern reached it.
-    if p.names[0] in prepared.broken_names or p.names[-1] in prepared.broken_names:
+    if ends & prepared.broken_names:
         reasons.add("chain_break")
     reason = next((r for r in _REASON_RANK if r in reasons), "no_relation")
     return Outcome(
@@ -365,11 +373,12 @@ def _fit(p: Pattern, c: Candidate) -> Outcome | str:
     it loops". Both end as no geometry; only one of them is worth going and looking at.
     """
     worst = "no_sequence"
+    needle = p.spellings or [frozenset({n}) for n in p.names]
     for names, stops, reverse in (
         (c.names, c.relation.stops, False),
         (c.names[::-1], c.relation.stops[::-1], True),
     ):
-        for at in _occurrences(names, p.names):
+        for at in _occurrences(names, needle):
             matched = list(stops[at : at + len(p.names)])
             out = _cut(p, c, matched, reverse)
             if not isinstance(out, str):
@@ -379,18 +388,23 @@ def _fit(p: Pattern, c: Candidate) -> Outcome | str:
     return worst
 
 
-def _occurrences(haystack: list[str], needle: list[str]) -> list[int]:
+def _occurrences(haystack: list[str], needle: list[frozenset[str]]) -> list[int]:
     """Every index where the pattern's stop names run contiguously through a line's.
 
     Every, not the first. A relation that calls at a station twice -- the New
     Addington loop does -- offers more than one placement, and only one of them
     projects in order along the track. Returning the first would refuse the pattern
     on a placement it never had to use.
+
+    Each element of the needle is the set of spellings that stop may go by, and a
+    position matches when the relation's single name is any of them.
     """
     n, m = len(haystack), len(needle)
-    if m == 0 or m > n or not all(needle):
+    if m == 0 or m > n or not all(any(s) for s in needle):
         return []
-    return [i for i in range(n - m + 1) if haystack[i : i + m] == needle]
+    return [
+        i for i in range(n - m + 1) if all(haystack[i + k] in needle[k] for k in range(m))
+    ]
 
 
 def _cut(p: Pattern, c: Candidate, matched: list[osm.Stop], reverse: bool) -> Outcome | str:

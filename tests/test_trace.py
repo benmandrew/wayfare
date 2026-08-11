@@ -105,6 +105,26 @@ def _line() -> dict:
         ("Vauxhall", "vauxhall"),
         ("Edgware Road Station Station", "edgware road"),
         ("Pier Head Ferry Terminal", "pier head"),
+        # The pair that cost the whole DLR on the first national run: OSM names a
+        # PTv2 stop member for its platform, BODS qualifies the same station by its
+        # mode, and neither qualifier appears on the other side.
+        ("Lewisham Platform 6", "lewisham"),
+        ("Lewisham DLR Station", "lewisham"),
+        ("Canary Wharf Platforms 5 & 6", "canary wharf"),
+        ("Canary Wharf DLR Station", "canary wharf"),
+        ("Shadwell DLR", "shadwell"),
+        ("Shadwell Platform 2", "shadwell"),
+        (
+            "Cutty Sark (for Maritime Greenwich) DLR Station",
+            "cutty sark for maritime greenwich",
+        ),
+        (
+            "Cutty Sark for Maritime Greenwich Platform 2",
+            "cutty sark for maritime greenwich",
+        ),
+        # A station whose whole name is a qualifier has to survive being stripped.
+        ("Bank", "bank"),
+        ("Bank Station", "bank"),
         (None, ""),
         ("", ""),
     ],
@@ -255,8 +275,35 @@ def _pattern(names: list[str], points: list[tuple[float, float]]) -> trace.Patte
         mode="metro",
         short_name="V",
         names=[osm.normalise(n) for n in names],
+        spellings=[osm.spellings(n) for n in names],
         points=points,
     )
+
+
+def test_spellings_offer_the_bracketed_disambiguator_both_ways() -> None:
+    """BODS names the line in brackets where OSM lets the relation say which it is."""
+    assert osm.spellings("Edgware Road (Bakerloo)") == {
+        "edgware road bakerloo",
+        "edgware road",
+    }
+    # And where the brackets hold part of the name, the full form survives.
+    assert "cutty sark for maritime greenwich" in osm.spellings(
+        "Cutty Sark (for Maritime Greenwich) DLR Station"
+    )
+
+
+def test_resolve_matches_a_station_the_timetable_qualifies_by_line() -> None:
+    data = _overpass(
+        members=[_stop(1), _stop(2), _stop(3), _way(101, [_A, _B]), _way(102, [_B, _C])],
+        nodes=[
+            _node(1, "Alpha", _A),
+            _node(2, "Edgware Road", _B),
+            _node(3, "Charlie", _C),
+        ],
+    )
+    cands, index = _candidates(data)
+    p = _pattern(["Alpha", "Edgware Road (Bakerloo)", "Charlie"], [_A, _B, _C])
+    assert trace.resolve(p, cands, index).status == "ok"
 
 
 def test_resolve_draws_the_whole_line() -> None:

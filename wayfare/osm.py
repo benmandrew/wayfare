@@ -291,11 +291,24 @@ def _near(a: tuple[float, float], b: tuple[float, float]) -> bool:
 # Pancras -- so the suffix, the full stops and the ampersand all have to go before
 # the two sequences can be compared. Measured: this takes the Victoria line from a
 # partial match to 16 of 16.
+#
+# The platform forms are the ones that are easy to miss, and missing them cost the
+# whole of the DLR on the first national run: a PTv2 stop member is a node on the
+# platform rather than a point for the station, so OSM writes "Lewisham Platform 6"
+# and "Canary Wharf Platforms 5 & 6" where BODS writes "Lewisham DLR Station". Both
+# sides carry a qualifier the other does not, both have to go, and with them gone
+# the two sequences agree 16 for 16. Before the fix every one of the 71 DLR patterns
+# was recorded `no_stop_match` against a relation that chains perfectly.
+#
+# Ordered longest first, because `re` alternation takes the first branch that
+# matches: "rail station" has to be offered before bare "station" or the pass leaves
+# a stranded "rail" behind.
 _SUFFIXES = re.compile(
     r"\s*\b("
+    r"platforms? \d+(?: and \d+)*|"
     r"underground station|rail station|railway station|tram stop|dlr station|"
     r"metro station|light railway station|bus station|ferry terminal|"
-    r"station|halt|stop"
+    r"station|halt|stop|dlr|underground"
     r")\s*$",
     re.I,
 )
@@ -309,17 +322,48 @@ _PUNCT = re.compile(r"[.,()\-/]")
 _SPACE = re.compile(r"\s+")
 
 
+_BRACKETED = re.compile(r"\s*\([^)]*\)")
+
+
+def spellings(name: str | None) -> frozenset[str]:
+    """Every form of a station name the other publisher might have written.
+
+    One name is not enough, because the two publishers disambiguate differently and
+    only one of them does it in the name. There are two Edgware Road stations a few
+    hundred metres apart, so BODS writes "Edgware Road (Bakerloo)" and "Edgware Road
+    (Circle Line)" where OSM writes "Edgware Road" twice and lets the relation say
+    which is which. Flattening the brackets gives "edgware road bakerloo", which
+    matches neither.
+
+    So the bracketed form is offered as well as the flattened one, and a stop matches
+    if *any* spelling agrees. The looser join is safe because it is not the only
+    check: the matched node still has to sit within `TRACE_STOP_MAX_M` of the
+    timetable's own coordinate, which is what keeps Edgware Road apart from Edgware
+    8 km up the Northern line. Brackets are not simply deleted, because sometimes
+    they hold the name -- OSM spells out "Cutty Sark for Maritime Greenwich" in full.
+    """
+    if not name:
+        return frozenset({""})
+    return frozenset({normalise(name), normalise(_BRACKETED.sub("", name))})
+
+
 def normalise(name: str | None) -> str:
     """A station name reduced to what both publishers agree on."""
     if not name:
         return ""
-    s = name.lower().replace("&", " and ")
-    s = _PUNCT.sub(" ", _APOSTROPHE.sub("", s))
-    # Twice, because "Waterloo Underground Station" and "Bank Station" both exist
-    # and so does "Edgware Road Station Station" in one feed's stop register.
-    for _ in range(2):
-        s = _SUFFIXES.sub("", _SPACE.sub(" ", s).strip())
-    return _SPACE.sub(" ", s).strip()
+    s = _SPACE.sub(" ", _PUNCT.sub(" ", _APOSTROPHE.sub("", name.lower()))).strip()
+    s = _SPACE.sub(" ", s.replace("&", " and ")).strip()
+    # Until it stops changing rather than a fixed number of passes: the qualifiers
+    # stack, and "Lewisham DLR Station" needs two while "Cutty Sark for Maritime
+    # Greenwich Platform 2" needs one. Bounded so a pathological name cannot spin,
+    # and a strip that empties the string is refused -- a station called "Bank" or
+    # "Underground" must survive being its own qualifier.
+    for _ in range(4):
+        shorter = _SPACE.sub(" ", _SUFFIXES.sub("", s)).strip()
+        if not shorter or shorter == s:
+            break
+        s = shorter
+    return s
 
 
 # -- geometry ----------------------------------------------------------------
