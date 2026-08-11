@@ -92,6 +92,106 @@ expression `build_patterns` uses, and aborts on any unmapped pattern or hash
 collision, so old and new ids are directly comparable and the churn figure is not a
 migration artefact.
 
+## `trace` against Great Britain, 2026-08-12
+
+The first run of the stage against real data. Bus Open Data Service (BODS) feed
+`20260807_022616`, on a copy of the server's database, so production was untouched.
+
+Work selected is every live non-road pattern carrying no `shape_id`. That is 1,737
+patterns — metro 1,417, ferry 170, tram 77, rail 71 and aerial 2.
+
+| Step | Result |
+|---|---|
+| Overpass | one query over 49.95,-5.27 to 54.13,1.59, **131 MB in 27s** |
+| relations | **1,022** — train 833, subway 97, tram 59, light rail 25, monorail 4, aerialway 2, funicular 2 |
+| chaining | 861 of 1,022 chain cleanly, 117 break, about 40 carry fewer than two stop members |
+| fit | ok **1,127** · no_stop_match 440 · no_relation 170, in **182s** |
+| drawn | 23,134 km of track; `segments` 629 rows -> **1,756** |
+
+One query covers the nation. 27 seconds and 131 MB is the whole national Overpass
+cost, far below what the per-way alternative was feared to cost. The 117 relations
+that do not chain are 94 `route=train`, 12 tram, 7 subway, 2 light rail and 2
+funicular.
+
+| mode | patterns resolved | share of timetabled trips |
+|---|---|---|
+| metro | 1,040 of 1,417 | 86.9% |
+| rail (the Docklands Light Railway) | 42 of 71 | 60.6% |
+| tram | 43 of 77 | 34.2% |
+| aerial | 2 of 2 | 100% |
+| ferry | 0 of 170 | — |
+
+**Ferries are 166 of the 170 `no_relation` rows, and that is the intended outcome.**
+`route=ferry` is deliberately absent from `config.OSM_ROUTE_VALUES`. The project's
+existing rule is that a ferry is drawn from the operator's own trace or not drawn at
+all, because an OSM ferry way is a schematic between two terminals rather than a
+survey of the crossing.
+
+**Every one of the eleven Underground lines comes out within a few percent of its
+published length.** Six can be quoted against a published figure:
+
+| line | drawn | published |
+|---|---|---|
+| Victoria | 21.53 km | 21 km |
+| Waterloo & City | 2.27 km | 2.37 km |
+| Bakerloo | 23.34 km | 23.2 km |
+| Circle | 27.33 km | 27 km |
+| Hammersmith & City | 25.49 km | 25.5 km |
+| Jubilee | 37.19 km | 36.2 km |
+
+The other five draw District 43.42 km, Metropolitan 44.80 km, Piccadilly 47.85 km,
+Central 54.81 km and Northern 36.60 km. Away from the Underground, the DLR's Lewisham
+to Bank is 11.07 km, London Trams' Wimbledon to Beckenham Junction 19.16 km and the
+cable car 1.13 km.
+
+**`trace` needs no detour guard, and that is measured rather than assumed.** Against
+the straight-line chain through its own stops, 1,102 of the 1,127 traces draw between
+1.0 and 1.3 times it, 8 between 1.3 and 1.6, and 13 under 1.0. Four exceed 2.5, and
+all four are the Piccadilly line's Heathrow Terminal 4 loop, which genuinely runs one
+way. A guard of the kind `match` carries would reject those four correct traces and
+nothing else.
+
+**The archive was built in the scratch data root and not deployed.** It comes to 138.8
+MB against production's 137.9 MB, and London at z12 lights 5.3% of its pixels against
+the current archive's 4.5%. The credit reads "Road and track geometry: ©
+OpenStreetMap contributors, Open Database License", which is the widened noun working.
+`patterns_pending` stayed 0 throughout, so trace failures never reached the publish
+gate.
+
+**Two naming conventions cost 414 patterns between them, and the run is what found
+both** (fixed in `5cd1435`).
+
+**Platform and mode qualifiers.** A Public Transport version 2 (PTv2) stop member is a
+node on the platform, so OpenStreetMap writes "Lewisham Platform 6" and "Canary Wharf
+Platforms 5 & 6", where BODS qualifies the same station by mode and writes "Lewisham
+DLR Station" and "Shadwell DLR". Neither qualifier appears on the other side, and one
+mismatched stop refuses the whole contiguous run. That cost every one of the 71 DLR
+patterns, against relations that chain with zero breaks. Fixing it took the DLR from 0
+to 42 and the total from 713 to 755.
+
+**A station needs more than one spelling.** Two Edgware Road stations sit a few hundred
+metres apart, so BODS disambiguates in the name — "Edgware Road (Bakerloo)" — where
+OpenStreetMap writes "Edgware Road" twice and lets the relation say which is which.
+Flattening the brackets matches neither. `osm.spellings` now offers the bracketed and
+the unbracketed form, and a stop matches if any spelling agrees. The looser join is
+safe because the matched node still has to sit within `TRACE_STOP_MAX_M` of the
+timetable's coordinate, which is what keeps Edgware Road apart from Edgware, 8 km up
+the Northern line. This took the total from 755 to 1,127 and the Underground from 668
+to 1,040.
+
+**What is unresolved.** 440 `no_stop_match` rows and 4 `no_relation` rows remain. One
+cause is diagnosed and it is an OpenStreetMap gap rather than a naming problem. The
+Northern line pattern via Bank calls at Kennington, the relation's stop members omit
+it, so the run is not contiguous and the pattern is refused. Whether the rest are the
+same shape is unmeasured. Trams are the weakest mode at 34.2% of trips and nothing has
+been looked into there. 117 relations do not chain, 94 of them `route=train`, which is
+where they will matter once heavy rail has a timetable source.
+
+The stage was designed against a survey of Greater London and ran against the nation
+with no change to its design; what it turned out to need was two spellings of a station
+name. Until the remaining 440 refusals are triaged there is no way to tell a mapping
+gap from a convention neither publisher has written down.
+
 ## Determinism
 
 All three art styles are byte-identical run to run, which none of them were. Ties

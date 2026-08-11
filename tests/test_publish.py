@@ -853,7 +853,7 @@ def test_a_database_without_a_segments_table_still_publishes():
     con.execute("CREATE TABLE edge_services (edge_id BIGINT)")
     con.execute("INSERT INTO edge_services VALUES (1)")
 
-    assert publish.contents(con) == {"road": True, "operator": False}
+    assert publish.contents(con) == {"road": True, "operator": False, "track": False}
     assert publish.export_segments_geojsonl(con) is None
 
 
@@ -1152,14 +1152,14 @@ def test_the_credit_follows_what_the_archive_actually_holds(con, tmp_path, monke
     either wrong is a licence statement that is false and invisible in the picture."""
     from wayfare import db
 
-    assert publish.contents(con) == {"road": False, "operator": False}
+    assert publish.contents(con) == {"road": False, "operator": False, "track": False}
 
     db.set_meta(con, "feed_version", "F1")
     _tram(con, 1, [-2245000, -2240000], [53480000, 53481000])
-    assert publish.contents(con) == {"road": False, "operator": True}
+    assert publish.contents(con) == {"road": False, "operator": True, "track": False}
 
     _edge(con, 5, ["42"])
-    assert publish.contents(con) == {"road": True, "operator": True}
+    assert publish.contents(con) == {"road": True, "operator": True, "track": False}
 
 
 def _stub_tippecanoe(monkeypatch, calls):

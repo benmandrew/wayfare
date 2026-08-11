@@ -58,7 +58,17 @@ class Credit:
 # The one credit that is not a property of any feed. Every map-matched edge is an
 # OpenStreetMap way, so an archive holding them is a derived database whatever the
 # timetable's licence says. Named here because it is the same for every region.
-OPENSTREETMAP = Credit("Road geometry", "OpenStreetMap contributors", ODBL, OSM_COPYRIGHT)
+#
+# Only the noun varies, and it has to: since `wayfare trace` an archive may hold OSM
+# geometry that is track rather than road -- the Underground drawn from route
+# relations -- and an archive holding only that would credit "Road geometry" for a
+# tube tunnel. Which noun applies is `config.credit_parts`'s to decide, because only
+# it knows what was built.
+def openstreetmap(what: str = "Road geometry") -> Credit:
+    return Credit(what, "OpenStreetMap contributors", ODBL, OSM_COPYRIGHT)
+
+
+OPENSTREETMAP = openstreetmap()
 
 
 # --- Rendering ----------------------------------------------------------------

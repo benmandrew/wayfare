@@ -186,6 +186,98 @@ feed and never on `matchable`. Northern Ireland has no non-bus routes and was no
 touched. The replaced archives are at `work/previous-great_britain.pmtiles` and
 `/home/ben/archive-backup-20260810/` on the server.
 
+## Done — the Underground and the DLR drawn from OSM
+
+**`wayfare trace`, a sixth stage between `match` and `aggregate`** (2026-08-11). Great
+Britain's `route_type=1` is 54 routes, 61,288 trips and 1,525 patterns, and 1,417 of
+those patterns (92.9%) carry no `shape_id`; `route_type=2` is three routes, all of them
+the Docklands Light Railway (DLR), 71 patterns, none with a shape. Seventeen named
+lines arrive with a full stop sequence and no geometry — the Underground (41 line
+records, 11 named lines, 58,560 trips), the DLR (6,630 trips), London Trams, West
+Midlands Metro, Blackpool, the Air-Rail Link and the IFS Cloud Cable Car — and both
+existing geometry paths refuse them, since there is no road under a tube tunnel and
+nothing in `shapes` to copy. The new stage draws them from OpenStreetMap route
+relations, whose `role=""` members are already in route order and already join end to
+end, so a pattern's geometry is a cut of its line's chain: no snapping, no shortest
+path, no Markov model. `wayfare/osm.py` is the Overpass client, the relation parser,
+the chain walk, the name normalisation and the projection; `wayfare/trace.py` is the
+stage. `trace_status` and `traces` are new tables on `match_status`'s design, a
+permanent cache selected by the absence of a row, with `transport_error` as the one
+retryable status. `aggregate.build_segments` now unions `shapes` and `traces`, kept
+disjoint by `shape_id IS NULL` so `segments` keeps its primary key, and the operator's
+own recording always wins where there is one. `publish.contents` gained `track`,
+computed from `segments JOIN traces`, which widens the ODbL noun to "Track geometry" or
+"Road and track geometry" — an archive of tube tunnels is derived from OSM with no
+matched edge in it. `deploy/refresh.sh` runs `wayfare trace --retry transient` after
+the publish gate and lets it fail.
+
+The relations were surveyed before the stage was written, against BODS
+`20260806_022608` and one Overpass query over Greater London. 556 route relations;
+every Underground line, the DLR (5 masters), London Trams (3) and the Elizabeth line
+(5) carry a `route_master`; chain walks with zero breaks on Victoria (24 ways, 21.69 km
+against an official 21 km), Central (125 ways, 54.75 km), Jubilee (59 ways, 37.15 km)
+and the DLR's Lewisham to Stratford (81 ways, 11.02 km). The 1,417 Underground patterns
+are 459 distinct station sequences over 11 lines, every one a contiguous sub-path of
+its line. There is no `naptan:AtcoCode` on any Underground stop node, so the join is by
+normalised name with a coordinate check: 16 of 16 Victoria line stops match, 15 of them
+within 150 m, the worst being Highbury & Islington at 216 m where the timetable's point
+is the National Rail entrance and the node is the tube platform.
+
+**Run against Great Britain** (2026-08-12), feed `20260807_022616`, on a copy of the
+server's database so that production stayed untouched. 1,737 live non-road patterns
+carry no `shape_id`, and one Overpass query over their bounding box returned 131 MB and
+1,022 route relations in 27 seconds — the whole national fetch cost. 861 of those
+relations chain cleanly. The fit resolved 1,127 patterns in 182 seconds, 23,134 km of
+track, and took `segments` from 629 rows to 1,756: metro 1,040 of 1,417 patterns and
+86.9% of its trips, the DLR 42 of 71 and 60.6%, tram 43 of 77 and 34.2%, the cable car
+2 of 2. Ferries draw nothing, which is 166 of the 170 `no_relation` rows and is correct
+— `route=ferry` is deliberately outside `config.OSM_ROUTE_VALUES`, because an OSM ferry
+way is a schematic between terminals. All eleven Underground lines come out within a
+few percent of published length, and the archive built from the scratch root is 138.8
+MB against production's 137.9 MB, credit widened to "Road and track geometry". It has
+not been deployed. 655 tests pass, ruff and mypy are clean. Figures in
+`docs/results.md`.
+
+The run found two naming conventions, both now fixed in `5cd1435`. A stop member is a
+node on the platform, so OSM writes "Lewisham Platform 6" where BODS qualifies by mode,
+"Lewisham DLR Station"; that cost all 71 DLR patterns and took the total from 713 to
+755. And a station needs more than one spelling, because BODS disambiguates the two
+Edgware Roads in the name where OSM lets the relation do it; offering both the
+bracketed and the unbracketed form took the total from 755 to 1,127.
+
+**What the run leaves open.** 440 `no_stop_match` and 4 `no_relation` rows remain, and
+only one cause is diagnosed: the Northern line pattern via Bank calls at Kennington and
+the relation's stop members omit it, so the run is not contiguous and is refused. That
+is an OSM gap rather than a naming problem, and whether the other 439 are the same
+shape is unmeasured. Trams are the weakest mode at 34.2% of trips and nothing has been
+looked into there. 117 relations do not chain, 94 of them `route=train`, which is the
+mode where they will matter.
+
+## Next — National Rail
+
+**GB heavy rail is absent from BODS.** All three `route_type=2` routes in the national
+bundle are the DLR, so nothing in the timetable this project ingests describes a
+National Rail service. Adding one means a second timetable source, and the two halves
+of the problem are in very different shape.
+
+The geometry is the solved part. Network Rail's Infrastructure Network Model is OGL
+v3.0, free and needs no account: 49,274 track links and 1,411 Engineer's Line References
+(ELRs) in EPSG:27700, quoted at ±0.5 m. OSM corroborates it — `ref` is a genuine ELR on
+98.3% of the 65,972 `usage=main|branch` running-line ways — so there are two independent
+surveys of where the track goes.
+
+The blocker is the timetable join. A Common Interface File (CIF) schedule keys every
+location on a Timing Point Location (TIPLOC) code, and TIPLOC is on 34 of 90,811 rail
+ways and 164 of 3,648 station nodes. `ref:crs`, the three-letter Computer Reservation
+System station code, is on 2,857 station nodes (78.3%) and on no ways at all. So the
+chain is TIPLOC to CRS to station node to track, and its first hop needs a crosswalk —
+Network Rail's CORPUS or the Rail Delivery Group's RSPS5046 — which has never been
+verified to exist openly.
+
+The licence question comes before any of that. RDG's licence is not OGL and has a
+separate production tier, and Network Rail caps access at 1,000 users. Everything this
+project ingests today is OGL v3.0 or CC BY 4.0.
+
 ## Next — the picture
 
 **Decide whether `coalesce` becomes the default for `density`.** The flag exists and

@@ -79,35 +79,59 @@ def build_segments(con: duckdb.DuckDBPyConnection) -> None:
     `pattern_stops`. A departed tram stops being drawn on the next run, which is the
     same rule `edge_services` follows.
 
-    A non-road pattern with no shape gets no row and is simply not drawn. That is
-    the "bad geometry is worse than missing geometry" rule applied to the one case
-    where inventing would be easy: the stops are known, and a straight line between
-    them would render perfectly happily down the wrong side of a river.
+    Two sources, and the operator's own wins. Where the feed carries a trace that
+    recording is of where the *vehicle* goes; an OSM relation is a survey of where
+    the track is, which is the same line for a tram and not quite the same line for
+    anything with a depot or a turnback. The `wayfare trace` arm therefore only
+    covers the patterns with no `shape_id` at all -- which is what keeps the two arms
+    disjoint, and what lets `segments` keep its primary key on `pattern_id`.
+
+    A non-road pattern with neither gets no row and is simply not drawn. That is the
+    "bad geometry is worse than missing geometry" rule applied to the one case where
+    inventing would be easy: the stops are known, and a straight line between them
+    would render perfectly happily down the wrong side of a river.
     """
     con.execute("DELETE FROM segments")
     con.execute(f"""
         INSERT INTO segments
-        SELECT p.pattern_id, p.mode, s.lon_e6, s.lat_e6,
-               list_min(s.lon_e6), list_min(s.lat_e6),
-               list_max(s.lon_e6), list_max(s.lat_e6)
-        FROM patterns p
-        JOIN shapes s ON s.shape_id = p.shape_id
-        WHERE {db.current_feed()} AND NOT {db.matchable()}
+        WITH geom AS (
+            SELECT p.pattern_id, p.mode, s.lon_e6, s.lat_e6
+            FROM patterns p
+            JOIN shapes s ON s.shape_id = p.shape_id
+            WHERE {db.current_feed()} AND NOT {db.matchable()}
+            UNION ALL
+            SELECT p.pattern_id, p.mode, t.lon_e6, t.lat_e6
+            FROM patterns p
+            JOIN traces t ON t.pattern_id = p.pattern_id
+            WHERE {db.current_feed()} AND NOT {db.matchable()}
+              AND p.shape_id IS NULL
+        )
+        SELECT pattern_id, mode, lon_e6, lat_e6,
+               list_min(lon_e6), list_min(lat_e6),
+               list_max(lon_e6), list_max(lat_e6)
+        FROM geom
     """)
-    drawn, missing = db.row(
+    drawn, traced, missing = db.row(
         con,
         f"""
         SELECT (SELECT count(*) FROM segments),
                (SELECT count(*) FROM patterns p
+                JOIN traces t ON t.pattern_id = p.pattern_id
                 WHERE {db.current_feed()} AND NOT {db.matchable()}
-                  AND p.shape_id IS NULL)
+                  AND p.shape_id IS NULL),
+               (SELECT count(*) FROM patterns p
+                WHERE {db.current_feed()} AND NOT {db.matchable()}
+                  AND p.shape_id IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM traces t WHERE t.pattern_id = p.pattern_id))
         """,
     )
     if drawn or missing:
         log.info(
-            "%d non-road patterns drawn from operator geometry, "
-            "%d have none and are not drawn",
+            "%d non-road patterns drawn (%d of them from OSM route relations), "
+            "%d have no geometry from either source and are not drawn",
             drawn,
+            traced,
             missing,
         )
 
@@ -214,6 +238,49 @@ def coverage(con: duckdb.DuckDBPyConnection) -> dict[str, object]:
                 SELECT m.status, count(*) FROM match_status m
                 JOIN patterns p USING (pattern_id) WHERE {live}
                 GROUP BY m.status
+                """
+            ).fetchall()
+        },
+        "traced": _traced(con, live),
+    }
+
+
+def _traced(con: duckdb.DuckDBPyConnection, live: str) -> dict[str, object]:
+    """What `wayfare trace` owes and what it has drawn, kept out of the funnel.
+
+    Out of it deliberately, and for the reason `patterns_by_mode` is out of it: the
+    funnel counts matchable patterns, and every pattern counted here is one Valhalla
+    will never be asked about. Folding an unresolvable relation into
+    `patterns_pending` would put a permanent floor under the number
+    `deploy/refresh.sh` gates a publish on, which is exactly the mistake the mode
+    filter already made once.
+
+    A database with no `trace_status` table reports nothing rather than raising.
+    `status` connects read-only, so a data root that has not been opened for writing
+    since this stage landed still has the old schema -- the same trap `db.matchable`
+    carries a connection to survive.
+    """
+    if not db.table_exists(con, "trace_status"):
+        return {}
+    owed = f"{live} AND NOT {db.matchable('p', con)} AND p.shape_id IS NULL"
+    pending = db.scalar(
+        con,
+        f"""
+        SELECT count(*) FROM patterns p WHERE {owed}
+          AND NOT EXISTS (SELECT 1 FROM trace_status t
+                          WHERE t.pattern_id = p.pattern_id)
+        """,
+    )
+    return {
+        "patterns_owed": db.scalar(con, f"SELECT count(*) FROM patterns p WHERE {owed}"),
+        "patterns_pending": pending,
+        "by_status": {
+            row[0]: row[1]
+            for row in con.execute(
+                f"""
+                SELECT t.status, count(*) FROM trace_status t
+                JOIN patterns p USING (pattern_id) WHERE {live}
+                GROUP BY t.status
                 """
             ).fetchall()
         },

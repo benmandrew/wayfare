@@ -177,6 +177,58 @@ CREATE TABLE IF NOT EXISTS segments (
     max_lat_e6  INTEGER
 );
 
+-- Stage 2b: track drawn from OpenStreetMap route relations --------------------
+
+-- One row per non-road pattern the tracer has considered, always, exactly as
+-- `match_status` is one row per matchable pattern. This is the checkpoint and the
+-- cache: work is selected by the *absence* of a row here, so a relation that does
+-- not resolve is recorded rather than re-fetched every run.
+--
+-- The statuses are permanent but the last, for the reason `match_status`'s are:
+--   ok             the relation chained and its stops matched the pattern's
+--   no_relation    nothing in the fetched set carries this pattern's stop sequence
+--   chain_break    the relation's ways do not form one continuous path
+--   no_stop_match  a relation matched by mode and area, but not stop for stop
+--   not_monotonic  the stops matched but project out of order along the chain,
+--                  which is what a loop or a doubled-back relation does; the
+--                  geometry would be a confident line down the wrong branch
+--   skipped        fewer than two stops, so there is nothing to fit
+--   error          a bug or a malformed response; permanent until the code changes
+--   transport_error  the request never got an answer, so nothing was learned
+CREATE TABLE IF NOT EXISTS trace_status (
+    pattern_id   BIGINT PRIMARY KEY,
+    status       VARCHAR,
+    relation_id  BIGINT,   -- the OSM relation it resolved to, where one did
+    osm_route    VARCHAR,  -- the relation's `route` tag: subway | train | tram | ...
+    n_ways       INTEGER,
+    n_stops      INTEGER,  -- pattern stops matched to relation stop nodes
+    worst_stop_m DOUBLE,   -- furthest a matched stop sits from its OSM node
+    length_m     DOUBLE,
+    detail       VARCHAR,
+    traced_at    TIMESTAMP
+);
+
+-- The geometry that came back, for the patterns where it did.
+--
+-- Separate from `edges` and deliberately so. These way ids are OpenStreetMap's and
+-- are durable, but they carry no Valhalla GraphId -- nothing routed them -- and
+-- `edges.edge_id` is that GraphId and the primary key. Minting synthetic values
+-- into it would break the one invariant the pipeline rests on. Keyed on pattern_id
+-- for the same reason `segments` is: there is exactly one path per pattern.
+--
+-- `way_ids` is kept although nothing draws it. It is the durable identity of what
+-- was drawn, it is what a later decision to invert relation track into
+-- edge->services would build on, and it is the evidence for the ODbL credit this
+-- table makes the archive owe.
+CREATE TABLE IF NOT EXISTS traces (
+    pattern_id  BIGINT PRIMARY KEY,
+    relation_id BIGINT,
+    way_ids     BIGINT[],
+    -- Micro-degree integer lists, exactly as `edges` and `segments` store geometry.
+    lon_e6      INTEGER[],
+    lat_e6      INTEGER[]
+);
+
 -- Free-form key/value for provenance: feed version, OSM extract date, the Valhalla
 -- graph build id that edge_id values belong to.
 CREATE TABLE IF NOT EXISTS meta (

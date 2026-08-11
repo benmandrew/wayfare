@@ -172,7 +172,11 @@ def archive_name(region: str | None = None) -> str:
 
 
 def credit_parts(
-    region: str | None = None, *, road: bool = True, operator: bool = False
+    region: str | None = None,
+    *,
+    road: bool = True,
+    operator: bool = False,
+    track: bool = False,
 ) -> tuple[licences.Credit, ...]:
     """Everything a picture of this region owes an acknowledgement to.
 
@@ -200,6 +204,15 @@ def credit_parts(
     licence, so it needs naming rather than crediting separately -- and naming it
     matters, because this is the wording that says what each credit covers.
 
+    `track` is the second way OpenStreetMap gets into an archive, and it owes the
+    same ODbL for a different reason. `road` means Valhalla matched a service onto
+    OSM ways; `track` means `wayfare trace` copied an OSM route relation's own
+    geometry, which is what draws the Underground. They are independent -- a
+    rail-only region has track and no road -- so both set the ODbL credit and
+    together they only widen its noun. Getting that noun wrong is not cosmetic: an
+    archive of nothing but tube tunnels crediting "Road geometry" describes data it
+    does not hold.
+
     The basemap is not here. It belongs to the page that chooses it, not to the data,
     and a render carries no basemap at all.
     """
@@ -208,16 +221,27 @@ def credit_parts(
         "Routes, timetables and operator geometry" if operator else "Routes and timetables"
     )
     parts = [licences.Credit(what, f.attribution, f.licence)]
-    if road:
-        parts.append(licences.OPENSTREETMAP)
+    if road or track:
+        geometry = (
+            "Road and track geometry"
+            if road and track
+            else "Track geometry"
+            if track
+            else "Road geometry"
+        )
+        parts.append(licences.openstreetmap(geometry))
     return tuple(parts)
 
 
 def credit_html(
-    region: str | None = None, *, road: bool = True, operator: bool = False
+    region: str | None = None,
+    *,
+    road: bool = True,
+    operator: bool = False,
+    track: bool = False,
 ) -> str:
     """This region's credit, rendered for a map attribution control."""
-    return licences.html(credit_parts(region, road=road, operator=operator))
+    return licences.html(credit_parts(region, road=road, operator=operator, track=track))
 
 
 def credit_lines(
@@ -226,16 +250,23 @@ def credit_lines(
     links: bool = True,
     road: bool = True,
     operator: bool = False,
+    track: bool = False,
 ) -> tuple[str, ...]:
     """This region's credit as plain text, one line per thing being credited."""
-    return licences.lines(credit_parts(region, road=road, operator=operator), links=links)
+    return licences.lines(
+        credit_parts(region, road=road, operator=operator, track=track), links=links
+    )
 
 
 def credit_text(
-    region: str | None = None, *, road: bool = True, operator: bool = False
+    region: str | None = None,
+    *,
+    road: bool = True,
+    operator: bool = False,
+    track: bool = False,
 ) -> str:
     """This region's credit with the links spelled out, for anywhere HTML is not read."""
-    return licences.text(credit_parts(region, road=road, operator=operator))
+    return licences.text(credit_parts(region, road=road, operator=operator, track=track))
 
 
 # Geofabrik rebuilds these daily. Valhalla downloads its own copy at graph-build
@@ -457,6 +488,61 @@ SEQ_PARTITIONS = int(os.environ.get("WAYFARE_SEQ_PARTITIONS", "16"))
 # Results are committed this often. Smaller means less lost work when the server is
 # restarted mid-run; larger means fewer write transactions.
 CHECKPOINT_EVERY = 200
+
+# --- Tracing from OSM route relations ---------------------------------------
+
+# Overpass, not the OSM API. `trace` needs to *discover* relations over an area
+# rather than fetch one it already knows the id of, and only Overpass answers that.
+# One request per run returns every route relation in the region with its member
+# geometry inline, which is why the quota this endpoint meters is affordable here
+# where it would not be for a per-relation walk.
+OVERPASS_URL = os.environ.get("WAYFARE_OVERPASS", "https://overpass-api.de/api/interpreter")
+OVERPASS_TIMEOUT = 600.0
+# The `[timeout:]` Overpass itself is asked to honour, which is a different number
+# for a different party: ours bounds how long we wait for the socket, this bounds how
+# long the server will spend before giving up and saying so.
+OVERPASS_QUERY_TIMEOUT = 540
+
+# Every `type=route` value worth fetching. Deliberately wider than the modes that
+# will be traced, because the discriminator is the stop-sequence join and not this
+# list: the Elizabeth line is tagged `route=train` rather than `subway`, so a set
+# written from the obvious names misses it entirely and the failure looks like
+# missing data rather than a wrong filter. Costing a few thousand extra relations in
+# one request is the cheaper mistake.
+OSM_ROUTE_VALUES = (
+    "subway",
+    "light_rail",
+    "tram",
+    "train",
+    "monorail",
+    "funicular",
+    "aerialway",
+)
+
+# Roles that name a calling point in a PTv2 relation. `platform` is deliberately
+# absent: a platform member is a way or a node beside the track, and leaving the
+# platform roles in the *way* chain produces 11 to 25 spurious breaks per relation,
+# which reads as broken mapping rather than as a filter mistake.
+OSM_STOP_ROLES = ("stop", "stop_entry_only", "stop_exit_only")
+
+# How far a timetabled stop may sit from the OSM node it matched, in metres.
+# Calibrated against a measurement rather than intuition: over the Victoria line 15
+# of 16 stops land within 150 m, and the exception is Highbury & Islington at 216 m,
+# where the GTFS point is the National Rail entrance and the OSM node is the tube
+# platform. A large interchange is exactly where the two disagree most, so the bound
+# has to clear that case; 400 m does, and is still far under the ~1.2 km spacing
+# between Underground stations.
+TRACE_STOP_MAX_M = 400.0
+# How far apart two consecutive projections along the chain may sit before the match
+# is refused as out of order. A relation that loops -- the New Addington branch is
+# one -- projects a later stop *behind* an earlier one, and slicing between them
+# draws a confident line down the wrong side of the loop.
+TRACE_MONOTONIC_SLACK_M = 250.0
+# Two OSM ways are joined when their endpoints are this close. They should be the
+# same node and therefore identical to the 1e-7 degree Overpass prints, so this is a
+# rounding guard rather than a tolerance; anything larger would start welding genuine
+# gaps shut.
+TRACE_JOIN_TOLERANCE_M = 1.0
 
 # --- Publishing ------------------------------------------------------------
 

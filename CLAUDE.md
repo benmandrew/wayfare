@@ -4,8 +4,9 @@ Dataset of public transport routes across these islands: Great Britain from
 DfT BODS, the Republic of Ireland from the National Transport Authority, and
 Northern Ireland from Translink through OpenDataNI. Bus and coach are snapped
 to the road network; tram, metro, rail and ferry are drawn from the operator's
-own shape. Two consumers: an interactive web map (hover a road, see which
-services use it) and artistic renderings of areas.
+own shape, or from an OSM route relation where the operator publishes none. Two
+consumers: an interactive web map (hover a road, see which services use it) and
+artistic renderings of areas.
 
 ## Where the detail lives
 
@@ -15,7 +16,7 @@ the area they cover — most of them record something that was a bug first.
 
 - `docs/data.md` — the feeds, their sizes and traps, mode filtering, coverage gaps,
   attribution.
-- `docs/pipeline.md` — the five stages, storage, DuckDB lessons, clustering, tiles.
+- `docs/pipeline.md` — the stages, storage, DuckDB lessons, clustering, tiles.
 - `docs/rendering.md` — `art`: the style/spec split, streaming, banding, coalescing,
   where a render's time actually goes, the `/art` endpoint and the studio page.
 - `docs/results.md` — measured runs: Wales, Greater London, Great Britain, feed churn.
@@ -25,11 +26,12 @@ the area they cover — most of them record something that was a bug first.
 
 ## Architecture
 
-Five stages, each reading what the last wrote, each independently re-runnable:
+Six stages, each reading what the last wrote, each independently re-runnable:
 
     acquire  -> raw downloads
     patterns -> 1.55M trips collapse to distinct ordered stop sequences
     match    -> Valhalla; the stage that runs for a day or two
+    trace    -> OSM route relations for the modes with no road and no shape
     aggregate-> invert pattern->edges into edge->services
     publish  -> GeoJSONL -> tippecanoe -> PMTiles
 
@@ -139,6 +141,14 @@ check that looks at pixels. Test that the order is *defined*, not that two runs 
 confident-looking line down a road no bus uses. `low_confidence` rows are kept so they
 are never retried, but their edges are dropped.
 
+**`trace` refuses a relation that does not chain, or stops that do not run in order
+along it.** It cuts a pattern's geometry out of an OSM route relation's own chain, so
+it snaps nothing and has no confidence score to fall back on. A break in the chain and
+a sequence that turns round partway both draw confident track no service runs — a loop
+takes the wrong branch — so both end as an outcome in `trace_status` and write nothing
+to `traces`. That table is a permanent cache like `match_status`, `transport_error` is
+its one retryable status, and trace failures never gate a publish.
+
 **A licence condition travels with the data, not with the page.** `publish` stamps the
 credit into the archive's own tileset metadata, derived from `config.Feed`, so a copied
 archive keeps it and the viewer, which loads every archive it is offered onto one
@@ -181,7 +191,7 @@ timestamp, no path, no version, or the byte-identical tests are a fiction.
 
 **Great Britain is complete end to end**, on the server, feed `20260807_022616`: 52,554
 patterns, 95.9% matched, 2,746,261 edges, 129.5 MB PMTiles. Wales and Greater London were
-the two rehearsals for it and both stand. 546 tests pass, ruff and mypy clean.
+the two rehearsals for it and both stand. 655 tests pass, ruff and mypy clean.
 
 **Both parts of Ireland are complete end to end**, on the server, against one shared
 Valhalla graph `3.8.3/1786309727` built from the 409 MB island extract. The Republic on
@@ -213,13 +223,15 @@ and 16,833 edges reachable from no bus at all — because `aggregate` filtered o
 live feed and never on `matchable`. Those are gone, which is why the edge count fell to
 2,729,428.
 
-**Great Britain's database is pre-multi-modal** — no `patterns.mode`, no `segments`, no
-`modes` in `meta` — because `connect` migrates only when it is not read-only and nothing
-has opened it for writing since. `status` and `publish` both connect read-only, and both
-failed against it until `db.matchable` was given a connection and `publish` learnt to read
-a missing table as an empty one. Its archive therefore carries no `segments` layer and a
-road-only credit, both correct for what the database holds. Re-running `patterns` would
-migrate it and give Great Britain its trams, rail and ferries.
+**Great Britain's database is multi-modal**: `patterns.mode`, a `segments` table and all
+ten modes in `meta.modes`. An earlier note here said otherwise and was stale.
+
+**`trace` has run nationally** (2026-08-12), on a copy of the server's database, so
+production is untouched. 1,127 of 1,737 geometry-less patterns are drawn from OSM route
+relations, 23,134 km of track, 86.9% of Underground trips and 60.6% of the DLR's;
+`segments` goes 629 rows to 1,756. One Overpass query costs 131 MB and 27 seconds
+nationally. Ferries resolve to nothing by design. 440 patterns still find no stop match,
+and trams are the weakest mode at 34.2% of trips.
 
 Feed churn is measured: two Wales feeds two days apart took 3,584 patterns to 3,541 — 30
 new, 73 departed, about 8 seconds of matching to catch up against 16m23s for the full run.
