@@ -718,8 +718,12 @@ def _tippecanoe(
         "--drop-densest-as-needed",
         # Line simplification is what makes national coverage tractable, but at max
         # zoom the geometry should be the real road.
-        "--simplification=4",
+        f"--simplification={config.SIMPLIFICATION}",
         "--no-simplification-of-shared-nodes",
+        # Left at tippecanoe's default until it was measured. It is a Mapbox hosting
+        # limit rather than anything about the format, and this archive is served off
+        # a box over range requests, so it is ours to set.
+        f"--maximum-tile-bytes={config.MAX_TILE_BYTES}",
     ]
     if extend:
         cmd.append("--extend-zooms-if-still-dropping")

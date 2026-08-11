@@ -460,6 +460,27 @@ CHECKPOINT_EVERY = 200
 
 # --- Publishing ------------------------------------------------------------
 
+# How hard tippecanoe simplifies a line below the maximum zoom, in tile units. Lower
+# keeps more of the road's shape and costs bytes; the maximum zoom is never simplified,
+# so this is about z5-z13 only.
+#
+# 4 was tippecanoe's default and was never measured. The archive has room for less at
+# the zooms where anyone looks closely: the largest z12 tile is 116 KB against the
+# 500 KB limit, z13 50 KB and z14 18 KB, so those bands are using a fraction of what
+# they may. z10 and z11 have less to give, at 366 KB and 308 KB.
+SIMPLIFICATION = 4
+# The per-tile ceiling that decides when `--drop-densest-as-needed` fires.
+#
+# tippecanoe's default is 500,000, which is a Mapbox hosted-service limit rather than
+# anything in the vector tile format -- the spec sets no size at all. This archive is
+# served off one machine over HTTP range requests, so nothing rejects a larger tile and
+# the number is a choice about fetch and decode time.
+#
+# It binds hard at the low zooms and only there. Measured on Great Britain, the largest
+# z5 tile wanted 1.50 MB and was cut to 406 KB, z8 wanted 0.79 MB and z9 0.55 MB, while
+# nothing at z10 or above reached the limit at all. Raising it is the only way to give
+# z5-z9 more detail, because they are already at the ceiling rather than under it.
+MAX_TILE_BYTES = 500_000
 MIN_ZOOM = 5
 MAX_ZOOM = 14
 # Below this zoom the archive carries geometry and `n` and nothing else.

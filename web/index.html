@@ -191,6 +191,26 @@ a.btn { text-decoration: none; }
 }
 .spin { color: var(--muted); font-size: 12px; }
 
+/* --- zoom readout --- */
+/* Which zoom you are on is the first question whenever the map looks wrong,
+   because what a zoom holds is decided per band: z5-z7, z8-z9, z10 and z11-z14
+   are four separate tippecanoe runs over four different inputs. It sits with the
+   scale bar, which answers the other "where am I" question, and it names the tile
+   zoom as well as the camera's -- above the archive's maximum every tile is the
+   maximum zoom's, overzoomed, and that is worth being able to see. */
+.zoomlevel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  color: var(--text);
+  padding: 2px 7px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.6;
+}
+.zoomlevel .tiles { color: var(--muted); }
+
 /* --- credits --- */
 /* One control carries the lot: the basemap's line, and each source's own
    attribution, which for the bus archive is stamped into the tiles themselves.
@@ -749,8 +769,58 @@ function start(missing) {
 
   offerRegions(map, missing);
 
+  /* ---------- zoom readout ---------- */
+
+  // The deepest zoom any loaded archive carries. Past it MapLibre keeps drawing,
+  // overzooming the deepest tiles it has, so the camera's zoom and the zoom the
+  // geometry came from stop agreeing -- which is exactly when someone is trying
+  // to work out why detail stopped arriving.
+  function maxArchiveZoom() {
+    const zooms = REGIONS.map((r) => r.header && r.header.maxZoom).filter(
+      (z) => typeof z === "number",
+    );
+    return zooms.length ? Math.max(...zooms) : null;
+  }
+
+  class ZoomLevelControl {
+    constructor(maxZoom) {
+      this._maxZoom = maxZoom;
+    }
+    onAdd(map) {
+      this._map = map;
+      this._el = document.createElement("div");
+      this._el.className = "maplibregl-ctrl zoomlevel";
+      this._el.title = "Camera zoom, and the zoom the tiles being drawn came from";
+      this._el.setAttribute("aria-live", "off");
+      this._update = () => {
+        const z = map.getZoom();
+        // MapLibre asks a vector source for floor(zoom), and stops at the
+        // source's own maximum rather than requesting tiles that do not exist.
+        const tiles =
+          this._maxZoom === null
+            ? Math.floor(z)
+            : Math.min(Math.floor(z), this._maxZoom);
+        this._el.innerHTML =
+          "z" +
+          z.toFixed(1) +
+          (tiles === Math.floor(z)
+            ? ""
+            : ' <span class="tiles">tiles z' + tiles + "</span>");
+      };
+      map.on("zoom", this._update);
+      this._update();
+      return this._el;
+    }
+    onRemove() {
+      this._map.off("zoom", this._update);
+      this._el.remove();
+      this._map = undefined;
+    }
+  }
+
   map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom-right");
   map.addControl(new maplibregl.ScaleControl({ maxWidth: 90, unit: "metric" }), "bottom-left");
+  map.addControl(new ZoomLevelControl(maxArchiveZoom()), "bottom-left");
   // Last, and bottom-left, for two reasons. A corner stacks its controls in the
   // order they were added, so adding the credit after the scale bar puts it
   // nearest the bottom edge -- which is the strip still free once the info card

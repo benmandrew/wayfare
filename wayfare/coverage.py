@@ -587,3 +587,52 @@ def draw(
         100 * lit,
     )
     return lit
+
+
+def sizes(archive: Path) -> dict[int, list[int]]:
+    """Every tile's stored size, per zoom, read from the directory alone.
+
+    No tile is decompressed, so this is a pass over the index rather than the file.
+    The sizes are what PMTiles stores, which is what a client fetches over a range
+    request and what tippecanoe's limit is applied to.
+    """
+    per: dict[int, list[int]] = defaultdict(list)
+    with archive.open("rb") as fh:
+        for zoom in range(0, 24):
+            found, _ = _tiles_at(fh, zoom)
+            if found:
+                per[zoom] = [entry.length for entry, _, _, _ in found]
+            fh.seek(0)
+    return dict(per)
+
+
+def report_sizes(archive: Path, limit: int | None = None) -> dict[int, int]:
+    """Log how much of the per-tile budget each zoom is using. Returns the maxima.
+
+    The gap between the median and the maximum is the thing to read. Great Britain's
+    median z11 tile is 3 KB against a 308 KB worst case, so the budget is set by a
+    handful of tiles over central London while the rest of the country has two orders
+    of magnitude spare -- detail added everywhere is priced by the worst tile, and
+    detail added only where there is room is nearly free.
+
+    A zoom sitting just under the limit is not headroom. It means
+    `--drop-densest-as-needed` pushed it there, and the only way to give that zoom
+    more is to raise `config.MAX_TILE_BYTES`.
+    """
+    limit = limit or config.MAX_TILE_BYTES
+    per = sizes(archive)
+    log.info("%s: tile sizes against the %d KB limit", archive.name, round(limit / 1024))
+    peaks = {}
+    for zoom in sorted(per):
+        v = sorted(per[zoom])
+        peaks[zoom] = v[-1]
+        log.info(
+            "z%-2d %6d tiles  total %6.1f MB  median %5.0f KB  max %5.0f KB  %5.2fx spare",
+            zoom,
+            len(v),
+            sum(v) / 1e6,
+            v[len(v) // 2] / 1024,
+            v[-1] / 1024,
+            limit / max(v[-1], 1),
+        )
+    return peaks

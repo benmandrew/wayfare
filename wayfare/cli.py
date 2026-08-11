@@ -423,6 +423,7 @@ def _dispatch(args: argparse.Namespace) -> int:
             else list(range(config.MIN_ZOOM, config.DETAIL_ZOOM))
         )
         try:
+            coverage.report_sizes(args.archive)
             coverage.report(args.archive, zooms, args.cell)
         except (OSError, RuntimeError, ValueError) as exc:
             log.error("%s", exc)
