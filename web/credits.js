@@ -17,27 +17,25 @@ const BASEMAP_CREDIT =
   '<a href="https://carto.com/attributions">CARTO</a> · ' +
   '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
 
-// Fold the credit down to its (i), which `compact: true` alone does not do.
+// Fold the credit down to its (i) before it is ever drawn open, which
+// `compact: true` alone does not do.
 //
-// MapLibre's own _updateCompact adds `maplibregl-compact-show` alongside the
-// compact class the first time it runs against a non-empty credit, so the panel
-// loads *open* and folds away only on the first drag -- and a map nobody drags
-// never gets there. Removing the one class is the library's own collapse, the
-// body of the _updateCompactMinimize it binds to `drag`; the `open` attribute is
-// deliberately left alone, because the container is a <details> whose button
-// lives in the summary and stays open whichever way the panel is folded.
+// MapLibre's _updateCompact adds `maplibregl-compact-show` *alongside* the
+// compact class, and only on the run where it first adds compact -- a run it
+// skips while the container is still `maplibregl-attrib-empty`, so the panel
+// opens itself when the first source's metadata lands. Adding the compact class
+// here, straight after the control is added, is the guard that run tests first:
+// finding it already present, it never adds the show class at all, and the
+// button then owns the panel from the first frame. Waiting for `idle` and
+// removing the show class also folds it, but only after a visible flash of the
+// open panel.
 //
-// On `idle` rather than straight after the control is added: until a source
-// reports a credit the container is `maplibregl-attrib-empty`, which
-// _updateCompact skips, and it then adds both classes when that source's
-// metadata lands. Idle is the point every source has reported in, so nothing
-// arrives afterwards to re-open what this closed. The user is not fought for it
-// -- the panel starts open, so the only click available before idle is the one
-// that agrees with us.
+// The container is a <details> and `open` is set to match: MapLibre's own folded
+// state is open-without-compact-show, because the button lives in the summary
+// and the CSS, not the element, hides the credit body.
 function collapseCredit(map) {
-  map.once("idle", () => {
-    for (const el of map.getContainer().querySelectorAll(".maplibregl-ctrl-attrib")) {
-      el.classList.remove("maplibregl-compact-show");
-    }
-  });
+  for (const el of map.getContainer().querySelectorAll(".maplibregl-ctrl-attrib")) {
+    el.classList.add("maplibregl-compact");
+    el.setAttribute("open", "");
+  }
 }

@@ -855,7 +855,8 @@ function start(missing) {
   // deduplicated by MapLibre, so there is nothing to assemble here.
   //
   // `compact` gets the button but not the closed state -- see collapseCredit,
-  // which is what makes the line above true on load rather than after a drag.
+  // which is what makes the line above true from the first frame rather than
+  // after a flash of the open panel.
   map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-left");
   collapseCredit(map);
 

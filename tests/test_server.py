@@ -828,9 +828,8 @@ def test_both_pages_take_the_basemap_credit_from_one_place():
 
 def test_both_pages_fold_the_credit_away_on_load():
     """`compact: true` buys the (i) button and not the closed state -- MapLibre
-    opens the panel as soon as a source reports a credit and folds it away only on
-    the first drag. Every map has to close it once, so a third one added later is
-    the thing this catches."""
+    opens the panel itself as soon as a source reports a credit. Every map has to
+    start it closed, so a third one added later is the thing this catches."""
     assert "function collapseCredit" in (WEB / "credits.js").read_text()
     for page in PAGES:
         assert "collapseCredit(" in (WEB / page).read_text()
