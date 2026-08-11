@@ -1,12 +1,14 @@
 # wayfare
 
-wayfare builds a dataset of bus routes snapped to the real road network across these
-islands: Great Britain from Department for Transport (DfT) Bus Open Data Service (BODS)
-open data, the Republic of Ireland from the National Transport Authority, and Northern
-Ireland from Translink through OpenDataNI. A timetable says which stops a service calls
-at, not which roads the bus drives down. So
-wayfare resolves each route onto OpenStreetMap (OSM) way identifiers and inverts the
-result: every road segment carries the list of services that use it.
+wayfare builds a dataset of public transport routes across these islands: Great
+Britain from Department for Transport (DfT) Bus Open Data Service (BODS) open data, the
+Republic of Ireland from the National Transport Authority, and Northern Ireland from
+Translink through OpenDataNI. A timetable says which stops a service calls at, not which
+roads the bus drives down. So for bus and coach, the default selection and the bulk of
+the data, wayfare resolves each route onto OpenStreetMap (OSM) way identifiers and
+inverts the result: every road segment carries the list of services that use it. A tram,
+metro, rail or ferry route has no road under it, and is drawn from the trace its
+operator published instead.
 
 Two artefacts come out. The first is a *PMTiles* archive — a single-file archive of map
 tiles — behind an interactive map, where hovering a road lists the service numbers on
@@ -34,14 +36,17 @@ Each stage reads what the last one wrote, and each re-runs on its own.
   Nodes (NaPTAN) stop register. The bundle comes from BODS for every region except
   `ireland`, which comes from the NTA and skips NaPTAN, since NaPTAN covers only GB.
 - **patterns** (`gtfs.py`). The timetable collapses to distinct ordered stop sequences,
-  in DuckDB.
+  in DuckDB. `--modes` chooses which of the ten modes in `config.MODES` reach the
+  database; the default is bus and coach, and the selection is remembered in
+  `meta.modes`.
 - **match** (`match.py`, `valhalla.py`). Each pattern becomes an ordered list of road
-  edges. This is the long stage; it is interruption-safe and resumes from its last
-  committed batch.
+  edges. Road modes only; `db.matchable` keeps the rest away from Valhalla. This is the
+  long stage; it is interruption-safe and resumes from its last committed batch.
 - **aggregate** (`aggregate.py`). Pattern-to-edges inverted to edge-to-services, keyed on
-  the public service number rather than the GTFS `route_id`.
+  the public service number rather than the GTFS `route_id`. Every non-road pattern's
+  operator shape is copied into `segments`, which is how a tram or a ferry gets drawn.
 - **publish** (`publish.py`). One GeoJSON feature per line, then tippecanoe to
-  `bus.pmtiles`.
+  `bus.pmtiles`. The roads are one tile layer and the segments another.
 - **art** (`art.py`). A bounding box or named preset to PNG or SVG, in one of three
   styles: `density`, `spectrum` or `strands`. A PNG is drawn in horizontal bands, one
   process per core, which is about three times faster over a national window and
@@ -121,7 +126,7 @@ or finds it already there.
 
 The credit also reaches the map. `wayfare publish` stamps it into the PMTiles archive's
 own tileset metadata, along with OpenStreetMap's ODbL credit for the road geometry,
-which every region owes because every road segment is an OSM way. Putting it there
+which an archive owes wherever a route was matched onto an OSM way. Putting it there
 rather than on the page is what makes it survive a copy to someone else's bucket. The
 viewer and the art page's window picker both read it out of the archive and show it in
 the map's attribution control, so an archive built for one region credits that region's

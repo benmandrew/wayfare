@@ -329,6 +329,28 @@ a nightly job with a half-hour budget spends it on the busiest roads first, so a
 partially drained queue degrades gracefully. `publish` can be spread by rebuilding
 one region's PMTiles per night, which the multi-region viewer already supports.
 
+## aggregate
+
+**A non-road mode has no road under it, so it is never matched and is drawn from the
+operator's own trace.** `db.matchable` is the predicate that keeps a tram, a metro, a
+train or a ferry away from Valhalla, and `aggregate.build_segments` is what draws it
+instead: one row in `segments` for each live non-road pattern, holding the shape its
+operator published, in the same integer micro-degrees `edges` uses. That path has no
+matcher, no routing and no snapping in it. A recording is the best geometry available
+for a mode with no way in the graph, and it is a survey rather than a schematic —
+Metrolink's traces run to a median 474 points against the bus feed's 849. A route
+therefore gets its geometry one of two ways. The mode decides which.
+
+**`segments` is rebuilt outright rather than merged, and a pattern with no shape gets
+no row.** The table is derived from `patterns` and `shapes` and costs one
+`INSERT ... SELECT` to recompute, where a match costs a Valhalla call and is cached for
+ever, so it holds the current feed only exactly as `pattern_stops` does and a departed
+tram stops being drawn on the next run. Missing geometry is left missing for the reason
+the match section already gives: the stops are known, so a straight line between two of
+them would draw perfectly happily down the wrong side of a river. Great Britain's
+ferries are the worked example, 244 of 416 patterns carrying a trace and the other 172
+drawing nothing at all, and docs/data.md has the reasoning for that mode in particular.
+
 ## Storage
 
 **Storage is one DuckDB file** (`work/wayfare.duckdb`). DuckDB rather than SQLite
@@ -476,6 +498,20 @@ z5-z7 and reads a filtered copy of the export, `near` covers z8-z10 and reads al
 `detail` covers z11-z14. The first two exclude the card-only attributes, which is how the
 z11+ confinement above is implemented. Splitting the low zooms into their own *band* is
 what lets them take a different input from the rest.
+
+**A region with non-road modes gets a fourth pass, and its segments go in a layer of
+their own.** The two layers carry different attributes and are drawn differently: the
+viewer colours a road by how many distinct services use it, and a segment by its mode,
+with a legend listing the modes actually drawn. `tile-join` keeps distinct layer names,
+so the second layer costs one tippecanoe pass and nothing else. That pass covers z5-z14
+in one band rather than three. Banding exists to keep info-card attributes off millions
+of edges at zooms nobody reads them at and to thin the quietest roads out of the far
+view; Great Britain holds 630 segments against 2.7M edges, and a tram line thinned out
+of its own layer would only be missing. Either half can be absent, and each is skipped
+rather than joined in empty: a bus-only region gets no segments pass, and a region with
+no matched edges gets no road bands, because tippecanoe exits 110 on an empty input
+rather than writing an empty archive. Irish Rail on its own is 331 patterns and not one
+of them is a road.
 
 **`--drop-densest-as-needed` chooses by spatial density, so it thins cities hardest and
 leaves a rural road carrying two buses a week alone.** On the Great Britain archive

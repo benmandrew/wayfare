@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "wayfare"
 version = "0.1.0"
-description = "UK bus routes snapped to the road network"
+description = "Public transport routes across Great Britain and Ireland"
 requires-python = ">=3.12"
 dependencies = [
     "requests>=2.32",

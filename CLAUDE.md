@@ -1,10 +1,11 @@
 # wayfare
 
-Dataset of bus routes snapped to the road network across these islands: Great
-Britain from DfT BODS, the Republic of Ireland from the National Transport
-Authority, and Northern Ireland from Translink through OpenDataNI. Two consumers:
-an interactive web map (hover a road, see which buses use it) and artistic
-renderings of areas.
+Dataset of public transport routes across these islands: Great Britain from
+DfT BODS, the Republic of Ireland from the National Transport Authority, and
+Northern Ireland from Translink through OpenDataNI. Bus and coach are snapped
+to the road network; tram, metro, rail and ferry are drawn from the operator's
+own shape. Two consumers: an interactive web map (hover a road, see which
+services use it) and artistic renderings of areas.
 
 ## Where the detail lives
 
@@ -136,8 +137,9 @@ are never retried, but their edges are dropped.
 credit into the archive's own tileset metadata, derived from `config.Feed`, so a copied
 archive keeps it and the viewer, which loads every archive it is offered onto one
 map, shows all of their credits together in the one control.
-Every region owes two credits: the timetable's publisher, and OpenStreetMap under ODbL
-for the geometry. `pmtiles.Protocol` needs `{ metadata: true }` or MapLibre never sees
+Every archive owes the timetable's publisher, and owes OpenStreetMap under ODbL only
+where a route was matched onto its ways, which `publish.contents` reads off the
+database. `pmtiles.Protocol` needs `{ metadata: true }` or MapLibre never sees
 any of it, which looks like a viewer crediting only its basemap rather than an error.
 Every render stamps the same credit into its own PNG or SVG metadata, unconditionally,
 and nothing that varies between two renders of one request may join it there — no

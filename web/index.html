@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Wayfare — bus routes on the road network</title>
+<title>Wayfare — public transport routes</title>
 <!-- The basemap is on another origin, so its first tile pays a DNS lookup, a TCP
      handshake and a TLS handshake before a byte of it moves. None of that needs
      anything from this page, so it can overlap the 803 KB library download
@@ -222,7 +222,7 @@ a.btn { text-decoration: none; }
 </head>
 <body>
 
-<div id="map" role="application" aria-label="Map of bus services by road segment"></div>
+<div id="map" role="application" aria-label="Map of public transport services"></div>
 
 <div class="stack stack--tl">
   <div class="panel">
@@ -232,7 +232,7 @@ a.btn { text-decoration: none; }
         <!-- Not "UK": the Republic of Ireland is one of the regions, and every
              region on the map shares this line. A single named region overwrites
              it with its own name. -->
-        <div class="sub" id="sub">Bus services by road segment</div>
+        <div class="sub" id="sub">Services by road, and by route where there is no road</div>
       </div>
       <a class="btn" href="art.html" title="Draw the network as a picture">Art</a>
       <button class="btn" id="theme" title="Toggle light/dark" aria-label="Toggle light or dark theme">Dark</button>
@@ -242,24 +242,24 @@ a.btn { text-decoration: none; }
       <select class="btn" id="region" title="Jump to a region" aria-label="Jump to a region" hidden></select>
     </div>
     <div class="search">
-      <label class="sr-only" for="q">Filter by bus number</label>
-      <input id="q" type="search" placeholder="Filter by bus number, e.g. 42, X57" autocomplete="off" spellcheck="false" aria-describedby="hint">
+      <label class="sr-only" for="q">Filter by service number</label>
+      <input id="q" type="search" placeholder="Filter by service number, e.g. 42, X57" autocomplete="off" spellcheck="false" aria-describedby="hint">
       <!-- The match count is written here as you type, so it has to be announced
            rather than merely updated. Polite: it should not interrupt a keystroke. -->
       <div class="hint" id="hint" role="status" aria-live="polite">Press <b>/</b> to search.</div>
     </div>
     <div class="help" id="help" hidden>
-      <p>Most lines are a road segment — a stretch of road between two junctions. Colour and thickness both show <b>how many distinct bus services</b> use it, so trunk corridors stand out from the tail.</p>
+      <p>Most lines are a road segment — a stretch of road between two junctions. Colour and thickness both show <b>how many distinct bus and coach services</b> use it, so trunk corridors stand out from the tail.</p>
       <p>Trams, metros, trains and ferries have no road under them, so they are drawn from the operator's own trace and coloured by mode instead of by service count. The key below lists the ones on this map.</p>
-      <p>Hover a line for its service list. Filtering matches whole bus numbers, so <code>4</code> will not match <code>42</code>.</p>
+      <p>Hover a line for its service list. Filtering matches whole service numbers, so <code>4</code> will not match <code>42</code>.</p>
       <p>Zoomed out, the map thins the densest areas to keep tiles small, so a
-         quiet-looking city is not necessarily a city without buses. Zoom in for
+         quiet-looking city is not necessarily a city without services. Zoom in for
          the complete picture.</p>
     </div>
   </div>
 
   <div class="panel legend">
-    <div class="legend-title">Bus services per road</div>
+    <div class="legend-title">Services per road</div>
     <div class="ramp" id="ramp"></div>
     <div class="ticks"><span>1</span><span>6</span><span>12</span><span>24</span><span>40+</span></div>
     <!-- Filled in from what is actually drawn, and hidden until something is.
@@ -271,7 +271,7 @@ a.btn { text-decoration: none; }
 
 <div class="stack stack--tr">
   <div class="panel card" id="card">
-    <p class="road empty" id="road">Hover a road to see its bus services.</p>
+    <p class="road empty" id="road">Hover a line to see what runs on it.</p>
     <div class="meta" id="meta"></div>
     <div class="chips" id="chips"></div>
     <div class="note" id="note" hidden></div>
@@ -541,9 +541,9 @@ function offerRegions(map, missing) {
   if (missing) {
     $("sub").textContent =
       `${REGIONS.length} region${REGIONS.length === 1 ? "" : "s"}, ${missing} unavailable` +
-      ` — bus services by road segment`;
+      ` — public transport services`;
   } else if (REGIONS.length === 1 && here.length === 1) {
-    $("sub").textContent = `${regionLabel(here[0].name)} — bus services by road segment`;
+    $("sub").textContent = `${regionLabel(here[0].name)} — public transport services`;
   }
   if (here.length < 2) return; // nowhere to jump to
 
@@ -725,7 +725,7 @@ function start(missing) {
     // Take the floor from the archives themselves, not a constant: a hardcoded
     // 4.6 sat *below* z5, and MapLibre floors the map zoom to pick a tile level,
     // so every view between 4.6 and 5 asked for z4, got nothing, and drew the
-    // basemap alone. That reads as "this region has no buses", not as a limit.
+    // basemap alone. That reads as "this region has no services", not as a limit.
     //
     // The deepest floor of the several, not the shallowest: at a zoom one archive
     // cannot answer, its region alone goes blank, which is the same lie told about
