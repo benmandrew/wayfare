@@ -7,11 +7,16 @@
 # check rather than surfacing on the next release, without ever putting
 # unreviewed code on Docker Hub.
 #
-# Nothing is built or published until `check.yml` is green. Format, lint, types
-# and tests run first, as a called workflow rather than a parallel one, so there
-# is no window in which an image on Docker Hub is newer than the last passing
-# check. The cost is that a red check hides the Dockerfile result for that run;
-# the build is one `needs` away once the check is fixed.
+# Nothing is published until `check.yml` is green, so there is no window in which
+# an image on Docker Hub is newer than the last passing check. The gate sits on
+# the `push` job rather than on `build`, which is what lets the Dockerfile build
+# alongside the checks instead of after them: a pull request never publishes, so
+# waiting for the check before building one bought nothing and cost 34s of every
+# run. On a publishing run the `push` job rebuilds from the layer cache `build`
+# just wrote, and only then pushes.
+#
+# The cost is unchanged from before: a red check hides the Dockerfile result for
+# that run. It now surfaces sooner, because `build` no longer waits.
 #
 # Two repository secrets are required:
 #   DOCKERHUB_USERNAME  the Docker Hub account
@@ -36,6 +41,11 @@ env:
   # ref it is aimed at, so without this a manual run from a feature branch would
   # overwrite `latest` with unreviewed code. Gating the push itself, rather than
   # the trigger, is what makes that impossible.
+  #
+  # The `push` job repeats this expression in its `if` rather than reading it
+  # from here. The `env` context is not available to a job-level `if`, only to a
+  # step-level one, and a job guarded by an expression that is always empty runs
+  # every time.
   PUBLISH: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
 
 # A second push to the same branch makes the first one's image irrelevant.
@@ -49,8 +59,9 @@ jobs:
   check:
     uses: ./.github/workflows/check.yml
 
+  # No `needs`, so this runs alongside `check` rather than behind it. It never
+  # pushes; that is the `push` job's business.
   build:
-    needs: check
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -61,31 +72,11 @@ jobs:
       # export one.
       - uses: docker/setup-buildx-action@v3
 
-      - id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - if: env.PUBLISH == 'true'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64
-          push: ${{ env.PUBLISH == 'true' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          push: false
           # mode=max, not the default min: the expensive work is in the
           # `tippecanoe` and `deps` stages, which compile from source and then
           # get discarded. min caches only the layers of the final image, so
@@ -104,3 +95,49 @@ jobs:
           # free either way.
           cache-from: type=gha
           cache-to: ${{ env.PUBLISH == 'true' && 'type=gha,mode=max' || '' }}
+
+  # Everything that touches Docker Hub, and the only job the check gates. It
+  # needs `build` as well, so a Dockerfile that does not build is never the
+  # thing a green check appears to bless.
+  push:
+    needs: [check, build]
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Reads the cache `build` wrote a moment ago and writes none of its own:
+      # every layer is already there, so this resolves to a push rather than a
+      # build. Re-running the action, rather than handing an image between the
+      # two jobs, is what keeps that transfer out of the run -- the alternative
+      # is an artifact uploaded and downloaded to move something both runners
+      # can fetch from the layer cache for nothing.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
