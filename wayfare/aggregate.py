@@ -63,6 +63,7 @@ def build(con: duckdb.DuckDBPyConnection) -> None:
     )
     log.info("%d edges carry %d edge-service pairs", n_edges, n_rows)
     build_segments(con)
+    build_track_services(con)
 
 
 def build_segments(con: duckdb.DuckDBPyConnection) -> None:
@@ -285,3 +286,54 @@ def _traced(con: duckdb.DuckDBPyConnection, live: str) -> dict[str, object]:
             ).fetchall()
         },
     }
+
+
+def build_track_services(con: duckdb.DuckDBPyConnection) -> int:
+    """Invert relation track from per-pattern into per-way: which lines use this rail.
+
+    `segments` draws one polyline per pattern, so two services over one stretch of
+    the West Coast Main Line are two coincident lines and nothing can be asked which
+    services use a given piece of track. This is the same inversion `edge_services`
+    performs for roads, keyed one level up the identifier stack: straight on
+    `way_id`, because nothing routed this track and there is no Valhalla GraphId to
+    key on. `way_id` is also the more durable of the two -- an `edge_id` is valid
+    only within one graph build.
+
+    **Only patterns this pipeline built from a relation are inverted**, which is
+    what `route_id LIKE 'osm:r%'` is doing, and leaving it out would ship a
+    confident lie. `trace` records `way_ids` as the whole candidate chain rather
+    than the ways inside the slice it cut, so a Northern line short working from
+    Edgware to Kennington is stored against every way of the Northern line. That is
+    harmless while the column only documents what was drawn; inverted, it attributes
+    a service to track it never runs on. An `osmroutes` pattern *is* its whole
+    relation, so for those the two are the same thing by construction.
+
+    `n_trips` sums to NULL rather than to zero where no timetable has been
+    attributed, because zero trips a week and an unknown number of trips a week are
+    different claims and only one of them is true.
+    """
+    con.execute("DELETE FROM track_services")
+    con.execute(f"""
+        INSERT INTO track_services
+        SELECT way_id, short_name, agency_id,
+               count(DISTINCT pattern_id)                  AS n_patterns,
+               CASE WHEN count(n_trips) = 0 THEN NULL
+                    ELSE sum(n_trips) END                  AS n_trips
+        FROM (
+            -- The subquery is what gives the fallback a name GROUP BY can refer
+            -- to without repeating the expression, exactly as `build` does above.
+            SELECT u.way_id, p.pattern_id, p.agency_id, p.n_trips,
+                   COALESCE(NULLIF(trim(p.short_name), ''), p.route_id) AS short_name
+            FROM traces t
+            JOIN patterns p USING (pattern_id)
+            CROSS JOIN unnest(t.way_ids) AS u(way_id)
+            WHERE {db.current_feed()} AND NOT {db.matchable()}
+              AND p.route_id LIKE 'osm:r%'
+        )
+        GROUP BY way_id, short_name, agency_id
+    """)
+    n_ways, n_rows = db.row(
+        con, "SELECT count(DISTINCT way_id), count(*) FROM track_services"
+    )
+    log.info("%d ways carry %d track-service pairs", n_ways, n_rows)
+    return int(n_rows)

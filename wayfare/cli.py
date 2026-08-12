@@ -12,11 +12,25 @@ import argparse
 import json
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import duckdb
 
-from . import acquire, aggregate, config, coverage, db, gtfs, logs, match, publish, trace
+from . import (
+    acquire,
+    aggregate,
+    config,
+    coverage,
+    db,
+    gtfs,
+    logs,
+    match,
+    osmroutes,
+    publish,
+    railtrips,
+    trace,
+)
 
 log = logs.get("cli")
 
@@ -124,6 +138,49 @@ def main(argv: list[str] | None = None) -> int:
         "alias for the ones that are safe unattended (transport_error). A literal "
         "status such as no_relation or chain_break is for after fixing the tracer "
         "itself, or after re-querying Overpass",
+    )
+
+    p = sub.add_parser(
+        "routes",
+        help="build services from OSM route relations, for the modes with no "
+        "timetable at all (Great Britain's National Rail)",
+    )
+    p.add_argument(
+        "--relations",
+        type=Path,
+        default=None,
+        help="where the Overpass response is cached (default: "
+        "raw/osm_routes.json in the data root). Deliberately not the file `trace` "
+        "uses: the two stages ask for different windows, and sharing one body lets "
+        "whichever ran first decide the other's coverage",
+    )
+    p.add_argument(
+        "--refresh",
+        action="store_true",
+        help="re-query Overpass even though a cached response is present",
+    )
+    p.add_argument(
+        "--cif",
+        type=Path,
+        default=None,
+        help="a Network Rail CIF schedule to attribute trips from. Optional: the "
+        "track draws without one and `trips` stays null, which is the whole point "
+        "of building the geometry from OpenStreetMap first",
+    )
+    p.add_argument(
+        "--stops",
+        type=Path,
+        default=None,
+        help="the NaPTAN CSV that turns a CIF TIPLOC into a place "
+        "(default: raw/naptan.csv in the data root)",
+    )
+    p.add_argument(
+        "--on",
+        default=None,
+        help="the date whose service to count, YYYY-MM-DD (default: today). One "
+        "day rather than a range, because a service cancelled for one week of a "
+        "six-month schedule is running and is not, and either answer for the whole "
+        "range is one that cannot be defended",
     )
 
     sub.add_parser("aggregate", help="invert to edge -> services")
@@ -398,6 +455,57 @@ def _dispatch(args: argparse.Namespace) -> int:
         for row in match.summary(con):
             log.info("  %-16s %-6s n=%-7d edges=%-6s detour=%s", *row)
         con.close()
+        return 0
+
+    if args.cmd == "routes":
+        _require_db()
+        con = db.connect()
+        try:
+            built = osmroutes.run(con, cache=args.relations, refresh=args.refresh)
+        except RuntimeError as exc:
+            log.error("%s", exc)
+            return 1
+        finally:
+            con.close()
+        log.info(
+            "  %d relations considered, %d chained, %d services over %d ways",
+            built.considered,
+            built.chained,
+            built.patterns,
+            built.ways,
+        )
+        log.info(
+            "  refused: %d did not chain, %d named fewer than two stops",
+            built.skipped_broken,
+            built.skipped_no_stops,
+        )
+        if args.cif:
+            con = db.connect()
+            try:
+                when = (
+                    datetime.strptime(args.on, "%Y-%m-%d").date()
+                    if args.on
+                    else datetime.now(UTC).date()
+                )
+                got = railtrips.run_cached(
+                    con,
+                    args.cif,
+                    args.stops or (config.RAW / "naptan.csv"),
+                    on=when,
+                    cache=args.relations,
+                )
+            except (RuntimeError, ValueError) as exc:
+                log.error("%s", exc)
+                return 1
+            finally:
+                con.close()
+            log.info(
+                "  %d of %d legs placed, %.1f%% of weekly leg-trips over %d ways",
+                got.legs_placed,
+                got.legs,
+                got.trip_coverage,
+                got.ways,
+            )
         return 0
 
     if args.cmd == "trace":

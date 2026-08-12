@@ -229,6 +229,72 @@ CREATE TABLE IF NOT EXISTS traces (
     lat_e6      INTEGER[]
 );
 
+-- Stage 2d: track inverted from per-pattern to per-way ------------------------
+
+-- The geometry of one OpenStreetMap way, so track can be drawn once rather than
+-- once per service that runs over it.
+--
+-- `traces` holds a whole pattern's path flattened into one polyline, which cannot
+-- be cut back into ways -- the way boundaries are gone by the time it is stored.
+-- Measured over Great Britain's 911 chaining `route=train` relations: drawn per
+-- pattern that is 1,569,495 vertices, drawn per way 443,126, because 75.8% of ways
+-- carry two or more relations. The reduction is the reason this table exists.
+--
+-- Deliberately not `edges`. That table's key is a Valhalla GraphId, and nothing
+-- routed these; minting a synthetic id into it would break the one identity the
+-- pipeline rests on. `way_id` is OpenStreetMap's own and is durable across graph
+-- rebuilds, which `edge_id` is not.
+CREATE TABLE IF NOT EXISTS ways (
+    way_id      BIGINT PRIMARY KEY,
+    -- Micro-degree integer lists and a bbox, exactly as `edges` and `segments`
+    -- store geometry, so a window test is an integer overlap.
+    lon_e6      INTEGER[],
+    lat_e6      INTEGER[],
+    min_lon_e6  INTEGER,
+    min_lat_e6  INTEGER,
+    max_lon_e6  INTEGER,
+    max_lat_e6  INTEGER
+);
+
+-- Which services use one piece of track: the `edge_services` inversion, for the
+-- modes drawn from route relations rather than matched onto roads.
+--
+-- `n_trips` is nullable and that is the point. A relation names its operator and
+-- its line and lists its ways in order, so geometry and service identity are both
+-- available with no timetable at all, under a licence the archive already carries.
+-- A timetable, where there is one, fills this column in and changes nothing else.
+--
+-- `n_patterns` here counts *relations*, which is not the quantity
+-- `edge_services.n_patterns` counts. A way carrying eight relations is a fact about
+-- how thoroughly its line has been mapped rather than how busy it is, so the two
+-- must never share a colour ramp -- which is why this is published as its own layer.
+CREATE TABLE IF NOT EXISTS track_services (
+    way_id      BIGINT,
+    short_name  VARCHAR,
+    agency_id   VARCHAR,
+    n_patterns  INTEGER,
+    n_trips     INTEGER    -- NULL until a timetable has been attributed
+);
+
+-- How many trains a week run over one way, attributed from a timetable.
+--
+-- Separate from `track_services` because the two answer different questions and are
+-- filled from different sources. That table says which lines use a piece of track
+-- and comes from OpenStreetMap; this says how busy it is and comes from a timetable
+-- that may not exist. Keeping them apart is what lets the track layer ship, and
+-- stay correct, with no timetable at all.
+--
+-- Attributed per *leg* rather than per pattern, which is the whole reason it is
+-- keyed on the way. Measured against the April 2024 national extract: matching a
+-- whole calling sequence onto a relation covers 23.9% of GB rail trips, and
+-- matching each consecutive pair of calls covers 82.0%. A fast service does not need
+-- a relation with its exact stopping pattern; each of its legs runs on track some
+-- relation covers.
+CREATE TABLE IF NOT EXISTS way_trips (
+    way_id   BIGINT PRIMARY KEY,
+    n_trips  INTEGER   -- trips per week, the unit `edge_services.n_trips` uses
+);
+
 -- Free-form key/value for provenance: feed version, OSM extract date, the Valhalla
 -- graph build id that edge_id values belong to.
 CREATE TABLE IF NOT EXISTS meta (

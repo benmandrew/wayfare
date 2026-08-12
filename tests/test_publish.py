@@ -661,13 +661,14 @@ def test_publish_stamps_the_region_it_was_given(monkeypatch, tmp_path):
     licence is a property of the feed and not of the machine running the build."""
     seen = {}
 
-    def fake_build_tiles(path, out=None, attribution=None, segments=None):
+    def fake_build_tiles(path, out=None, attribution=None, segments=None, track=None):
         seen["credit"] = attribution
         return tmp_path / "bus.pmtiles"
 
     monkeypatch.setattr(config, "OUT", tmp_path)
     monkeypatch.setattr(publish, "export_geojsonl", lambda con: tmp_path / "e.geojsonl")
     monkeypatch.setattr(publish, "export_segments_geojsonl", lambda con: None)
+    monkeypatch.setattr(publish, "export_track_geojsonl", lambda con: None)
     monkeypatch.setattr(publish, "contents", lambda con: {"road": True, "operator": False})
     monkeypatch.setattr(publish, "build_tiles", fake_build_tiles)
     publish.build(_A_CONNECTION, region="ireland")
@@ -685,7 +686,7 @@ def _built_out(monkeypatch, tmp_path, **kwargs) -> Path:
     """Run `build` against a stubbed tippecanoe and report the path it chose."""
     seen = {}
 
-    def fake_build_tiles(path, out=None, attribution=None, segments=None):
+    def fake_build_tiles(path, out=None, attribution=None, segments=None, track=None):
         seen["out"] = out
         return out
 
@@ -693,6 +694,7 @@ def _built_out(monkeypatch, tmp_path, **kwargs) -> Path:
     # Stubbed alongside the edge export: this helper is about which path `build`
     # chooses, and it hands `build` a None connection to prove it never reads one.
     monkeypatch.setattr(publish, "export_segments_geojsonl", lambda con: None)
+    monkeypatch.setattr(publish, "export_track_geojsonl", lambda con: None)
     monkeypatch.setattr(publish, "contents", lambda con: {"road": True, "operator": False})
     monkeypatch.setattr(publish, "build_tiles", fake_build_tiles)
     publish.build(_A_CONNECTION, **kwargs)

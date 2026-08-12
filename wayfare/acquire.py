@@ -9,6 +9,7 @@ pipeline is expected to be re-run many times against the same inputs.
 from __future__ import annotations
 
 import csv
+import os
 import re
 import shutil
 import time
@@ -34,6 +35,16 @@ REQUIRED_GTFS = ("stop_times.txt", "trips.txt", "routes.txt", "stops.txt")
 _GUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 
 
+class Unauthorized(Exception):
+    """A source needs credentials and did not get usable ones.
+
+    Its own class because it must not be retried, and for the opposite reason to
+    `Invalid`: those bytes are wrong and will be wrong again, where these bytes were
+    never sent. Five attempts at a 401 with backoff proves nothing about the
+    password and is indistinguishable, from the far end, from guessing at it.
+    """
+
+
 class Invalid(Exception):
     """The transfer completed but the bytes are wrong.
 
@@ -55,6 +66,12 @@ class Source:
     # continue instead of starting over. Measured, not assumed -- of our three
     # sources only Geofabrik does, and it is also much the largest.
     resumable: bool = False
+    # The *name* of a credential pair, never the credentials. Network Rail's
+    # SCHEDULE feed is the first source here behind a login, and a `Source` is a
+    # frozen dataclass that gets logged, compared and held in lists -- a password
+    # in it would reach a log line eventually. The name resolves through
+    # `credentials` at request time and nothing holds the secret in between.
+    credentials_from: str | None = None
 
 
 def check_gtfs(path: Path) -> None:
@@ -149,9 +166,9 @@ def download(src: Source, dest_dir: Path | None = None, force: bool = False) -> 
             log.info("%s: fetched %s (%.2f GB)", src.name, dest.name, _gb(dest))
             return dest
 
-        except Invalid:
-            # Complete but wrong. Re-fetching gets the same bytes, so stop now
-            # rather than spending four more full transfers to prove it.
+        except (Invalid, Unauthorized):
+            # Complete but wrong, or never sent. Re-fetching gets the same answer,
+            # so stop now rather than spending four more full transfers to prove it.
             part.unlink(missing_ok=True)
             raise
 
@@ -180,13 +197,47 @@ def download(src: Source, dest_dir: Path | None = None, force: bool = False) -> 
     ) from last_error
 
 
+def credentials(name: str) -> tuple[str, str]:
+    """The user and password a named source logs in with, from the environment.
+
+    ``WAYFARE_<NAME>_USER`` and ``WAYFARE_<NAME>_PASS``, which is the file Compose
+    and direnv already share -- `.envrc` is `use flake` plus `dotenv_if_exists .env`.
+    Both halves are required and the error names the variables rather than the
+    value, because the value is the thing that must not be written down.
+    """
+    user = os.environ.get(f"WAYFARE_{name}_USER")
+    password = os.environ.get(f"WAYFARE_{name}_PASS")
+    if not user or not password:
+        raise Unauthorized(
+            f"{name} needs WAYFARE_{name}_USER and WAYFARE_{name}_PASS in the "
+            "environment; set them in .env"
+        )
+    return user, password
+
+
 def _stream(src: Source, part: Path) -> None:
     headers = {"User-Agent": config.USER_AGENT}
     have = part.stat().st_size if (src.resumable and part.exists()) else 0
     if have:
         headers["Range"] = f"bytes={have}-"
+    auth = credentials(src.credentials_from) if src.credentials_from else None
 
-    with requests.get(src.url, headers=headers, stream=True, timeout=(30, 300)) as r:
+    with requests.get(
+        src.url, headers=headers, auth=auth, stream=True, timeout=(30, 300)
+    ) as r:
+        # Refused rather than failed. `raise_for_status` would raise an HTTPError
+        # that the caller cannot tell from a dropped connection, and it would be
+        # retried five times over rising backoff against a password that is not
+        # going to start working.
+        if r.status_code in (401, 403):
+            raise Unauthorized(
+                f"{src.name}: {r.status_code} from {src.url.split('?')[0]}; "
+                + (
+                    f"check WAYFARE_{src.credentials_from}_USER and _PASS"
+                    if src.credentials_from
+                    else "this source needs credentials and none were configured"
+                )
+            )
         r.raise_for_status()
         # Asking to resume is not the same as being allowed to. A 206 carries the
         # remainder and is appended; anything else carries the whole file from byte

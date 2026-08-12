@@ -38,6 +38,11 @@ LAYER = "bus"
 # attributes and the viewer styles them differently -- and because tile-join keeps
 # distinct layer names, so this costs one more tippecanoe pass and nothing else.
 LAYER_SEGMENTS = "segments"
+# Track drawn from OSM route relations, inverted to one feature per way. Its own
+# layer and not merged into `segments`, because its `n` counts relations where the
+# road layer's counts timetabled services -- two quantities that must never share
+# a colour ramp.
+LAYER_TRACK = "track"
 
 # The archive a publish writes when it is told neither a path nor to use the region's
 # name. Region-agnostic, and deliberately still the default -- see `default_out`.
@@ -532,6 +537,7 @@ def build_tiles(
     out: Path | None = None,
     attribution: str | None = None,
     segments: Path | None = None,
+    track: Path | None = None,
 ) -> Path:
     """Build the archive in four zoom bands and join them.
 
@@ -652,6 +658,21 @@ def build_tiles(
                 attribution,
                 False,
                 layer=LAYER_SEGMENTS,
+            )
+            parts.append(tiles)
+        # Same single pass, same reasoning: 55,114 ways is not millions, and a
+        # rail line thinned out of the only layer that draws it is just absent.
+        if track:
+            tiles = tmp / "track.pmtiles"
+            _tippecanoe(
+                track,
+                tiles,
+                config.MIN_ZOOM,
+                config.MAX_ZOOM,
+                (),
+                attribution,
+                False,
+                layer=LAYER_TRACK,
             )
             parts.append(tiles)
         if not parts:
@@ -914,4 +935,81 @@ def build(
         out or default_out(region),
         attribution=config.credit_html(region, **held),
         segments=export_segments_geojsonl(con) if con is not None else None,
+        track=export_track_geojsonl(con) if con is not None else None,
     )
+
+
+def export_track_geojsonl(
+    con: duckdb.DuckDBPyConnection, path: Path | None = None
+) -> Path | None:
+    """One feature per way of relation track, with the services that use it.
+
+    The counterpart of `export_geojsonl` for the modes nothing routed. Where that
+    one coalesces edges into ways as it streams, this is already per way: the
+    inversion happened in `aggregate.build_track_services`, so a way is one row here
+    and one feature out.
+
+    Drawing per way rather than per pattern is the whole point. Great Britain's 911
+    chaining `route=train` relations are 1,569,495 vertices drawn one polyline per
+    relation and 443,126 drawn once per way, because 75.8% of ways carry two or more
+    relations. Nothing is lost in the reduction -- the service list is what the
+    overlap was carrying, and it is right here on the feature.
+
+    `trips` is null where no timetable has been attributed, and stays null rather
+    than becoming zero. A viewer can style "unknown" and cannot style a lie.
+
+    `ORDER BY way_id` for the reason every other export sorts: a rebuild has to be
+    byte-identical, and DuckDB's parallel hash join returns rows in a varying order
+    otherwise.
+    """
+    if not (db.table_exists(con, "track_services") and _has_rows(con, "track_services")):
+        return None
+    if not db.table_exists(con, "way_trips"):
+        return None
+    path = path or (config.WORK / "track.geojsonl")
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    rows = con.execute(
+        """
+        SELECT w.way_id, w.lon_e6, w.lat_e6,
+               count(*)                                   AS n,
+               list(ts.short_name ORDER BY ts.short_name)  AS refs,
+               -- From `way_trips`, not from the services: a leg's trips are a
+               -- property of the track, and summing a per-service column would
+               -- multiply them by however many relations happen to cover it.
+               any_value(wt.n_trips)                      AS trips
+        FROM track_services ts
+        JOIN ways w USING (way_id)
+        LEFT JOIN way_trips wt USING (way_id)
+        GROUP BY w.way_id, w.lon_e6, w.lat_e6
+        ORDER BY w.way_id
+        """
+    ).fetchall()
+
+    with path.open("w") as fh:
+        for way_id, lon_e6, lat_e6, n, refs, trips in rows:
+            fh.write(
+                json.dumps(
+                    {
+                        "type": "Feature",
+                        "properties": {
+                            "way_id": way_id,
+                            "n": n,
+                            "refs": list(refs[: config.MAX_REFS_IN_TILE]),
+                            "trips": trips,
+                        },
+                        "geometry": {
+                            "type": "LineString",
+                            "coordinates": [
+                                [x / 1e6, y / 1e6]
+                                for x, y in zip(lon_e6, lat_e6, strict=True)
+                            ],
+                        },
+                    },
+                    separators=(",", ":"),
+                )
+            )
+            fh.write("\n")
+
+    log.info("%d ways of relation track written to %s", len(rows), path)
+    return path
