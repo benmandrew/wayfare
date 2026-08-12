@@ -72,6 +72,23 @@ fi
 wayfare trace --retry transient || \
   echo "refresh: trace did not finish; the relations it missed stay pending" >&2
 
+# The modes with no timetable at all: Great Britain's National Rail, which BODS
+# does not carry. Same slot as `trace` and for the same reasons -- after the gate,
+# and allowed to fail, because it asks the same metered public API and a busy
+# Overpass must not cost a region its buses.
+#
+# It must run *after* `patterns`, not before. `patterns` sets the feed version these
+# rows are stamped with, and a relation written against the previous one is departed
+# the moment the new feed lands -- which would draw the country's rail for exactly
+# one run and then silently stop.
+#
+# No `--cif`, so `trips` stays null and the track draws under ODbL alone. That is
+# the point of building the geometry from OpenStreetMap first: nothing here waits
+# on a Network Rail login, and adding one later fills a column rather than changing
+# what is drawn.
+wayfare routes || \
+  echo "refresh: routes did not finish; rail keeps whatever it last drew" >&2
+
 wayfare aggregate
 # Before publish, not after: clustering goes stale rather than off, and the rows
 # this run matched land unsorted on the end where no zonemap can help.
