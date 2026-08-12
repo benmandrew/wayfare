@@ -34,9 +34,10 @@ That collapses what could have been three schedules into one chained unit. Separ
 acquire, drain and publish timers would have bought re-entry: a drain stopped after
 an hour, resumed the following night, publishing only once the queue finally
 emptied. Re-entry is worth having when the drain is bounded. This one is not, so the
-script runs `acquire`, `patterns`, `match`, `aggregate`, `cluster` and `publish` in
-order under `set -euo pipefail`, and a stage that fails stops the run where it
-stands.
+script runs `acquire`, `patterns`, `match`, `trace`, `routes`, `aggregate`,
+`cluster` and `publish` in order under `set -euo pipefail`, and a stage that fails
+stops the run where it stands — except the two that ask Overpass, which are
+allowed to fail and are covered below.
 
 `cluster` runs before `publish`, not after. Clustering goes stale rather than off,
 and the rows this run matched land unsorted on the end of the table where no zonemap
@@ -97,6 +98,28 @@ the gate reads, which is the mistake the mode filter already made once, describe
 the section above. `wayfare status` reports a separate `traced` block instead —
 patterns owed, patterns pending, and a count per status — and a database written
 before the stage existed reports nothing there rather than raising.
+
+## `routes` runs in the same slot, for the same reasons
+
+**`wayfare routes` sits immediately after `trace`, also past the gate and also
+allowed to fail.** It draws the modes with no timetable *at all* rather than merely
+no geometry — Great Britain's National Rail, which BODS does not carry. A route
+relation becomes a service in its own right, so the track arrives under ODbL, which
+every archive already carries and credits for its matched roads.
+
+It asks the same metered public service `trace` does, so it gets the same treatment:
+`|| echo` and the run carries on. What it does not draw this month it draws next
+month, because the stage rebuilds its patterns from OpenStreetMap every run rather
+than carrying them forward.
+
+**It must run after `patterns`, and the ordering is not cosmetic.** `patterns` sets
+the feed version these rows are stamped with, and a relation written against the
+previous one is departed the moment the new feed lands. Placed before `patterns` the
+stage would draw the country's rail for exactly one refresh and then silently stop.
+
+**No `--cif`, so `trips` stays null.** That is the point of taking the geometry from
+OpenStreetMap first: nothing in the scheduled run waits on a Network Rail login, and
+adding credentials later fills a column rather than changing what is drawn.
 
 ## The mode selection lives in the database
 
