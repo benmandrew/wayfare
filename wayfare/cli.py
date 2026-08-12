@@ -16,7 +16,19 @@ from pathlib import Path
 
 import duckdb
 
-from . import acquire, aggregate, config, coverage, db, gtfs, logs, match, publish, trace
+from . import (
+    acquire,
+    aggregate,
+    config,
+    coverage,
+    db,
+    gtfs,
+    logs,
+    match,
+    osmroutes,
+    publish,
+    trace,
+)
 
 log = logs.get("cli")
 
@@ -124,6 +136,26 @@ def main(argv: list[str] | None = None) -> int:
         "alias for the ones that are safe unattended (transport_error). A literal "
         "status such as no_relation or chain_break is for after fixing the tracer "
         "itself, or after re-querying Overpass",
+    )
+
+    p = sub.add_parser(
+        "routes",
+        help="build services from OSM route relations, for the modes with no "
+        "timetable at all (Great Britain's National Rail)",
+    )
+    p.add_argument(
+        "--relations",
+        type=Path,
+        default=None,
+        help="where the Overpass response is cached (default: "
+        "raw/osm_routes.json in the data root). Deliberately not the file `trace` "
+        "uses: the two stages ask for different windows, and sharing one body lets "
+        "whichever ran first decide the other's coverage",
+    )
+    p.add_argument(
+        "--refresh",
+        action="store_true",
+        help="re-query Overpass even though a cached response is present",
     )
 
     sub.add_parser("aggregate", help="invert to edge -> services")
@@ -398,6 +430,30 @@ def _dispatch(args: argparse.Namespace) -> int:
         for row in match.summary(con):
             log.info("  %-16s %-6s n=%-7d edges=%-6s detour=%s", *row)
         con.close()
+        return 0
+
+    if args.cmd == "routes":
+        _require_db()
+        con = db.connect()
+        try:
+            built = osmroutes.run(con, cache=args.relations, refresh=args.refresh)
+        except RuntimeError as exc:
+            log.error("%s", exc)
+            return 1
+        finally:
+            con.close()
+        log.info(
+            "  %d relations considered, %d chained, %d services over %d ways",
+            built.considered,
+            built.chained,
+            built.patterns,
+            built.ways,
+        )
+        log.info(
+            "  refused: %d did not chain, %d named fewer than two stops",
+            built.skipped_broken,
+            built.skipped_no_stops,
+        )
         return 0
 
     if args.cmd == "trace":

@@ -256,6 +256,26 @@ CREATE TABLE IF NOT EXISTS ways (
     max_lat_e6  INTEGER
 );
 
+-- Which services use one piece of track: the `edge_services` inversion, for the
+-- modes drawn from route relations rather than matched onto roads.
+--
+-- `n_trips` is nullable and that is the point. A relation names its operator and
+-- its line and lists its ways in order, so geometry and service identity are both
+-- available with no timetable at all, under a licence the archive already carries.
+-- A timetable, where there is one, fills this column in and changes nothing else.
+--
+-- `n_patterns` here counts *relations*, which is not the quantity
+-- `edge_services.n_patterns` counts. A way carrying eight relations is a fact about
+-- how thoroughly its line has been mapped rather than how busy it is, so the two
+-- must never share a colour ramp -- which is why this is published as its own layer.
+CREATE TABLE IF NOT EXISTS track_services (
+    way_id      BIGINT,
+    short_name  VARCHAR,
+    agency_id   VARCHAR,
+    n_patterns  INTEGER,
+    n_trips     INTEGER    -- NULL until a timetable has been attributed
+);
+
 -- Free-form key/value for provenance: feed version, OSM extract date, the Valhalla
 -- graph build id that edge_id values belong to.
 CREATE TABLE IF NOT EXISTS meta (
