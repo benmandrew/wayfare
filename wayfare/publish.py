@@ -955,6 +955,8 @@ def export_track_geojsonl(
     """
     if not (db.table_exists(con, "track_services") and _has_rows(con, "track_services")):
         return None
+    if not db.table_exists(con, "way_trips"):
+        return None
     path = path or (config.WORK / "track.geojsonl")
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -962,12 +964,14 @@ def export_track_geojsonl(
         """
         SELECT w.way_id, w.lon_e6, w.lat_e6,
                count(*)                                   AS n,
-               list(ts.short_name ORDER BY ts.n_trips DESC NULLS LAST, ts.short_name)
-                                                          AS refs,
-               CASE WHEN count(ts.n_trips) = 0 THEN NULL
-                    ELSE sum(ts.n_trips) END              AS trips
+               list(ts.short_name ORDER BY ts.short_name)  AS refs,
+               -- From `way_trips`, not from the services: a leg's trips are a
+               -- property of the track, and summing a per-service column would
+               -- multiply them by however many relations happen to cover it.
+               any_value(wt.n_trips)                      AS trips
         FROM track_services ts
         JOIN ways w USING (way_id)
+        LEFT JOIN way_trips wt USING (way_id)
         GROUP BY w.way_id, w.lon_e6, w.lat_e6
         ORDER BY w.way_id
         """

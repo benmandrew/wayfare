@@ -276,6 +276,25 @@ CREATE TABLE IF NOT EXISTS track_services (
     n_trips     INTEGER    -- NULL until a timetable has been attributed
 );
 
+-- How many trains a week run over one way, attributed from a timetable.
+--
+-- Separate from `track_services` because the two answer different questions and are
+-- filled from different sources. That table says which lines use a piece of track
+-- and comes from OpenStreetMap; this says how busy it is and comes from a timetable
+-- that may not exist. Keeping them apart is what lets the track layer ship, and
+-- stay correct, with no timetable at all.
+--
+-- Attributed per *leg* rather than per pattern, which is the whole reason it is
+-- keyed on the way. Measured against the April 2024 national extract: matching a
+-- whole calling sequence onto a relation covers 23.9% of GB rail trips, and
+-- matching each consecutive pair of calls covers 82.0%. A fast service does not need
+-- a relation with its exact stopping pattern; each of its legs runs on track some
+-- relation covers.
+CREATE TABLE IF NOT EXISTS way_trips (
+    way_id   BIGINT PRIMARY KEY,
+    n_trips  INTEGER   -- trips per week, the unit `edge_services.n_trips` uses
+);
+
 -- Free-form key/value for provenance: feed version, OSM extract date, the Valhalla
 -- graph build id that edge_id values belong to.
 CREATE TABLE IF NOT EXISTS meta (

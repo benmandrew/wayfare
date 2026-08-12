@@ -12,6 +12,7 @@ import argparse
 import json
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import duckdb
@@ -27,6 +28,7 @@ from . import (
     match,
     osmroutes,
     publish,
+    railtrips,
     trace,
 )
 
@@ -156,6 +158,29 @@ def main(argv: list[str] | None = None) -> int:
         "--refresh",
         action="store_true",
         help="re-query Overpass even though a cached response is present",
+    )
+    p.add_argument(
+        "--cif",
+        type=Path,
+        default=None,
+        help="a Network Rail CIF schedule to attribute trips from. Optional: the "
+        "track draws without one and `trips` stays null, which is the whole point "
+        "of building the geometry from OpenStreetMap first",
+    )
+    p.add_argument(
+        "--stops",
+        type=Path,
+        default=None,
+        help="the NaPTAN CSV that turns a CIF TIPLOC into a place "
+        "(default: raw/naptan.csv in the data root)",
+    )
+    p.add_argument(
+        "--on",
+        default=None,
+        help="the date whose service to count, YYYY-MM-DD (default: today). One "
+        "day rather than a range, because a service cancelled for one week of a "
+        "six-month schedule is running and is not, and either answer for the whole "
+        "range is one that cannot be defended",
     )
 
     sub.add_parser("aggregate", help="invert to edge -> services")
@@ -454,6 +479,33 @@ def _dispatch(args: argparse.Namespace) -> int:
             built.skipped_broken,
             built.skipped_no_stops,
         )
+        if args.cif:
+            con = db.connect()
+            try:
+                when = (
+                    datetime.strptime(args.on, "%Y-%m-%d").date()
+                    if args.on
+                    else datetime.now(UTC).date()
+                )
+                got = railtrips.run_cached(
+                    con,
+                    args.cif,
+                    args.stops or (config.RAW / "naptan.csv"),
+                    on=when,
+                    cache=args.relations,
+                )
+            except (RuntimeError, ValueError) as exc:
+                log.error("%s", exc)
+                return 1
+            finally:
+                con.close()
+            log.info(
+                "  %d of %d legs placed, %.1f%% of weekly leg-trips over %d ways",
+                got.legs_placed,
+                got.legs,
+                got.trip_coverage,
+                got.ways,
+            )
         return 0
 
     if args.cmd == "trace":

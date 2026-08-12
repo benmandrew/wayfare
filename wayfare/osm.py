@@ -106,6 +106,12 @@ class Chain:
     points: list[tuple[float, float]] = field(default_factory=list)
     way_ids: list[int] = field(default_factory=list)
     breaks: int = 0
+    # The way each point came from, exactly parallel to `points`. `way_ids` says
+    # which ways the chain is made of and this says *where* each one is, which is
+    # the difference between recording what was drawn and being able to cut it up
+    # again: a slice of the chain is a range of distances, and without this there is
+    # no way back from that range to the ways under it.
+    way_at: list[int] = field(default_factory=list)
 
 
 # -- fetching ----------------------------------------------------------------
@@ -265,16 +271,20 @@ def _walk(ways: list[Way] | tuple[Way, ...]) -> Chain:
             continue
         if not out.points:
             out.points = pts
+            out.way_at = [way.way_id] * len(pts)
             out.way_ids.append(way.way_id)
             continue
         tail = out.points[-1]
         if _near(tail, pts[0]):
             out.points.extend(pts[1:])
+            out.way_at.extend([way.way_id] * (len(pts) - 1))
         elif _near(tail, pts[-1]):
             out.points.extend(reversed(pts[:-1]))
+            out.way_at.extend([way.way_id] * (len(pts) - 1))
         else:
             out.breaks += 1
             out.points.extend(pts)
+            out.way_at.extend([way.way_id] * len(pts))
         out.way_ids.append(way.way_id)
     return out
 
@@ -459,3 +469,33 @@ def _at(
             a, b = latlon[i], latlon[i + 1]
             return (a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]))
     return latlon[-1]
+
+
+def ways_between(chain: Chain, cum: list[float], start_m: float, end_m: float) -> list[int]:
+    """The ways a slice of a chain runs over, in order, without duplicates.
+
+    `slice_between` answers the same question in geometry and throws the way ids
+    away doing it, which is exactly the gap that stops relation track being
+    attributed: a timetable knows a train ran from one station to another, and the
+    only way to turn that into "these ways carried it" is to keep the identity
+    through the cut.
+
+    A *segment* rather than a vertex is what belongs to a way -- the segment ending
+    at point i+1 is part of whichever way contributed that point -- so a slice that
+    starts and ends mid-way still names both of them. Getting that wrong at the ends
+    is how a service loses the half-way it entered on.
+    """
+    if start_m > end_m:
+        start_m, end_m = end_m, start_m
+    out: list[int] = []
+    for i in range(len(cum) - 1):
+        if cum[i + 1] > start_m and cum[i] < end_m:
+            way = chain.way_at[i + 1]
+            if not out or out[-1] != way:
+                out.append(way)
+    # A cut shorter than one segment overlaps no segment strictly, and the train
+    # still ran over the way it happened on.
+    if not out and chain.way_at:
+        idx = min(range(len(cum)), key=lambda i: abs(cum[i] - start_m))
+        out.append(chain.way_at[idx])
+    return out
