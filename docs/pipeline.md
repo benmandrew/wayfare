@@ -672,8 +672,8 @@ distinct values, and costs an approximate figure in the info card.
 
 **What "card-only" covers is `way`, `refs` and `name`, and `trips` is no longer one
 of them.** It was, for as long as the info card was its only reader. The viewer's
-second colour mode reads it, and an attribute a paint property cannot find is not an
-error MapLibre reports: it takes the fallback out of `to-number` and draws every road
+colour ramp reads it at every zoom, and an attribute a paint property cannot find is
+not an error MapLibre reports: it takes the fallback out of `to-number` and draws every road
 in the first ramp colour, so a whole country below z11 came out one flat blue and read
 as a region with no buses. `_DETAIL_ONLY` is now the three the card alone opens, and
 the card does not open below `DETAIL_ZOOM`. The cost is a key and a varint per feature

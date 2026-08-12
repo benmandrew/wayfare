@@ -94,11 +94,10 @@ h1 {
   letter-spacing: .02em;
 }
 .sub { color: var(--muted); font-size: 11.5px; margin-top: 2px; }
-/* Wraps, because a fourth control does not fit beside the title at this width.
-   The floor on the title column is what forces the wrap: without it flexbox
-   spends the whole row on the controls and squeezes the strapline down to one
-   word per line. 110px is under what is free with the three buttons alone, so a
-   single region still gets the one-row header it always had. */
+/* The floor on the title column is what forces the wrap on a narrow panel:
+   without it flexbox spends the whole row on the controls and squeezes the
+   strapline down to one word per line. 110px is under what is free with the three
+   buttons alone, so the ordinary case is still the one-row header. */
 .head { padding: 10px 12px; display: flex; align-items: flex-start; gap: 8px; flex-wrap: wrap; }
 .head > div { flex: 1; min-width: 110px; }
 
@@ -115,12 +114,6 @@ h1 {
 }
 .btn:hover { color: var(--text); border-color: var(--muted); }
 a.btn { text-decoration: none; }
-/* A `select` is as wide as its widest option unless told otherwise, and the
-   options are whole region names. Capped so it cannot claim the width of the
-   panel on the line it wraps onto, and pushed to the right-hand end of that
-   line. Its own text is only ever "Go to…"; the popup still opens as wide as
-   its contents. */
-#region { max-width: 160px; margin-left: auto; }
 
 /* --- search --- */
 .search { padding: 0 12px 10px; }
@@ -156,8 +149,6 @@ a.btn { text-decoration: none; }
 
 /* --- legend --- */
 .legend { padding: 10px 12px; }
-.legend-head { display: flex; margin-bottom: 8px; }
-#colourBy { flex: 1; }
 .legend-title { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
 .ramp { height: 8px; border-radius: 2px; margin: 7px 0 4px; }
 /* Absolute rather than a flex row, because a tick has to sit on the colour it
@@ -167,9 +158,7 @@ a.btn { text-decoration: none; }
 .ticks span { position: absolute; top: 0; white-space: nowrap; }
 .modes { display: flex; flex-wrap: wrap; gap: 3px 12px; margin-top: 9px; }
 .mode { display: flex; align-items: center; gap: 6px; font-size: 11.5px; }
-/* Wide enough that six gradient stops read as a ramp rather than a smudge. The
-   flat swatch under the services ramp is the same width, so the key does not
-   change shape when the ramp does. */
+/* Wide enough that six gradient stops read as a ramp rather than a smudge. */
 .mode i { width: 26px; height: 4px; border-radius: 2px; flex: none; }
 
 /* --- help --- */
@@ -266,9 +255,6 @@ a.btn { text-decoration: none; }
       <a class="btn" href="art.html" title="Draw the network as a picture">Art</a>
       <button class="btn" id="theme" title="Toggle light/dark" aria-label="Toggle light or dark theme">Dark</button>
       <button class="btn" id="helpBtn" title="What am I looking at?" aria-label="What am I looking at?" aria-expanded="false" aria-controls="help">?</button>
-      <!-- Last, so that it is this one that wraps to a second line when the four
-           of them do not fit. Reading order and tab order then still agree. -->
-      <select class="btn" id="region" title="Jump to a region" aria-label="Jump to a region" hidden></select>
     </div>
     <div class="search">
       <label class="sr-only" for="q">Filter by service number</label>
@@ -279,8 +265,8 @@ a.btn { text-decoration: none; }
     </div>
     <div class="help" id="help" hidden>
       <p>Most lines are a road segment — a stretch of road between two junctions. Thickness shows <b>how many distinct bus and coach services</b> use it, so trunk corridors stand out from the tail.</p>
-      <p><b>Colour by</b> chooses what the ramp means. <b>Services</b> matches the thickness: how many services run here at all. <b>Journeys a day</b> counts departures instead, averaged over the whole week and drawn on a logarithmic scale, so one route every ten minutes reads as busy where a service count calls it one road out of one. Grey means the archive under you carries no departure count at that zoom.</p>
-      <p>Trams, metros, trains and ferries have no road under them, so they are drawn from the operator's own trace and keep a colour of their own, listed in the key below. Under <b>Services</b> that colour is flat, because a line on its own track is always one service. Under <b>Journeys a day</b> each mode is shaded along its own colour on the same scale as the bar above, so a quiet ferry and a busy one are the same red at different depths. Each line is one route's trace, so where two share a track they are two lines, not one busier one.</p>
+      <p>Colour shows <b>journeys a day</b> — the departures along that road, averaged over the whole week and drawn on a logarithmic scale. Thickness and colour answer different questions, so a lane with one service every ten minutes is thin and bright. Grey means the archive under you carries no departure count at that zoom.</p>
+      <p>Trams, metros, trains and ferries have no road under them, so they are drawn from the operator's own trace and keep a colour of their own, listed in the key below. Each is shaded along that colour on the same scale as the bar above, so a quiet ferry and a busy one are the same red at different depths. Each line is one route's trace, so where two share a track they are two lines, not one busier one.</p>
       <p>Hover a line for its service list. Filtering matches whole service numbers, so <code>4</code> will not match <code>42</code>.</p>
       <p>Zoomed out, the map thins the densest areas to keep tiles small, so a
          quiet-looking city is not necessarily a city without services. Zoom in for
@@ -289,25 +275,14 @@ a.btn { text-decoration: none; }
   </div>
 
   <div class="panel legend">
-    <!-- The switch sits on the legend rather than up in the header because the
-         legend is the thing it changes: title, ramp and ticks are all rewritten
-         from it, so the control and its effect are one glance apart. -->
-    <div class="legend-head">
-      <label class="sr-only" for="colourBy">Colour roads by</label>
-      <select class="btn" id="colourBy" title="What the colour ramp means">
-        <option value="services">Colour: services</option>
-        <option value="journeys">Colour: journeys a day</option>
-      </select>
-    </div>
-    <div class="legend-title" id="rampTitle">Services per road</div>
+    <div class="legend-title">Journeys a day</div>
     <div class="ramp" id="ramp"></div>
-    <!-- Rewritten from the active ramp's own stops, so the labels cannot drift
-         from the colours above them. -->
+    <!-- Written from the ramp's own stops, so the labels cannot drift from the
+         colours above them. -->
     <div class="ticks" id="ticks"></div>
     <!-- Filled in from what is actually drawn, and hidden until something is.
          A Great Britain archive holds no ferry, and a key to one would be a
-         promise the tiles do not keep. Hidden outright under the journeys ramp,
-         where mode is not what a colour means any more. -->
+         promise the tiles do not keep. -->
     <div class="modes" id="modes" hidden></div>
   </div>
 </div>
@@ -363,9 +338,7 @@ const LAYER_SEG = "segments";
 
 // The road ramp, six steps. Light goes pale-blue -> deep violet so busy roads
 // darken against the light basemap; dark goes the other way, into warm yellow, so
-// they glow against the dark one. Shared by both colour modes: only what the six
-// steps *mean* changes, so the separation from the mode palette worked out below
-// holds whichever mode is showing.
+// they glow against the dark one.
 const RAMP_COLOURS = {
   light: ["#a9c3dc","#6f9cc6","#4275ac","#2e5290","#3a3672","#3d1d4e"],
   dark:  ["#2f4d6b","#3d7ea8","#3fa8bd","#5fcf9f","#c0e86f","#ffdf5c"],
@@ -377,11 +350,11 @@ const BASEMAP = {
 };
 const HOVER_COLOUR = { light: "#d64512", dark: "#ffffff" };
 
-// One colour per non-road mode, and deliberately outside the bus ramp rather than
-// an extension of it. The bus ramp encodes *how many* services use a road; a tram
-// line is one service on its own track, so a position on that ramp would be a
-// number nobody can read. These say "this is a different mode" and nothing else.
-// Hues are spread rather than shaded, because these are categories and not a
+// One colour per non-road mode, and deliberately outside the road ramp rather than
+// an extension of it: a tram on its own track drawn in a road colour reads as a
+// road carrying buses. Each is the *top* of that mode's own ramp, built below, so
+// the colour here is what the busiest line of that mode is drawn in.
+// Hues are spread rather than shaded, because the modes are categories and not a
 // scale: nothing about a ferry is "more" than a tram. The four common modes come
 // first; the cable-hauled tail is rare enough in these islands to be one heritage
 // line each, but a mode sharing a colour with another mode is worse than a mode
@@ -422,16 +395,16 @@ const FALLBACK_MODE_COLOUR = { light: "#6b6b6b", dark: "#b9b9b9" };
 
 /* ---------- ramps built from a mode's own colour ---------- */
 
-// Under the journeys ramp a segment has a number worth shading, and the colour
-// above is the wrong thing to shade it with on its own: one flat pink says "tram"
-// and says nothing about whether it runs twice a day or every four minutes. So
-// each mode gets a ramp of its own, generated from the colour it already has in
-// the key rather than hand-picked -- the hue stays exactly what the key promises,
-// and adding a mode to `MODE_COLOUR` adds its ramp with it.
+// A segment has a number worth shading, and one flat colour per mode says nothing
+// about it: a single pink says "tram" and leaves a line running twice a day looking
+// like one running every four minutes. So each mode gets a ramp of its own,
+// generated from the colour it already has in the key rather than hand-picked --
+// the hue stays exactly what the key promises, and adding a mode to `MODE_COLOUR`
+// adds its ramp with it.
 //
 // Generated in OKLab, which is the space the palette above was separated in. The
 // mode's own colour is the *top* of its ramp, so the busiest tram is the tram
-// colour and the key is telling the truth in both colour modes. Below that,
+// colour and the key is telling the truth. Below that,
 // lightness carries most of the range and chroma only some of it: drain the
 // chroma too and the four quiet modes converge on the same grey, which is the one
 // thing this ramp exists to avoid.
@@ -574,15 +547,12 @@ const PER_DAY = ["/", ["to-number", ["get", "trips"], 0], 7];
 // the gradient the legend paints -- one function, so the bar and the map cannot
 // disagree about where a colour begins.
 //
-// The two modes differ in the scale, not just the attribute. A road carries
-// between one and a few dozen services, which is a range you can draw straight.
-// Journeys a day span three orders of magnitude -- a lane with four buses a week
-// against a corridor with a departure a minute -- and drawn straight, everything
-// but a handful of city corridors sits in the first colour. So the journeys ramp
-// interpolates in log10, over half-decade stops, which puts the six colours at
-// even spacing and gives the rural tail as much of the ramp as the cities. The
-// same reasoning is written up at `Weights` in `wayfare/art.py`, which reached it
-// first and for the same data.
+// The scale is log10, because journeys a day span three orders of magnitude -- a
+// lane with four buses a week against a corridor with a departure a minute -- and
+// drawn straight, everything but a handful of city corridors sits in the first
+// colour. Half-decade stops put the six colours at even spacing and give the rural
+// tail as much of the ramp as the cities. The same reasoning is written up at
+// `Weights` in `wayfare/art.py`, which reached it first and for the same data.
 //
 // The stops are read off the national export rather than guessed, and the first
 // guess is why. It topped out at 300 a day, which measurement then put at inner
@@ -611,74 +581,48 @@ const PER_DAY = ["/", ["to-number", ["get", "trips"], 0], 7];
 //
 // The top still clamps 0.9%, and that is one fixed scale serving a country where
 // the busiest road carries 9,445 journeys a day and the median lane carries 31.
-const COLOUR_BY = {
-  services: {
-    label: "Services per road",
-    expr: ["to-number", ["get", "n"], 1],
-    at: (v) => v,
-    stops: [1, 3, 6, 12, 24, 40],
-    // Not the stops: six labels on an uneven scale crowd at the low end, where
-    // the first three stops sit inside the first eighth of the bar.
-    ticks: [1, 6, 12, 24, 40],
-    // A non-road mode has no service count to read -- a tram is one service on its
-    // own track -- so under this ramp segments keep one flat colour each.
-    segmentRamps: false,
-  },
-  journeys: {
-    label: "Journeys a day",
-    // Clamped above zero before the log: an edge with no trips is not something
-    // the pipeline publishes, but -Infinity reaching a paint property is a blank
-    // map rather than an error, so it is not left to chance.
-    expr: ["log10", ["max", PER_DAY, 0.01]],
-    at: Math.log10,
-    stops: [3, 10, 30, 100, 300, 1000],
-    ticks: [3, 10, 30, 100, 300, 1000],
-    // Each mode shaded along its own colour, on this same scale, so the ticks
-    // below the bar read for the key as well as for the bar.
-    segmentRamps: true,
-    // The attribute this ramp cannot be drawn without. An archive published
-    // before `trips` was taken out of `_DETAIL_ONLY` answers every zoom below 11
-    // without it, and MapLibre has no way to say so: the fallback in `to-number`
-    // is read, every road comes back as the first colour, and a whole country
-    // drawn in one pale blue reads as a region with no buses. Better to draw the
-    // grey and let the shape of it say "this archive cannot answer". It goes away
-    // by itself at the next `wayfare publish` -- no re-matching, only the tiles.
-    needs: "trips",
-  },
+const RAMP = {
+  // Clamped above zero before the log: an edge with no trips is not something the
+  // pipeline publishes, but -Infinity reaching a paint property is a blank map
+  // rather than an error, so it is not left to chance.
+  expr: ["log10", ["max", PER_DAY, 0.01]],
+  at: Math.log10,
+  stops: [3, 10, 30, 100, 300, 1000],
+  ticks: [3, 10, 30, 100, 300, 1000],
+  // The attribute this ramp cannot be drawn without. An archive published before
+  // `trips` was taken out of `_DETAIL_ONLY` answers every zoom below 11 without
+  // it, and MapLibre has no way to say so: the fallback in `to-number` is read,
+  // every road comes back as the first colour, and a whole country drawn in one
+  // pale blue reads as a region with no buses. Better to draw the grey and let the
+  // shape of it say "this archive cannot answer". It goes away by itself at the
+  // next `wayfare publish` -- no re-matching, only the tiles.
+  needs: "trips",
 };
 
-// Deliberately outside both ramps and both mode palettes, and neutral in each
-// theme: "no answer here", not a low value.
-const UNAVAILABLE = { light: "#c9ccd1", dark: "#43464b" };
+// Where the bar sits on the log scale. Shared by the road bar, the mode key and
+// the ticks, so a swatch, the bar above it and the labels under it all read
+// against the same positions.
+const SCALE_LO = RAMP.at(RAMP.stops[0]);
+const SCALE_HI = RAMP.at(RAMP.stops[RAMP.stops.length - 1]);
+const scalePos = (v) => (((RAMP.at(v) - SCALE_LO) / (SCALE_HI - SCALE_LO)) * 100).toFixed(1);
 
-// ?colour=journeys first, then what was last chosen here, then the count the map
-// has always opened on. The parameter is so a link can carry the mode as well as
-// the place -- "look at this on frequency" is most of why anyone sends one.
-//
-// Both sources are validated against the vocabulary rather than trusted: a
-// query string is whatever was typed and localStorage outlives a rename, and
-// either reaching `colourExpr` as an undefined lookup takes the map out.
-const pick = (...names) => names.find((k) => k && k in COLOUR_BY) || "services";
-let colourBy = pick(
-  new URLSearchParams(location.search).get("colour"),
-  localStorage.getItem("wayfare-colour-by"),
-);
+// Deliberately outside both themes' ramps and both mode palettes, and neutral in
+// each theme: "no answer here", not a low value.
+const UNAVAILABLE = { light: "#c9ccd1", dark: "#43464b" };
 
 // One ramp's worth of interpolate, over whichever six colours it is handed. The
 // road ramp and every mode ramp share the scale, so the ticks under the bar read
 // for all of them at once.
-const rampOver = (c, colours) => [
-  "interpolate", ["linear"], c.expr,
-  ...c.stops.flatMap((v, i) => [c.at(v), colours[i]]),
+const rampOver = (colours) => [
+  "interpolate", ["linear"], RAMP.expr,
+  ...RAMP.stops.flatMap((v, i) => [RAMP.at(v), colours[i]]),
 ];
 
-// Grey where the attribute the ramp needs is missing, rather than the first colour
-// of a ramp that could not be evaluated.
-const guarded = (c, t, expr) =>
-  c.needs ? ["case", ["has", c.needs], expr, UNAVAILABLE[t]] : expr;
+// Grey where `trips` is missing, rather than the first colour of a ramp that could
+// not be evaluated.
+const guarded = (t, expr) => ["case", ["has", RAMP.needs], expr, UNAVAILABLE[t]];
 
-const colourExpr = (t, by) =>
-  guarded(COLOUR_BY[by], t, rampOver(COLOUR_BY[by], RAMP_COLOURS[t]));
+const colourExpr = (t) => guarded(t, rampOver(RAMP_COLOURS[t]));
 
 // Width ramps on service count, and the whole thing ramps on zoom so hairlines
 // at z6 grow into readable strokes at z16. `bump` is added at the leaf: a
@@ -698,33 +642,19 @@ const width = (bump) => [
 ];
 const HOVER_BUMP = ["case", ["boolean", ["feature-state", "hover"], false], 2, 0];
 
-// Colour by mode rather than by count. `match` falls through to grey for a mode
-// this page has no colour for, so a feed that starts publishing funiculars draws
-// them in grey rather than not at all.
-const modeColourExpr = (t) => [
-  "match", ["get", "mode"],
-  ...Object.entries(MODE_COLOUR[t]).flatMap(([m, c]) => [m, c]),
-  FALLBACK_MODE_COLOUR[t],
-];
-
-// A tram had no position on the service-count ramp, which is why it was given a
-// flat mode colour instead: it is one service on its own track, so the count is
-// always one and a road-shaped answer to "how many" is no answer. Journeys a day
-// is a question it *can* answer, so under that ramp each mode is shaded along its
-// own colour -- still a tram at a glance, and now also a busy or a quiet one.
+// Each mode shaded along its own colour, on the same scale as the road ramp, so
+// the ticks under the bar read for the key as well as for the bar -- still a tram
+// at a glance, and also a busy or a quiet one.
 //
 // A `match` per mode rather than one shared ramp, because the modes have to stay
 // told apart. `match` falls through to the fallback colour's ramp, so a feed that
 // starts publishing funiculars shades them in grey rather than not at all.
-const segColourExpr = (t, by) => {
-  const c = COLOUR_BY[by];
-  if (!c.segmentRamps) return modeColourExpr(t);
-  return guarded(c, t, [
+const segColourExpr = (t) =>
+  guarded(t, [
     "match", ["get", "mode"],
-    ...Object.keys(MODE_COLOUR[t]).flatMap((m) => [m, rampOver(c, modeRamp(t, m))]),
-    rampOver(c, modeRamp(t, "other")),
+    ...Object.keys(MODE_COLOUR[t]).flatMap((m) => [m, rampOver(modeRamp(t, m))]),
+    rampOver(modeRamp(t, "other")),
   ]);
-};
 
 // A segment carries no service count -- two trams over one street are two
 // coincident lines, not one edge that knows about both -- so `trips` is the only
@@ -858,22 +788,20 @@ wayfare serve</pre>
 /* ---------- regions ---------- */
 
 // The page is a static bundle and cannot list a directory, so the server says
-// which archives it has, and every one of them is on screen at once. The control
-// is therefore somewhere to go rather than something to choose: the regions are
-// hundreds of miles apart and panning between them at a national zoom is a chore.
-// A ?tiles= URL is a name we cannot label -- it may be somebody's bucket -- so it
-// is left out of the list rather than title-cased into nonsense.
+// which archives it has, and every one of them is on screen at once. A ?tiles=
+// URL is a name we cannot label -- it may be somebody's bucket -- so it is left
+// unnamed rather than title-cased into nonsense.
 const regionLabel = (n) =>
   n.replace(/\.pmtiles$/, "").replace(/[-_]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 
 const named = () => REGIONS.filter((r) => !r.name.includes("/") && framed(r.header));
 
-function offerRegions(map, missing) {
+// The strapline the page ships with already covers the ordinary case, so several
+// loaded regions need nothing said. It speaks up for the two cases it cannot: one
+// region, which it can name, and an archive that did not open, which nothing else
+// would report.
+function describeRegions(missing) {
   const here = named();
-  // The strapline the page ships with already covers the ordinary case, and the
-  // dropdown below names the regions, so several loaded regions need nothing
-  // said. It speaks up for the two cases it cannot: one region, which it can
-  // name, and an archive that did not open, which nothing else would report.
   if (missing) {
     $("sub").textContent =
       `${REGIONS.length} region${REGIONS.length === 1 ? "" : "s"}, ${missing} unavailable` +
@@ -881,31 +809,9 @@ function offerRegions(map, missing) {
   } else if (REGIONS.length === 1 && here.length === 1) {
     $("sub").textContent = `${regionLabel(here[0].name)} — public transport services`;
   }
-  if (here.length < 2) return; // nowhere to jump to
-
-  const sel = $("region");
-  // A placeholder that stays selected, because the control does not hold a state
-  // any more. Leaving a region selected would mean picking it twice in a row
-  // fires no `change` and the second click appears to do nothing.
-  sel.innerHTML =
-    `<option value="">Go to…</option>` +
-    here
-      .map((r) => `<option value="${escapeHtml(r.name)}">${escapeHtml(regionLabel(r.name))}</option>`)
-      .join("");
-  sel.hidden = false;
-  sel.addEventListener("change", () => {
-    const to = here.find((r) => r.name === sel.value);
-    sel.value = "";
-    if (to) map.fitBounds(bounds(to.header), { padding: 24 });
-  });
 }
 
 /* ---------- what the archives cover ---------- */
-
-const bounds = (h) => [
-  [h.minLon, h.minLat],
-  [h.maxLon, h.maxLat],
-];
 
 const framed = (h) => Number.isFinite(h.minLon) && h.maxLon > h.minLon;
 
@@ -958,7 +864,7 @@ const busLayer = (r) => ({
   "source-layer": LAYER_SRC,
   layout: { "line-cap": "round", "line-join": "round" },
   paint: {
-    "line-color": hoverOr(colourExpr(theme, colourBy)),
+    "line-color": hoverOr(colourExpr(theme)),
     "line-width": width(HOVER_BUMP),
     "line-opacity": 0.85,
   },
@@ -973,7 +879,7 @@ const segLayer = (r) => ({
   "source-layer": LAYER_SEG,
   layout: { "line-cap": "round", "line-join": "round" },
   paint: {
-    "line-color": hoverOr(segColourExpr(theme, colourBy)),
+    "line-color": hoverOr(segColourExpr(theme)),
     "line-width": segWidth(HOVER_BUMP),
     "line-opacity": 0.95,
   },
@@ -1083,7 +989,7 @@ function start(missing) {
     map.fitBounds(covered, { padding: 24, animate: false });
   }
 
-  offerRegions(map, missing);
+  describeRegions(missing);
 
   /* ---------- zoom readout ---------- */
 
@@ -1272,17 +1178,17 @@ function start(missing) {
     }
   });
 
-  /* ---------- theme and colour mode ---------- */
+  /* ---------- theme ---------- */
 
-  // Both controls change the same three things -- the two ramps on the map and
-  // the legend under them -- so neither owns the repaint. Every layer of every
-  // region is reassigned, because a colour expression is built from the theme and
-  // the mode together and there is no partial version of it.
+  // The two ramps on the map and the legend under them all change together, so
+  // they are repainted together. Every layer of every region is reassigned,
+  // because a colour expression is built from the theme and there is no partial
+  // version of it.
   function repaintColours() {
-    const colour = hoverOr(colourExpr(theme, colourBy));
+    const colour = hoverOr(colourExpr(theme));
     for (const id of BUS) map.setPaintProperty(id, "line-color", colour);
     for (const id of MATCH) map.setPaintProperty(id, "line-color", HOVER_COLOUR[theme]);
-    const segColour = hoverOr(segColourExpr(theme, colourBy));
+    const segColour = hoverOr(segColourExpr(theme));
     for (const id of SEG) map.setPaintProperty(id, "line-color", segColour);
     paintLegend();
     paintModeLegend();
@@ -1297,28 +1203,13 @@ function start(missing) {
     repaintColours();
   });
 
-  $("colourBy").value = colourBy;
-  $("colourBy").addEventListener("change", (e) => {
-    colourBy = pick(e.target.value);
-    localStorage.setItem("wayfare-colour-by", colourBy);
-    repaintColours();
-    // The card is showing whatever was last hovered, and it names the unit the
-    // ramp is in. Leaving it says "trips a week" under a bar labelled journeys.
-    redrawCard();
-  });
-
   /* ---------- info card ---------- */
 
   let current = null;
-  // The last thing shown, kept so the card can be rebuilt in place when the unit
-  // under it changes. `current` is the road's properties and drives the chips;
-  // this is either kind, and drives everything else.
-  let shown = null;
 
-  // The card leads with whatever the ramp is measuring, so the number a colour
-  // stands for is the first number on the card. The other one still follows,
-  // because the two answer different questions about the same road and the card
-  // is where a reader gets to see both.
+  // Journeys a day leads, because that is what a colour on the map stands for.
+  // Trips a week follows: it is the number the pipeline stores, it answers a
+  // different question about the same road, and the card is where both are free.
   // Empty, not a zero, when the archive did not carry the attribute at this zoom:
   // "0 journeys/day" is a wrong answer where a missing line is an absent one.
   const rate = (p) => {
@@ -1328,17 +1219,14 @@ function start(missing) {
     // hourly service is the whole of the interesting range, and none above it,
     // where it is noise.
     const perDay = perWeek / 7;
-    const day = `<b>${perDay < 10 ? perDay.toFixed(1) : Math.round(perDay).toLocaleString()}</b> journeys/day`;
-    const week = `<b>${perWeek.toLocaleString()}</b> trips/week`;
-    // Whichever one the ramp is in comes first, so the number a colour stands for
-    // is the first number on the card. The other still follows: they answer
-    // different questions about the same road and this is where both are free.
-    return colourBy === "journeys" ? [day, week] : [week, day];
+    return [
+      `<b>${perDay < 10 ? perDay.toFixed(1) : Math.round(perDay).toLocaleString()}</b> journeys/day`,
+      `<b>${perWeek.toLocaleString()}</b> trips/week`,
+    ];
   };
 
   function showFeature(p) {
     current = p;
-    shown = { kind: "road", p };
     const n = Number(p.n) || 0;
     $("road").textContent = p.name || "Unnamed road";
     $("road").classList.remove("empty");
@@ -1370,7 +1258,6 @@ function start(missing) {
   // geometry is the operator's own trace, not a road the pipeline identified.
   function showSegment(p) {
     current = null; // no service list, so nothing for the chips to draw
-    shown = { kind: "segment", p };
     const mode = MODE_LABEL[p.mode] || p.mode || "Other";
     $("road").textContent = p.ref ? `${mode} ${p.ref}` : mode;
     $("road").classList.remove("empty");
@@ -1378,12 +1265,6 @@ function start(missing) {
     $("note").hidden = false;
     $("note").textContent = `Drawn from the operator's own trace, not map-matched.`;
     $("chips").innerHTML = "";
-  }
-
-  function redrawCard() {
-    if (!shown) return;
-    if (shown.kind === "road") showFeature(shown.p);
-    else showSegment(shown.p);
   }
 
   function redrawChips() {
@@ -1483,16 +1364,14 @@ function paintModeLegend() {
   // grey it is drawn in.
   const order = Object.keys(MODE_COLOUR[theme]);
   const rank = (m) => (order.indexOf(m) < 0 ? order.length : order.indexOf(m));
-  // Under a ramp the key has to *be* the ramp. A solid swatch would name one
-  // colour out of six and leave the other five looking like modes with no key.
-  const c = COLOUR_BY[colourBy];
+  // Each mode is drawn along a ramp, so the key has to *be* that ramp. A solid
+  // swatch would name one colour out of six and leave the other five looking like
+  // modes with no key.
   $("modes").innerHTML = [...seenModes]
     .sort((a, b) => rank(a) - rank(b))
     .map((m) => {
-      const fill = c.segmentRamps
-        ? gradient(c, modeRamp(theme, m))
-        : MODE_COLOUR[theme][m] || FALLBACK_MODE_COLOUR[theme];
       const label = MODE_LABEL[m] || "Other";
+      const fill = gradient(modeRamp(theme, m));
       return `<span class="mode"><i style="background:${fill}"></i>${escapeHtml(label)}</span>`;
     })
     .join("");
@@ -1500,44 +1379,29 @@ function paintModeLegend() {
 }
 
 // Where each of a ramp's six colours sits along the bar, in the ramp's own scale.
-// Shared by the road bar and the mode key so a swatch and the bar above it read
-// against the same ticks.
-function gradient(c, colours) {
-  const lo = c.at(c.stops[0]);
-  const hi = c.at(c.stops[c.stops.length - 1]);
-  const stops = c.stops
-    .map((v, i) => `${colours[i]} ${(((c.at(v) - lo) / (hi - lo)) * 100).toFixed(1)}%`)
-    .join(", ");
+function gradient(colours) {
+  const stops = RAMP.stops.map((v, i) => `${colours[i]} ${scalePos(v)}%`).join(", ");
   return `linear-gradient(90deg, ${stops})`;
 }
 
-// The title, the bar and its ticks all say what a colour means, so they are
-// written together and cannot be left describing the ramp before last. The mode
-// key is `paintModeLegend`'s, because it is driven by what has been rendered
-// rather than by what is selected.
+// The bar and its ticks both say what a colour means, so they are written
+// together. The mode key is `paintModeLegend`'s, because it is driven by what has
+// been rendered rather than by what the bar shows.
 function paintLegend() {
-  const c = COLOUR_BY[colourBy];
-  $("rampTitle").textContent = c.label;
+  $("ramp").style.background = gradient(RAMP_COLOURS[theme]);
 
-  // Both the gradient and the ticks are placed by the ramp's own scale, so a tick
-  // sits on the colour it names. Under the journeys ramp the stops are
-  // half-decades and this comes out evenly spaced; under the services ramp it
-  // does not, and spreading the labels evenly instead would put "6" a third of
-  // the way along a bar that reaches it in an eighth.
-  const lo = c.at(c.stops[0]);
-  const hi = c.at(c.stops[c.stops.length - 1]);
-  const pos = (v) => (((c.at(v) - lo) / (hi - lo)) * 100).toFixed(1);
-
-  $("ramp").style.background = gradient(c, RAMP_COLOURS[theme]);
-
+  // The ticks are placed by the ramp's own scale, so a tick sits on the colour it
+  // names. The stops are half-decades, so on a log bar this comes out evenly
+  // spaced -- which is what the log scale was chosen for.
+  //
   // `translateX(-p%)` shifts a label by its own width in proportion to how far
   // along the bar it sits: the first ends up left-aligned at 0, the last
   // right-aligned at 100, everything between centred. Without it both ends hang
   // off the bar and the last one is clipped by the panel.
-  const top = c.ticks[c.ticks.length - 1];
-  $("ticks").innerHTML = c.ticks
+  const top = RAMP.ticks[RAMP.ticks.length - 1];
+  $("ticks").innerHTML = RAMP.ticks
     .map((v) => {
-      const p = pos(v);
+      const p = scalePos(v);
       const label = v === top ? `${v}+` : String(v);
       return `<span style="left:${p}%;transform:translateX(-${p}%)">${label}</span>`;
     })
