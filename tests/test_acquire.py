@@ -232,3 +232,99 @@ def test_non_resumable_sources_send_no_range_header(tmp_path, monkeypatch):
     monkeypatch.setattr(acquire.requests, "get", fake_get)
     acquire._stream(acquire.sources("wales")[0], part)
     assert "Range" not in seen
+
+
+# --- Credentials ------------------------------------------------------------
+#
+# Network Rail's SCHEDULE feed is the first source behind a login. What is tested
+# here is mostly that a refusal stops immediately: a 401 retried five times over
+# rising backoff proves nothing about the password and looks, from the far end,
+# exactly like guessing at it.
+
+
+def test_credentials_come_from_the_environment(monkeypatch):
+    monkeypatch.setenv("WAYFARE_NROD_USER", "someone@example.com")
+    monkeypatch.setenv("WAYFARE_NROD_PASS", "hunter2")
+    assert acquire.credentials("NROD") == ("someone@example.com", "hunter2")
+
+
+def test_missing_credentials_name_the_variables_not_the_value(monkeypatch):
+    monkeypatch.delenv("WAYFARE_NROD_USER", raising=False)
+    monkeypatch.delenv("WAYFARE_NROD_PASS", raising=False)
+    with pytest.raises(acquire.Unauthorized, match="WAYFARE_NROD_USER"):
+        acquire.credentials("NROD")
+
+
+def test_half_a_credential_pair_is_not_enough(monkeypatch):
+    monkeypatch.setenv("WAYFARE_NROD_USER", "someone@example.com")
+    monkeypatch.delenv("WAYFARE_NROD_PASS", raising=False)
+    with pytest.raises(acquire.Unauthorized):
+        acquire.credentials("NROD")
+
+
+def test_a_source_with_credentials_sends_them(tmp_path, monkeypatch):
+    monkeypatch.setenv("WAYFARE_NROD_USER", "someone@example.com")
+    monkeypatch.setenv("WAYFARE_NROD_PASS", "hunter2")
+    seen = {}
+
+    def fake_get(url, headers=None, auth=None, **k):
+        seen["auth"] = auth
+        return FakeResponse(200, b"DATA")
+
+    monkeypatch.setattr(acquire.requests, "get", fake_get)
+    src = acquire.Source("cif", "http://x/c.gz", "c.gz", credentials_from="NROD")
+    acquire._stream(src, tmp_path / "c.gz.part")
+    assert seen["auth"] == ("someone@example.com", "hunter2")
+
+
+def test_a_source_without_credentials_sends_none(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_get(url, headers=None, auth=None, **k):
+        seen["auth"] = auth
+        return FakeResponse(200, b"DATA")
+
+    monkeypatch.setattr(acquire.requests, "get", fake_get)
+    src = acquire.Source("osm", "http://x/y.pbf", "y.pbf")
+    acquire._stream(src, tmp_path / "y.pbf.part")
+    assert seen["auth"] is None
+
+
+def test_a_401_is_refused_rather_than_raised_as_a_transfer_fault(tmp_path, monkeypatch):
+    monkeypatch.setenv("WAYFARE_NROD_USER", "u")
+    monkeypatch.setenv("WAYFARE_NROD_PASS", "p")
+    monkeypatch.setattr(acquire.requests, "get", lambda *a, **k: FakeResponse(401, b"nope"))
+    src = acquire.Source("cif", "http://x/c.gz?type=x", "c.gz", credentials_from="NROD")
+    with pytest.raises(acquire.Unauthorized, match="401"):
+        acquire._stream(src, tmp_path / "c.gz.part")
+
+
+def test_a_refusal_is_not_retried(tmp_path, monkeypatch):
+    """The whole point of the separate class: five attempts change nothing."""
+    monkeypatch.setenv("WAYFARE_NROD_USER", "u")
+    monkeypatch.setenv("WAYFARE_NROD_PASS", "p")
+    monkeypatch.setattr(config, "DOWNLOAD_BACKOFF", 0.0)
+    calls = {"n": 0}
+
+    def fake_get(*a, **k):
+        calls["n"] += 1
+        return FakeResponse(403, b"nope")
+
+    monkeypatch.setattr(acquire.requests, "get", fake_get)
+    src = acquire.Source("cif", "http://x/c.gz", "c.gz", credentials_from="NROD")
+    with pytest.raises(acquire.Unauthorized):
+        acquire.download(src, tmp_path)
+    assert calls["n"] == 1
+
+
+def test_an_unset_credential_stops_before_any_request(tmp_path, monkeypatch):
+    monkeypatch.delenv("WAYFARE_NROD_USER", raising=False)
+    monkeypatch.delenv("WAYFARE_NROD_PASS", raising=False)
+
+    def boom(*a, **k):
+        raise AssertionError("no request should be made without credentials")
+
+    monkeypatch.setattr(acquire.requests, "get", boom)
+    src = acquire.Source("cif", "http://x/c.gz", "c.gz", credentials_from="NROD")
+    with pytest.raises(acquire.Unauthorized):
+        acquire.download(src, tmp_path)
