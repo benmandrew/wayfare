@@ -368,8 +368,17 @@ def _chain(members: list[Member]) -> list[Member]:
     return out
 
 
-# Only `n` survives below DETAIL_ZOOM; it is what the colour and width ramps read.
-_DETAIL_ONLY = ("way", "refs", "trips", "name")
+# `n` and `trips` both survive below DETAIL_ZOOM, because both are weights the
+# viewer paints with: `n` drives the service-count ramp, `trips` the journeys-a-day
+# one. `trips` used to be stripped here alongside the info card's attributes, which
+# was right while nothing but the card read it and wrong the moment a colour mode
+# did -- the map went flat below z11 rather than reporting a missing attribute.
+#
+# It costs a key and a varint per feature in the three overview bands, against
+# `refs`, which is a whole comma-joined service list and stays excluded. The way id
+# and the road name go with it: the info card is the only reader of all three, and
+# the card does not open below DETAIL_ZOOM.
+_DETAIL_ONLY = ("way", "refs", "name")
 
 # `export_geojsonl` writes with separators=(",", ":"), so this is the shape of every
 # line it produces. A line that does not match is a change to the export that this

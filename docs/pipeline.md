@@ -670,6 +670,21 @@ list cheap. Card-only attributes are confined to z11+. Bucketing `trips` to a lo
 was tried and rejected: it saves a further 2.1%, because MVT already pools the 1,759
 distinct values, and costs an approximate figure in the info card.
 
+**What "card-only" covers is `way`, `refs` and `name`, and `trips` is no longer one
+of them.** It was, for as long as the info card was its only reader. The viewer's
+second colour mode reads it, and an attribute a paint property cannot find is not an
+error MapLibre reports: it takes the fallback out of `to-number` and draws every road
+in the first ramp colour, so a whole country below z11 came out one flat blue and read
+as a region with no buses. `_DETAIL_ONLY` is now the three the card alone opens, and
+the card does not open below `DETAIL_ZOOM`. The cost is a key and a varint per feature
+in the three overview bands; `refs`, which is a whole comma-joined service list, is
+still excluded and is where the saving actually was.
+
+An archive published before that change answers its low zooms without `trips`, so the
+viewer guards the journeys ramp with `["has", "trips"]` and draws grey where the
+attribute is absent. The guard is transitional and self-clearing: it never fires
+against an archive built since, and republishing is a `publish` run, not a re-match.
+
 **The export is deterministic, and must stay that way.** Two things made it not be:
 `list(short_name ORDER BY n_trips DESC)` with no tiebreak, so equally busy services came
 back in arbitrary order and that order was part of the coalescing key; and `_chain`
