@@ -150,16 +150,18 @@ a.btn { text-decoration: none; }
 /* --- legend --- */
 .legend { padding: 10px 12px; }
 .legend-title { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
-.ramp { height: 8px; border-radius: 2px; margin: 7px 0 4px; }
+/* One row per mode, stacked, each bar the full width of the panel. Every ramp
+   spans the same scale, so bars of one length under one set of ticks can be read
+   against each other -- a short swatch could only name a colour. */
+.ramps { margin: 7px 0 4px; }
+.ramp-row + .ramp-row { margin-top: 7px; }
+.ramp-label { font-size: 11.5px; margin-bottom: 3px; }
+.ramp { height: 8px; border-radius: 2px; }
 /* Absolute rather than a flex row, because a tick has to sit on the colour it
    names and the stops are not evenly spaced. `paintLegend` writes the `left` and
    the matching `translateX`. */
 .ticks { position: relative; height: 13px; color: var(--muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
 .ticks span { position: absolute; top: 0; white-space: nowrap; }
-.modes { display: flex; flex-wrap: wrap; gap: 3px 12px; margin-top: 9px; }
-.mode { display: flex; align-items: center; gap: 6px; font-size: 11.5px; }
-/* Wide enough that six gradient stops read as a ramp rather than a smudge. */
-.mode i { width: 26px; height: 4px; border-radius: 2px; flex: none; }
 
 /* --- help --- */
 .help { padding: 0 12px 11px; color: var(--muted); font-size: 11.5px; }
@@ -266,7 +268,7 @@ a.btn { text-decoration: none; }
     <div class="help" id="help" hidden>
       <p>Most lines are a road segment — a stretch of road between two junctions. Thickness shows <b>how many distinct bus and coach services</b> use it, so trunk corridors stand out from the tail.</p>
       <p>Colour shows <b>journeys a day</b> — the departures along that road, averaged over the whole week and drawn on a logarithmic scale. Thickness and colour answer different questions, so a lane with one service every ten minutes is thin and bright. Grey means the archive under you carries no departure count at that zoom.</p>
-      <p>Trams, metros, trains and ferries have no road under them, so they are drawn from the operator's own trace and keep a colour of their own, listed in the key below. Each is shaded along that colour on the same scale as the bar above, so a quiet ferry and a busy one are the same red at different depths. Each line is one route's trace, so where two share a track they are two lines, not one busier one.</p>
+      <p>Trams, metros, trains and ferries have no road under them, so they are drawn from the operator's own trace and keep a colour of their own, with a bar each in the key below. Every bar is the same scale, so a quiet ferry and a busy one are the same red at different depths. Each line is one route's trace, so where two share a track they are two lines, not one busier one.</p>
       <p>Hover a line for its service list. Filtering matches whole service numbers, so <code>4</code> will not match <code>42</code>.</p>
       <p>Zoomed out, the map thins the densest areas to keep tiles small, so a
          quiet-looking city is not necessarily a city without services. Zoom in for
@@ -276,14 +278,14 @@ a.btn { text-decoration: none; }
 
   <div class="panel legend">
     <div class="legend-title">Journeys a day</div>
-    <div class="ramp" id="ramp"></div>
-    <!-- Written from the ramp's own stops, so the labels cannot drift from the
-         colours above them. -->
+    <!-- The road bar first, then a row for each mode actually drawn. A Great
+         Britain archive holds no ferry, and a key to one would be a promise the
+         tiles do not keep. -->
+    <div class="ramps" id="ramps"></div>
+    <!-- Written from the ramps' own stops, so the labels cannot drift from the
+         colours above them. One row of ticks serves every bar, because every bar
+         is the same scale. -->
     <div class="ticks" id="ticks"></div>
-    <!-- Filled in from what is actually drawn, and hidden until something is.
-         A Great Britain archive holds no ferry, and a key to one would be a
-         promise the tiles do not keep. -->
-    <div class="modes" id="modes" hidden></div>
   </div>
 </div>
 
@@ -528,6 +530,17 @@ function modeRamp(t, mode) {
   return rampCache.get(key);
 }
 
+// Which modes have been drawn, and so which rows the legend carries. Declared up
+// here rather than beside `noteRenderedModes`, which fills it: `paintLegend`
+// reads it and boot paints the legend before the map exists, so a declaration
+// further down leaves that first paint throwing on the temporal dead zone.
+//
+// Modes accumulate and are never removed. Panning away from the only tram line in
+// the window should not take the row for it off the page, and a mode drawn once
+// has been drawn -- the legend is a claim about the archives loaded, not about the
+// current viewport.
+const seenModes = new Set();
+
 const $ = (id) => document.getElementById(id);
 let theme = localStorage.getItem("wayfare-theme")
   || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
@@ -599,8 +612,8 @@ const RAMP = {
   needs: "trips",
 };
 
-// Where the bar sits on the log scale. Shared by the road bar, the mode key and
-// the ticks, so a swatch, the bar above it and the labels under it all read
+// Where the bar sits on the log scale. Shared by every bar in the legend and by
+// the ticks, so each mode's bar and the labels under the lot of them all read
 // against the same positions.
 const SCALE_LO = RAMP.at(RAMP.stops[0]);
 const SCALE_HI = RAMP.at(RAMP.stops[RAMP.stops.length - 1]);
@@ -1191,7 +1204,6 @@ function start(missing) {
     const segColour = hoverOr(segColourExpr(theme));
     for (const id of SEG) map.setPaintProperty(id, "line-color", segColour);
     paintLegend();
-    paintModeLegend();
   }
 
   $("theme").addEventListener("click", () => {
@@ -1337,12 +1349,6 @@ function basemapTiles(t) {
   );
 }
 
-// Modes accumulate and are never removed. Panning away from the only tram line in
-// the window should not take the key to it off the page, and a mode drawn once has
-// been drawn -- the legend is a claim about the archives loaded, not about the
-// current viewport.
-const seenModes = new Set();
-
 function noteRenderedModes(map, ids) {
   const live = ids.filter((id) => map.getLayer(id));
   if (!live.length) return;
@@ -1354,28 +1360,7 @@ function noteRenderedModes(map, ids) {
       added = true;
     }
   }
-  if (added) paintModeLegend();
-}
-
-function paintModeLegend() {
-  if (!seenModes.size) return;
-  // Ordered by the palette rather than alphabetically, so the four common modes
-  // stay together at the front and an unrecognised one sorts to the end with the
-  // grey it is drawn in.
-  const order = Object.keys(MODE_COLOUR[theme]);
-  const rank = (m) => (order.indexOf(m) < 0 ? order.length : order.indexOf(m));
-  // Each mode is drawn along a ramp, so the key has to *be* that ramp. A solid
-  // swatch would name one colour out of six and leave the other five looking like
-  // modes with no key.
-  $("modes").innerHTML = [...seenModes]
-    .sort((a, b) => rank(a) - rank(b))
-    .map((m) => {
-      const label = MODE_LABEL[m] || "Other";
-      const fill = gradient(modeRamp(theme, m));
-      return `<span class="mode"><i style="background:${fill}"></i>${escapeHtml(label)}</span>`;
-    })
-    .join("");
-  $("modes").hidden = false;
+  if (added) paintLegend();
 }
 
 // Where each of a ramp's six colours sits along the bar, in the ramp's own scale.
@@ -1384,11 +1369,27 @@ function gradient(colours) {
   return `linear-gradient(90deg, ${stops})`;
 }
 
-// The bar and its ticks both say what a colour means, so they are written
-// together. The mode key is `paintModeLegend`'s, because it is driven by what has
-// been rendered rather than by what the bar shows.
+// The bars and the ticks both say what a colour means, so they are written
+// together. Bus and coach are the road network and every other mode is drawn from
+// its own trace, which is two sources and one question, so they are one list of
+// rows rather than a bar with a key beside it. The road row is unconditional and
+// the rest arrive as they are rendered, so the list grows downwards.
 function paintLegend() {
-  $("ramp").style.background = gradient(RAMP_COLOURS[theme]);
+  // Ordered by the palette rather than alphabetically, so the four common modes
+  // stay together at the front and an unrecognised one sorts to the end with the
+  // grey it is drawn in.
+  const order = Object.keys(MODE_COLOUR[theme]);
+  const rank = (m) => (order.indexOf(m) < 0 ? order.length : order.indexOf(m));
+  const rows = [["Bus and coach", RAMP_COLOURS[theme]]];
+  for (const m of [...seenModes].sort((a, b) => rank(a) - rank(b))) {
+    rows.push([MODE_LABEL[m] || "Other", modeRamp(theme, m)]);
+  }
+  $("ramps").innerHTML = rows
+    .map(([label, colours]) =>
+      `<div class="ramp-row"><div class="ramp-label">${escapeHtml(label)}</div>`
+      + `<div class="ramp" style="background:${gradient(colours)}"></div></div>`
+    )
+    .join("");
 
   // The ticks are placed by the ramp's own scale, so a tick sits on the colour it
   // names. The stops are half-decades, so on a log bar this comes out evenly
