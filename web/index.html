@@ -94,11 +94,10 @@ h1 {
   letter-spacing: .02em;
 }
 .sub { color: var(--muted); font-size: 11.5px; margin-top: 2px; }
-/* Wraps, because a fourth control does not fit beside the title at this width.
-   The floor on the title column is what forces the wrap: without it flexbox
-   spends the whole row on the controls and squeezes the strapline down to one
-   word per line. 110px is under what is free with the three buttons alone, so a
-   single region still gets the one-row header it always had. */
+/* The floor on the title column is what forces the wrap on a narrow panel:
+   without it flexbox spends the whole row on the controls and squeezes the
+   strapline down to one word per line. 110px is under what is free with the three
+   buttons alone, so the ordinary case is still the one-row header. */
 .head { padding: 10px 12px; display: flex; align-items: flex-start; gap: 8px; flex-wrap: wrap; }
 .head > div { flex: 1; min-width: 110px; }
 
@@ -115,12 +114,6 @@ h1 {
 }
 .btn:hover { color: var(--text); border-color: var(--muted); }
 a.btn { text-decoration: none; }
-/* A `select` is as wide as its widest option unless told otherwise, and the
-   options are whole region names. Capped so it cannot claim the width of the
-   panel on the line it wraps onto, and pushed to the right-hand end of that
-   line. Its own text is only ever "Go to…"; the popup still opens as wide as
-   its contents. */
-#region { max-width: 160px; margin-left: auto; }
 
 /* --- search --- */
 .search { padding: 0 12px 10px; }
@@ -262,9 +255,6 @@ a.btn { text-decoration: none; }
       <a class="btn" href="art.html" title="Draw the network as a picture">Art</a>
       <button class="btn" id="theme" title="Toggle light/dark" aria-label="Toggle light or dark theme">Dark</button>
       <button class="btn" id="helpBtn" title="What am I looking at?" aria-label="What am I looking at?" aria-expanded="false" aria-controls="help">?</button>
-      <!-- Last, so that it is this one that wraps to a second line when the four
-           of them do not fit. Reading order and tab order then still agree. -->
-      <select class="btn" id="region" title="Jump to a region" aria-label="Jump to a region" hidden></select>
     </div>
     <div class="search">
       <label class="sr-only" for="q">Filter by service number</label>
@@ -798,22 +788,20 @@ wayfare serve</pre>
 /* ---------- regions ---------- */
 
 // The page is a static bundle and cannot list a directory, so the server says
-// which archives it has, and every one of them is on screen at once. The control
-// is therefore somewhere to go rather than something to choose: the regions are
-// hundreds of miles apart and panning between them at a national zoom is a chore.
-// A ?tiles= URL is a name we cannot label -- it may be somebody's bucket -- so it
-// is left out of the list rather than title-cased into nonsense.
+// which archives it has, and every one of them is on screen at once. A ?tiles=
+// URL is a name we cannot label -- it may be somebody's bucket -- so it is left
+// unnamed rather than title-cased into nonsense.
 const regionLabel = (n) =>
   n.replace(/\.pmtiles$/, "").replace(/[-_]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 
 const named = () => REGIONS.filter((r) => !r.name.includes("/") && framed(r.header));
 
-function offerRegions(map, missing) {
+// The strapline the page ships with already covers the ordinary case, so several
+// loaded regions need nothing said. It speaks up for the two cases it cannot: one
+// region, which it can name, and an archive that did not open, which nothing else
+// would report.
+function describeRegions(missing) {
   const here = named();
-  // The strapline the page ships with already covers the ordinary case, and the
-  // dropdown below names the regions, so several loaded regions need nothing
-  // said. It speaks up for the two cases it cannot: one region, which it can
-  // name, and an archive that did not open, which nothing else would report.
   if (missing) {
     $("sub").textContent =
       `${REGIONS.length} region${REGIONS.length === 1 ? "" : "s"}, ${missing} unavailable` +
@@ -821,31 +809,9 @@ function offerRegions(map, missing) {
   } else if (REGIONS.length === 1 && here.length === 1) {
     $("sub").textContent = `${regionLabel(here[0].name)} — public transport services`;
   }
-  if (here.length < 2) return; // nowhere to jump to
-
-  const sel = $("region");
-  // A placeholder that stays selected, because the control does not hold a state
-  // any more. Leaving a region selected would mean picking it twice in a row
-  // fires no `change` and the second click appears to do nothing.
-  sel.innerHTML =
-    `<option value="">Go to…</option>` +
-    here
-      .map((r) => `<option value="${escapeHtml(r.name)}">${escapeHtml(regionLabel(r.name))}</option>`)
-      .join("");
-  sel.hidden = false;
-  sel.addEventListener("change", () => {
-    const to = here.find((r) => r.name === sel.value);
-    sel.value = "";
-    if (to) map.fitBounds(bounds(to.header), { padding: 24 });
-  });
 }
 
 /* ---------- what the archives cover ---------- */
-
-const bounds = (h) => [
-  [h.minLon, h.minLat],
-  [h.maxLon, h.maxLat],
-];
 
 const framed = (h) => Number.isFinite(h.minLon) && h.maxLon > h.minLon;
 
@@ -1023,7 +989,7 @@ function start(missing) {
     map.fitBounds(covered, { padding: 24, animate: false });
   }
 
-  offerRegions(map, missing);
+  describeRegions(missing);
 
   /* ---------- zoom readout ---------- */
 
