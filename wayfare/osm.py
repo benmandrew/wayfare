@@ -91,6 +91,12 @@ class Relation:
     name: str | None
     ways: tuple[Way, ...]
     stops: tuple[Stop, ...]
+    # The rest of the relation's tags. `trace` needs none of them -- it joins on the
+    # stop sequence and nothing else -- but a relation used as a *service* rather
+    # than as geometry needs its `operator` and `ref`, which are the only record of
+    # whose line it is. Kept whole rather than as two fields so that reading a third
+    # one later is not a schema change.
+    tags: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -217,6 +223,7 @@ def parse(data: dict[str, Any]) -> list[Relation]:
                 name=tags.get("name"),
                 ways=tuple(ways),
                 stops=tuple(stops),
+                tags=tags,
             )
         )
     return out

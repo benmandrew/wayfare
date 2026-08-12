@@ -229,6 +229,33 @@ CREATE TABLE IF NOT EXISTS traces (
     lat_e6      INTEGER[]
 );
 
+-- Stage 2d: track inverted from per-pattern to per-way ------------------------
+
+-- The geometry of one OpenStreetMap way, so track can be drawn once rather than
+-- once per service that runs over it.
+--
+-- `traces` holds a whole pattern's path flattened into one polyline, which cannot
+-- be cut back into ways -- the way boundaries are gone by the time it is stored.
+-- Measured over Great Britain's 911 chaining `route=train` relations: drawn per
+-- pattern that is 1,569,495 vertices, drawn per way 443,126, because 75.8% of ways
+-- carry two or more relations. The reduction is the reason this table exists.
+--
+-- Deliberately not `edges`. That table's key is a Valhalla GraphId, and nothing
+-- routed these; minting a synthetic id into it would break the one identity the
+-- pipeline rests on. `way_id` is OpenStreetMap's own and is durable across graph
+-- rebuilds, which `edge_id` is not.
+CREATE TABLE IF NOT EXISTS ways (
+    way_id      BIGINT PRIMARY KEY,
+    -- Micro-degree integer lists and a bbox, exactly as `edges` and `segments`
+    -- store geometry, so a window test is an integer overlap.
+    lon_e6      INTEGER[],
+    lat_e6      INTEGER[],
+    min_lon_e6  INTEGER,
+    min_lat_e6  INTEGER,
+    max_lon_e6  INTEGER,
+    max_lat_e6  INTEGER
+);
+
 -- Free-form key/value for provenance: feed version, OSM extract date, the Valhalla
 -- graph build id that edge_id values belong to.
 CREATE TABLE IF NOT EXISTS meta (
