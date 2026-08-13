@@ -93,4 +93,10 @@ wayfare aggregate
 # Before publish, not after: clustering goes stale rather than off, and the rows
 # this run matched land unsorted on the end where no zonemap can help.
 wayfare cluster
-wayfare publish
+
+# --name-by-region because every deployed data root holds one region's archive under
+# its own name, and three of them are served from one directory. Without the flag
+# `publish` writes bus.pmtiles, which is the name nothing here serves -- and it
+# refuses outright rather than writing it, so a refresh without this cannot finish
+# at all. It exited here on 2026-08-12, which is how long the flag had been missing.
+wayfare publish --name-by-region
