@@ -118,9 +118,32 @@ def test_one_feature_per_way_with_its_service_list(built, tmp_path):
     props = features[0]["properties"]
     assert props["way_id"] == 10
     assert props["n"] == 1
-    assert props["refs"] == ["XC"]
+    assert props["refs"] == "XC"
     assert props["trips"] is None
     assert features[0]["geometry"]["type"] == "LineString"
+
+
+def test_refs_is_a_string_rather_than_an_array(built, tmp_path):
+    """A vector tile cannot hold an array, and tippecanoe does not say so.
+
+    It stores the array's JSON *text* instead, so a two-service way reached the
+    viewer as the literal `["Northern line","Jubilee line"]` and the split on commas
+    came back holding `["Northern line` and `Jubilee line"]`. Every name mangled and
+    the service search matching nothing, with no error anywhere. `export_geojsonl`
+    has always joined; this is the same contract, checked rather than assumed.
+    """
+    both = [
+        relation(relation_id=1, tags={"ref": "XC", "operator": "CrossCountry"}),
+        relation(relation_id=2, name="Other", tags={"ref": "TP"}),
+    ]
+    osmroutes.write(built, osmroutes.candidates(both)[0])
+    aggregate.build_track_services(built)
+    path = publish.export_track_geojsonl(built, tmp_path / "track.geojsonl")
+    assert path is not None
+    props = json.loads(path.read_text().splitlines()[0])["properties"]
+    assert isinstance(props["refs"], str)
+    assert props["refs"] == "TP,XC"
+    assert props["refs"].split(",") == ["TP", "XC"]
 
 
 def test_the_export_is_ordered_so_a_rebuild_is_byte_identical(built, tmp_path):

@@ -90,6 +90,18 @@ wayfare routes || \
   echo "refresh: routes did not finish; rail keeps whatever it last drew" >&2
 
 wayfare aggregate
+
+# After `aggregate`, which builds `segments` out of `patterns` and `shapes`, and
+# before `cluster`, which is the only thing that gives the space back: a DELETE
+# leaves DuckDB's high-water mark where it was, and `cluster` copies the database
+# into a fresh file. Pruning after it would reclaim nothing until the following
+# run. Every refresh reloads `shapes` from the feed, so this drops a table that
+# is rebuilt weekly rather than one that is kept -- Wales measured 160 MB to 114
+# MB compacted. It refuses while any matchable pattern is unmatched, which the
+# gate above has already established, and it spares the shapes a live non-road
+# pattern is drawn from.
+wayfare prune
+
 # Before publish, not after: clustering goes stale rather than off, and the rows
 # this run matched land unsorted on the end where no zonemap can help.
 wayfare cluster
