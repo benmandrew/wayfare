@@ -404,23 +404,45 @@ def _drop_routes_off_the_isles(con: duckdb.DuckDBPyConnection) -> None:
     every bounding box would then read it as a domestic service.
 
     It runs on `pattern_raw`, before `pattern_stops` and `patterns` are written, so a
-    dropped pattern never reaches either and departs on the ordinary path: its
-    `last_seen` stays at the previous feed. Its `match_status` row survives, which is
-    the point -- nothing here is re-matched if the rule is ever loosened.
+    dropped pattern never reaches either. That is enough for a feed this rule has
+    always applied to, and not enough for one it has not: a pattern already stored
+    leaves by `last_seen` falling behind, and re-running against the feed version
+    already on disk stamps the same value it is holding. It would stay live, keep its
+    weight, and lose only its `pattern_stops` rows, which are rebuilt outright --
+    a live pattern with no stops. `_retire_unselected_modes` exists for the same
+    reason and takes the same way out, which is to delete the stored row.
+
+    `match_status` is left alone, which is the point -- nothing here is re-matched if
+    the rule is ever loosened.
     """
     outside = config.british_isles_sql("s.lat", "s.lon")
-    n_before = db.scalar(con, "SELECT count(*) FROM pattern_raw")
     con.execute(f"""
-        DELETE FROM pattern_raw WHERE pattern_id IN (
-            SELECT pr.pattern_id
-            FROM pattern_raw pr, unnest(pr.stop_seq) AS u(stop_id)
-            JOIN stops s ON s.stop_id = u.stop_id
-            WHERE NOT {outside}
-        )
+        CREATE OR REPLACE TEMP TABLE off_isles AS
+        SELECT DISTINCT pr.pattern_id
+        FROM pattern_raw pr, unnest(pr.stop_seq) AS u(stop_id)
+        JOIN stops s ON s.stop_id = u.stop_id
+        WHERE NOT {outside}
     """)
-    n_dropped = n_before - db.scalar(con, "SELECT count(*) FROM pattern_raw")
-    if n_dropped:
-        log.info("%d patterns dropped for calling outside the British Isles", n_dropped)
+    n_dropped = db.scalar(con, "SELECT count(*) FROM off_isles")
+    if not n_dropped:
+        return
+
+    con.execute(
+        "DELETE FROM pattern_raw WHERE pattern_id IN (SELECT pattern_id FROM off_isles)"
+    )
+    n_stored = db.scalar(
+        con,
+        "SELECT count(*) FROM patterns WHERE pattern_id IN "
+        "(SELECT pattern_id FROM off_isles)",
+    )
+    con.execute(
+        "DELETE FROM patterns WHERE pattern_id IN (SELECT pattern_id FROM off_isles)"
+    )
+    log.info("%d patterns dropped for calling outside the British Isles", n_dropped)
+    if n_stored:
+        log.info(
+            "%d of them were stored by an earlier build and have been retired", n_stored
+        )
 
 
 def _check_unique_ids(con: duckdb.DuckDBPyConnection) -> None:
