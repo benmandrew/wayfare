@@ -995,7 +995,15 @@ def export_track_geojsonl(
                         "properties": {
                             "way_id": way_id,
                             "n": n,
-                            "refs": list(refs[: config.MAX_REFS_IN_TILE]),
+                            # Comma-joined, exactly as `export_geojsonl` writes it,
+                            # because a JSON array is not a thing a vector tile can
+                            # hold. Tippecanoe does not drop one and does not warn:
+                            # it stores the array's *JSON text* as a string, so the
+                            # viewer's `refs.split(",")` came back holding
+                            # `["Northern line` and `Jubilee line"]`. Every name
+                            # mangled, and the service search silently matching
+                            # nothing on this layer.
+                            "refs": ",".join(refs[: config.MAX_REFS_IN_TILE]),
                             "trips": trips,
                         },
                         "geometry": {

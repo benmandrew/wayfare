@@ -3,19 +3,26 @@
 A deployed region is one Docker Compose project: `valhalla` holding the routing
 graph, `web` serving the viewer and the tile archives, and one `data` volume that
 both of them share. A refresh replaces the timetable in that volume and republishes
-the tileset, on a schedule, with nobody watching. Three files under `deploy/` are
-the whole of it — `refresh.sh`, `wayfare-refresh.service` and
-`wayfare-refresh.timer`.
+the tileset, on a schedule, with nobody watching. `deploy/refresh.sh` is the stage
+sequence, and it is the whole of what this repository owns. The schedule around it
+is cron under Ansible, described below. `wayfare-refresh.service` and
+`wayfare-refresh.timer` sit beside the script as the reference for what any
+scheduler has to provide, and neither has ever been installed.
 
 ## What a refresh is
 
-**A refresh is the churn and nothing else.** `match` selects work by the *absence*
-of a `match_status` row, and `match_status` is keyed on pattern identity rather than
-on a run, so a feed whose *patterns* — the ordered stop sequences that are the unit
-of work — are mostly unchanged costs only the ones that are new. Everything carried
-over from the previous feed is already matched and is skipped for free. *Churn*, the
-count of patterns that appear and depart between two feeds, is therefore the number
-that sets what a refresh costs.
+**The stage that dominates a refresh costs the churn and nothing else.** `match`
+selects work by the *absence* of a `match_status` row, and `match_status` is keyed on
+pattern identity rather than on a run, so a feed whose *patterns* — the ordered stop
+sequences that are the unit of work — are mostly unchanged costs only the ones that
+are new. Everything carried over from the previous feed is already matched and is
+skipped for free. *Churn*, the count of patterns that appear and depart between two
+feeds, is therefore the number that sets what the day-or-two stage costs.
+
+`match` and `trace` are the two incremental stages. `acquire`, `patterns`,
+`aggregate`, `prune`, `cluster` and `publish` are full passes every run, so what a
+refresh costs is that fixed floor plus the churn. The floor is what decides whether a
+shorter interval is affordable, and the Cadence section at the end prices it.
 
 **Measured on Wales, two feeds two days apart: 3,584 patterns became 3,541** — 30
 new, 73 departed — and matching the new ones took ~8 s against 16m23s for the
@@ -34,7 +41,7 @@ That collapses what could have been three schedules into one chained unit. Separ
 acquire, drain and publish timers would have bought re-entry: a drain stopped after
 an hour, resumed the following night, publishing only once the queue finally
 emptied. Re-entry is worth having when the drain is bounded. This one is not, so the
-script runs `acquire`, `patterns`, `match`, `trace`, `routes`, `aggregate`,
+script runs `acquire`, `patterns`, `match`, `trace`, `routes`, `aggregate`, `prune`,
 `cluster` and `publish` in order under `set -euo pipefail`, and a stage that fails
 stops the run where it stands — except the two that ask Overpass, which are
 allowed to fail and are covered below.
@@ -42,6 +49,16 @@ allowed to fail and are covered below.
 `cluster` runs before `publish`, not after. Clustering goes stale rather than off,
 and the rows this run matched land unsorted on the end of the table where no zonemap
 can help them.
+
+**`prune` sits between `aggregate` and `cluster`, and both neighbours decide that
+slot.** `aggregate` rebuilds `segments` out of `patterns` and `shapes`, so pruning
+before it would take away the source of a non-road pattern's geometry. `cluster` is
+the only thing that gives space back — a DELETE leaves DuckDB's high-water mark
+where it is, and `cluster` copies the database into a fresh file — so pruning after
+it would reclaim nothing until the following run. Wales measured 160 MB going to 114
+MB compacted, and the shapes are reloaded from the feed by the next `patterns`
+anyway. The command refuses while any matchable pattern is unmatched, which the gate
+above has already established by the time it runs.
 
 ## The publish gate is two counts
 
@@ -108,9 +125,25 @@ relation becomes a service in its own right, so the track arrives under ODbL, wh
 every archive already carries and credits for its matched roads.
 
 It asks the same metered public service `trace` does, so it gets the same treatment:
-`|| echo` and the run carries on. What it does not draw this month it draws next
-month, because the stage rebuilds its patterns from OpenStreetMap every run rather
+`|| echo` and the run carries on. What it does not draw this run it draws the next
+one, because the stage rebuilds its patterns from the relation set every run rather
 than carrying them forward.
+
+**Neither stage re-queries Overpass on a schedule, and the geometry ages because of
+it.** `osm.fetch` reads `raw/osm_relations.json` or `raw/osm_routes.json` where one
+exists and only `--refresh` overrides that, which `refresh.sh` never passes. That is
+what keeps a shortened interval off a public service: the national query cost 131 MB
+and 27 seconds once, and every run since has read the file. Left alone, the track
+stays as OpenStreetMap had it on the day of that query, so "next run draws it" covers
+a fit that failed and not a relation the map has gained since.
+
+**Deleting the two files is what re-queries, and the schedule does it every 30 days.**
+`wayfare-refresh.sh` in `roles/wayfare` keeps a second stamp beside the first and
+removes `raw/osm_relations.json` and `raw/osm_routes.json` when that stamp is older
+than `wayfare_refresh_osm_days`. The stages then find nothing cached and ask Overpass
+once, which is one national query a month against a weekly run. That stamp is written
+before the run for the same reason the other one is: a re-query that fails must not
+turn into a re-query every night.
 
 **It must run after `patterns`, and the ordering is not cosmetic.** `patterns` sets
 the feed version these rows are stamped with, and a relation written against the
@@ -131,7 +164,7 @@ and every other number the run reports would have stayed healthy while it did.
 `build_patterns` now writes the selection to `meta.modes` beside `feed_version` and
 defaults to `gtfs.stored_modes` rather than to a constant. An unrecognised stored
 name is left to raise rather than being dropped, on the same reading as
-`--force-graph`: renaming a mode should break the timer and be dealt with by a
+`--force-graph`: renaming a mode should break the schedule and be dealt with by a
 person.
 
 **Deselecting a mode has to retire its patterns, because nothing else will.** A
@@ -144,28 +177,56 @@ retired — it means a database written before modes existed, where everything s
 is road-going by construction, and matching those against a name would delete a
 national match run.
 
-`refresh.sh`, the unit and the timer need no change for any of this. The database
-carries the selection, so a refresh inherits whatever the region was last built
-with, and a multi-modal region is scheduled exactly as a road-only one is.
+`refresh.sh` and the cron entry need no change for any of this. The database carries
+the selection, so a refresh inherits whatever the region was last built with, and a
+multi-modal region is scheduled exactly as a road-only one is.
 
-## Installing it
+## How it is scheduled: cron, under Ansible
 
-`refresh.sh` stays in the checkout and finds its own compose file, so it can be run
-from anywhere. The unit and the timer go to `/etc/systemd/system/`. Edit
-`WorkingDirectory=` in the unit to wherever the checkout lives, then:
+**The schedule lives in `roles/wayfare` of the Ansible repository, and this script is
+vendored into it.** emel carries no checkout of this repository, so the role copies
+`deploy/refresh.sh` in unmodified and installs it at `<build home>/deploy/refresh.sh`
+— which is the path that makes the script's own `cd "$(dirname …)/.."` land on the
+Ansible-rendered build Compose file. The stage sequence stays upstream because which
+stages run, behind which gate, with which flags is exactly what changed on 2026-08-12
+when `--name-by-region` turned out to be mandatory. The cost is that a change here
+reaches the host when somebody re-vendors the file, and the role's header carries the
+`diff` recipe that says whether it is current.
 
-    systemctl daemon-reload
-    systemctl enable --now wayfare-refresh.timer
-    systemctl start wayfare-refresh.service
+Cron rather than a systemd *timer*, because every scheduled job in that repository is
+a crontab entry. Four things the unit provided are provided again:
 
-The third line runs one refresh immediately, without waiting for the timer.
-`systemctl status wayfare-refresh` and `journalctl -u wayfare-refresh` are where its
-output goes: logging is on stderr and `wayfare status` prints its JSON on stdout, so
-the two never mix in a capture.
+- `Type=oneshot` becomes `flock -n` on the cron line, so a tick landing on a running
+  drain is a no-op rather than a second writer.
+- `Persistent=true` becomes a stamp file at `/var/lib/wayfare/last-attempt`. The line
+  fires nightly at 03:17 and the stamp's age decides whether the tick does anything,
+  so a host that was down delays a refresh by a night.
+- `OnFailure=` becomes a line in `/var/log/services.log`, which Alloy ships to Loki.
+- `RandomizedDelaySec=1h` is dropped. It keeps a fleet off the Bus Open Data Service
+  (BODS) at one instant, and this is one host.
+
+**The stamp is written before the run, not after.** A failure then costs a full
+interval instead of retrying nightly against a feed that is still broken, which
+bounds the rate rather than merely reducing it.
+
+**Tearing the stack down is the wrapper's job, and it is worth real memory.**
+`refresh.sh` leaves the containers up and the unit never took them down either.
+Measured 19 hours after a finished run, `valhalla` held 4.24 GiB of anonymous memory
+at 14.4 GB resident and emel was 2.3 GB into swap. The wrapper runs `docker compose
+down` from an `EXIT` trap, so the failure and interrupt paths release it too, and the
+graph survives as a bind mount.
+
+**The host's caps are lower than the numbers elsewhere in these docs.** emel runs 2
+match workers and 3 Valhalla threads against the 6 the throughput figures were taken
+at, and `WAYFARE_MEM` is 6 GB rather than the project's 8 GB. 4 workers and 6 threads
+put Valhalla at its 10 GB ceiling for a whole run: 1.66M reclaims, four OOM kills, and
+throughput falling from 8.6/s to 0.13/s at 92% as reclaim evicted the mmap'd graph
+tiles. Every rate in docs/results.md is a ceiling on that box.
 
 **`REFRESH_NO_FETCH=1` skips the download.** It is for a retry after a failure past
 `acquire`, because `acquire --force` otherwise re-fetches 1.28 GB for Great Britain
-to get a feed already sitting in the volume.
+to get a feed already sitting in the volume. Removing the stamp is what lets the next
+nightly tick pick a failed run up early.
 
 ## Traps
 
@@ -173,11 +234,13 @@ to get a feed already sitting in the volume.
 `match.pin_graph`, the check that stops edge ids from one Valhalla graph build
 mixing with edge ids from another. Attended, that override is a decision; unattended,
 the failure is silent, renders fine and is wrong, and costs a full re-match to undo.
-A graph rebuild should break the timer and be dealt with by a person.
+A graph rebuild should break the schedule and be dealt with by a person.
 
-**`Type=oneshot` is load-bearing, not ceremony.** DuckDB takes a single writer, and
-oneshot is what stops a timer firing mid-drain from starting a second one. The later
-fire becomes a no-op rather than a corruption.
+**Mutual exclusion is load-bearing, and cron gives none of it for free.** DuckDB
+takes a single writer, and a drain runs for hours, so a nightly tick will routinely
+land on one still running. `flock -n` on the cron line is what makes that tick a
+no-op, standing in for the unit's `Type=oneshot`. Without `-n` it would queue and
+start a second writer the moment the first finished.
 
 **One region per deployment.** `meta.feed_version` is single-valued, so a second
 region acquired into the first's volume becomes the current feed, and the next
@@ -188,11 +251,19 @@ compose project and a second data volume, not a second entry in the same one.
 data root holds its region's archive under its own name, and the served directory
 holds all three. A bare `publish` writes `bus.pmtiles`, which nothing serves, so
 `publish.default_out` stops rather than succeeding quietly — and `set -e` then ends
-the run. The flag was missing from this script until 2026-08-13, which means the
-scheduled refresh could not have completed on any of the three deployments and the
-recent republishes were done by hand. Nor could one have run: as of 2026-08-13 the
-server carries no timer and no checkout of this repository, only a compose file and a
-script written for one run. Everything under "Installing it" is still a plan.
+the run. The flag was missing from this script until 2026-08-13, so no scheduled
+refresh could have completed on any of the three deployments, and the republishes up
+to that date were done by hand.
+
+**Running the timer alongside the cron entry would put two writers on one database.**
+The unit and the timer in `deploy/` are a reference for what a scheduler owes this
+script, and Ansible replaces them rather than joining them. Installing both is the
+one way to lose the database that neither side checks for.
+
+**Only Great Britain is on the schedule.** The role deploys one build stack at
+`WAYFARE_REGION=all`, which publishes `great_britain.pmtiles`. Ireland's and Northern
+Ireland's archives are served from the same read-only mount and are refreshed by
+nothing, because a second region needs a second data root and the role renders one.
 
 **Failure has to propagate, hence `set -e` and `&&` rather than `;`.** The Bus Open
 Data Service (BODS) answers an outage with HTTP 200 and an HTML error page, and the
@@ -253,16 +324,31 @@ change that made the same requests cheaper by a round trip.
 
 ## Cadence
 
-**Monthly is the largest sensible gap rather than the natural one.** BODS
-republishes far more often than that, and the pair churn was first measured against
-were two days apart. A shorter period means less churn per run and a shorter drain,
-so the timer's `OnCalendar=monthly` is a ceiling to move in from, not a target.
-`Persistent=true` runs a refresh missed while the box was down, and
-`RandomizedDelaySec=1h` keeps a fleet of these off BODS at the same instant.
+**Monthly is the largest sensible gap, and the deployed interval is 7 days.** BODS
+republishes far more often than monthly, and the pair churn was first measured
+against were two days apart, so the `OnCalendar=monthly` the unit still carries is a
+ceiling to move in from. Ansible sets `wayfare_refresh_interval_days: 7` and moved in
+once.
+
+**Shortening the interval buys a smaller drain and pays for the full passes four
+times as often.** `match` and `trace` are the two stages whose cost is churn;
+`acquire`, `patterns`, `aggregate`, `prune`, `cluster` and `publish` cost the same
+whatever the interval, so weekly is four times that floor. In transfer that floor is
+the 1.28 GB feed and the 102 MB NaPTAN register, about 1.4 GB a week. The 2.16 GB OSM
+extract is not in it, because `acquire` fetches a pbf only under `--with-osm` and the
+Valhalla image pulls its own from `tile_urls` when it builds a graph.
+
+**Departed rows accumulate per run rather than per month, and `prune` does not touch
+them.** `prune_shapes` drops operator geometry alone. A departed pattern keeps its
+`match_status` row deliberately, so a seasonal service that returns is free, and its
+`pattern_edges` rows stay because no policy decides when they should go — the gap is
+recorded in PLAN.md and nothing in the schedule closes it. Four times the runs is
+four times the departed rows arriving in a month, so the size of the DuckDB file
+under `wayfare_data_dir` is the thing to watch on a shortened interval.
 
 The honest way to pick a period is to watch what `patterns` logs — new, carried over
 still unmatched, departed — across a few runs, and set the interval against the
 churn actually observed rather than against a calendar word. What makes that worth
-doing is that the cost of a refresh is not the timetable's size but its
-instability, and nothing in the pipeline knows that number until a schedule has been
+doing is that the cost of a refresh is its timetable's instability rather than its
+size, and nothing in the pipeline knows that number until a schedule has been
 running long enough to reveal it.

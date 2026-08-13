@@ -269,6 +269,7 @@ a.btn { text-decoration: none; }
       <p>Most lines are a road segment — a stretch of road between two junctions. Thickness shows <b>how many distinct bus and coach services</b> use it, so trunk corridors stand out from the tail.</p>
       <p>Colour shows <b>journeys a day</b> — the departures along that road, averaged over the whole week and drawn on a logarithmic scale. Thickness and colour answer different questions, so a lane with one service every ten minutes is thin and bright. Grey means the archive under you carries no departure count at that zoom.</p>
       <p>Trams, metros, trains and ferries have no road under them, so they are drawn from the operator's own trace and keep a colour of their own, with a bar each in the key below. Every bar is the same scale, so a quiet ferry and a busy one are the same red at different depths. Each line is one route's trace, so where two share a track they are two lines, not one busier one.</p>
+      <p>National Rail is drawn from OpenStreetMap route relations, because Great Britain's rail timetable is not in the open bus feed. It is one line per stretch of track rather than one per service, and it is a single flat brown rather than a bar: no timetable is attributed to it, so nothing here knows how often a train runs. Hovering still lists which services use that stretch.</p>
       <p>Hover a line for its service list. Filtering matches whole service numbers, so <code>4</code> will not match <code>42</code>.</p>
       <p>Zoomed out, the map thins the densest areas to keep tiles small, so a
          quiet-looking city is not necessarily a city without services. Zoom in for
@@ -337,6 +338,11 @@ const LAYER_SRC = "bus";    // the matched road network inside every archive
 // own inside the same archive, absent from a bus-only region -- MapLibre tolerates
 // a layer whose source-layer is missing, so nothing has to ask first.
 const LAYER_SEG = "segments";
+// National Rail, which BODS does not carry at all. Drawn from OSM route relations
+// and inverted to one feature per way, so it is neither a matched road nor one
+// pattern's trace and gets a layer of its own. Absent from a region that has none,
+// and MapLibre tolerates a layer whose source-layer is missing, so nothing asks.
+const LAYER_TRACK = "track";
 
 // The road ramp, six steps. Light goes pale-blue -> deep violet so busy roads
 // darken against the light basemap; dark goes the other way, into warm yellow, so
@@ -506,13 +512,13 @@ const RAMP_LOW = {
   dark: { lightness: (L) => L * 0.55, chroma: 1 },
 };
 
-function rampFrom(hex, t) {
+function rampFrom(hex, t, steps = RAMP_STEPS) {
   const { L, C, H } = hexToOklch(hex);
   const low = RAMP_LOW[t];
   const loL = low.lightness(L);
   const loC = C * low.chroma;
-  return Array.from({ length: RAMP_STEPS }, (_, i) => {
-    const u = i / (RAMP_STEPS - 1);
+  return Array.from({ length: steps }, (_, i) => {
+    const u = i / (steps - 1);
     const stepL = loL + (L - loL) * u;
     const stepC = loC + (C - loC) * u;
     return oklchToHex(stepL, fitChroma(stepL, stepC, H), H);
@@ -530,6 +536,31 @@ function modeRamp(t, mode) {
   return rampCache.get(key);
 }
 
+// The one flat colour relation track is drawn in: the middle of the mode's own
+// ramp. Flat because the track has no journey count to shade by -- `trips` is null
+// until a timetable is attributed, and a way carries a service *count* which is a
+// different quantity from the journeys a day every other colour on this map means.
+// The middle rather than either end because both ends state a weight: the top is
+// the colour the busiest line of that mode is drawn in, and the bottom the quietest.
+//
+// Taken at u = 0.5 of the ramp rather than by indexing it, because six steps have
+// no middle one -- steps 2 and 3 straddle the midpoint. Three steps put one exactly
+// on it, and the same generator produces both.
+const midCache = new Map();
+function modeMid(t, mode) {
+  const key = `${t}|${mode}`;
+  if (!midCache.has(key)) {
+    const hex = MODE_COLOUR[t][mode] || FALLBACK_MODE_COLOUR[t];
+    midCache.set(key, rampFrom(hex, t, 3)[1]);
+  }
+  return midCache.get(key);
+}
+
+// The mode the track layer is drawn as. A constant rather than a feature property:
+// `routes` only builds `route=train` relations, so every feature in this layer is
+// heavy rail, and there is no per-feature mode in the tile to read.
+const TRACK_MODE = "rail";
+
 // Which modes have been drawn, and so which rows the legend carries. Declared up
 // here rather than beside `noteRenderedModes`, which fills it: `paintLegend`
 // reads it and boot paints the legend before the map exists, so a declaration
@@ -540,6 +571,12 @@ function modeRamp(t, mode) {
 // has been drawn -- the legend is a claim about the archives loaded, not about the
 // current viewport.
 const seenModes = new Set();
+
+// Track is tracked separately from `seenModes`, and has to be: a track feature has
+// no `mode` property to read, and its legend row is a flat swatch rather than a
+// ramp. Folding it into the mode set would paint a rail ramp for geometry that is
+// drawn in one colour, which is the legend telling a different story from the map.
+let seenTrack = false;
 
 const $ = (id) => document.getElementById(id);
 let theme = localStorage.getItem("wayfare-theme")
@@ -688,6 +725,17 @@ const segWidth = (bump) => [
   16, byTrips(1.30, 2.30, 3.60, bump),
 ];
 
+// Track takes the middle of that same range at every zoom, for the reason its
+// colour takes the middle of the ramp: there is no count to widen it by. Letting
+// `byTrips` read a null `trips` would not have been neutral -- the fallback is 20,
+// the bottom of the scale, so every rail line in the country would have drawn at
+// the width of a service running twice a day.
+const trackWidth = (bump) => [
+  "+",
+  ["interpolate", ["linear"], ["zoom"], 6, 0.45, 9, 0.85, 12, 1.35, 16, 2.30],
+  bump,
+];
+
 // The hovered segment in the accent colour, everything else off the ramp. Shared
 // with the theme toggle, which rebuilds the same expression for every region.
 const hoverOr = (base) => [
@@ -773,6 +821,7 @@ async function openArchive(name, i) {
       layer: `bus-${i}`,
       match: `bus-match-${i}`,
       seg: `seg-${i}`,
+      track: `track-${i}`,
     };
   } catch (err) {
     console.error(`could not read ${url}`, err);
@@ -898,6 +947,23 @@ const segLayer = (r) => ({
   },
 });
 
+// National Rail, one feature per way rather than per service, because 75.8% of GB
+// rail ways carry two or more relations. Below the segments: where a tram shares an
+// alignment with a railway, the tram's own trace is the more specific answer and
+// should be the one the cursor gets.
+const trackLayer = (r) => ({
+  id: r.track,
+  type: "line",
+  source: r.src,
+  "source-layer": LAYER_TRACK,
+  layout: { "line-cap": "round", "line-join": "round" },
+  paint: {
+    "line-color": hoverOr(modeMid(theme, TRACK_MODE)),
+    "line-width": trackWidth(HOVER_BUMP),
+    "line-opacity": 0.95,
+  },
+});
+
 // Drawn only while a filter is active: the matching services on top of the
 // dimmed network.
 const matchLayer = (r) => ({
@@ -962,10 +1028,12 @@ function start(missing) {
   // has to be the brightest thing on screen.
   const layers = [{ id: "basemap", type: "raster", source: "basemap" }];
   for (const r of REGIONS) layers.push(busLayer(r));
+  for (const r of REGIONS) layers.push(trackLayer(r));
   for (const r of REGIONS) layers.push(segLayer(r));
   for (const r of REGIONS) layers.push(matchLayer(r));
 
   const BUS = REGIONS.map((r) => r.layer);
+  const TRACK = REGIONS.map((r) => r.track);
   const SEG = REGIONS.map((r) => r.seg);
   const MATCH = REGIONS.map((r) => r.match);
 
@@ -1100,7 +1168,14 @@ function start(missing) {
     // is nothing to merge across regions -- a segment is one pattern's own trace,
     // not a road two archives independently describe.
     const segHits = map.queryRenderedFeatures(e.point, { layers: SEG });
-    const hits = segHits.length ? segHits : map.queryRenderedFeatures(e.point, { layers: BUS });
+    const trackHits = segHits.length
+      ? []
+      : map.queryRenderedFeatures(e.point, { layers: TRACK });
+    const hits = segHits.length
+      ? segHits
+      : trackHits.length
+        ? trackHits
+        : map.queryRenderedFeatures(e.point, { layers: BUS });
     const f = hits[0];
     map.getCanvas().style.cursor = f ? "pointer" : "";
     if (hovered && (!f || hovered.id !== f.id || hovered.src !== f.source)) {
@@ -1111,6 +1186,7 @@ function start(missing) {
     hovered = { src: f.source, sourceLayer: f.sourceLayer, id: f.id };
     setHover(hovered, true);
     if (segHits.length) showSegment(f.properties);
+    else if (trackHits.length) showTrack(f.properties);
     else showFeature(mergeRegions(hits));
   });
 
@@ -1134,6 +1210,11 @@ function start(missing) {
     }
     for (const id of BUS) map.setPaintProperty(id, "line-opacity", on ? 0.12 : 0.85);
     for (const id of SEG) map.setPaintProperty(id, "line-opacity", segOpacity(active));
+    // Track dims on the same rule and for the same reason. `refs` here is the same
+    // comma-joined list the road layer carries, so searching "XC" finds the
+    // CrossCountry track as well as the coaches -- which is the point of the search
+    // being national rather than per-layer.
+    for (const id of TRACK) map.setPaintProperty(id, "line-opacity", segOpacity(active));
 
     if (on) {
       countMatches();
@@ -1179,6 +1260,7 @@ function start(missing) {
   // On idle rather than on load: an archive's segments are not necessarily in the
   // opening view, and the tiles holding them arrive whenever the user reaches them.
   map.on("idle", () => noteRenderedModes(map, SEG));
+  map.on("idle", () => noteRenderedTrack(map, TRACK));
   addEventListener("keydown", (e) => {
     if (e.key === "/" && document.activeElement !== input) {
       e.preventDefault();
@@ -1203,6 +1285,8 @@ function start(missing) {
     for (const id of MATCH) map.setPaintProperty(id, "line-color", HOVER_COLOUR[theme]);
     const segColour = hoverOr(segColourExpr(theme));
     for (const id of SEG) map.setPaintProperty(id, "line-color", segColour);
+    const trackColour = hoverOr(modeMid(theme, TRACK_MODE));
+    for (const id of TRACK) map.setPaintProperty(id, "line-color", trackColour);
     paintLegend();
   }
 
@@ -1277,6 +1361,30 @@ function start(missing) {
     $("note").hidden = false;
     $("note").textContent = `Drawn from the operator's own trace, not map-matched.`;
     $("chips").innerHTML = "";
+  }
+
+  // A way of relation track, which is the one layer that answers for several
+  // services at once -- 75.8% of them carry two or more. So it gets the chips, the
+  // same as a road does, and unlike a segment it has a way id to show: this
+  // geometry *is* an OpenStreetMap way rather than something snapped to one.
+  //
+  // No journeys a day, and no zero standing in for them. The count this layer
+  // carries is services, not journeys, and printing it beside a colour that means
+  // journeys everywhere else on the map would be answering a question nobody asked.
+  function showTrack(p) {
+    current = p;
+    const n = Number(p.n) || 0;
+    $("road").textContent = MODE_LABEL[TRACK_MODE];
+    $("road").classList.remove("empty");
+    $("meta").innerHTML = [
+      `${n} ${n === 1 ? "service" : "services"}`,
+      p.way_id === undefined ? null : `way ${p.way_id}`,
+    ].filter(Boolean).join(" · ");
+    $("note").hidden = false;
+    $("note").textContent =
+      "Drawn from an OpenStreetMap route relation. No timetable is attributed, so "
+      + "this track carries no journey count.";
+    redrawChips();
   }
 
   function redrawChips() {
@@ -1363,6 +1471,15 @@ function noteRenderedModes(map, ids) {
   if (added) paintLegend();
 }
 
+// The same, for the layer that has no mode to read: its presence is the fact.
+function noteRenderedTrack(map, ids) {
+  if (seenTrack) return;
+  const live = ids.filter((id) => map.getLayer(id));
+  if (!live.length || !map.queryRenderedFeatures({ layers: live }).length) return;
+  seenTrack = true;
+  paintLegend();
+}
+
 // Where each of a ramp's six colours sits along the bar, in the ramp's own scale.
 function gradient(colours) {
   const stops = RAMP.stops.map((v, i) => `${colours[i]} ${scalePos(v)}%`).join(", ");
@@ -1383,6 +1500,14 @@ function paintLegend() {
   const rows = [["Bus and coach", RAMP_COLOURS[theme]]];
   for (const m of [...seenModes].sort((a, b) => rank(a) - rank(b))) {
     rows.push([MODE_LABEL[m] || "Other", modeRamp(theme, m)]);
+  }
+  // Last, and flat: a bar of one colour repeated, so `gradient` renders it without
+  // a special case and the row reads as "this is not a scale". It is a separate row
+  // from any rail the timetable supplied, because they are different claims -- one
+  // knows how often it runs and the other does not.
+  if (seenTrack) {
+    const mid = modeMid(theme, TRACK_MODE);
+    rows.push(["National Rail track", Array(RAMP_STEPS).fill(mid)]);
   }
   $("ramps").innerHTML = rows
     .map(([label, colours]) =>

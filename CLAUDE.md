@@ -20,8 +20,8 @@ the area they cover — most of them record something that was a bug first.
 - `docs/rendering.md` — `art`: the style/spec split, streaming, banding, coalescing,
   where a render's time actually goes, the `/art` endpoint and the studio page.
 - `docs/results.md` — measured runs: Wales, Greater London, Great Britain, feed churn.
-- `docs/deploy.md` — the scheduled refresh: one systemd unit over Compose, why the
-  publish gate is two counts, and what must never run unattended.
+- `docs/deploy.md` — the scheduled refresh: weekly cron over Compose, vendored into
+  Ansible, why the publish gate is two counts, and what must never run unattended.
 - `PLAN.md` — what is done, what is next, known gaps.
 
 ## Architecture

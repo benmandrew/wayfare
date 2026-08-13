@@ -250,7 +250,7 @@ def test_selecting_a_mode_does_not_move_any_other_pattern_id(gtfs_dir: Path, con
 
 
 def test_the_selection_is_remembered_across_a_bare_rebuild(gtfs_dir: Path, con):
-    """`deploy/refresh.sh` runs `wayfare patterns` with no flags, monthly, with
+    """`deploy/refresh.sh` runs `wayfare patterns` with no flags, weekly, with
     nobody watching. Were the default a constant rather than what this database was
     last built with, the first refresh after a multi-modal build would drop every
     ferry -- and report a healthy run while doing it."""
