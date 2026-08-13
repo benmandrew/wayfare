@@ -318,6 +318,7 @@ def build_patterns(
         GROUP BY t.route_id, t.direction, ts.stop_seq, t.mode
     """)
     _check_unique_ids(con)
+    _drop_routes_off_the_isles(con)
 
     # pattern_stops is derived and cheap, so it is rebuilt outright and holds only
     # the current feed. patterns is not: match_status and pattern_edges hang off
@@ -392,6 +393,34 @@ def build_patterns(
         100.0 * (n_with_shape or 0) / max(n_patterns, 1),
         n_refs or 0,
     )
+
+
+def _drop_routes_off_the_isles(con: duckdb.DuckDBPyConnection) -> None:
+    """Drop any pattern that calls at a stop outside the British Isles.
+
+    The whole pattern, not the offending stop. Dropping the stop alone would leave a
+    London-to-Warsaw coach in the dataset as a London-to-Dover one, with a stop
+    sequence that no longer says where it goes -- and `span_m`, the detour check and
+    every bounding box would then read it as a domestic service.
+
+    It runs on `pattern_raw`, before `pattern_stops` and `patterns` are written, so a
+    dropped pattern never reaches either and departs on the ordinary path: its
+    `last_seen` stays at the previous feed. Its `match_status` row survives, which is
+    the point -- nothing here is re-matched if the rule is ever loosened.
+    """
+    outside = config.british_isles_sql("s.lat", "s.lon")
+    n_before = db.scalar(con, "SELECT count(*) FROM pattern_raw")
+    con.execute(f"""
+        DELETE FROM pattern_raw WHERE pattern_id IN (
+            SELECT pr.pattern_id
+            FROM pattern_raw pr, unnest(pr.stop_seq) AS u(stop_id)
+            JOIN stops s ON s.stop_id = u.stop_id
+            WHERE NOT {outside}
+        )
+    """)
+    n_dropped = n_before - db.scalar(con, "SELECT count(*) FROM pattern_raw")
+    if n_dropped:
+        log.info("%d patterns dropped for calling outside the British Isles", n_dropped)
 
 
 def _check_unique_ids(con: duckdb.DuckDBPyConnection) -> None:

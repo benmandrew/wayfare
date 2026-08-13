@@ -51,6 +51,27 @@ required; see `config.USER_AGENT`.
 (41 MB) for development. `ireland` is a slug too and is not one of these: it resolves
 through `config.FEEDS` to the National Transport Authority instead, and skips NaPTAN.
 
+**BODS carries international coach, and its continental stops are correct.** 41 live
+stops of the August 2026 national feed stand outside these islands — Calais, Lille,
+Brussels, Amsterdam, Cologne, Hamburg, Berlin, Prague, Lodz, and Warsaw at 20.96°E.
+They are real coordinates for real services, so nothing that checks a coordinate for
+validity catches them. What they broke was `osmroutes.bbox`, which took a plain
+min/max over every live stop and handed Overpass a window from Ireland to Poland; the
+query ran out of memory against the 8 GB limit and the stage died with no traceback.
+
+`config.british_isles_sql` is the boundary, and `patterns` drops any pattern calling
+outside it — 52 of 55,198, every one of them coach. Three of its four bounds are a
+box. The fourth is a line through the Channel, because a box cannot do it: Calais is
+half a degree *east* of Dover, so the cut there is longitude, while Brittany is two
+degrees *west* of Cornwall, so the cut there is latitude. One straight line cannot
+serve both, and a line steep enough for Dieppe eventually takes in Bergen — hence the
+cap on it north of the Wash. The nearest British stop it keeps and the nearest
+continental stop it drops are each about 15 km clear of it.
+
+The whole pattern goes, not the offending stop. Dropping the stop alone would leave a
+London-to-Warsaw coach in the dataset as a London-to-Dover one, and `span_m`, the
+detour check and every bounding box would then read it as domestic.
+
 **Sizes.** National GTFS: 1.28 GB zipped, 7.84 GB unpacked, `stop_times.txt` 5.09
 GB, `shapes.txt` 2.53 GB, 1.55M trips. OSM Great Britain: 2.16 GB. NaPTAN CSV: 102
 MB, 435k records. Budget ~40 GB of disk including the Valhalla graph.

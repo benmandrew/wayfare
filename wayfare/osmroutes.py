@@ -79,6 +79,13 @@ def bbox(con: duckdb.DuckDBPyConnection) -> tuple[float, float, float, float] | 
 
     Hence a separate cache file too. Two windows sharing one cached body means
     whichever stage ran first silently decides the other's coverage.
+
+    Clipped to the British Isles, which `patterns` has already done to the rows this
+    reads. Kept here as well because the failure it prevents is silent and expensive:
+    BODS carries coach to Warsaw, and a min/max that meets one of those stops asks
+    Overpass for every railway between Ireland and Poland. That is the query that
+    ran out of memory before the clip existed, and a database built by an older
+    `patterns` would do it again.
     """
     row = db.row(
         con,
@@ -88,6 +95,7 @@ def bbox(con: duckdb.DuckDBPyConnection) -> tuple[float, float, float, float] | 
         JOIN stops s USING (stop_id)
         JOIN patterns p USING (pattern_id)
         WHERE {db.current_feed()}
+          AND {config.british_isles_sql("s.lat", "s.lon")}
         """,
     )
     if row is None or row[0] is None:

@@ -184,6 +184,16 @@ region acquired into the first's volume becomes the current feed, and the next
 `publish` overwrites the first region's archive. A second region means a second
 compose project and a second data volume, not a second entry in the same one.
 
+**`publish` needs `--name-by-region` here, and refuses without it.** Every deployed
+data root holds its region's archive under its own name, and the served directory
+holds all three. A bare `publish` writes `bus.pmtiles`, which nothing serves, so
+`publish.default_out` stops rather than succeeding quietly — and `set -e` then ends
+the run. The flag was missing from this script until 2026-08-13, which means the
+scheduled refresh could not have completed on any of the three deployments and the
+recent republishes were done by hand. Nor could one have run: as of 2026-08-13 the
+server carries no timer and no checkout of this repository, only a compose file and a
+script written for one run. Everything under "Installing it" is still a plan.
+
 **Failure has to propagate, hence `set -e` and `&&` rather than `;`.** The Bus Open
 Data Service (BODS) answers an outage with HTTP 200 and an HTML error page, and the
 `MIN_GTFS_BYTES` floor in `acquire` is what turns that body into a non-zero exit

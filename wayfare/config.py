@@ -306,6 +306,59 @@ def osm_url(region: str | None = None) -> str:
     return GEOFABRIK + OSM_EXTRACTS.get(region, OSM_EXTRACTS["all"])
 
 
+# --- Geography -------------------------------------------------------------
+
+# The British Isles, as four bounds on a stop's own coordinates.
+#
+# BODS carries international coach: 41 of Great Britain's live stops stand in
+# France, Belgium, the Netherlands, Germany, Czechia and Poland, the furthest being
+# Warsaw at 20.96 E. They are correct coordinates for real services, so no validity
+# check catches them -- and a plain min/max over every live stop therefore draws a
+# window from Ireland to Poland, which is what `osmroutes.bbox` handed Overpass
+# before this existed.
+#
+# Three of the four bounds are a box. The fourth is a line through the Channel,
+# because a box cannot do it: Calais sits east of Dover by half a degree, so the
+# cut there is longitude, while Brittany sits *west* of Cornwall, so the cut there
+# is latitude. One line cannot serve both -- which is why the southern bound is
+# separate, and why the line is capped rather than run on north of the Wash, where
+# extending it would eventually take in Bergen.
+#
+# Measured against the August 2026 national feed: it drops 52 patterns of 55,198,
+# every one of them coach, and every stop it drops is continental. The nearest
+# British stop it keeps is Jarvist Place near Deal, 0.209 deg clear of the line;
+# the nearest continental stop it drops is Calais (Eurotunnel), 0.279 deg beyond
+# it. Both margins are around 15 km, so the two sides do not nearly touch.
+ISLES_LAT_MIN = 49.80  # Bishop Rock is 49.87; Alderney, deliberately out, is 49.72
+ISLES_LAT_MAX = 61.10  # Out Stack is 60.86; the Faroes are 62.0
+ISLES_LON_MIN = -11.00  # Tearaght Island is -10.67
+ISLES_LON_CAP = 2.00  # Lowestoft Ness, the easternmost point, is 1.76
+ISLES_CHANNEL_LON = 0.90  # the line's longitude at 50 N, in the western Channel
+ISLES_CHANNEL_SLOPE = 0.60  # degrees of longitude it gains per degree north
+
+
+def british_isles_sql(lat: str, lon: str) -> str:
+    """The bounds above as a SQL predicate over two coordinate columns.
+
+    A fragment rather than a table so that both the stage that drops the routes and
+    the stages that size a bounding box read the same definition. A second copy
+    would drift, and the way it would fail is a window that quietly reaches the
+    continent again.
+    """
+    return (
+        f"({lat} BETWEEN {ISLES_LAT_MIN} AND {ISLES_LAT_MAX}"
+        f" AND {lon} BETWEEN {ISLES_LON_MIN} AND least("
+        f"{ISLES_LON_CAP}, {ISLES_CHANNEL_LON}"
+        f" + {ISLES_CHANNEL_SLOPE} * ({lat} - 50.0)))"
+    )
+
+
+def in_british_isles(lat: float, lon: float) -> bool:
+    """`british_isles_sql` for a single point, for callers holding no connection."""
+    limit = min(ISLES_LON_CAP, ISLES_CHANNEL_LON + ISLES_CHANNEL_SLOPE * (lat - 50.0))
+    return ISLES_LAT_MIN <= lat <= ISLES_LAT_MAX and ISLES_LON_MIN <= lon <= limit
+
+
 NAPTAN_URL = "https://naptan.api.dft.gov.uk/v1/access-nodes?dataFormat=csv"
 
 # BODS blocks requests that look like generic scrapers.
