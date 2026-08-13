@@ -842,6 +842,33 @@ def test_neither_page_hardcodes_the_data_credit():
         assert "Open Government Licence" not in (WEB / page).read_text()
 
 
+# --- The viewer's own style ---------------------------------------------------
+#
+# There is no JavaScript test harness here, so this reads the source: narrow, and
+# guarding a failure that showed up as a page rather than as a stack trace.
+
+
+def _const(page: str, name: str) -> str:
+    """One `const <name> = [...]` from a page, whitespace collapsed."""
+    text = (WEB / page).read_text()
+    start = text.index(f"const {name} = ")
+    return " ".join(text[start : text.index("\n];", start)].split())
+
+
+def test_every_width_keeps_zoom_at_the_top_of_its_interpolate():
+    """A `["zoom"]` expression is legal only as the input to the outermost
+    interpolate, and MapLibre rejects the whole style for one paint property that
+    breaks the rule -- basemap, roads, every region. `trackWidth` wrapped its zoom
+    interpolate in a `["+"]` to add the hover bump, so the viewer drew a blank page
+    with one line in the console for every archive, from the day the track layer
+    landed. The bump belongs on each stop."""
+    for name in ("width", "segWidth", "trackWidth"):
+        body = _const("index.html", name)
+        assert body.startswith(
+            f'const {name} = (bump) => [ "interpolate", ["linear"], ["zoom"],'
+        )
+
+
 def _connect(base: str) -> http.client.HTTPConnection:
     """A raw connection, because urllib sends `Connection: close` on every request
     and so can never show one being reused."""

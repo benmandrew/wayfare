@@ -730,10 +730,19 @@ const segWidth = (bump) => [
 // `byTrips` read a null `trips` would not have been neutral -- the fallback is 20,
 // the bottom of the scale, so every rail line in the country would have drawn at
 // the width of a service running twice a day.
+//
+// The bump goes on each stop rather than around the whole thing, the same as it
+// does for the other two widths and for the same rule: a ["zoom"] expression is
+// legal only as the input to the outermost interpolate, so wrapping this one in
+// an ["+"] made the style invalid. MapLibre rejects the *whole style* for one bad
+// paint property -- basemap, roads and all -- so the failure was a blank page with
+// one line in the console, on every archive, since the track layer was added.
 const trackWidth = (bump) => [
-  "+",
-  ["interpolate", ["linear"], ["zoom"], 6, 0.45, 9, 0.85, 12, 1.35, 16, 2.30],
-  bump,
+  "interpolate", ["linear"], ["zoom"],
+  6,  ["+", 0.45, bump],
+  9,  ["+", 0.85, bump],
+  12, ["+", 1.35, bump],
+  16, ["+", 2.30, bump],
 ];
 
 // The hovered segment in the accent colour, everything else off the ramp. Shared
