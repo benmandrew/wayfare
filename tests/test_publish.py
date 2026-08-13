@@ -424,8 +424,53 @@ def test_the_overview_band_drops_the_card_only_attributes(monkeypatch, tmp_path)
         assert name in far
         assert name in mid
         assert name in near
-        assert name not in detail
+    # Two of the three are absent from the detail band because it carries them. The
+    # third is absent because it is the detail band's feature id rather than one of
+    # its attributes, so it is named by `--use-attribute-for-id` instead.
+    assert "refs" not in detail
+    assert "name" not in detail
+    assert "--use-attribute-for-id=way" in detail
     assert join[0] == "tile-join"
+
+
+def test_only_the_detail_band_spends_the_way_id_and_the_coarser_grid(monkeypatch, tmp_path):
+    """The way id earns its place in the feature id field only where it is carried.
+
+    A tile pools attribute values per layer, which dedupes `refs` 5.9x and `name`
+    6.1x against 1.37x for `way` -- a way id is near-unique per feature, so it is the
+    one attribute the pool cannot help and the one worth moving. It takes 20.28% off
+    Great Britain's detail band. The overview bands exclude `way` outright and have
+    nothing to move, so they keep the edge id and the assertion here is that the two
+    do not drift into each other.
+
+    `-D` belongs to the detail band for the same reason in reverse: it is the band
+    with zooms below its own maximum that anybody reads. An overview band quantised
+    the same way would be quantising z5, where a unit is already about 300 m.
+    """
+    import subprocess
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
+    monkeypatch.setattr(publish.subprocess, "run", fake_run)
+
+    src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3])
+    publish.build_tiles(src, tmp_path / "bus.pmtiles")
+
+    far, mid, near, detail, _join = calls
+    for overview in (far, mid, near):
+        assert "--use-attribute-for-id=id" in overview
+        assert "-D" not in overview
+    assert "--use-attribute-for-id=way" in detail
+    # The edge id is still a property of every exported feature, and a property
+    # tippecanoe is not told to drop is one it writes into every tile.
+    assert "id" in detail[detail.index("-x") :]
+    assert detail[detail.index("-D") + 1] == str(config.LOW_DETAIL)
 
 
 def test_every_band_keeps_the_two_attributes_the_ramps_paint_from(monkeypatch, tmp_path):

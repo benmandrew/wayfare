@@ -23,7 +23,7 @@ import tempfile
 from collections import defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import duckdb
 
@@ -272,11 +272,13 @@ def coalesce(rows: list[Any]) -> list[tuple[dict[str, Any], list[list[float]]]]:
         capped = display[key][1]
         for edge_id, pts in _chain(_dedupe_reversed(members)):
             props: dict[str, Any] = {
-                # Consumed by --use-attribute-for-id and then excluded, so it costs
-                # nothing in the tile: it lands in the MVT feature id field, which
-                # is what setFeatureState addresses. The lowest edge id in the
-                # segment names it, so the id is stable for a given build.
+                # The overview bands' feature id, and excluded everywhere else --
+                # the detail band puts the way id there instead, and a property no
+                # band is told to drop is one every band writes. The lowest edge id
+                # in the segment names it, so it is stable for a given build.
                 "id": int(edge_id),
+                # The detail band's feature id, and excluded from the overview
+                # bands by `_DETAIL_ONLY`, so it is never both at once.
                 "way": int(way_id),
                 "n": n,
                 "refs": ",".join(capped),
@@ -399,6 +401,23 @@ _NUM = rb"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?"
 _FIRST_POINT = re.compile(rb'"coordinates":\[\[(' + _NUM + rb"),(" + _NUM + rb")\]")
 
 Cell = tuple[int, int]
+
+
+class _Band(NamedTuple):
+    """One tippecanoe pass over the road export, covering a range of zooms.
+
+    The defaults are the overview bands: the Valhalla edge id in the feature id
+    field and tippecanoe's own tile grid. Only `detail` departs from either.
+    """
+
+    name: str
+    min_zoom: int
+    max_zoom: int
+    floors: Mapping[Cell, int]
+    exclude: Sequence[str]
+    extend: bool = False
+    id_attribute: str = "id"
+    low_detail: int | None = None
 
 
 def _features(geojsonl: Path) -> Iterator[tuple[bytes, Cell, int]]:
@@ -617,29 +636,43 @@ def build_tiles(
             # overlaps the near band, and tile-join merges the two into tiles holding
             # both copies of every road.
             bands = [
-                (
-                    "far",
-                    config.MIN_ZOOM,
-                    config.FAR_ZOOM - 1,
-                    far_floors,
-                    _DETAIL_ONLY,
-                    False,
+                _Band(
+                    "far", config.MIN_ZOOM, config.FAR_ZOOM - 1, far_floors, _DETAIL_ONLY
                 ),
-                (
-                    "mid",
-                    config.FAR_ZOOM,
-                    config.MID_ZOOM - 1,
-                    mid_floors,
-                    _DETAIL_ONLY,
-                    False,
+                _Band(
+                    "mid", config.FAR_ZOOM, config.MID_ZOOM - 1, mid_floors, _DETAIL_ONLY
                 ),
-                ("near", config.MID_ZOOM, config.DETAIL_ZOOM - 1, {}, _DETAIL_ONLY, False),
-                ("detail", config.DETAIL_ZOOM, config.MAX_ZOOM, {}, (), True),
+                _Band("near", config.MID_ZOOM, config.DETAIL_ZOOM - 1, {}, _DETAIL_ONLY),
+                # The one band that carries `way`, and so the one band that can spend
+                # it on the feature id instead of an attribute. `id` is excluded by
+                # hand here because it is no longer what `--use-attribute-for-id`
+                # consumes, and a property tippecanoe is not told to drop is a
+                # property it writes into every feature.
+                _Band(
+                    "detail",
+                    config.DETAIL_ZOOM,
+                    config.MAX_ZOOM,
+                    {},
+                    ("id",),
+                    extend=True,
+                    id_attribute="way",
+                    low_detail=config.LOW_DETAIL,
+                ),
             ]
-            for name, lo, hi, floors, exclude, extend in bands:
-                src = _hold_back(geojsonl, tmp / f"{name}.geojsonl", floors)
-                part = tmp / f"{name}.pmtiles"
-                _tippecanoe(src, part, lo, hi, exclude, attribution, extend)
+            for band in bands:
+                src = _hold_back(geojsonl, tmp / f"{band.name}.geojsonl", band.floors)
+                part = tmp / f"{band.name}.pmtiles"
+                _tippecanoe(
+                    src,
+                    part,
+                    band.min_zoom,
+                    band.max_zoom,
+                    band.exclude,
+                    attribution,
+                    band.extend,
+                    id_attribute=band.id_attribute,
+                    low_detail=band.low_detail,
+                )
                 parts.append(part)
         # One pass over the whole zoom range rather than banded like the roads. The
         # bands exist to stop millions of edges paying for info-card attributes at
@@ -716,6 +749,8 @@ def _tippecanoe(
     attribution: str,
     extend: bool = True,
     layer: str = LAYER,
+    id_attribute: str = "id",
+    low_detail: int | None = None,
 ) -> None:
     cmd = [
         "tippecanoe",
@@ -728,12 +763,25 @@ def _tippecanoe(
         str(min_zoom),
         "-z",
         str(max_zoom),
-        # The edge id belongs in the MVT feature id field, not in the attributes.
+        # One id belongs in the MVT feature id field rather than in the attributes.
         # It is two varints and a pool entry per feature cheaper there, and it is
         # where setFeatureState looks -- so the viewer needs no promoteId either.
-        "--use-attribute-for-id=id",
+        #
+        # Which id pays for itself is measured, and it is the OSM way. A tile's
+        # value pool dedupes repeated attributes within the tile, and it does that
+        # 5.9x for `refs` and 6.1x for `name` against 1.37x for `way`: a way id is
+        # near-unique per feature, so it is the one attribute pooling cannot help.
+        # Moving it into the id field takes 20.28% off Great Britain's detail band,
+        # 21.5 MB, and saves more than deleting it outright would, because a sorted
+        # way id compresses where the Valhalla GraphId it displaces did not.
+        #
+        # It costs uniqueness. A way is several features wherever its service set
+        # changes along it, and they now share an id -- which the MVT spec asks for
+        # and does not require, MapLibre does not mind, and the viewer turns into
+        # hovering a whole way rather than one segment of it.
+        f"--use-attribute-for-id={id_attribute}",
         "-x",
-        "id",
+        id_attribute,
         # Where the credit is kept. It lands in the tileset metadata, PMTiles carries
         # that verbatim, and MapLibre reads a source's own attribution into the
         # control without the page saying anything -- so both the viewer and the art
@@ -754,6 +802,8 @@ def _tippecanoe(
         # a box over range requests, so it is ours to set.
         f"--maximum-tile-bytes={config.MAX_TILE_BYTES}",
     ]
+    if low_detail is not None:
+        cmd += ["-D", str(low_detail)]
     if config.SIMPLIFY_SHARED_NODES:
         cmd.append("--no-simplification-of-shared-nodes")
     if extend:

@@ -1000,10 +1000,22 @@ function start(missing) {
     sources[r.src] = {
       type: "vector",
       url: "pmtiles://" + r.url,
-      // No promoteId: tippecanoe writes the edge id into the MVT feature id
-      // field itself, which is what setFeatureState addresses. Ids are unique
-      // within an archive and not across them, so anything keyed on one is
-      // keyed on the source too.
+      // No promoteId: tippecanoe writes an id into the MVT feature id field
+      // itself, which is what setFeatureState addresses. Which id depends on the
+      // band. From DETAIL_ZOOM up it is the OSM way id, which took 20.28% -- 21.5
+      // MB -- off Great Britain's detail band by no longer being an attribute as
+      // well, because a sorted way id compresses where the Valhalla edge id it
+      // replaced does not. Below DETAIL_ZOOM it is still the edge id.
+      //
+      // So an id is not unique within a layer either, up there: a way is several
+      // features by design, wherever the service set changes along it, wherever
+      // tippecanoe cuts it at a tile edge, and for both halves of a one-way pair,
+      // which carry different services. The MVT spec only says ids SHOULD be
+      // unique and MapLibre does not mind, but setFeatureState keys on them, so
+      // hovering at DETAIL_ZOOM and above lights the whole way rather than the
+      // piece under the cursor. That is accepted -- the card still describes the
+      // one segment. Across archives an id still means nothing, so anything keyed
+      // on one is keyed on the source too.
       //
       // No `attribution` either, and that is the point: `wayfare publish` puts
       // the timetable's publisher, its licence and OpenStreetMap's ODbL claim on
@@ -1143,8 +1155,9 @@ function start(missing) {
 
   /* ---------- hover ---------- */
 
-  // A feature is identified by its source as well as its id: the id is
-  // tippecanoe's edge id, unique inside one archive and meaningless across them.
+  // A feature is identified by its source as well as its id: the id is the OSM
+  // way id from DETAIL_ZOOM up and tippecanoe's edge id below it, and neither
+  // means anything in another archive.
   // The source-layer rides along because there are now two of them in one archive
   // and setFeatureState addresses a feature by all three.
   let hovered = null; // { src, sourceLayer, id }
@@ -1187,7 +1200,7 @@ function start(missing) {
     setHover(hovered, true);
     if (segHits.length) showSegment(f.properties);
     else if (trackHits.length) showTrack(f.properties);
-    else showFeature(mergeRegions(hits));
+    else showFeature(mergeRegions(hits), f.id);
   });
 
   /* ---------- filter ---------- */
@@ -1227,14 +1240,17 @@ function start(missing) {
   function countMatches() {
     if (!active.length || !map.isStyleLoaded()) return;
     // Counted by OSM way, the one identity every archive holding the road agrees
-    // on. Counted by `source:id` -- an id is unique inside an archive and nowhere
-    // else -- a road two archives both cover scored once per archive, and two
-    // overlapping regions reported twice the segments on screen. Below
-    // DETAIL_ZOOM the way id is not in the tiles at all, so the fallback is what
-    // runs on every national view rather than a branch that never fires.
+    // on, and from DETAIL_ZOOM up that is the feature id rather than a property.
+    // The source must stay out of that key: counted by `source:id` -- an edge id
+    // is unique inside an archive and nowhere else -- a road two archives both
+    // cover scored once per archive, and two overlapping regions reported twice
+    // the segments on screen. Below DETAIL_ZOOM the way id is not in the tiles at
+    // all, in either field, so the fallback is what runs on every national view
+    // rather than a branch that never fires. `refs` is the test, because it is
+    // stripped from exactly the same bands the way id is.
     const seen = new Set(
       map.queryRenderedFeatures({ layers: MATCH }).map((f) =>
-        f.properties.way !== undefined ? `w${f.properties.way}` : `${f.source}:${f.id}`
+        f.properties.refs !== undefined ? `w${f.id}` : `${f.source}:${f.id}`
       )
     );
     const label = active.map((t) => `<b>${escapeHtml(t)}</b>`).join(", ");
@@ -1321,21 +1337,26 @@ function start(missing) {
     ];
   };
 
-  function showFeature(p) {
+  // `way` is the feature's own id rather than one of its properties, so it is
+  // passed alongside them: the tiles stopped carrying it as an attribute, which
+  // is 20.28% of the detail band. It is only a way id from DETAIL_ZOOM up, which
+  // is the same range `detailed` covers, so it is read nowhere else.
+  function showFeature(p, way) {
     current = p;
     const n = Number(p.n) || 0;
     $("road").textContent = p.name || "Unnamed road";
     $("road").classList.remove("empty");
     // Below DETAIL_ZOOM the archive carries geometry, `n` and `trips` only: the
-    // service list, road name and way id are stripped, because nothing reads them
-    // when the country is a few hundred pixels across. `refs` is the one to test
-    // for -- `trips` is now published at every zoom, so its presence no longer
-    // tells the two apart.
+    // service list and road name are stripped, because nothing reads them when
+    // the country is a few hundred pixels across, and the feature id is the edge
+    // id rather than the way. `refs` is the one to test for -- `trips` is now
+    // published at every zoom and the way id is no longer a property at any of
+    // them, so neither tells the two apart.
     const detailed = p.refs !== undefined;
     $("meta").innerHTML = [
       `<b>${n}</b> service${n === 1 ? "" : "s"}`,
       ...rate(p),
-      ...(detailed ? [`way <b>${escapeHtml(p.way)}</b>`] : []),
+      ...(detailed ? [`way <b>${escapeHtml(way)}</b>`] : []),
     ].join(" · ");
     // The pipeline caps `refs` generously and always carries the true count in
     // `n`, so the shortfall is read off the data rather than from a constant here
@@ -1411,8 +1432,9 @@ function start(missing) {
 // Republic were matched against one island graph, so a cross-border road is a
 // feature in each, carrying that feed's services and no others. Showing the
 // topmost hit alone gave one country's list and dropped the other's without
-// saying so — a wrong answer rather than a thin one. `way` is the OSM id and the
-// only identity the archives share; ids are per-archive.
+// saying so — a wrong answer rather than a thin one. The OSM way id is the only
+// identity the archives share, and from DETAIL_ZOOM up it is the feature id
+// itself; an edge id is per-archive.
 //
 // One feature per source before anything is added up. Within a single archive a
 // way is drawn as several features — wherever the service set changes along it,
@@ -1423,12 +1445,17 @@ function start(missing) {
 function mergeRegions(hits) {
   const top = hits[0].properties;
   // Below DETAIL_ZOOM the tiles carry geometry and `n` alone: no way id to match
-  // hits on, and no refs to union. That path is untouched.
-  if (top.way === undefined) return top;
+  // hits on -- the feature id is the per-archive edge id down there -- and no
+  // refs to union. `refs` is the sentinel because it is stripped from exactly the
+  // bands the way id is. That path is untouched.
+  if (top.refs === undefined) return top;
 
+  // The way is the feature's id now, so the match is on the hit rather than on
+  // its properties.
+  const way = hits[0].id;
   const first = new Map();
   for (const h of hits) {
-    if (h.properties.way !== top.way || first.has(h.source)) continue;
+    if (h.id !== way || first.has(h.source)) continue;
     first.set(h.source, h.properties);
   }
   if (first.size < 2) return top;
@@ -1443,8 +1470,9 @@ function mergeRegions(hits) {
       if (!refs.includes(ref)) refs.push(ref);
     }
   }
-  // Name and way id describe the road itself, so they come through unchanged.
-  // `n` stays the true total against which `refs`, capped per archive, is short.
+  // The name describes the road itself, so it comes through unchanged, and the
+  // way id was never in here to carry. `n` stays the true total against which
+  // `refs`, capped per archive, is short.
   return { ...top, n, trips, refs: refs.join(",") };
 }
 

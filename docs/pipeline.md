@@ -678,7 +678,8 @@ in the first ramp colour, so a whole country below z11 came out one flat blue an
 as a region with no buses. `_DETAIL_ONLY` is now the three the card alone opens, and
 the card does not open below `DETAIL_ZOOM`. The cost is a key and a varint per feature
 in the three overview bands; `refs`, which is a whole comma-joined service list, is
-still excluded and is where the saving actually was.
+still excluded and is where the saving actually was. `way` has since left the
+attributes altogether: it is the detail band's feature id, below.
 
 An archive published before that change answers its low zooms without `trips`, so the
 viewer guards the journeys ramp with `["has", "trips"]` and draws grey where the
@@ -720,6 +721,68 @@ rather than joined in empty: a bus-only region gets no segments pass, and a regi
 no matched edges gets no road bands, because tippecanoe exits 110 on an empty input
 rather than writing an empty archive. Irish Rail on its own is 331 patterns and not one
 of them is a road.
+
+**The detail band's feature id is the OSM way id, and moving it there saves more than
+deleting it would.** MVT pools attribute values per layer per tile, so what a repeated
+value costs after the first is two varints. The pool dedupes `refs` 5.9x and `name`
+6.1x within a tile against 1.37x for `way`: a way id is near-unique per feature, which
+makes it the one attribute pooling cannot help.
+`--use-attribute-for-id=way -x way -x id` takes Great Britain's detail band from
+106,221,548 bytes to 84,677,158, 20.28%, where excluding `way` outright and leaving the
+GraphId in the id field takes 19.39%. Deleting an attribute saving less than moving it
+is the surprise, and the export's `ORDER BY way_id` is the reason: a sorted way id
+compresses where the GraphId it displaces did not. It costs uniqueness, since a way is
+several features wherever its service set changes along it and those features now share
+an id, which the MVT specification asks for and does not require. A hover therefore
+lights the whole way rather than one segment of it.
+
+**The viewer tells the two id ranges apart by `refs`, not by a zoom it works out for
+itself.** `_DETAIL_ONLY` strips `way`, `refs` and `name` from exactly the three bands
+that keep the edge id, so testing `p.refs` is the same question as "did this feature
+come from an overview band". Two places in `web/index.html` asked `p.way === undefined`
+instead, which was the same test only while `way` was still an attribute of the detail
+band. `showFeature` now takes the way id as a parameter, `countMatches` keys on
+`w${f.id}` above `DETAIL_ZOOM`, and `mergeRegions` matches on `h.id`.
+
+**`-D 10` quantises the detail band's lower zooms, and its saving and the id change are
+disjoint.** tippecanoe's `-D` is the tile grid as a power of two, default 12 for a
+4096-unit tile, and 10 is 1024 units. Alone it takes the same band from 106,221,548
+bytes to 98,223,063, 7.53%. Both together give 77,033,089, 27.48%, against the 27.81%
+the two summed predict — near-additive, because one shrinks the attribute block and the
+other the geometry. The ground truth for the setting is that MapLibre draws a vector
+tile across 512 screen pixels, which puts detail 9 at one grid unit per pixel at native
+zoom and 10 at half a unit. 9 was measured and rejected: 10.81% on Ireland for a 375 m
+worst-case collapse at z11, taking 8.58% of that zoom's features with it. What 10 costs
+is visible in the largest z13 tile, where 25 ways of 1,984 collapse to a point and drop
+out, median length 2.88 m and maximum 5.93 m against a native-zoom screen pixel of
+5.75 m. All 25 are still drawn at z14.
+
+**Whole archive, verified end to end rather than inferred from the band.** Great Britain
+published from a copy of the server's database, against an archive built the old way
+from byte-identical inputs — 867,359 road features, 3,204 segments, 63,387 track ways —
+goes 166,165,053 bytes to 136,786,795, 17.7%. Per zoom: z5-z10 unchanged, z11 30.9%,
+z12 28.7%, z13 26.7%, z14 14.6%. z14 saves least because `-D` never touches a band's
+maximum zoom, so the whole of its saving is the id change. Nothing has been republished;
+the candidate archive is at
+`/home/samba/sambashare/wayfare-cand/out/great_britain.pmtiles` on the server. Taking it
+live needs a `publish` run and no migration behind it, because `way` was already a
+column on `edges` and already in the export.
+
+**Simplification reaches the maximum zoom, and a note here used to say it did not.**
+Measured on Ireland's detail band: `--simplify-only-low-zooms` builds 6.16% *bigger*,
+`--simplification-at-maximum-zoom=8` alongside `--simplification=8` is byte-identical to
+`--simplification=8` on its own, and turning simplification off entirely costs 25.89%.
+`config.SIMPLIFICATION` is the largest single geometry saving in the build, which is not
+what a knob believed to apply to five of six zooms would be.
+
+**Feature ordering and tippecanoe's coalescing flags are exhausted, and so is gzip.**
+Every ordering and coalescing variant measured lands between +0.00% and +1.29% against
+the current build; `--reorder` costs +0.21% on Great Britain, and the `--coalesce`
+family merges nothing at all, because `publish.coalesce` has already taken everything
+mergeable out of the export. Compression is at its ceiling too: 315.2 MB of tiles come
+back as 143.5 MB, and recompressing every tile at level 9 saves 0.06%. zstd would save
+about 9.0 MB, and stock `pmtiles.js` throws on compression methods 3 and 4, so no
+browser client could read the result.
 
 **`--drop-densest-as-needed` chooses by spatial density, so it thins cities hardest and
 leaves a rural road carrying two buses a week alone.** On the Great Britain archive
