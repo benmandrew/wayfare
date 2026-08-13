@@ -155,7 +155,14 @@ a.btn { text-decoration: none; }
    against each other -- a short swatch could only name a colour. */
 .ramps { margin: 7px 0 4px; }
 .ramp-row + .ramp-row { margin-top: 7px; }
-.ramp-label { font-size: 11.5px; margin-bottom: 3px; }
+/* The whole label is the hit target for the checkbox in it, so the mode's name
+   switches the mode -- an 11.5px row is a small thing to ask a cursor to find. */
+.ramp-label { font-size: 11.5px; margin-bottom: 3px; display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.ramp-label input { margin: 0; accent-color: var(--accent); }
+/* A row switched off keeps its place and its colours, dimmed. Dropping it would
+   move every row under it, so the second click of a pair lands on a mode the
+   reader did not aim at. */
+.ramp-row.off .ramp-label, .ramp-row.off .ramp { opacity: .4; }
 .ramp { height: 8px; border-radius: 2px; }
 /* Absolute rather than a flex row, because a tick has to sit on the colour it
    names and the stops are not evenly spaced. `paintLegend` writes the `left` and
@@ -270,6 +277,7 @@ a.btn { text-decoration: none; }
       <p>Colour shows <b>journeys a day</b> — the departures along that road, averaged over the whole week and drawn on a logarithmic scale. Thickness and colour answer different questions, so a lane with one service every ten minutes is thin and bright. Grey means the archive under you carries no departure count at that zoom.</p>
       <p>Trams, metros, trains and ferries have no road under them, so they are drawn from the operator's own trace and keep a colour of their own, with a bar each in the key below. Every bar is the same scale, so a quiet ferry and a busy one are the same red at different depths. Each line is one route's trace, so where two share a track they are two lines, not one busier one.</p>
       <p>National Rail is drawn from OpenStreetMap route relations, because Great Britain's rail timetable is not in the open bus feed. It is one line per stretch of track rather than one per service, and it is a single flat brown rather than a bar: no timetable is attributed to it, so nothing here knows how often a train runs. Hovering still lists which services use that stretch.</p>
+      <p>Each row of the key is a switch. Clear its checkbox to take that mode off the map.</p>
       <p>Hover a line for its service list. Filtering matches whole service numbers, so <code>4</code> will not match <code>42</code>.</p>
       <p>Zoomed out, the map thins the densest areas to keep tiles small, so a
          quiet-looking city is not necessarily a city without services. Zoom in for
@@ -578,6 +586,18 @@ const seenModes = new Set();
 // drawn in one colour, which is the legend telling a different story from the map.
 let seenTrack = false;
 
+// Which legend rows are switched off. Absence is on, so a mode that arrives
+// later arrives drawn, and the road row is on before anything has been seen at
+// all. Keyed by row rather than by mode because the road and the track rows are
+// whole layers while a mode is a filter over one -- `rowKey` is what keeps a
+// mode called "bus" out of the road row's key.
+//
+// Module scope, beside the sets that decide which rows exist, because
+// `paintLegend` runs before the map does and has to draw the boxes in whatever
+// state they are already in.
+const hiddenRows = new Set();
+const rowKey = (mode) => `mode:${mode}`;
+
 const $ = (id) => document.getElementById(id);
 let theme = localStorage.getItem("wayfare-theme")
   || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
@@ -777,6 +797,15 @@ const segTokenFilter = (tokens) => [
 const segOpacity = (tokens) =>
   tokens.length ? ["case", segTokenFilter(tokens), 0.95, 0.1] : 0.95;
 const NEVER = ["==", ["id"], -1];
+
+// Every mode's traces share one layer per region, so switching a mode off is a
+// filter rather than a visibility. The legend files a feature with no `mode` under
+// "other", so the filter reproduces that fallback rather than reading the property
+// straight -- otherwise clearing "Other" leaves exactly the features it names on
+// the map, because `["get", "mode"]` on an absent property is null and null is in
+// no list.
+const modeOrOther = ["case", ["has", "mode"], ["to-string", ["get", "mode"]], "other"];
+const withoutModes = (modes) => ["!", ["in", modeOrOther, ["literal", modes]]];
 
 /* ---------- boot ---------- */
 
@@ -1226,10 +1255,9 @@ function start(missing) {
     // Every region filters together. A service number is a national search, not
     // a search of whichever archive the cursor happens to be over.
     const on = active.length > 0;
-    for (const id of MATCH) {
-      map.setFilter(id, on ? tokenFilter(active) : NEVER);
-      map.setLayoutProperty(id, "visibility", on ? "visible" : "none");
-    }
+    // The match layer's own visibility is left to `applyRows`: it draws over the
+    // road network, so it has two reasons to be off and only one of them is here.
+    for (const id of MATCH) map.setFilter(id, on ? tokenFilter(active) : NEVER);
     for (const id of BUS) map.setPaintProperty(id, "line-opacity", on ? 0.12 : 0.85);
     for (const id of SEG) map.setPaintProperty(id, "line-opacity", segOpacity(active));
     // Track dims on the same rule and for the same reason. `refs` here is the same
@@ -1238,6 +1266,7 @@ function start(missing) {
     // being national rather than per-layer.
     for (const id of TRACK) map.setPaintProperty(id, "line-opacity", segOpacity(active));
 
+    applyRows();
     if (on) {
       countMatches();
     } else {
@@ -1246,8 +1275,50 @@ function start(missing) {
     redrawChips();
   }
 
+  /* ---------- mode switches ---------- */
+
+  // What each legend row switches. The road network and the relation track are a
+  // layer each, so they go off by visibility; the modes share one layer per region
+  // and go off by filter. Every region moves together, the same as the search does
+  // -- a mode is a mode wherever the cursor is.
+  function applyRows() {
+    const show = (id, on) => map.setLayoutProperty(id, "visibility", on ? "visible" : "none");
+    const busOn = !hiddenRows.has("bus");
+    for (const id of BUS) show(id, busOn);
+    // The match highlight is the road network drawn a second time, so hiding the
+    // roads has to take it with them -- left alone it would keep drawing the very
+    // services the box was cleared to be rid of, and brighter than they were.
+    for (const id of MATCH) show(id, busOn && active.length > 0);
+    for (const id of TRACK) show(id, !hiddenRows.has("track"));
+    const off = [...hiddenRows]
+      .filter((k) => k.startsWith("mode:"))
+      .map((k) => k.slice("mode:".length));
+    for (const id of SEG) map.setFilter(id, off.length ? withoutModes(off) : null);
+  }
+
+  // Delegated, because `paintLegend` rewrites the rows whenever the theme changes
+  // or a mode is drawn for the first time, and a handler bound to a checkbox would
+  // go with them. The row is dimmed in place rather than by repainting the legend:
+  // a repaint replaces the box that was just clicked, which takes the focus off it
+  // mid-keystroke for anyone using the keyboard.
+  $("ramps").addEventListener("change", (e) => {
+    const box = e.target.closest("input[data-row]");
+    if (!box) return;
+    if (box.checked) hiddenRows.delete(box.dataset.row);
+    else hiddenRows.add(box.dataset.row);
+    box.closest(".ramp-row").classList.toggle("off", !box.checked);
+    applyRows();
+  });
+
   function countMatches() {
     if (!active.length || !map.isStyleLoaded()) return;
+    // Nothing is drawn to count with the roads switched off, and "nothing in view"
+    // would read as a search that found no such service.
+    if (hiddenRows.has("bus")) {
+      const label = active.map((t) => `<b>${escapeHtml(t)}</b>`).join(", ");
+      $("hint").innerHTML = `${label} — bus and coach are switched off in the key.`;
+      return;
+    }
     // Counted by OSM way, the one identity every archive holding the road agrees
     // on, and from DETAIL_ZOOM up that is the feature id rather than a property.
     // The source must stay out of that key: counted by `source:id` -- an edge id
@@ -1534,9 +1605,9 @@ function paintLegend() {
   // grey it is drawn in.
   const order = Object.keys(MODE_COLOUR[theme]);
   const rank = (m) => (order.indexOf(m) < 0 ? order.length : order.indexOf(m));
-  const rows = [["Bus and coach", RAMP_COLOURS[theme]]];
+  const rows = [{ key: "bus", label: "Bus and coach", colours: RAMP_COLOURS[theme] }];
   for (const m of [...seenModes].sort((a, b) => rank(a) - rank(b))) {
-    rows.push([MODE_LABEL[m] || "Other", modeRamp(theme, m)]);
+    rows.push({ key: rowKey(m), label: MODE_LABEL[m] || "Other", colours: modeRamp(theme, m) });
   }
   // Last, and flat: a bar of one colour repeated, so `gradient` renders it without
   // a special case and the row reads as "this is not a scale". It is a separate row
@@ -1544,13 +1615,24 @@ function paintLegend() {
   // knows how often it runs and the other does not.
   if (seenTrack) {
     const mid = modeMid(theme, TRACK_MODE);
-    rows.push(["National Rail track", Array(RAMP_STEPS).fill(mid)]);
+    rows.push({
+      key: "track",
+      label: "National Rail track",
+      colours: Array(RAMP_STEPS).fill(mid),
+    });
   }
+  // The box is drawn from `hiddenRows` rather than left as the browser found it,
+  // because this runs again on every theme change and every mode drawn for the
+  // first time. A row rebuilt from the markup alone would come back ticked and the
+  // mode would stay off the map, which is the switch lying about the map.
   $("ramps").innerHTML = rows
-    .map(([label, colours]) =>
-      `<div class="ramp-row"><div class="ramp-label">${escapeHtml(label)}</div>`
-      + `<div class="ramp" style="background:${gradient(colours)}"></div></div>`
-    )
+    .map(({ key, label, colours }) => {
+      const off = hiddenRows.has(key);
+      return `<div class="ramp-row${off ? " off" : ""}"><label class="ramp-label">`
+        + `<input type="checkbox" data-row="${escapeHtml(key)}"${off ? "" : " checked"}>`
+        + `${escapeHtml(label)}</label>`
+        + `<div class="ramp" style="background:${gradient(colours)}"></div></div>`;
+    })
     .join("");
 
   // The ticks are placed by the ramp's own scale, so a tick sits on the colour it
