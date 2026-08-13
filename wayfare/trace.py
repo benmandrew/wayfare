@@ -145,6 +145,11 @@ def bbox(con: duckdb.DuckDBPyConnection) -> tuple[float, float, float, float] | 
     slug and this needs a box. A national run asks for the country; a run against
     one city asks for that city, which is the difference between a minute of Overpass
     and most of an hour.
+
+    Clipped to the British Isles for the reason `osmroutes.bbox` is. This window has
+    never met a continental stop -- it spans the pending non-road patterns, which are
+    urban rail -- but nothing about the construction stops it, and the mode selection
+    is the only thing standing in the way.
     """
     row = db.row(
         con,
@@ -153,6 +158,7 @@ def bbox(con: duckdb.DuckDBPyConnection) -> tuple[float, float, float, float] | 
         FROM pattern_stops ps
         JOIN stops s USING (stop_id)
         WHERE ps.pattern_id IN (SELECT p.pattern_id {_pending_sql()})
+          AND {config.british_isles_sql("s.lat", "s.lon")}
         """,
     )
     if row is None or row[0] is None:

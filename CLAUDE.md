@@ -83,6 +83,16 @@ selectable. Do not pipeline across batch boundaries without an in-flight exclusi
 **Every consumer of `patterns` filters on `db.current_feed()`**, so departed patterns
 are never matched, aggregated or rendered.
 
+**A stop's coordinates being valid does not make it British.** BODS carries
+international coach, so 41 live stops of the national feed stand between Calais and
+Warsaw at coordinates that are entirely correct. `config.british_isles_sql` is the
+boundary and `patterns` drops the whole pattern, not the stop; anything that sizes a
+window off stop coordinates clips to it as well, because the way this fails is an
+Overpass query for every railway between Ireland and Poland, which dies with no
+traceback. It is a box on three sides and a capped line through the Channel on the
+fourth — Calais is east of Dover and Brittany is west of Cornwall, so no single line
+separates both.
+
 **The mode selection lives in `meta.modes`, not in the invocation.** `patterns` rebuilds
 the table from whatever selection it is handed and `deploy/refresh.sh` hands it none, so
 it defaults to `gtfs.stored_modes`, and narrowing the selection retires the deselected
