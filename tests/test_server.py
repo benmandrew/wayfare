@@ -842,6 +842,49 @@ def test_neither_page_hardcodes_the_data_credit():
         assert "Open Government Licence" not in (WEB / page).read_text()
 
 
+# --- The viewer's own style ---------------------------------------------------
+#
+# Two rules the browser enforces and nothing else does. There is no JavaScript
+# test harness here, so these read the source: narrow, and each one guards a
+# failure that showed up as a page rather than as a stack trace.
+
+
+def _const(page: str, name: str) -> str:
+    """One `const <name> = [...]` from a page, whitespace collapsed."""
+    text = (WEB / page).read_text()
+    start = text.index(f"const {name} = ")
+    return " ".join(text[start : text.index("\n];", start)].split())
+
+
+def test_every_width_keeps_zoom_at_the_top_of_its_interpolate():
+    """A `["zoom"]` expression is legal only as the input to the outermost
+    interpolate, and MapLibre rejects the whole style for one paint property that
+    breaks the rule -- basemap, roads, every region. `trackWidth` wrapped its zoom
+    interpolate in a `["+"]` to add the hover bump, so the viewer drew a blank page
+    with one line in the console for every archive, from the day the track layer
+    landed. The bump belongs on each stop."""
+    for name in ("width", "segWidth", "trackWidth"):
+        body = _const("index.html", name)
+        assert body.startswith(
+            f'const {name} = (bump) => [ "interpolate", ["linear"], ["zoom"],'
+        )
+
+
+def test_every_legend_row_is_a_switch():
+    """The key is also the control: a checkbox per row, on unless it has been
+    cleared. `hiddenRows` holds that off the DOM because `paintLegend` rewrites the
+    rows on a theme change and on the first sighting of a mode -- a box drawn from
+    the markup alone comes back ticked over a mode that is still off the map."""
+    text = (WEB / "index.html").read_text()
+    assert 'type="checkbox" data-row=' in text
+    assert "const off = hiddenRows.has(key);" in text
+    assert '${off ? "" : " checked"}' in text
+    # The road network and the relation track are a layer each; the modes share one
+    # layer per region, so a mode goes off by filter and not by visibility.
+    assert "withoutModes" in text
+    assert "map.setFilter(id, off.length ? withoutModes(off) : null)" in text
+
+
 def _connect(base: str) -> http.client.HTTPConnection:
     """A raw connection, because urllib sends `Connection: close` on every request
     and so can never show one being reused."""
