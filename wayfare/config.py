@@ -599,9 +599,15 @@ TRACE_JOIN_TOLERANCE_M = 1.0
 
 # --- Publishing ------------------------------------------------------------
 
-# How hard tippecanoe simplifies a line below the maximum zoom, in tile units. Lower
-# keeps more of the road's shape and costs bytes; the maximum zoom is never simplified,
-# so this is about z5-z13 only.
+# How hard tippecanoe simplifies a line, in tile units. Lower keeps more of the road's
+# shape and costs bytes.
+#
+# It applies at every zoom including the maximum. A note here used to say the maximum
+# zoom was never simplified, and measuring it on Ireland's detail band says otherwise:
+# `--simplify-only-low-zooms` builds 6.16% *bigger*, and `--simplification-at-maximum-
+# zoom=8` alongside `--simplification=8` is byte-identical to `--simplification=8` on
+# its own. Turning simplification off altogether costs 25.89%, which makes this knob
+# the largest single geometry saving in the build.
 #
 # 4 was tippecanoe's default. It has now been measured and it stays: building Great
 # Britain at 4, 2 and 1 gives 130.4 MB, 135.2 MB and 140.8 MB, and moves the ink in a
@@ -610,6 +616,22 @@ TRACE_JOIN_TOLERANCE_M = 1.0
 # along single ways, and `SIMPLIFY_SHARED_NODES` pins every junction -- so a lower
 # setting buys geometry nobody can see at 8% more bytes.
 SIMPLIFICATION = 4
+# The grid the detail band's lower zooms are quantised to, as a power of two --
+# tippecanoe's `-D`. Its default is 12, a 4096-unit tile; this is 1024 units.
+#
+# It reaches z11-z13 and never z14, which keeps `-d` at the default and comes out
+# bit-identical, so the zoom a street is read at does not move. MapLibre draws a
+# vector tile across 512 screen pixels, which puts detail 9 at one grid unit per
+# pixel at native zoom and this at half a unit.
+#
+# Measured on Great Britain's detail band: 106.2 MB to 98.2 MB, 7.53%. The 2.97% of
+# z11 features it costs are short edges collapsing to a single point on the coarser
+# grid, and the ink they carried is not visible at that zoom -- rasterised over
+# Leinster, z11 lit pixels go 2.524% to 2.516%.
+#
+# 9 was measured and rejected: 10.81% on Ireland for a 375 m worst-case collapse at
+# z11, taking 8.58% of that zoom's features with it.
+LOW_DETAIL = 10
 # Whether to keep a node shared between two features fixed while simplifying.
 #
 # On, and it should stay on: simplification is free to move a vertex, and moving one

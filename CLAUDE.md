@@ -137,6 +137,16 @@ road; and a longitude near the prime meridian is written `-1.1e-05`, which a num
 pattern without an exponent skips without a word. Counting features per zoom, and per
 cell, in the finished archive is what catches any of them.
 
+**The detail band's feature id is the OSM way id, and the overview bands' is the
+Valhalla edge id.** So `way` is an attribute of no band and neither is `id`, and the
+viewer tells the two ranges apart by reading `refs`, which `_DETAIL_ONLY` strips from
+exactly the bands that carry the edge id. Put `way` back as an attribute, or strip
+`refs` from a band, and the viewer hovers in the wrong id space with no error to show
+for it. A way whose service set changes along it is several features sharing one id,
+so a hover selects the whole way. Carrying this to a served archive is a `publish`
+run and no migration — `way` was already a column on `edges` and already in the
+export.
+
 **Nothing holds a whole window or a whole table.** `art` streams its window and
 `publish.export_geojsonl` streams by `way_id`. Anything statistical — weight
 percentiles, group stats — must read the *unsampled*, *unbanded* window, and only
@@ -242,6 +252,11 @@ relations, 23,134 km of track, 86.9% of Underground trips and 60.6% of the DLR's
 `segments` goes 629 rows to 1,756. One Overpass query costs 131 MB and 27 seconds
 nationally. Ferries resolve to nothing by design. 440 patterns still find no stop match,
 and trams are the weakest mode at 34.2% of trips.
+
+**Nothing has been republished with the smaller detail band** (2026-08-13). Great
+Britain's candidate archive is at `/home/samba/sambashare/wayfare-cand/out/great_britain.pmtiles`
+on the server, 136,786,795 bytes against 166,165,053 for the same inputs built the old
+way, and every served archive is untouched. Taking it live is a `publish` run.
 
 Feed churn is measured: two Wales feeds two days apart took 3,584 patterns to 3,541 — 30
 new, 73 departed, about 8 seconds of matching to catch up against 16m23s for the full run.
