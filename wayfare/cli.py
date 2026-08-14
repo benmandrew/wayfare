@@ -475,7 +475,9 @@ def _dispatch(args: argparse.Namespace) -> int:
             built.ways,
         )
         log.info(
-            "  refused: %d did not chain, %d named fewer than two stops",
+            "  refused: %d belong to another region, %d did not chain, "
+            "%d named fewer than two stops",
+            built.skipped_not_ours,
             built.skipped_broken,
             built.skipped_no_stops,
         )

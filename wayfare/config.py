@@ -102,6 +102,18 @@ class Feed:
     # The datasets a feed is assembled from, where no single file is the feed.
     # `url` is empty in that case and `filename` names the bundle acquire builds.
     parts: tuple[Part, ...] = ()
+    # The window `osmroutes` discovers this region's route relations over, as
+    # (south, west, north, east), intersected with the box the region's own stops
+    # draw. Only a region whose services leave it needs one: Translink runs coach
+    # and rail to Dublin, so a min/max over Northern Ireland's live stops reaches
+    # 53.3 N and asks Overpass for most of the Republic.
+    bounds: tuple[float, float, float, float] | None = None
+    # The names this region's own rail carries in an OSM `operator` tag. A window
+    # is a box and a border is not, so the box cannot be the only gate. A region
+    # that names none draws whatever its window returns, less anything a region
+    # here claims -- which is how Great Britain keeps drawing what it drew while
+    # stopping at the Irish Sea.
+    operators: tuple[str, ...] = ()
 
 
 FEEDS = {
@@ -117,6 +129,10 @@ FEEDS = {
         attribution="National Transport Authority",
         stop_register=False,
         resumable=True,
+        # No bounds: a box cannot describe the Republic, because Donegal reaches
+        # further north than any part of Northern Ireland. The operator gate is
+        # the whole of the border here.
+        operators=("Iarnród Éireann", "Irish Rail"),
     ),
     "northern_ireland": Feed(
         # No URL: there is no Northern Irish GTFS to download. `acquire` fetches
@@ -131,6 +147,14 @@ FEEDS = {
         stop_register=False,
         resumable=True,
         parts=NI_PARTS,
+        # The six counties, padded. Cranfield Point at 54.02 N is the southernmost
+        # of them and Burr Point at -5.43 the easternmost; Rathlin is 55.30 N and
+        # Fermanagh reaches -8.18. Dublin, at 53.35 N, falls outside, which is what
+        # stops Overpass returning the Republic's network. Donegal falls inside and
+        # has had no working railway since 1960, and the Sligo line stays south of
+        # 54 N as far west as Boyle, so neither meets the box.
+        bounds=(54.0, -8.35, 55.35, -5.35),
+        operators=("NI Railways", "Northern Ireland Railways", "Translink"),
     ),
 }
 

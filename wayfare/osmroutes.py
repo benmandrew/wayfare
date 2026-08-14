@@ -19,6 +19,12 @@ Measured over the national Overpass body, `route=train`, Great Britain:
 * 96.6% carry `operator`, 99.7% `name`, 62.6% `ref`.
 * 55,114 distinct ways, 26,454 km of unique track.
 
+That 911 is now enforced rather than observed. `config.Feed.bounds` narrows the
+Overpass window per region, below the British Isles clip a min/max over the region's
+stops gives it, and `config.Feed.operators` refuses a relation whose `operator` names
+only another region's rail -- which is what now keeps Iarnród Éireann's share of the
+other 70 out of Great Britain's archive.
+
 Two things this deliberately does not do:
 
 * **It does not reorder a relation's members.** A greedy endpoint walk rescues 15 of
@@ -32,6 +38,8 @@ Two things this deliberately does not do:
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from dataclasses import dataclass
 from math import cos, radians, sqrt
 from pathlib import Path
@@ -54,21 +62,84 @@ ROUTE_MODES: dict[str, str] = {"train": "rail"}
 # the edge of the region has its relation returned at all.
 BBOX_PAD = 0.05
 
+# An `operator` tag is a `;`-separated list where a line is run jointly. Some
+# mappers write a bilingual pair with a slash instead, so both separate.
+_OPERATOR_SPLIT = re.compile(r"[;/]")
+
+_NOT_ALNUM = re.compile(r"[^a-z0-9]+")
+
+
+def operator_key(name: str) -> str:
+    """An `operator` value reduced to what two spellings of it agree on.
+
+    Accents fold rather than being kept: `Iarnród Éireann` is tagged with them and
+    without them across the network, and neither spelling is the wrong one.
+    """
+    folded = unicodedata.normalize("NFKD", name).casefold()
+    bare = "".join(c for c in folded if not unicodedata.combining(c))
+    return _NOT_ALNUM.sub(" ", bare).strip()
+
+
+def claims(region: str | None = None) -> tuple[frozenset[str], frozenset[str]]:
+    """The operator keys this region draws, and the ones another region draws.
+
+    Both sets come out of `config.FEEDS`, so every region's run reads the same
+    ownership and two of them cannot both keep a relation.
+    """
+    region = region or config.BODS_REGION
+    mine = frozenset(operator_key(n) for n in config.feed(region).operators)
+    others = frozenset(
+        operator_key(n)
+        for slug, other in config.FEEDS.items()
+        if slug != region
+        for n in other.operators
+    )
+    return mine, others - mine
+
+
+def ours(tag: str | None, mine: frozenset[str], others: frozenset[str]) -> bool:
+    """Whether this region draws a relation, from the operators it names.
+
+    Three cases, and the third is the one a cross-border service needs.
+
+    A tag naming nobody any region claims is left to the window. That is what keeps
+    a region with no operators of its own -- Great Britain, and every BODS slug --
+    drawing what it has always drawn, while still refusing Iarnród Éireann's
+    relations, which reach its window because the British Isles clip admits them.
+
+    A tag naming only another region's operators is refused outright.
+
+    A tag naming both goes to whichever is written first. The Enterprise is run
+    jointly by Iarnród Éireann and NI Railways, and both regions' runs read the one
+    tag, so first-listed is arbitrary about which archive gets that line and exact
+    about it landing in only one.
+    """
+    named = [operator_key(n) for n in _OPERATOR_SPLIT.split(tag or "")]
+    claimed = [n for n in named if n in mine or n in others]
+    if not claimed:
+        return True
+    return claimed[0] in mine
+
 
 @dataclass(frozen=True)
 class Built:
     """What one run produced, for the CLI to print and the tests to assert on."""
 
+    # Every relation of a drawn route the window returned, this region's or not.
     considered: int
+    # Of the ones this region draws, those whose ways form one unbroken path.
     chained: int
     patterns: int
     ways: int
     skipped_no_stops: int
     skipped_broken: int
+    skipped_not_ours: int
     track_km: float
 
 
-def bbox(con: duckdb.DuckDBPyConnection) -> tuple[float, float, float, float] | None:
+def bbox(
+    con: duckdb.DuckDBPyConnection, region: str | None = None
+) -> tuple[float, float, float, float] | None:
     """The window to ask Overpass for: every live pattern's stops, padded.
 
     Every live pattern rather than the pending non-road ones `trace.bbox` uses, and
@@ -86,6 +157,11 @@ def bbox(con: duckdb.DuckDBPyConnection) -> tuple[float, float, float, float] | 
     Overpass for every railway between Ireland and Poland. That is the query that
     ran out of memory before the clip existed, and a database built by an older
     `patterns` would do it again.
+
+    Then clipped again to `config.Feed.bounds` where the region has them, which is
+    the same failure one border in rather than one sea. Translink runs to Dublin,
+    so Northern Ireland's stops draw a box over most of the island and every
+    relation of the Republic's network comes back inside it.
     """
     row = db.row(
         con,
@@ -101,7 +177,18 @@ def bbox(con: duckdb.DuckDBPyConnection) -> tuple[float, float, float, float] | 
     if row is None or row[0] is None:
         return None
     south, west, north, east = (float(v) for v in row)
-    return (south - BBOX_PAD, west - BBOX_PAD, north + BBOX_PAD, east + BBOX_PAD)
+    south, west = south - BBOX_PAD, west - BBOX_PAD
+    north, east = north + BBOX_PAD, east + BBOX_PAD
+    limit = config.feed(region).bounds
+    if limit is not None:
+        south, west = max(south, limit[0]), max(west, limit[1])
+        north, east = min(north, limit[2]), min(east, limit[3])
+        if south >= north or west >= east:
+            raise RuntimeError(
+                f"region {region or config.BODS_REGION!r} has bounds {limit}, which "
+                "its live stops never meet; no relation could be discovered"
+            )
+    return (south, west, north, east)
 
 
 def _span_m(points: list[tuple[float, float]]) -> float:
@@ -132,21 +219,32 @@ class Candidate:
 
 
 def candidates(
-    relations: list[osm.Relation], routes: dict[str, str] | None = None
-) -> tuple[list[Candidate], int, int]:
-    """The relations that can stand as a service, and counts of the two refusals.
+    relations: list[osm.Relation],
+    routes: dict[str, str] | None = None,
+    region: str | None = None,
+) -> tuple[list[Candidate], int, int, int]:
+    """The relations that can stand as a service, and counts of the three refusals.
 
-    A relation qualifies when its ways chain end to end with no break and it names
-    at least two stops. Both are the tests `trace` already applies, for the same
-    reason: a break draws confident track across a gap, and a relation with no stops
-    can be neither identified nor joined to anything later.
+    A relation qualifies when it is this region's to draw, its ways chain end to end
+    with no break, and it names at least two stops. The last two are the tests
+    `trace` already applies, for the same reason: a break draws confident track
+    across a gap, and a relation with no stops can be neither identified nor joined
+    to anything later.
+
+    The first is `ours`, and it is what the window cannot do. A window is a box, a
+    border is not, and two archives are loaded onto one map -- so a relation kept by
+    both regions is a line the viewer draws twice.
     """
     routes = routes or ROUTE_MODES
+    mine, others = claims(region)
     out: list[Candidate] = []
-    broken = no_stops = 0
+    broken = no_stops = not_ours = 0
     for r in relations:
         mode = routes.get(r.route or "")
         if mode is None or not r.ways:
+            continue
+        if not ours(r.tags.get("operator"), mine, others):
+            not_ours += 1
             continue
         chain = osm.chain(r)
         if chain.breaks:
@@ -177,7 +275,7 @@ def candidates(
                 lat_e6=[round(lat * 1e6) for lat, _ in chain.points],
             )
         )
-    return out, broken, no_stops
+    return out, broken, no_stops, not_ours
 
 
 def write(con: duckdb.DuckDBPyConnection, found: list[Candidate]) -> int:
@@ -310,34 +408,48 @@ def run(
     *,
     refresh: bool = False,
     routes: dict[str, str] | None = None,
+    region: str | None = None,
 ) -> Built:
-    """Fetch the relations and turn the ones that qualify into services."""
-    window = bbox(con)
+    """Fetch the relations and turn the ones that qualify into services.
+
+    The region is ambient, out of `WAYFARE_REGION`, exactly as it is for `acquire`
+    and `publish`. It decides the window and it decides the operator gate, so a run
+    against the wrong data root draws another region's rail into this one's archive
+    -- which is why the log line names it.
+    """
+    window = bbox(con, region)
     if window is None:
         raise RuntimeError("no live patterns to derive a window from")
     relations = osm.fetch(window, cache or config.RAW / "osm_routes.json", refresh=refresh)
     wanted = routes or ROUTE_MODES
     considered = [r for r in relations if (r.route or "") in wanted]
-    found, broken, no_stops = candidates(relations, wanted)
+    found, broken, no_stops, not_ours = candidates(relations, wanted, region)
     n_patterns = write(con, found)
-    n_ways = write_ways(con, [r for r in relations if (r.route or "") in wanted])
+    # Only the relations that became patterns. `ways` is joined to `track_services`
+    # on the way out, so a refused relation's ways are rows nothing can reach --
+    # and in Northern Ireland's database they were the whole Republic's track.
+    drawn = {c.relation_id for c in found}
+    n_ways = write_ways(con, [r for r in relations if r.relation_id in drawn])
     km = sum(c.span_m for c in found) / 1000.0
     built = Built(
         considered=len(considered),
-        chained=len(considered) - broken,
+        chained=len(considered) - broken - not_ours,
         patterns=n_patterns,
         ways=n_ways,
         skipped_no_stops=no_stops,
         skipped_broken=broken,
+        skipped_not_ours=not_ours,
         track_km=km,
     )
     log.info(
-        "%d relations considered, %d chained, %d became patterns over %d ways "
-        "(%d broken, %d with fewer than two named stops)",
+        "%s: %d relations considered, %d chained, %d became patterns over %d ways "
+        "(%d another region's, %d broken, %d with fewer than two named stops)",
+        region or config.BODS_REGION,
         built.considered,
         built.chained,
         built.patterns,
         built.ways,
+        built.skipped_not_ours,
         built.skipped_broken,
         built.skipped_no_stops,
     )

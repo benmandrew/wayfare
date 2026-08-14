@@ -72,6 +72,56 @@ The whole pattern goes, not the offending stop. Dropping the stop alone would le
 London-to-Warsaw coach in the dataset as a London-to-Dover one, and `span_m`, the
 detour check and every bounding box would then read it as domestic.
 
+**The same failure sits one border in rather than one sea out.** `osmroutes` discovers
+OpenStreetMap `route=train` relations over a window and turns each one into a pattern,
+which is how Great Britain's National Rail gets drawn at all, since BODS does not carry
+it, and is Northern Ireland's only source of rail, since Translink's assembled GTFS is
+Ulsterbus, Goldline and Metro. That window was a min/max over every live pattern's
+stops, clipped only to `config.british_isles_sql`, and Translink runs coach and rail to
+Dublin. So Northern Ireland's window reached 53.3°N and spanned most of the island: it
+drew 17,549 ways of track against the Republic's 4,156, both archives carried the
+Republic's rail, and the viewer, which loads every archive it is offered onto one map,
+drew it twice. Nothing downstream narrowed it again — `osmroutes.candidates` gated on
+chaining and on naming two stops and applied no geography, `write_ways` wrote every way
+of every relation the window returned, and `publish` has no region clip. Overpass
+`rel(...)(bbox)` selects relations *intersecting* the box and `out geom` returns them
+whole, so a line that pokes into the box arrives entire.
+
+There are now two gates, because a window is a box and a border is not.
+`config.Feed.bounds` is a per-region window, `(south, west, north, east)`, intersected
+with the box the region's own stops draw. Northern Ireland gets `(54.0, -8.35, 55.35,
+-5.35)`. Cranfield Point at 54.02°N is the southernmost point of the six counties, Burr
+Point at -5.43° the easternmost, Rathlin is 55.30°N and Fermanagh reaches -8.18°. Dublin
+at 53.35°N falls outside, which is what stops Overpass returning the Republic's network.
+Donegal falls inside and has had no working railway since 1960, and the Sligo line stays
+south of 54°N as far west as Boyle, so neither meets the box. Bounds that never meet the
+region's live stops raise, rather than querying an empty box and reporting that nothing
+was discovered, which would read as an Overpass that answered. The Republic gets no
+bounds at all, because a box cannot describe it: Donegal reaches further north than any
+part of Northern Ireland, which is the Channel line's problem in a different shape.
+
+`config.Feed.operators` is the second gate, the names a region's own rail carries in an
+OSM `operator` tag, read by `osmroutes.ours`. A tag naming nobody any region claims is
+left to the window, which is what keeps every BODS slug drawing what it has always
+drawn. A tag naming only another region's operators is refused. A tag naming both goes
+to whichever region is written first. The Enterprise is run jointly by Iarnród Éireann
+and NI Railways and both regions' runs read the one tag, so first-listed is arbitrary
+about which archive gets that line and exact about its landing in only one. Operator
+names fold case and accents, because `Iarnród Éireann` is tagged with them and without
+them across the network, and they split on `;` and on `/`.
+
+The operator gate bites Great Britain too, deliberately. Its window is clipped to the
+British Isles, so Iarnród Éireann's relations always reached it, and the 70 chained
+relations that sit outside Great Britain were being drawn into its archive. Great
+Britain names no operators of its own and does not need to, since naming another
+region's is enough to refuse. `write_ways` now writes only the relations that became
+patterns, and `ways` is joined to `track_services` on the way out, so a refused
+relation's ways were rows nothing could reach — in Northern Ireland's database, the
+whole Republic's track. Nothing is live yet, and taking it live is a `wayfare routes`
+run and then a `publish` for each affected region, with no migration. A continental
+relation carries an operator no region claims, so the window is still the only thing
+holding those out, and the window is a box over the British Isles.
+
 **Sizes.** National GTFS: 1.28 GB zipped, 7.84 GB unpacked, `stop_times.txt` 5.09
 GB, `shapes.txt` 2.53 GB, 1.55M trips. OSM Great Britain: 2.16 GB. NaPTAN CSV: 102
 MB, 435k records. Budget ~40 GB of disk including the Valhalla graph.

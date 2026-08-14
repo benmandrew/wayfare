@@ -81,9 +81,15 @@ wayfare trace --retry transient || \
   echo "refresh: trace did not finish; the relations it missed stay pending" >&2
 
 # The modes with no timetable at all: Great Britain's National Rail, which BODS
-# does not carry. Same slot as `trace` and for the same reasons -- after the gate,
-# and allowed to fail, because it asks the same metered public API and a busy
-# Overpass must not cost a region its buses.
+# does not carry, and Northern Ireland's, which Translink's four datasets do not.
+# Same slot as `trace` and for the same reasons -- after the gate, and allowed to
+# fail, because it asks the same metered public API and a busy Overpass must not
+# cost a region its buses.
+#
+# It reads WAYFARE_REGION, which is what decides both the window it asks Overpass
+# for and which operators' relations it keeps. A run against the wrong data root
+# draws another region's rail into this one's archive, so the stage names the
+# region it thinks it is in its own log line.
 #
 # It must run *after* `patterns`, not before. `patterns` sets the feed version these
 # rows are stamped with, and a relation written against the previous one is departed

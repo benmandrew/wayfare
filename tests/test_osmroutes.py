@@ -61,8 +61,8 @@ def relation(
 
 
 def test_a_chaining_relation_becomes_a_candidate():
-    found, broken, no_stops = osmroutes.candidates([relation()])
-    assert (broken, no_stops) == (0, 0)
+    found, broken, no_stops, not_ours = osmroutes.candidates([relation()])
+    assert (broken, no_stops, not_ours) == (0, 0, 0)
     (c,) = found
     assert c.route_id == "osm:r1"
     assert c.mode == "rail"
@@ -76,21 +76,21 @@ def test_a_relation_that_does_not_chain_is_refused():
         way(10, [(51.0, -1.0), (51.1, -1.0)]),
         way(11, [(52.0, -1.0), (52.1, -1.0)]),  # joins at neither end
     ]
-    found, broken, _ = osmroutes.candidates([relation(ways=broken_ways)])
+    found, broken, *_ = osmroutes.candidates([relation(ways=broken_ways)])
     assert found == []
     assert broken == 1
 
 
 def test_a_relation_naming_fewer_than_two_stops_is_refused():
     one = [stop(100, "Alpha Rail Station", 51.0, -1.0)]
-    found, _, no_stops = osmroutes.candidates([relation(stops=one)])
+    found, _, no_stops, _ = osmroutes.candidates([relation(stops=one)])
     assert found == []
     assert no_stops == 1
 
 
 def test_a_mode_with_its_own_timetable_is_not_admitted():
     """Admitting `subway` would draw a second Underground beside the BODS one."""
-    found, broken, no_stops = osmroutes.candidates([relation(route="subway")])
+    found, broken, no_stops, _ = osmroutes.candidates([relation(route="subway")])
     assert (found, broken, no_stops) == ([], 0, 0)
 
 
@@ -107,6 +107,67 @@ def test_the_relation_name_is_the_fallback():
 def test_the_operator_becomes_the_agency():
     (c,) = osmroutes.candidates([relation(tags={"operator": "ScotRail"})])[0]
     assert c.agency_id == "ScotRail"
+
+
+# --- whose relation is it ----------------------------------------------------
+#
+# The window is a box and the border is not, so the box cannot be the only gate.
+# Northern Ireland's live stops reach Dublin and every relation of the Republic's
+# network came back inside them -- and both archives are loaded onto one map, so
+# the two of them drew the Republic's rail twice.
+
+
+def ni(tags: dict[str, str]) -> tuple[int, int]:
+    """How many candidates and how many refusals a Northern Ireland run gets."""
+    found, _, _, not_ours = osmroutes.candidates(
+        [relation(tags=tags)], region="northern_ireland"
+    )
+    return len(found), not_ours
+
+
+def test_another_regions_operator_is_refused():
+    assert ni({"operator": "Iarnród Éireann"}) == (0, 1)
+
+
+def test_the_regions_own_operator_is_kept():
+    assert ni({"operator": "NI Railways"}) == (1, 0)
+
+
+def test_accents_do_not_decide_ownership():
+    """The tag is written both ways across the network and neither is wrong."""
+    assert ni({"operator": "Iarnrod Eireann"}) == (0, 1)
+
+
+def test_a_relation_naming_no_operator_is_left_to_the_window():
+    assert ni({}) == (1, 0)
+
+
+def test_an_operator_no_region_claims_is_left_to_the_window():
+    """What keeps every BODS slug drawing what it has always drawn."""
+    found, *_ = osmroutes.candidates([relation(tags={"operator": "ScotRail"})])
+    assert len(found) == 1
+
+
+def test_a_region_with_no_operators_still_refuses_a_claimed_one():
+    """Great Britain's window is clipped to the British Isles, so Iarnród
+    Éireann's relations reach it and were drawn into its archive too."""
+    found, _, _, not_ours = osmroutes.candidates(
+        [relation(tags={"operator": "Iarnród Éireann"})]
+    )
+    assert (len(found), not_ours) == (0, 1)
+
+
+def test_a_jointly_run_line_goes_to_the_operator_named_first():
+    """The Enterprise. Both regions read the one tag, so which archive gets it is
+    arbitrary and its landing in only one of them is not."""
+    joint = {"operator": "Iarnród Éireann;NI Railways"}
+    assert ni(joint) == (0, 1)
+    kept, _, _, _ = osmroutes.candidates([relation(tags=joint)], region="ireland")
+    assert len(kept) == 1
+
+
+def test_a_bilingual_operator_pair_separates_on_the_slash():
+    assert ni({"operator": "Iarnród Éireann / Irish Rail"}) == (0, 1)
 
 
 # --- what lands in the database ----------------------------------------------
@@ -204,3 +265,50 @@ def test_ways_are_rebuilt_not_merged(seeded):
 def test_a_degenerate_way_is_not_stored(seeded):
     """One point cannot be drawn and cannot be oriented."""
     assert osmroutes.write_ways(seeded, [relation(ways=[way(10, [(51.0, -1.0)])])]) == 0
+
+
+# --- the window --------------------------------------------------------------
+
+
+def live(con, stops: list[tuple[float, float]]) -> None:
+    """One live pattern calling at these coordinates, and nothing else."""
+    db.set_meta(con, "feed_version", FEED)
+    con.execute(
+        "INSERT INTO patterns (pattern_id, route_id, short_name, direction, n_stops,"
+        " n_trips, span_m, mode, first_seen, last_seen)"
+        " VALUES (1, 'R1', 'X', 0, ?, 1, 0.0, 'bus', ?, ?)",
+        [len(stops), FEED, FEED],
+    )
+    for i, (lat, lon) in enumerate(stops):
+        con.execute(
+            "INSERT INTO stops VALUES (?, ?, ?, ?)", [f"S{i}", f"Stop {i}", lat, lon]
+        )
+        con.execute("INSERT INTO pattern_stops VALUES (1, ?, ?)", [i, f"S{i}"])
+
+
+BELFAST = (54.60, -5.93)
+DUBLIN = (53.35, -6.25)
+
+
+def test_a_cross_border_stop_no_longer_widens_the_window(con):
+    """Translink runs coach and rail to Dublin, so a min/max over the province's
+    live stops reaches 53.3 N and asks Overpass for most of the Republic."""
+    live(con, [BELFAST, DUBLIN])
+    box = osmroutes.bbox(con, "northern_ireland")
+    assert box is not None
+    assert box[0] == 54.0
+
+
+def test_a_region_with_no_bounds_keeps_the_window_its_stops_draw(con):
+    live(con, [BELFAST, DUBLIN])
+    box = osmroutes.bbox(con, "all")
+    assert box is not None
+    assert box[0] == pytest.approx(DUBLIN[0] - osmroutes.BBOX_PAD)
+
+
+def test_bounds_that_never_meet_the_stops_are_an_error(con):
+    """A misconfigured region would otherwise query an empty box and report that
+    it discovered nothing, which reads as an Overpass that answered."""
+    live(con, [DUBLIN])
+    with pytest.raises(RuntimeError, match="bounds"):
+        osmroutes.bbox(con, "northern_ireland")
