@@ -1,11 +1,12 @@
 # Pipeline
 
-Six stages, each reading what the last wrote, each independently re-runnable:
+Seven stages, each reading what the last wrote, each independently re-runnable:
 
     acquire  -> raw downloads
     patterns -> 1.55M trips collapse to distinct ordered stop sequences
     match    -> Valhalla; the stage that runs for a day or two
     trace    -> OSM route relations for the modes with no road and no shape
+    routes   -> OSM route relations as services, for the modes with no timetable
     aggregate-> invert pattern->edges into edge->services
     publish  -> GeoJSONL -> tippecanoe -> PMTiles
 
@@ -522,6 +523,119 @@ and the four over 2.5 are all the Piccadilly line's Heathrow Terminal 4 loop, wh
 genuinely one-way. Figures, correctness checks and the 440 patterns still refused are
 in docs/results.md.
 
+## routes
+
+**A route relation can stand as the service itself, with no timetable behind it.**
+`trace` uses one as *geometry* for a pattern a feed already carries. `routes` uses one
+as the pattern. That is what makes Great Britain's National Rail drawable at all,
+because BODS does not carry it and every timetable source for it sits behind a login
+or a licence negotiation. `wayfare/osmroutes.py` has the reasoning for the gate and
+for leaving `n_trips` null; this section is about what the stage costs.
+
+**It costs 54m43s nationally, and 99.8% of that is two insert loops.** Profiled on the
+server, 8 cores, against the cached 121.5 MB Overpass body already on disk:
+
+```
+json.loads                             3.23s     121.5 MB, 8,502 elements
+osm.parse                              1.90s     1,312 relations, 2,310,035 way points
+candidates (chaining)                  1.14s     935 candidates, 1,786,403 chain points
+write (patterns/traces/trace_status)  543.17s     935 patterns
+write_ways                          2733.06s     68,369 ways, 566,572 points
+                                    ─────────
+                                    3282.50s     54m 43s
+```
+
+`write_ways` is 83.3% and `write` is 16.5%. Reading, parsing and chaining the whole
+national body together take 6.3 seconds. Building the 68,369 row tuples inside
+`write_ways` takes 0.78s of its 2,733, so the rest is the insert and nothing else.
+
+**The stage has no incremental path.** `run()` chains every relation and rewrites
+every pattern and way on every invocation. Nothing consults an existing `traces` or
+`trace_status` row, which is what makes the neighbouring stages cheap on a re-run:
+`match` selects work by the absence of a `match_status` row and `trace` selects
+pending patterns. Rebuilding rather than carrying forward is deliberate and it is
+correct, because it is what stops a line retired in OpenStreetMap being drawn for
+ever. The semantics are not the problem. The price of them is.
+
+**`deploy/refresh.sh` pays that price every week, to reach an answer it already had.**
+Line 89 runs `wayfare routes` with no `--refresh`, and nothing in the script or in
+`acquire` deletes `raw/osm_routes.json` — `acquire`'s `osm` source is the Geofabrik
+pbf for Valhalla, a different file. So the scheduled path never re-queries Overpass.
+It re-parses the same bytes, re-chains the same relations and rewrites the same rows.
+The output is a pure function of a file that cannot change between runs, and the only
+thing that legitimately differs is the `last_seen` stamp moving to the new feed
+version. The rail layer's OpenStreetMap content is therefore frozen at whatever was
+last cached until someone passes `--refresh` by hand, which is a coverage fact worth
+knowing rather than a bug.
+
+**The two writers are slow for different reasons.** Baselines on a subset, extrapolated;
+the extrapolation checks out against the full run at 2,419s predicted for `write_ways`
+against 2,733s measured, and 458s predicted for `write` against the 543s it took
+including the SQL that follows its staging insert.
+
+```
+ways 68,369 rows / 566,572 points
+ways executemany, autocommit (n=5000)      176.93s   (x13.7 -> 2419s)
+ways executemany, one transaction (n=5000)  17.87s   (x13.7 ->  244s)
+ways executemany, txn, no PK (n=5000)       17.47s   (x13.7 ->  239s)
+ways CSV staging, all 68,369                 1.46s
+ways arrow, all 68,369                       0.53s
+
+osm_route_raw 935 rows / 1,786,403 points
+osm_route_raw executemany (n=100)           48.95s   (x9.3  ->  458s)
+osm_route_raw arrow, all 935                 0.21s
+```
+
+**A missing `BEGIN`/`COMMIT` is 90% of `write_ways`.** 2,419s falls to 244s from the
+transaction alone. `write` has one and `write_ways` does not, and that is the whole
+difference between 40ms and 3.6ms per row.
+
+**The primary key on `way_id` costs nothing, and that hypothesis was wrong.** 17.47s
+into a table with no key against 17.87s into `ways` as it stands. An *adaptive radix
+tree* (ART) index maintained over 68,369 inserts sounds expensive and is not the
+cost here. Recorded so the next reader does not re-test it.
+
+**A transaction is still not the fix.** At 244s, `executemany` remains 167× slower
+than staging the points to a file and 460× slower than handing DuckDB one Arrow
+table, and it does nothing at all for `write`. The per-unit rates separate the two:
+`write_ways` is per-row bound at 8.3 points per row, where `write` is per-point bound
+at 0.30ms over only 935 rows. Its 458s is 1.79M list elements crossing the binding
+layer one at a time, which Arrow moves in 0.21s.
+
+| | now | + transaction | + columnar |
+|---|---|---|---|
+| fetch, parse, chain | 6.3s | 6.3s | 6.3s |
+| `write` | 543s | 543s | ~85s |
+| `write_ways` | 2,733s | ~244s | ~1s |
+| total | 54m 43s | 13m 13s | ~1m 32s |
+
+The residual ~85s in the columnar column is the SQL after the staging insert, the
+`pattern_id` hashing and the three inserts. It was not timed separately and is an
+estimate rather than a measurement. Timing it is the next step if 1m32s is not enough.
+
+**Choosing between Arrow and file staging is a dependency question, not a speed one.**
+Arrow is 2.8× faster on `ways` and needs no temporary file, and for `write` there is
+no clean flat shape to stage at all: the row carries `way_ids`, `lon_e6` and `lat_e6`
+as three parallel lists of different lengths, so a file means three of them or a
+synthetic join key. Against that, `pycairo`, `numpy` and `pyarrow` are the `art` extra
+and the pipeline does not import them, so reaching for Arrow here moves that boundary.
+Staying inside it costs roughly a further minute, at about 2m30s.
+
+**Skipping the stage outright is the larger win and is independent of the writers.**
+The output is a pure function of the cache bytes, `ROUTE_MODES` and the derivation
+code, so a digest of the cache file held in `meta` lets a matching run carry its rows
+forward with one UPDATE stamping `last_seen` on the `route_id LIKE 'osm:r%'` rows.
+`traces`, `trace_status` and `ways` are keyed on `pattern_id` and `way_id` and hold no
+feed version, so they need nothing. Two guards make it safe. The digest has to include
+a derivation-version constant, bumped when `candidates`, `osm.chain` or `osm.normalise`
+change, which is the discipline `pattern_id` already carries and the thing that stops a
+parser fix being silently ignored. And an UPDATE that touches zero rows has to fall
+through to the full rebuild, so a restored or re-clustered database cannot end up
+holding a matching digest and no rail.
+
+None of this is implemented. The numbers above are a measurement of the stage as it
+stands, taken on a scratch database while the served archives were untouched.
+
 ## aggregate
 
 **A non-road mode has no road under it, so it is never matched and is drawn from the
@@ -593,6 +707,13 @@ newline-delimited JSON for `edges` because it carries INTEGER[] geometry and roa
 names holding quotes and commas. Multi-row VALUES and unnest of parallel arrays are
 no better than executemany. Never add a row-at-a-time insert loop on a table that
 grows with the network.
+
+**That 2,700 rows/s assumes the insert sits inside a transaction, and without one it
+is 25 rows/s.** Each bound insert then commits on its own. `routes.write_ways` is the
+worked example: 68,369 rows in 2,733 seconds, 40ms each, 108× below the figure above,
+and one `BEGIN`/`COMMIT` around it recovers 90% of that. The rule above still holds
+afterwards — a transaction takes the loop from unusable to merely slow, and staging to
+a file is 167× faster again. The routes section has the full comparison.
 
 ## Clustering
 
