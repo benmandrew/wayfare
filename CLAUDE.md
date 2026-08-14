@@ -169,6 +169,16 @@ takes the wrong branch — so both end as an outcome in `trace_status` and write
 to `traces`. That table is a permanent cache like `match_status`, `transport_error` is
 its one retryable status, and trace failures never gate a publish.
 
+**`osmroutes` draws whatever rail its window admits, and a window is a box while a
+border is not.** Northern Ireland's stops reach Dublin, so a window sized off them drew
+17,549 ways of track against the Republic's own 4,156, both archives carried the
+Republic's rail, and the viewer draws every archive it is offered onto one map.
+`config.Feed.bounds` narrows the window per region, and `config.Feed.operators` refuses
+a relation whose `operator` names only another region's rail while leaving one that
+names nobody to the window, which is what keeps every BODS slug drawing what it always
+drew. Bounds that never meet the region's live stops raise, because an empty box reports
+that nothing was discovered.
+
 **A licence condition travels with the data, not with the page.** `publish` stamps the
 credit into the archive's own tileset metadata, derived from `config.Feed`, so a copied
 archive keeps it and the viewer, which loads every archive it is offered onto one

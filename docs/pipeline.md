@@ -549,6 +549,11 @@ write_ways                          2733.06s     68,369 ways, 566,572 points
 national body together take 6.3 seconds. Building the 68,369 row tuples inside
 `write_ways` takes 0.78s of its 2,733, so the rest is the insert and nothing else.
 
+**That profile predates the territory gate**, which docs/data.md covers. `write_ways`
+now writes the relations that became patterns rather than every relation the window
+returned, so 68,369 rows is an upper bound on what a national run writes now rather
+than the figure. The stage has not been re-profiled since.
+
 **The stage has no incremental path.** `run()` chains every relation and rewrites
 every pattern and way on every invocation. Nothing consults an existing `traces` or
 `trace_status` row, which is what makes the neighbouring stages cheap on a re-run:
