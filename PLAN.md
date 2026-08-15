@@ -314,71 +314,74 @@ Rail relations are 1,569,495 vertices drawn per pattern against 443,126 per way.
 national trace run resolved 1,127 patterns, 1,040 of 1,417 metro patterns over eleven
 Underground lines. 804 tests pass, ruff and mypy are clean.
 
-## Done — a draft of the network under the network
+## Done — a coarse tile is not a small tile
 
-**The viewer reads each archive twice** (2026-08-15). Pop-in on a slow connection is
-the detail band arriving tile by tile over a blank map. MapLibre already refines within
-a source, holding a loaded parent tile on screen and overzooming it until the child
-lands, so what is missing is the cold view that holds no parent at all. The vendored
-MapLibre GL JS 4.7.1 has no `prefetchZoomDelta`, so it never fetches a coarser tile on
-purpose. A second vector source over the same PMTiles file, capped at `maxzoom` 9,
-covers that for the cost of one tile: it overzooms the published mid band from z9 up to
-z18 rather than requesting tiles it has been told do not exist.
+**The overzoomed stand-in was merged and reverted the same day** (2026-08-15, #64 and
+#65). The viewer opened each archive a second time capped at the mid band's top zoom and
+drew it under the road network while the detail tiles loaded. The mechanism worked: the
+cap held against the archive header, the layer drew 3,219 features at Dublin z13, and the
+per-region fade fired on the right edges. What it did not do was arrive first.
 
-**The cap is `config.MID_ZOOM - 1` and the layer starts at `config.MID_ZOOM`.** Both
-are band edges `publish` owns and `web/index.html` restates, so
-`test_the_draft_layer_tracks_the_bands_publish_actually_writes` reads them back out of
-the page. Capped higher, the second source fetches the same detail tiles as the first
-and doubles the cost of the view it exists to make cheaper. Drawn lower, it re-requests
-the tiles already on screen. Both still draw a map, which is why a test holds them.
+**The stand-in tile was the largest object in the load.** A cold profile at Dublin z13
+over 60 KB/s with 200 ms latency, cache disabled, taken through the Chrome DevTools
+Protocol: the two z9 tiles cost 75,307 and 101,835 bytes and completed at 18,854 ms and
+19,269 ms, where every z13 detail tile was in by 17,243 ms. The nine detail tiles came to
+about 124 KB between them, the largest 43,803 bytes. So the draft arrived after the band
+it was standing in for and never drew, while taking the load from 893,605 bytes and
+16,093 ms to 1,093,356 and 19,396 ms. Capping at the far band instead made it worse
+again, 1,320,857 bytes and 23,169 ms, because a z7 tile covers sixteen times the area.
 
-**The cap survives because MapLibre writes the source spec over the TileJSON**, as
-`pick(extend(tilejson, options))`. The other order would leave the archive header's own
-maxZoom of 14 standing and turn the draft into an uncapped copy of the layer above it,
-silently. `protocol.add` shares the PMTiles instance, so the second TileJSON costs no
-request, and the attribution control deduplicates by exact string, so an archive read
-by two sources is credited once.
+**The premise was that a coarse tile is a small tile, and it is not.** A low-zoom tile
+carries the whole network for a much larger area, and `OVERVIEW_CAP_FAR` and
+`OVERVIEW_CAP_MID` are both `None`, so nothing bounds one but `MAX_TILE_BYTES` at
+1,000,000. Area grows faster than simplification saves. A stand-in has to be an artefact
+built to be small; no band already in the archive is one. The first measurement of it was
+wrong in a way worth naming: a tile is in MapLibre's cache in `state: "loading"` from the
+moment it is *requested*, so counting tiles present reported the draft drawable nine
+seconds before its bytes existed. Read the state, or read the network.
 
-**The draft is drawn in the same colours at the same widths.** `publish._DETAIL_ONLY`
-strips `way`, `refs` and `name` from every band below the detail one and leaves `trips`
-and `n`, which are the two attributes the colour ramp and the width ramp read. So the
-real tiles refine the geometry and leave the map looking the same. What the missing
-three cost is every query: a draft feature carries neither the id the hover addresses
-nor the `refs` the search reads, so `OVERVIEW` is kept out of `BUS`, `SEG`, `TRACK` and
-`MATCH` and `liveLayers` never sees it. It dims to 0.12 with the road network under a
-search, being the one road layer a service number cannot be applied to.
+## Done — what a cold load actually spends
 
-**Three events, because no one of them is both edges.** `sourcedata` is the falling
-edge, firing as each tile lands. It is useless as the rising edge: 4.7.1 has no
-`sourcedataloading`, so the first report that tiles were missing would arrive at the
-moment they stopped being missing. `move` is the rising edge, reading one frame behind
-the render that requests the tiles. `idle` is the backstop for a view that needed no
-new tiles and fired neither. `map.isSourceLoaded` asks about the current viewport
-rather than the whole archive, which is the question being asked, and an early-out on
-an unchanged target keeps a per-frame handler down to a lookup per region.
+**The load was profiled rather than guessed at** (2026-08-15). Chrome DevTools Protocol,
+cache disabled, Dublin z13, against the served Ireland archives. At 60 KB/s and 200 ms
+the page transferred 893,605 bytes over 59 requests and took 16,093 ms to finish. The
+basemap was 447,036 of those bytes over 30 requests, 40.9%, and blocking it alone took
+the load to 12,104 ms. The vector data everybody comes for was 184,709 bytes, a fifth of
+what the page fetched.
 
-**Measured against the served archives, driven in headless Chrome.**
-`ireland.pmtiles` and `northern_ireland.pmtiles` were copied off the server, served
-with `wayfare serve`, and opened at `#13/53.3498/-6.2603` over a connection throttled
-through the Chrome DevTools Protocol. The overview source caches tiles at z9 and
-nothing deeper while the region source caches z13, so the cap holds against the
-header's own maxZoom of 14. The draft renders 3,219 features at that viewport against
-the detail band's 3,560, and its features carry `n` and `trips` and neither `refs` nor
-`name`, which is `_DETAIL_ONLY` doing what the paint expressions depend on. Drawn on
-its own it is Dublin's road network in the ramp's own colours at the ramp's own widths.
+**The basemap gives up resolution on a link that says it is slow.** `navigator.connection`
+reports Save-Data, which the user asked for, and `effectiveType`, which the browser
+guessed; either one drops the retina variant and sets the basemap source to `tileSize:
+512`, which makes MapLibre ask for one zoom lower and scale it up. A quarter of the tiles
+for a blurrier backdrop, with the roads on top unaffected because they are vector. On a
+normal screen that took the load to 597,466 bytes and 10,816 ms, a third off both. On a
+retina screen, where the baseline paid 1,185,780 bytes over 30 basemap tiles, it took the
+basemap to 155,839 over 9 and the whole load from 28,169 ms to 10,825 — 61.6%. A browser
+that reports nothing, which is every browser but Chromium's, is left exactly as it was:
+measured at 1,632,341 bytes against 1,627,357, and 28,169 ms against 27,707.
 
-**The draft stood in for 9.2 seconds at 60 KB/s and 14.7 seconds at 40 KB/s.** Its z9
-tile was drawable 8.6 s into the load where the region's detail tiles were not complete
-until 17.8 s, and 12.1 s against 26.8 s at the slower rate. The two regions faded
-independently, Northern Ireland's draft clearing at 12.8 s while Ireland's stayed up to
-26.8 s, which is the per-source test rather than a global one working as intended.
+**The archive's head is read in `<head>`, and read once.** A cold load ran page, library,
+then three serial reads of the archive before a tile was requested: `bytes=0-16383` for
+the header and root directory, the JSON metadata for the credit, and a leaf directory.
+The metadata read is bytes pmtiles.js has already downloaded — every archive's header,
+root and metadata end inside the first 16 KB, at 4,692 for Ireland, 5,193 for Great
+Britain and 12,702 for Northern Ireland, whose root is the large one because it has no
+leaves. So the page reads 16 KB up front, in parallel with the 231 KB library rather than
+behind it, and `HeadSource` answers any range inside it from memory. First tile requested
+went 9,405 ms to 5,863 on the archive that has leaves. Over 400 KB/s and 600 ms round
+trips, where latency rather than bandwidth binds, first tile drawn went 3,842 ms to 2,666
+and the whole load 5,646 to 4,637.
 
-**The draft covers the roads and not the other modes.** `segments` and `track` are
-single-pass z5–14 layers with no band structure to cap, so a tram or a railway has no
-coarse copy to stand in for it and arrives when its own tile does. Those layers are
-hundreds of features rather than millions, so they were left alone. It is a viewer
-change throughout — no republish and no re-match. 817 tests pass, ruff and mypy are
-clean.
+**32 KB was measured and lost.** Catching the first leaf directories as well sounded
+worth the bytes. Over 600 ms round trips it landed within 100 ms of the 16 KB head, and
+over a 60 KB/s pipe the extra 32 KB cost more than the round trip it saved: 913,023 bytes
+and 16,141 ms, behind the 16,093 ms of doing nothing at all. The reads worth removing are
+the ones already paid for.
+
+**Brotli was considered and left alone.** The library is 231,201 bytes gzipped and sits
+on the critical path, and brotli would take perhaps 35 KB off it. That needs a new runtime
+dependency in a project whose environment is a nix flake, to save a twentieth of what the
+basemap change saves without one.
 
 ## Next — National Rail
 

@@ -7,7 +7,6 @@ import http.client
 import io
 import json
 import os
-import re
 import socket
 import socketserver
 import threading
@@ -886,47 +885,50 @@ def test_every_legend_row_is_a_switch():
     assert "map.setFilter(id, off.length ? withoutModes(off) : null)" in text
 
 
-def _number(page: str, name: str) -> int:
-    """One `const <name> = <int>;` from a page."""
-    found = re.search(rf"const {name} = (\d+);", (WEB / page).read_text())
-    assert found, f"{name} is no longer a plain number in {page}"
-    return int(found.group(1))
+def test_the_archive_head_is_prefetched_under_the_key_that_reads_it():
+    """The prefetch in <head> and the lookup in `openArchive` have to agree on the
+    URL, because the map is keyed on it. They cannot share a helper -- one runs
+    before the page's own script exists -- so the expression is written twice, and
+    a divergence is silent in the worst way: every lookup misses, every archive
+    reads the network exactly as it did before, and the only evidence is a
+    prefetch nobody uses.
 
-
-def test_the_draft_layer_tracks_the_bands_publish_actually_writes():
-    """The viewer reads each archive twice: once uncapped, and once capped at the
-    mid band to stand in for the detail tiles while they are in flight. Both halves
-    of that are band edges `publish` owns and the page restates, so moving one in
-    `config` and not the other is what this catches.
-
-    Cap it too high and the second source fetches the same detail tiles as the
-    first, which doubles the cost of the view it exists to make cheaper. Draw it too
-    low and it re-requests the tiles already on screen. Neither shows up as an
-    error: the map still draws, just twice."""
-    assert _number("index.html", "OVERVIEW_ZOOM") == config.MID_ZOOM - 1
-    assert _number("index.html", "OVERVIEW_FROM") == config.MID_ZOOM
-    # The cap has to reach MapLibre as part of the source, not as a constant the
-    # page computes and then drops. Without this line the header's own maxZoom
-    # stands and the source is an uncapped copy of the one above it.
-    assert "maxzoom: OVERVIEW_ZOOM," in (WEB / "index.html").read_text()
-
-
-def test_the_draft_layer_is_never_queried():
-    """`publish._DETAIL_ONLY` strips `way`, `refs` and `name` from every band below
-    the detail one, so a draft feature carries neither the id the hover addresses
-    nor the `refs` the search reads. `liveLayers` is the only way into
-    queryRenderedFeatures, so keeping OVERVIEW out of it is what keeps the cursor in
-    the right id space -- and a hover in the wrong one answers with somebody else's
-    road rather than failing."""
+    16 KB because that is what `getHeaderAndRoot` reads for itself. Larger was
+    measured and lost: over a 60 KB/s pipe a 32 KB head cost more than the round
+    trip it saved."""
     text = (WEB / "index.html").read_text()
-    assert "const OVERVIEW = REGIONS.map((r) => r.over);" in text
-    assert "liveLayers(map, OVERVIEW)" not in text
-    for name in ("BUS", "TRACK", "SEG", "MATCH"):
-        assert f"const {name} = REGIONS.map((r) => r.over)" not in text
-    # And it dims with the network, because it is the one road layer a service
-    # number cannot be applied to. Left bright, a search for the X26 would answer
-    # with every road in the county.
-    assert "syncOverview();" in text
+    assert text.count("new URL(name, location.href).href") == 2
+    assert 'Range: "bytes=0-16383"' in text
+    assert "window.__heads" in text
+    assert "new pmtiles.PMTiles(new HeadSource(url, heads.get(url) || null))" in text
+
+
+def test_the_head_source_answers_only_what_it_wholly_holds():
+    """A range straddling the end of the buffer must go to the network entire. Half
+    an answer stitched to a second request is the round trip this exists to remove,
+    and a slice past the end of an ArrayBuffer is short rather than an error -- so
+    getting this wrong hands pmtiles.js a truncated directory, which it reads as a
+    corrupt archive rather than as a bug here."""
+    text = (WEB / "index.html").read_text()
+    assert "offset + length <= head.buf.byteLength" in text
+    # And a null head is "ask the network", so a host that refuses ranges or
+    # answers 404 to the prefetch behaves exactly as it did before it existed.
+    assert "const head = await this.head;" in text
+    assert "heads.get(url) || null" in text
+
+
+def test_the_basemap_gives_up_resolution_when_the_link_says_it_is_slow():
+    """Cold profiling put the basemap at 40.9% of everything transferred, and 72.7%
+    on a retina screen. Both halves of the reduction are gated on the same check --
+    the retina variant and the tile size -- because either one alone leaves the
+    other paying full price."""
+    text = (WEB / "index.html").read_text()
+    assert "function thriftyConnection()" in text
+    assert "devicePixelRatio > 1.4 && !thriftyConnection()" in text
+    assert "thriftyConnection() ? 512 : 256" in text
+    # Save-Data is the user asking; effectiveType is the browser guessing. Both.
+    assert "c.saveData" in text
+    assert "effectiveType" in text
 
 
 def _connect(base: str) -> http.client.HTTPConnection:
