@@ -7,7 +7,6 @@ import http.client
 import io
 import json
 import os
-import re
 import socket
 import socketserver
 import threading
@@ -884,49 +883,6 @@ def test_every_legend_row_is_a_switch():
     # layer per region, so a mode goes off by filter and not by visibility.
     assert "withoutModes" in text
     assert "map.setFilter(id, off.length ? withoutModes(off) : null)" in text
-
-
-def _number(page: str, name: str) -> int:
-    """One `const <name> = <int>;` from a page."""
-    found = re.search(rf"const {name} = (\d+);", (WEB / page).read_text())
-    assert found, f"{name} is no longer a plain number in {page}"
-    return int(found.group(1))
-
-
-def test_the_draft_layer_tracks_the_bands_publish_actually_writes():
-    """The viewer reads each archive twice: once uncapped, and once capped at the
-    mid band to stand in for the detail tiles while they are in flight. Both halves
-    of that are band edges `publish` owns and the page restates, so moving one in
-    `config` and not the other is what this catches.
-
-    Cap it too high and the second source fetches the same detail tiles as the
-    first, which doubles the cost of the view it exists to make cheaper. Draw it too
-    low and it re-requests the tiles already on screen. Neither shows up as an
-    error: the map still draws, just twice."""
-    assert _number("index.html", "OVERVIEW_ZOOM") == config.MID_ZOOM - 1
-    assert _number("index.html", "OVERVIEW_FROM") == config.MID_ZOOM
-    # The cap has to reach MapLibre as part of the source, not as a constant the
-    # page computes and then drops. Without this line the header's own maxZoom
-    # stands and the source is an uncapped copy of the one above it.
-    assert "maxzoom: OVERVIEW_ZOOM," in (WEB / "index.html").read_text()
-
-
-def test_the_draft_layer_is_never_queried():
-    """`publish._DETAIL_ONLY` strips `way`, `refs` and `name` from every band below
-    the detail one, so a draft feature carries neither the id the hover addresses
-    nor the `refs` the search reads. `liveLayers` is the only way into
-    queryRenderedFeatures, so keeping OVERVIEW out of it is what keeps the cursor in
-    the right id space -- and a hover in the wrong one answers with somebody else's
-    road rather than failing."""
-    text = (WEB / "index.html").read_text()
-    assert "const OVERVIEW = REGIONS.map((r) => r.over);" in text
-    assert "liveLayers(map, OVERVIEW)" not in text
-    for name in ("BUS", "TRACK", "SEG", "MATCH"):
-        assert f"const {name} = REGIONS.map((r) => r.over)" not in text
-    # And it dims with the network, because it is the one road layer a service
-    # number cannot be applied to. Left bright, a search for the X26 would answer
-    # with every road in the county.
-    assert "syncOverview();" in text
 
 
 def _connect(base: str) -> http.client.HTTPConnection:

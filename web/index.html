@@ -354,30 +354,6 @@ const LAYER_SEG = "segments";
 // source-layer is missing, so nothing asks.
 const LAYER_TRACK = "track";
 
-// `publish` writes the road network in four bands -- z5-7, z8-9, z10, z11-14 --
-// and the three below the top one are a thinned, simplified draft of it. So a
-// second source over the same archive, told to stop at the mid band's own top
-// zoom, is a stand-in for the detail band that costs one already-small tile:
-// MapLibre overzooms z9 all the way to z18 rather than asking for tiles it has
-// been told are not there.
-//
-// A stand-in and not a substitute. `publish._DETAIL_ONLY` strips `way`, `refs`
-// and `name` from every band below the detail one, so nothing in here can be
-// hovered, searched or counted, and these layers stay out of BUS, SEG, TRACK and
-// MATCH so that no query ever reaches them. What the band does still carry is
-// `trips` and `n` -- the two attributes the colour ramp and the width ramp read --
-// so the draft is drawn in the same colours at the same widths as the network it
-// stands in for, and refining into it changes the geometry rather than the map.
-const OVERVIEW_ZOOM = 9; // config.MID_ZOOM - 1: the top of the published mid band
-// Below this the archive's own tiles are the ones being drawn anyway, and asking
-// for them twice is the one thing a stand-in must not cost. A layer outside its
-// zoom range leaves its source unused, and an unused source is not updated, so
-// this is a floor on the requests and not only on the drawing.
-const OVERVIEW_FROM = 10; // config.MID_ZOOM
-// Fainter than the 0.85 the real network draws at, so a view still filling in
-// reads as provisional rather than as a network that lost its busy roads.
-const OVERVIEW_OPACITY = 0.5;
-
 // The road ramp, six steps. Light goes pale-blue -> deep violet so busy roads
 // darken against the light basemap; dark goes the other way, into warm yellow, so
 // they glow against the dark one.
@@ -913,11 +889,6 @@ async function openArchive(name, i) {
       match: `bus-match-${i}`,
       seg: `seg-${i}`,
       track: `track-${i}`,
-      // The same archive read a second time, capped at the mid band. A source of
-      // its own rather than a second layer on `src`, because the cap is a property
-      // of the source and it is the cap that makes this cheap.
-      oversrc: `overview-src-${i}`,
-      over: `overview-${i}`,
     };
   } catch (err) {
     console.error(`could not read ${url}`, err);
@@ -1014,33 +985,6 @@ function roamingBounds(el) {
 }
 
 /* ---------- one pair of layers per region ---------- */
-
-// The draft under the network: the mid band overzoomed, drawn while the detail
-// tiles are still in flight and faded out as they land. Nothing addresses a
-// feature in here, so it takes the plain colour and width expressions rather than
-// the ones that branch on feature state — a `hover` state is never set on this
-// source and the branch would never be taken.
-//
-// Starts invisible. `syncOverview` raises it on the first report that something on
-// screen is missing, which on a cold load is immediate, and a view whose tiles are
-// already cached never shows the draft at all.
-const overviewLayer = (r) => ({
-  id: r.over,
-  type: "line",
-  source: r.oversrc,
-  "source-layer": LAYER_SRC,
-  minzoom: OVERVIEW_FROM,
-  layout: { "line-cap": "round", "line-join": "round" },
-  paint: {
-    "line-color": colourExpr(theme),
-    "line-width": width(0),
-    "line-opacity": 0,
-    // Fade rather than blink. The draft arrives whenever a pan outruns the tiles
-    // and goes whenever they catch up, and a hard cut on both edges is a map that
-    // flickers every time someone moves it.
-    "line-opacity-transition": { duration: 300 },
-  },
-});
 
 const busLayer = (r) => ({
   id: r.layer,
@@ -1151,22 +1095,6 @@ function start(missing) {
       // MapLibre ignores an absent attribution.
       maxzoom: r.header.maxZoom,
     };
-    // The same file, capped at the mid band. This `maxzoom` has to beat the one
-    // the plugin reports off the archive header, and it does: MapLibre resolves a
-    // source as pick(extend(tilejson, options)), so the spec is written over the
-    // TileJSON rather than under it. Were it the other way round the cap would be
-    // silently ignored, this source would fetch the same detail tiles as the one
-    // above, and the stand-in would cost exactly what it exists to avoid.
-    //
-    // No `attribution` here either, and no second request to get one: `protocol.add`
-    // shares the PMTiles instance, so the header and metadata are already fetched,
-    // and the control dedupes the credit it hands back by exact string. The archive
-    // is credited once however many sources read it.
-    sources[r.oversrc] = {
-      type: "vector",
-      url: "pmtiles://" + r.url,
-      maxzoom: OVERVIEW_ZOOM,
-    };
   }
 
   // Every region's network first, then every region's matches above all of them,
@@ -1178,11 +1106,7 @@ function start(missing) {
   // Above the roads because a tram on a street would otherwise be buried under the
   // bus line sharing it; below the match highlight because a filtered service still
   // has to be the brightest thing on screen.
-  // The draft sits directly on the basemap and under everything real, so a road
-  // that has arrived always covers the coarse copy of itself rather than sitting
-  // beside it.
   const layers = [{ id: "basemap", type: "raster", source: "basemap" }];
-  for (const r of REGIONS) layers.push(overviewLayer(r));
   for (const r of REGIONS) layers.push(busLayer(r));
   for (const r of REGIONS) layers.push(trackLayer(r));
   for (const r of REGIONS) layers.push(segLayer(r));
@@ -1192,10 +1116,6 @@ function start(missing) {
   const TRACK = REGIONS.map((r) => r.track);
   const SEG = REGIONS.map((r) => r.seg);
   const MATCH = REGIONS.map((r) => r.match);
-  // Deliberately not joined to any of the four above. Those are what the hover
-  // query, the search and the match count walk, and a draft feature carries
-  // neither the way id nor the `refs` any of them need.
-  const OVERVIEW = REGIONS.map((r) => r.over);
 
   const map = new maplibregl.Map({
     container: "map",
@@ -1373,45 +1293,12 @@ function start(missing) {
     for (const id of TRACK) map.setPaintProperty(id, "line-opacity", trackOpacity(active));
 
     applyRows();
-    // The draft dims with the network it stands in for. It has to: `refs` is
-    // stripped from every band below the detail one, so this is the one layer on
-    // the map a service number cannot be applied to, and left bright it would
-    // answer a search for the X26 with every road in the county.
-    syncOverview();
     if (on) {
       countMatches();
     } else {
       $("hint").innerHTML = "Press <b>/</b> to search.";
     }
     redrawChips();
-  }
-
-  /* ---------- the draft under the network ---------- */
-
-  // The stand-in's whole job is to be gone before anyone can tell it from the real
-  // thing. `isSourceLoaded` asks about the current viewport rather than the whole
-  // archive -- "is anything on screen still missing" -- which is exactly the
-  // question, and it goes false again the moment a pan outruns the tiles.
-  //
-  // Only on a change, and that is not a micro-optimisation: `sourcedata` fires per
-  // tile per source, so a national view at speed is thousands of events, and a
-  // setPaintProperty on each one restarts the fade from wherever it had got to and
-  // leaves the draft stuck part-way in.
-  const drafted = new Map();
-  function syncOverview() {
-    for (const r of REGIONS) {
-      // A layer the style refused, and the same reasoning as `liveLayers`: one bad
-      // paint expression should cost the draft, not every mouse move after it.
-      if (!map.getLayer(r.over) || !map.getSource(r.src)) continue;
-      const target = map.isSourceLoaded(r.src)
-        ? 0
-        : active.length
-          ? 0.12
-          : OVERVIEW_OPACITY;
-      if (drafted.get(r.over) === target) continue;
-      drafted.set(r.over, target);
-      map.setPaintProperty(r.over, "line-opacity", target);
-    }
   }
 
   /* ---------- mode switches ---------- */
@@ -1424,10 +1311,6 @@ function start(missing) {
     const show = (id, on) => map.setLayoutProperty(id, "visibility", on ? "visible" : "none");
     const busOn = !hiddenRows.has("bus");
     for (const id of BUS) show(id, busOn);
-    // The draft is the road network drawn a second time, so it goes off with it.
-    // Left on, clearing the box would leave a ghost of the very roads it was
-    // cleared to be rid of, and one that reappears on every pan.
-    for (const id of OVERVIEW) show(id, busOn);
     // The match highlight is the road network drawn a second time, so hiding the
     // roads has to take it with them -- left alone it would keep drawing the very
     // services the box was cleared to be rid of, and brighter than they were.
@@ -1506,24 +1389,6 @@ function start(missing) {
   // opening view, and the tiles holding them arrive whenever the user reaches them.
   map.on("idle", () => noteRenderedModes(map, SEG));
   map.on("idle", () => noteRenderedTrack(map, TRACK));
-  // Three, because no one of them is both edges of the draft.
-  //
-  // `sourcedata` is the falling edge: it fires as each tile lands, which is when
-  // the draft has been overtaken. It is no good as the rising edge, because this
-  // MapLibre has no `sourcedataloading` -- the event fires when a tile *arrives*,
-  // so on the slow connection this exists for, the first report that tiles were
-  // missing would come at the moment they stopped being missing.
-  //
-  // `move` is the rising edge. A pan requests its tiles during the render that
-  // follows, so this reads one frame behind, and one frame is not worth a `render`
-  // handler. The early-out on an unchanged target is what makes a per-frame call
-  // affordable: the work is a lookup per region until something actually changes.
-  //
-  // `idle` is the backstop for a view that needed no new tiles at all and so fires
-  // neither of the others, which would leave the draft up from the previous one.
-  map.on("sourcedata", syncOverview);
-  map.on("move", syncOverview);
-  map.on("idle", syncOverview);
   addEventListener("keydown", (e) => {
     if (e.key === "/" && document.activeElement !== input) {
       e.preventDefault();
@@ -1545,9 +1410,6 @@ function start(missing) {
   function repaintColours() {
     const colour = hoverOr(colourExpr(theme));
     for (const id of BUS) map.setPaintProperty(id, "line-color", colour);
-    // The draft reads the same ramp without the hover branch, so it is the bare
-    // expression here as it is in the layer.
-    for (const id of OVERVIEW) map.setPaintProperty(id, "line-color", colourExpr(theme));
     for (const id of MATCH) map.setPaintProperty(id, "line-color", HOVER_COLOUR[theme]);
     const segColour = hoverOr(segColourExpr(theme));
     for (const id of SEG) map.setPaintProperty(id, "line-color", segColour);

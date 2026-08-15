@@ -147,16 +147,6 @@ so a hover selects the whole way. Carrying this to a served archive is a `publis
 run and no migration — `way` was already a column on `edges` and already in the
 export.
 
-**The draft under the network is the same archive read a second time, capped.** A
-second vector source at `maxzoom` `config.MID_ZOOM - 1`, drawn from `config.MID_ZOOM`
-up, stands in for the detail band while it loads, and MapLibre writes a source spec
-over the TileJSON it fetches — `pick(extend(tilejson, options))` — which is the only
-reason that cap beats the archive header's own 14. Lose it and the draft fetches the
-very tiles it exists to cover for. `_DETAIL_ONLY` leaves `trips` and `n` on the band,
-so it draws in the same colours and widths, and strips `way`, `refs` and `name`, so it
-can be neither hovered nor searched nor counted: it stays out of `BUS`, `SEG`, `TRACK`
-and `MATCH`, and it dims with the roads under a search rather than answering one.
-
 **Nothing holds a whole window or a whole table.** `art` streams its window and
 `publish.export_geojsonl` streams by `way_id`. Anything statistical — weight
 percentiles, group stats — must read the *unsampled*, *unbanded* window, and only
