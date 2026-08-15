@@ -137,7 +137,9 @@ def main(argv: list[str] | None = None) -> int:
         help="comma-separated statuses to forget and redo. `transient` is the "
         "alias for the ones that are safe unattended (transport_error). A literal "
         "status such as no_relation or chain_break is for after fixing the tracer "
-        "itself, or after re-querying Overpass",
+        "itself, or after re-querying Overpass. `ok` redraws what already worked, "
+        "which is what recuts a trace stored before the tracer kept the ways under "
+        "its own slice -- until then those patterns draw per pattern, not per way",
     )
 
     p = sub.add_parser(

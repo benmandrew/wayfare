@@ -346,10 +346,12 @@ const LAYER_SRC = "bus";    // the matched road network inside every archive
 // own inside the same archive, absent from a bus-only region -- MapLibre tolerates
 // a layer whose source-layer is missing, so nothing has to ask first.
 const LAYER_SEG = "segments";
-// National Rail, which BODS does not carry at all. Drawn from OSM route relations
-// and inverted to one feature per way, so it is neither a matched road nor one
-// pattern's trace and gets a layer of its own. Absent from a region that has none,
-// and MapLibre tolerates a layer whose source-layer is missing, so nothing asks.
+// Track drawn from OSM route relations and inverted to one feature per way, so it
+// is neither a matched road nor one pattern's trace and gets a layer of its own.
+// National Rail, which BODS does not carry at all, and the modes a timetable does
+// carry with no geometry to go with it -- the Underground, the DLR, the trams.
+// Absent from a region that has none, and MapLibre tolerates a layer whose
+// source-layer is missing, so nothing asks.
 const LAYER_TRACK = "track";
 
 // The road ramp, six steps. Light goes pale-blue -> deep violet so busy roads
@@ -564,10 +566,13 @@ function modeMid(t, mode) {
   return midCache.get(key);
 }
 
-// The mode the track layer is drawn as. A constant rather than a feature property:
-// `routes` only builds `route=train` relations, so every feature in this layer is
-// heavy rail, and there is no per-feature mode in the tile to read.
+// What a track feature is drawn as. `rail` where the tile carries no `mode`, which
+// is every archive built before the traced modes joined this layer: those hold
+// `route=train` and nothing else, so the fallback is the fact rather than a guess.
+// Same shape as `modeOrOther` below and for the same reason -- `["get", "mode"]` on
+// an absent property is null, and null matches no branch and belongs to no list.
 const TRACK_MODE = "rail";
+const trackMode = ["case", ["has", "mode"], ["to-string", ["get", "mode"]], TRACK_MODE];
 
 // Which modes have been drawn, and so which rows the legend carries. Declared up
 // here rather than beside `noteRenderedModes`, which fills it: `paintLegend`
@@ -580,11 +585,13 @@ const TRACK_MODE = "rail";
 // current viewport.
 const seenModes = new Set();
 
-// Track is tracked separately from `seenModes`, and has to be: a track feature has
-// no `mode` property to read, and its legend row is a flat swatch rather than a
-// ramp. Folding it into the mode set would paint a rail ramp for geometry that is
-// drawn in one colour, which is the legend telling a different story from the map.
-let seenTrack = false;
+// Track modes are kept apart from `seenModes`, and have to be: a track row is a
+// flat swatch where a segments row is a ramp, so folding the two sets together
+// would paint a scale for geometry drawn in one colour -- the legend telling a
+// different story from the map. A mode can legitimately be in both, and reads
+// straight: Manchester's trams come with the operator's own trace and shade by how
+// often they run, where the Underground is track and does not.
+const seenTrackModes = new Set();
 
 // Which legend rows are switched off. Absence is on, so a mode that arrives
 // later arrives drawn, and the road row is on before anything has been seen at
@@ -597,6 +604,7 @@ let seenTrack = false;
 // state they are already in.
 const hiddenRows = new Set();
 const rowKey = (mode) => `mode:${mode}`;
+const trackRowKey = (mode) => `track:${mode}`;
 
 const $ = (id) => document.getElementById(id);
 let theme = localStorage.getItem("wayfare-theme")
@@ -726,6 +734,17 @@ const segColourExpr = (t) =>
     rampOver(modeRamp(t, "other")),
   ]);
 
+// Track takes the middle of each mode's ramp rather than shading along it, which is
+// the same decision `modeMid` was written for and now has to be made per mode: a
+// way of track carries a service *count*, and a count of how thoroughly a line is
+// mapped is not the journeys a day every other colour on this map means. The
+// journey figure is on the feature and the card prints it; the paint stays flat.
+const trackColourExpr = (t) => [
+  "match", trackMode,
+  ...Object.keys(MODE_COLOUR[t]).flatMap((m) => [m, modeMid(t, m)]),
+  modeMid(t, "other"),
+];
+
 // A segment carries no service count -- two trams over one street are two
 // coincident lines, not one edge that knows about both -- so `trips` is the only
 // weight it has, and it means trips per week on this one pattern rather than
@@ -796,6 +815,13 @@ const segTokenFilter = (tokens) => [
 // already drawn -- where a road carries many services and needs a second pass.
 const segOpacity = (tokens) =>
   tokens.length ? ["case", segTokenFilter(tokens), 0.95, 0.1] : 0.95;
+// Track dims on the same rule and reads `refs`, the comma-joined list, because a
+// way carries every service that runs over it. `segOpacity` was doing this and
+// testing `ref`, which no track feature has: the property is absent, no token ever
+// matched, and a search dimmed the whole rail network to 0.1 without ever lighting
+// the line it named.
+const trackOpacity = (tokens) =>
+  tokens.length ? ["case", tokenFilter(tokens), 0.95, 0.1] : 0.95;
 const NEVER = ["==", ["id"], -1];
 
 // Every mode's traces share one layer per region, so switching a mode off is a
@@ -806,6 +832,9 @@ const NEVER = ["==", ["id"], -1];
 // no list.
 const modeOrOther = ["case", ["has", "mode"], ["to-string", ["get", "mode"]], "other"];
 const withoutModes = (modes) => ["!", ["in", modeOrOther, ["literal", modes]]];
+// The same for track, reading the mode the same way its paint does: absent means
+// heavy rail there, not "other".
+const withoutTrackModes = (modes) => ["!", ["in", trackMode, ["literal", modes]]];
 
 /* ---------- boot ---------- */
 
@@ -985,10 +1014,11 @@ const segLayer = (r) => ({
   },
 });
 
-// National Rail, one feature per way rather than per service, because 75.8% of GB
-// rail ways carry two or more relations. Below the segments: where a tram shares an
-// alignment with a railway, the tram's own trace is the more specific answer and
-// should be the one the cursor gets.
+// Relation track, one feature per way rather than per service, because 75.8% of GB
+// rail ways carry two or more relations and eleven Underground lines were 1,040
+// coincident polylines. Below the segments: where a tram shares an alignment with a
+// railway, the tram's own trace is the more specific answer and should be the one
+// the cursor gets.
 const trackLayer = (r) => ({
   id: r.track,
   type: "line",
@@ -996,7 +1026,7 @@ const trackLayer = (r) => ({
   "source-layer": LAYER_TRACK,
   layout: { "line-cap": "round", "line-join": "round" },
   paint: {
-    "line-color": hoverOr(modeMid(theme, TRACK_MODE)),
+    "line-color": hoverOr(trackColourExpr(theme)),
     "line-width": trackWidth(HOVER_BUMP),
     "line-opacity": 0.95,
   },
@@ -1237,7 +1267,7 @@ function start(missing) {
     hovered = { src: f.source, sourceLayer: f.sourceLayer, id: f.id };
     setHover(hovered, true);
     if (segHits.length) showSegment(f.properties);
-    else if (trackHits.length) showTrack(f.properties);
+    else if (trackHits.length) showTrack(f.properties, f.id);
     else showFeature(mergeRegions(hits), f.id);
   });
 
@@ -1264,7 +1294,7 @@ function start(missing) {
     // comma-joined list the road layer carries, so searching "XC" finds the
     // CrossCountry track as well as the coaches -- which is the point of the search
     // being national rather than per-layer.
-    for (const id of TRACK) map.setPaintProperty(id, "line-opacity", segOpacity(active));
+    for (const id of TRACK) map.setPaintProperty(id, "line-opacity", trackOpacity(active));
 
     applyRows();
     if (on) {
@@ -1277,10 +1307,10 @@ function start(missing) {
 
   /* ---------- mode switches ---------- */
 
-  // What each legend row switches. The road network and the relation track are a
-  // layer each, so they go off by visibility; the modes share one layer per region
-  // and go off by filter. Every region moves together, the same as the search does
-  // -- a mode is a mode wherever the cursor is.
+  // What each legend row switches. The road network is a layer, so it goes off by
+  // visibility; the modes share one layer per region -- one for segments and one
+  // for track -- and go off by filter. Every region moves together, the same as the
+  // search does: a mode is a mode wherever the cursor is.
   function applyRows() {
     const show = (id, on) => map.setLayoutProperty(id, "visibility", on ? "visible" : "none");
     const busOn = !hiddenRows.has("bus");
@@ -1289,11 +1319,17 @@ function start(missing) {
     // roads has to take it with them -- left alone it would keep drawing the very
     // services the box was cleared to be rid of, and brighter than they were.
     for (const id of MATCH) show(id, busOn && active.length > 0);
-    for (const id of TRACK) show(id, !hiddenRows.has("track"));
-    const off = [...hiddenRows]
-      .filter((k) => k.startsWith("mode:"))
-      .map((k) => k.slice("mode:".length));
+    const offRows = (prefix) =>
+      [...hiddenRows].filter((k) => k.startsWith(prefix)).map((k) => k.slice(prefix.length));
+    const off = offRows("mode:");
     for (const id of SEG) map.setFilter(id, off.length ? withoutModes(off) : null);
+    // Track reads its mode through the same rail fallback the paint does, so a row
+    // switched off clears the archives that name the mode and the older ones that
+    // only imply it.
+    const offTrack = offRows("track:");
+    for (const id of TRACK) {
+      map.setFilter(id, offTrack.length ? withoutTrackModes(offTrack) : null);
+    }
   }
 
   // Delegated, because `paintLegend` rewrites the rows whenever the theme changes
@@ -1381,7 +1417,7 @@ function start(missing) {
     for (const id of MATCH) map.setPaintProperty(id, "line-color", HOVER_COLOUR[theme]);
     const segColour = hoverOr(segColourExpr(theme));
     for (const id of SEG) map.setPaintProperty(id, "line-color", segColour);
-    const trackColour = hoverOr(modeMid(theme, TRACK_MODE));
+    const trackColour = hoverOr(trackColourExpr(theme));
     for (const id of TRACK) map.setPaintProperty(id, "line-color", trackColour);
     paintLegend();
   }
@@ -1405,7 +1441,10 @@ function start(missing) {
   // Empty, not a zero, when the archive did not carry the attribute at this zoom:
   // "0 journeys/day" is a wrong answer where a missing line is an absent one.
   const rate = (p) => {
-    if (p.trips === undefined) return [];
+    // Null as well as absent: the track layer publishes `trips` as null where no
+    // timetable has been attributed, and "0 journeys/day" is a wrong answer to a
+    // question the archive did not answer.
+    if (p.trips === undefined || p.trips === null) return [];
     const perWeek = Number(p.trips) || 0;
     // One decimal below ten a day, where the gap between a school bus and an
     // hourly service is the whole of the interesting range, and none above it,
@@ -1465,26 +1504,37 @@ function start(missing) {
   }
 
   // A way of relation track, which is the one layer that answers for several
-  // services at once -- 75.8% of them carry two or more. So it gets the chips, the
-  // same as a road does, and unlike a segment it has a way id to show: this
-  // geometry *is* an OpenStreetMap way rather than something snapped to one.
+  // services at once -- 75.8% of GB rail ways carry two or more, and eleven
+  // Underground lines were 1,040 coincident polylines before the inversion. So it
+  // gets the chips, the same as a road does, and unlike a segment it has a way id
+  // to show: this geometry *is* an OpenStreetMap way rather than something snapped
+  // to one.
   //
-  // No journeys a day, and no zero standing in for them. The count this layer
-  // carries is services, not journeys, and printing it beside a colour that means
-  // journeys everywhere else on the map would be answering a question nobody asked.
-  function showTrack(p) {
+  // Journeys a day only where a timetable said so. `rate` prints nothing at all for
+  // an absent `trips`, which is the honest reading for the rail this pipeline built
+  // out of relations alone: it knows which services use the track and not how often
+  // they run. The colour stays flat either way, so the card is where the number
+  // lives rather than the paint.
+  // `way` is the feature's own id rather than a property, the same as the detail
+  // band's, and passed alongside for the same reason: the tiles carry it in the MVT
+  // id field, which is also where `setFeatureState` looks for the hover highlight.
+  function showTrack(p, way) {
     current = p;
     const n = Number(p.n) || 0;
-    $("road").textContent = MODE_LABEL[TRACK_MODE];
+    const mode = p.mode || TRACK_MODE;
+    $("road").textContent = MODE_LABEL[mode] || "Other";
     $("road").classList.remove("empty");
     $("meta").innerHTML = [
       `${n} ${n === 1 ? "service" : "services"}`,
-      p.way_id === undefined ? null : `way ${p.way_id}`,
+      ...rate(p),
+      way === undefined ? null : `way ${escapeHtml(way)}`,
     ].filter(Boolean).join(" · ");
     $("note").hidden = false;
-    $("note").textContent =
-      "Drawn from an OpenStreetMap route relation. No timetable is attributed, so "
-      + "this track carries no journey count.";
+    $("note").textContent = p.trips === undefined || p.trips === null
+      ? "Drawn from an OpenStreetMap route relation. No timetable is attributed, so "
+        + "this track carries no journey count."
+      : "Drawn from an OpenStreetMap route relation, with the journeys the timetable "
+        + "runs over it.";
     redrawChips();
   }
 
@@ -1579,13 +1629,21 @@ function noteRenderedModes(map, ids) {
   if (added) paintLegend();
 }
 
-// The same, for the layer that has no mode to read: its presence is the fact.
+// The same, for the track layer. Its own set, because these rows are flat swatches
+// rather than ramps, and the fallback matches the paint: a feature with no `mode`
+// came out of an archive built when this layer was heavy rail alone.
 function noteRenderedTrack(map, ids) {
-  if (seenTrack) return;
   const live = ids.filter((id) => map.getLayer(id));
-  if (!live.length || !map.queryRenderedFeatures({ layers: live }).length) return;
-  seenTrack = true;
-  paintLegend();
+  if (!live.length) return;
+  let added = false;
+  for (const f of map.queryRenderedFeatures({ layers: live })) {
+    const m = f.properties?.mode || TRACK_MODE;
+    if (!seenTrackModes.has(m)) {
+      seenTrackModes.add(m);
+      added = true;
+    }
+  }
+  if (added) paintLegend();
 }
 
 // Where each of a ramp's six colours sits along the bar, in the ramp's own scale.
@@ -1610,14 +1668,15 @@ function paintLegend() {
     rows.push({ key: rowKey(m), label: MODE_LABEL[m] || "Other", colours: modeRamp(theme, m) });
   }
   // Last, and flat: a bar of one colour repeated, so `gradient` renders it without
-  // a special case and the row reads as "this is not a scale". It is a separate row
-  // from any rail the timetable supplied, because they are different claims -- one
-  // knows how often it runs and the other does not.
-  if (seenTrack) {
-    const mid = modeMid(theme, TRACK_MODE);
+  // a special case and the row reads as "this is not a scale". Separate rows from
+  // the modes above even where the mode is the same, because they are different
+  // claims about different geometry -- a way of track says which services use it,
+  // where a segment is one service's own alignment and knows how often it runs.
+  for (const m of [...seenTrackModes].sort((a, b) => rank(a) - rank(b))) {
+    const mid = modeMid(theme, m);
     rows.push({
-      key: "track",
-      label: "National Rail track",
+      key: trackRowKey(m),
+      label: `${MODE_LABEL[m] || "Other"} track`,
       colours: Array(RAMP_STEPS).fill(mid),
     });
   }

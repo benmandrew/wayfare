@@ -471,7 +471,9 @@ def _at(
     return latlon[-1]
 
 
-def ways_between(chain: Chain, cum: list[float], start_m: float, end_m: float) -> list[int]:
+def ways_between(
+    way_at: list[int], cum: list[float], start_m: float, end_m: float
+) -> list[int]:
     """The ways a slice of a chain runs over, in order, without duplicates.
 
     `slice_between` answers the same question in geometry and throws the way ids
@@ -484,18 +486,22 @@ def ways_between(chain: Chain, cum: list[float], start_m: float, end_m: float) -
     at point i+1 is part of whichever way contributed that point -- so a slice that
     starts and ends mid-way still names both of them. Getting that wrong at the ends
     is how a service loses the half-way it entered on.
+
+    Takes `Chain.way_at` rather than the whole chain, because that list is the only
+    part of it this reads and two callers reach it differently: `railtrips` holds
+    the chain and `trace` keeps the projection it built from one.
     """
     if start_m > end_m:
         start_m, end_m = end_m, start_m
     out: list[int] = []
     for i in range(len(cum) - 1):
         if cum[i + 1] > start_m and cum[i] < end_m:
-            way = chain.way_at[i + 1]
+            way = way_at[i + 1]
             if not out or out[-1] != way:
                 out.append(way)
     # A cut shorter than one segment overlaps no segment strictly, and the train
     # still ran over the way it happened on.
-    if not out and chain.way_at:
+    if not out and way_at:
         idx = min(range(len(cum)), key=lambda i: abs(cum[i] - start_m))
-        out.append(chain.way_at[idx])
+        out.append(way_at[idx])
     return out

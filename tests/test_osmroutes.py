@@ -256,10 +256,31 @@ def test_a_ways_bbox_is_stored_for_the_window_test(seeded):
     assert row == (-1_000_000, 51_000_000, -1_000_000, 51_100_000)
 
 
-def test_ways_are_rebuilt_not_merged(seeded):
+def test_two_writers_both_reach_the_table(seeded):
+    """`routes` writes the ways of its `route=train` relations and `trace` writes
+    the ways of the subway and tram relations it cut patterns out of. Neither sees
+    the other's, so a writer that cleared the table first would take the tube's
+    track out of the archive on the next `routes` run -- and the export joins
+    `ways` inside, so nothing would raise."""
     osmroutes.write_ways(seeded, [relation()])
     osmroutes.write_ways(seeded, [relation(ways=[way(99, [(50.0, 0.0), (50.1, 0.0)])])])
-    assert [r[0] for r in seeded.execute("SELECT way_id FROM ways").fetchall()] == [99]
+    got = [
+        r[0] for r in seeded.execute("SELECT way_id FROM ways ORDER BY way_id").fetchall()
+    ]
+    assert got == [10, 11, 99]
+
+
+def test_a_way_no_trace_runs_over_is_pruned(seeded):
+    """What the blanket delete used to do, said against what the table is for: a
+    way is drawn because some pattern's geometry runs over it."""
+    osmroutes.write(seeded, osmroutes.candidates([relation()])[0])
+    osmroutes.write_ways(seeded, [relation()])
+    osmroutes.write_ways(seeded, [relation(ways=[way(99, [(50.0, 0.0), (50.1, 0.0)])])])
+    assert osmroutes.prune_ways(seeded) == 1
+    got = [
+        r[0] for r in seeded.execute("SELECT way_id FROM ways ORDER BY way_id").fetchall()
+    ]
+    assert got == [10, 11]
 
 
 def test_a_degenerate_way_is_not_stored(seeded):

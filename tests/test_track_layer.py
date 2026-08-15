@@ -27,18 +27,21 @@ def built(con):
     return con
 
 
-def _timetabled_trace(con, pattern_id: int = 999) -> None:
-    """A pattern from the timetable whose geometry `trace` resolved: the case that
-    must not be inverted."""
+def _timetabled_trace(con, pattern_id: int = 999, *, ways_cut: bool = False) -> None:
+    """A pattern from the timetable whose geometry `trace` resolved.
+
+    `ways_cut` is what says whether its `way_ids` are the ways under its own
+    geometry or the whole line's chain, and only the first can be inverted.
+    """
     con.execute(
         "INSERT INTO patterns (pattern_id, route_id, short_name, mode, n_trips, "
         "first_seen, last_seen) VALUES (?, '43', 'Northern', 'metro', 12, ?, ?)",
         [pattern_id, FEED, FEED],
     )
     con.execute(
-        "INSERT INTO traces (pattern_id, relation_id, way_ids, lon_e6, lat_e6) "
-        "VALUES (?, 7, [10, 11], [-1000000, -1000000], [51000000, 51200000])",
-        [pattern_id],
+        "INSERT INTO traces (pattern_id, relation_id, way_ids, ways_cut, lon_e6, lat_e6) "
+        "VALUES (?, 7, [10, 11], ?, [-1000000, -1000000], [51000000, 51200000])",
+        [pattern_id, ways_cut],
     )
 
 
@@ -72,15 +75,43 @@ def test_two_relations_over_one_way_collapse_to_one_way(built):
     assert db.scalar(built, "SELECT count(*) FROM track_services") == 4
 
 
-def test_a_timetabled_trace_is_not_inverted(built):
-    """`trace` records the whole relation chain, not the slice it cut, so
-    inverting one attributes a short working to the whole line."""
-    _timetabled_trace(built)
+def test_an_uncut_trace_is_not_inverted(built):
+    """A trace holding the whole relation chain rather than the slice it drew would
+    attribute a short working to every way of its line."""
+    _timetabled_trace(built, ways_cut=False)
     aggregate.build_track_services(built)
     names = {
         r[0] for r in built.execute("SELECT short_name FROM track_services").fetchall()
     }
     assert names == {"XC"}
+
+
+def test_a_cut_trace_is_inverted_beside_the_relations(built):
+    """What the whole change buys: the Underground drawn per way rather than as
+    1,040 coincident polylines over eleven lines."""
+    _timetabled_trace(built, ways_cut=True)
+    aggregate.build_track_services(built)
+    rows = built.execute(
+        "SELECT way_id, short_name, mode, n_trips FROM track_services "
+        "ORDER BY way_id, short_name"
+    ).fetchall()
+    assert rows == [
+        (10, "Northern", "metro", 12),
+        (10, "XC", "rail", None),
+        (11, "Northern", "metro", 12),
+        (11, "XC", "rail", None),
+    ]
+
+
+def test_a_way_two_networks_share_is_one_row_per_mode(built):
+    """The one coincidence worth keeping. An Underground line and the National Rail
+    service beside it are not the same railway, and a way is painted by its mode."""
+    _timetabled_trace(built, ways_cut=True)
+    aggregate.build_track_services(built)
+    modes = built.execute(
+        "SELECT mode FROM track_services WHERE way_id = 10 ORDER BY mode"
+    ).fetchall()
+    assert [m[0] for m in modes] == ["metro", "rail"]
 
 
 def test_trips_stay_null_rather_than_becoming_zero(built):
@@ -117,10 +148,28 @@ def test_one_feature_per_way_with_its_service_list(built, tmp_path):
     assert len(features) == 2
     props = features[0]["properties"]
     assert props["way_id"] == 10
+    assert props["mode"] == "rail"
     assert props["n"] == 1
     assert props["refs"] == "XC"
     assert props["trips"] is None
     assert features[0]["geometry"]["type"] == "LineString"
+
+
+def test_a_traced_mode_carries_its_own_mode_and_its_journeys(built, tmp_path):
+    """`mode` is what the viewer paints by, and `trips` is what its card prints.
+    The count comes off the services here rather than out of `way_trips`, because
+    the timetable supplied the pattern and only OpenStreetMap supplied its shape."""
+    _timetabled_trace(built, ways_cut=True)
+    aggregate.build_track_services(built)
+    path = publish.export_track_geojsonl(built, tmp_path / "track.geojsonl")
+    assert path is not None
+    props = [json.loads(line)["properties"] for line in path.read_text().splitlines()]
+    metro = [p for p in props if p["mode"] == "metro"]
+    assert len(metro) == 2
+    assert metro[0]["refs"] == "Northern"
+    assert metro[0]["trips"] == 12
+    # And the relation rail beside it still says it does not know.
+    assert [p["trips"] for p in props if p["mode"] == "rail"] == [None, None]
 
 
 def test_refs_is_a_string_rather_than_an_array(built, tmp_path):
@@ -171,12 +220,21 @@ def test_a_relation_is_not_drawn_as_a_segment_as_well(built):
     assert db.scalar(built, "SELECT count(*) FROM segments") == 0
 
 
-def test_an_operator_trace_is_still_drawn_as_a_segment(built):
-    """The exclusion is of relation patterns, not of everything with a trace."""
-    _timetabled_trace(built)
+def test_an_uncut_trace_is_still_drawn_as_a_segment(built):
+    """The two layers partition. A trace the track layer will not invert has to keep
+    being drawn per pattern, or the line disappears between one release and the
+    tracer's next run over it."""
+    _timetabled_trace(built, ways_cut=False)
     aggregate.build_segments(built)
     drawn = built.execute("SELECT pattern_id FROM segments").fetchall()
     assert drawn == [(999,)]
+
+
+def test_a_cut_trace_leaves_the_segments_layer(built):
+    """And the other half of the partition: drawn per way, so not also per pattern."""
+    _timetabled_trace(built, ways_cut=True)
+    aggregate.build_segments(built)
+    assert db.scalar(built, "SELECT count(*) FROM segments") == 0
 
 
 def test_relation_track_is_credited_to_openstreetmap(built):

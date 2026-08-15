@@ -328,6 +328,27 @@ def test_resolve_cuts_a_short_working_to_its_own_stops() -> None:
     assert got.length_m < 400  # not the whole line
 
 
+def test_the_way_ids_are_cut_to_the_same_stops_the_geometry_is() -> None:
+    """The identity has to follow the geometry through the cut.
+
+    Recording the whole line's chain was harmless while nothing read the column.
+    Inverted into `track_services` it says this short working runs over way 101 and
+    way 103 as well, which is a confident lie about two thirds of the line -- the
+    same failure as drawing the whole line under every pattern that touches it,
+    moved from the picture into the service list.
+    """
+    cands, index = _candidates(_line())
+    got = trace.resolve(_pattern(["Bravo", "Charlie"], [_B, _C]), cands, index)
+    assert got.status == "ok"
+    assert got.way_ids == [102]
+    assert got.n_ways == 1
+    # And the whole line still names all three.
+    whole = trace.resolve(
+        _pattern(["Alpha", "Bravo", "Charlie", "Delta"], [_A, _B, _C, _D]), cands, index
+    )
+    assert whole.way_ids == [101, 102, 103]
+
+
 def test_resolve_matches_a_pattern_running_the_other_way() -> None:
     """A relation is per direction; half the patterns on it run against it."""
     cands, index = _candidates(_line())
@@ -561,12 +582,18 @@ def test_bbox_covers_the_pending_stops_with_room_for_the_line(rail_con) -> None:
 # -- what the rest of the pipeline does with it ------------------------------
 
 
-def test_segments_are_drawn_from_traces(rail_con) -> None:
+def test_a_trace_is_drawn_per_way_rather_than_per_pattern(rail_con) -> None:
+    """The whole point of cutting the way ids: two services over one stretch of
+    track are one feature carrying both, not two coincident lines."""
     trace.run(rail_con, relations=osm.parse(_rail_relation()))
     aggregate.build(rail_con)
-    mode, lon = db.row(rail_con, "SELECT mode, lon_e6 FROM segments")
-    assert mode == "rail"
-    assert len(lon) >= 2
+    assert db.scalar(rail_con, "SELECT count(*) FROM segments") == 0
+    rows = rail_con.execute(
+        "SELECT way_id, mode FROM track_services ORDER BY way_id"
+    ).fetchall()
+    assert rows == [(201, "rail"), (202, "rail")]
+    # And the geometry those rows are drawn with came in on the same run.
+    assert db.scalar(rail_con, "SELECT count(*) FROM ways") == 2
 
 
 def test_an_operator_shape_beats_a_relation(con, gtfs_dir) -> None:
@@ -584,7 +611,10 @@ def test_a_traced_archive_owes_openstreetmap_for_its_track(rail_con) -> None:
     trace.run(rail_con, relations=osm.parse(_rail_relation()))
     aggregate.build(rail_con)
     held = publish.contents(rail_con)
-    assert held == {"road": False, "operator": True, "track": True}
+    # `operator` is False and that is the honest reading: the geometry is an OSM
+    # relation's, not a recording the timetable's publisher shipped. It read True
+    # only while a trace was copied into `segments` alongside the operator shapes.
+    assert held == {"road": False, "operator": False, "track": True}
     credit = config.credit_html("all", **held)
     assert "Track geometry" in credit
     assert "Road geometry" not in credit

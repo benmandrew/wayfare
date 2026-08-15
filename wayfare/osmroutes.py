@@ -362,8 +362,12 @@ def write(con: duckdb.DuckDBPyConnection, found: list[Candidate]) -> int:
                 last_seen = excluded.last_seen
         """)  # noqa: S608 - feed is a meta value this pipeline wrote
         con.execute(f"""
-            INSERT OR REPLACE INTO traces (pattern_id, relation_id, way_ids, lon_e6, lat_e6)
-            SELECT {pid}, relation_id, way_ids, lon_e6, lat_e6 FROM osm_route_raw
+            INSERT OR REPLACE INTO traces
+                (pattern_id, relation_id, way_ids, ways_cut, lon_e6, lat_e6)
+            -- `ways_cut` is TRUE by construction rather than by any cutting: the
+            -- pattern *is* the relation here, so the ways of the line and the ways
+            -- under the geometry are one list. `trace` has to earn the same claim.
+            SELECT {pid}, relation_id, way_ids, TRUE, lon_e6, lat_e6 FROM osm_route_raw
         """)
         con.execute(f"""
             INSERT OR REPLACE INTO trace_status
@@ -384,16 +388,23 @@ def write(con: duckdb.DuckDBPyConnection, found: list[Candidate]) -> int:
 def write_ways(con: duckdb.DuckDBPyConnection, relations: list[osm.Relation]) -> int:
     """Per-way geometry, deduplicated across every relation that uses the way.
 
-    Rebuilt rather than merged, like `segments`: it is derived from a body that was
-    just fetched and costs nothing to recompute, and a way that has left the network
-    should stop being drawn on the next run.
+    Upserted rather than rebuilt, because two stages fill this table and neither
+    sees the other's relations: `routes` writes the ways of the `route=train`
+    relations it turned into services, and `trace` writes the ways of the subway,
+    light rail and tram relations it cut a timetable's patterns out of. A blanket
+    delete here would take the tube's track out of the archive on the next `routes`
+    run, and the export joins `ways` inside, so the failure is track that quietly
+    stops being drawn rather than anything that raises.
+
+    `prune_ways` is what keeps a way that has left the network from being drawn for
+    ever, and it is a separate call for the same reason: it has to run after every
+    writer, not after each one.
     """
     seen: dict[int, osm.Way] = {}
     for r in relations:
         for w in r.ways:
             if len(w.points) >= 2:
                 seen.setdefault(w.way_id, w)
-    con.execute("DELETE FROM ways")
     if not seen:
         return 0
     rows = []
@@ -401,8 +412,41 @@ def write_ways(con: duckdb.DuckDBPyConnection, relations: list[osm.Relation]) ->
         lons = [round(lon * 1e6) for _, lon in way.points]
         lats = [round(lat * 1e6) for lat, _ in way.points]
         rows.append((way.way_id, lons, lats, min(lons), min(lats), max(lons), max(lats)))
-    con.executemany("INSERT INTO ways VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+    con.executemany("INSERT OR REPLACE INTO ways VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
     return len(rows)
+
+
+def prune_ways(con: duckdb.DuckDBPyConnection) -> int:
+    """Drop the ways no trace runs over any more.
+
+    The blanket delete `write_ways` used to open with, expressed against what the
+    table is actually for. A way is drawn because some pattern's geometry runs over
+    it, so a way no `traces` row names is drawn by nothing -- a relation retired
+    from OpenStreetMap, or one that stopped chaining, or a line the mode selection
+    no longer admits.
+
+    Against `traces` rather than against live patterns, because that table is a
+    permanent cache and a departed service's row stays in it: the way is still the
+    right geometry for the next feed that carries the service again, and the export
+    reaches `ways` only through `track_services`, which is rebuilt against the live
+    patterns every run. So an unreferenced way is dead weight and a referenced one
+    is never drawn on its own account.
+    """
+    count = "SELECT count(*) FROM ways"
+    before = int(db.scalar(con, count))
+    # NOT EXISTS rather than NOT IN: a NULL anywhere in the unnested list makes
+    # `NOT IN` unknown for every row and the delete quietly does nothing.
+    con.execute("""
+        DELETE FROM ways w
+        WHERE NOT EXISTS (
+            SELECT 1 FROM traces t, unnest(t.way_ids) AS u(way_id)
+            WHERE u.way_id = w.way_id
+        )
+    """)
+    gone = before - int(db.scalar(con, count))
+    if gone:
+        log.info("%d ways no trace runs over any more were dropped", gone)
+    return gone
 
 
 def run(
@@ -433,6 +477,11 @@ def run(
     # and in Northern Ireland's database they were the whole Republic's track.
     drawn = {c.relation_id for c in found}
     n_ways = write_ways(con, [r for r in relations if r.relation_id in drawn])
+    # And the ones a previous run wrote that nothing reaches any more, which is the
+    # same claim over time rather than over one body. Narrowing the write keeps a
+    # refused relation's ways out; this is what takes out the ways of a relation
+    # that was drawn last week and is not drawn now.
+    prune_ways(con)
     km = sum(c.span_m for c in found) / 1000.0
     built = Built(
         considered=len(considered),

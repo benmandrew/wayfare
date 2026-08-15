@@ -37,7 +37,7 @@ from pathlib import Path
 
 import duckdb
 
-from . import config, db, logs, osm
+from . import config, db, logs, osm, osmroutes
 
 log = logs.get("trace")
 
@@ -95,6 +95,10 @@ class Candidate:
     metres: list[tuple[float, float]]
     cum: list[float]
     way_ids: list[int]
+    # Which way each point of the chain came from, parallel to `latlon`. `way_ids`
+    # is the whole line and this is where each way sits along it, which is what
+    # turns a cut expressed in metres back into the ways underneath it.
+    way_at: list[int]
     names: list[str]  # normalised stop names, in relation order
 
 
@@ -274,6 +278,7 @@ def prepare(relations: list[osm.Relation]) -> Prepared:
                 metres=metres,
                 cum=osm.cumulative(metres),
                 way_ids=ch.way_ids,
+                way_at=ch.way_at,
                 names=names,
             )
         )
@@ -456,17 +461,24 @@ def _cut(p: Pattern, c: Candidate, matched: list[osm.Stop], reverse: bool) -> Ou
     geom = osm.slice_between(c.latlon, c.cum, along[0], along[-1])
     if len(geom) < 2:
         return "off_track"
+    # The ways under the cut, not the ways of the line. Recording the whole chain
+    # documented what was drawn and no more, and it was enough while nothing read
+    # the column -- but inverted into `track_services` it says a Northern line
+    # short working from Edgware to Kennington runs over every way of the Northern
+    # line, which is a confident lie about half of it. `slice_between` answers the
+    # same question in geometry; this is the same cut, in identity.
+    ways = osm.ways_between(c.way_at, c.cum, along[0], along[-1])
     return Outcome(
         pattern_id=p.pattern_id,
         status="ok",
         relation_id=c.relation.relation_id,
         osm_route=c.relation.route,
-        n_ways=len(c.way_ids),
+        n_ways=len(ways),
         n_stops=len(matched),
         worst_stop_m=worst,
         length_m=abs(along[-1] - along[0]),
         detail=f"{c.relation.name or ''}{' reversed' if reverse else ''}".strip() or None,
-        way_ids=c.way_ids,
+        way_ids=ways,
         geom=geom,
     )
 
@@ -515,6 +527,10 @@ def run(
     prepared = prepare(relations)
     index = index_by_name(prepared.candidates)
     patterns = load_pending(con, limit)
+    # Only the relations that chained, because only those can be cut and so only
+    # those can end up named by a trace. Keyed by id, which is how an outcome
+    # refers back to one.
+    by_id = {c.relation.relation_id: c.relation for c in prepared.candidates}
 
     t0 = time.monotonic()
     counts: dict[str, int] = {}
@@ -524,11 +540,12 @@ def run(
         counts[got.status] = counts.get(got.status, 0) + 1
         batch.append(got)
         if len(batch) >= _CHECKPOINT_EVERY:
-            write_outcomes(con, batch)
+            write_outcomes(con, batch, by_id)
             batch = []
             log.info("%d/%d traced", n, len(patterns))
     if batch:
-        write_outcomes(con, batch)
+        write_outcomes(con, batch, by_id)
+    osmroutes.prune_ways(con)
 
     log.info(
         "traced %d patterns in %.1fs: %s",
@@ -539,11 +556,21 @@ def run(
     return counts
 
 
-def write_outcomes(con: duckdb.DuckDBPyConnection, outcomes: list[Outcome]) -> None:
+def write_outcomes(
+    con: duckdb.DuckDBPyConnection,
+    outcomes: list[Outcome],
+    relations: dict[int, osm.Relation] | None = None,
+) -> None:
     """Record every outcome, and the geometry of the ones that resolved.
 
     One row in `trace_status` per pattern whatever happened, because that row is
     what stops the pattern being handed out again.
+
+    The ways go in the same transaction as the traces that name them, not once at
+    the end of the run. `publish.export_track_geojsonl` joins `ways` inside, so a
+    trace whose ways are missing is a service that silently stops being drawn --
+    and a batch is the unit of checkpointing here for the reason it is in `match`,
+    which means an interrupted run has to leave a state the next one can use.
     """
     if not outcomes:
         return
@@ -578,8 +605,8 @@ def write_outcomes(con: duckdb.DuckDBPyConnection, outcomes: list[Outcome]) -> N
             con.executemany(
                 """
                 INSERT OR REPLACE INTO traces
-                    (pattern_id, relation_id, way_ids, lon_e6, lat_e6)
-                VALUES (?, ?, ?, ?, ?)
+                    (pattern_id, relation_id, way_ids, ways_cut, lon_e6, lat_e6)
+                VALUES (?, ?, ?, TRUE, ?, ?)
                 """,
                 [
                     (
@@ -592,6 +619,13 @@ def write_outcomes(con: duckdb.DuckDBPyConnection, outcomes: list[Outcome]) -> N
                     for o in drawn
                 ],
             )
+            if relations:
+                used = {
+                    o.relation_id: relations[o.relation_id]
+                    for o in drawn
+                    if o.relation_id in relations
+                }
+                osmroutes.write_ways(con, list(used.values()))
         con.execute("COMMIT")
     except Exception:
         con.execute("ROLLBACK")

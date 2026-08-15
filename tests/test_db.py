@@ -5,7 +5,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from wayfare import db
+from wayfare import aggregate, db
 
 
 def test_a_row_per_point_shapes_table_migrates_in_place(tmp_path: Path):
@@ -87,6 +87,77 @@ def test_patterns_gains_mode_empty_rather_than_backfilled(tmp_path: Path):
         assert (
             db.scalar(con, f"SELECT count(*) FROM patterns p WHERE {db.matchable()}") == 1
         )
+    finally:
+        con.close()
+
+
+def test_traces_gains_ways_cut_from_what_wrote_each_row(tmp_path: Path):
+    """Which rows can be inverted per way, decided from what is already stored.
+
+    A relation `osmroutes` built *is* its pattern, so its way list and the ways
+    under its geometry are the same list. A trace the tracer cut out of a line is
+    only the second if it was written after the tracer learned to cut, and nothing
+    stored tells them apart afterwards -- the way boundaries are gone by the time
+    the polyline lands. So the old rows read FALSE and keep being drawn per pattern
+    until `wayfare trace` runs over them again, which loses nothing and claims
+    nothing.
+    """
+    path = tmp_path / "old.duckdb"
+    old = duckdb.connect(str(path))
+    old.execute(db.SCHEMA)
+    old.execute("ALTER TABLE traces DROP COLUMN ways_cut")
+    old.executemany(
+        "INSERT INTO patterns (pattern_id, route_id, short_name, n_stops, n_trips, "
+        "first_seen, last_seen) VALUES (?, ?, 'V', 2, 10, 'F1', 'F1')",
+        [(1, "osm:r900"), (2, "43")],
+    )
+    old.executemany(
+        "INSERT INTO traces (pattern_id, relation_id, way_ids, lon_e6, lat_e6) "
+        "VALUES (?, 900, [10, 11], [-1000000], [51000000])",
+        [(1,), (2,)],
+    )
+    old.close()
+
+    con = db.connect(path)
+    try:
+        got = con.execute(
+            "SELECT pattern_id, ways_cut FROM traces ORDER BY pattern_id"
+        ).fetchall()
+        assert got == [(1, True), (2, False)]
+    finally:
+        con.close()
+
+
+def test_track_services_gains_mode_backfilled_to_rail(tmp_path: Path):
+    """Every row already in it came from a `route=train` relation, and a NULL mode
+    would draw in the fallback grey for as long as it took someone to notice.
+
+    The rebuild is checked here too, because ALTER appends and `SCHEMA` does not:
+    `mode` is fourth in a fresh database and last in a migrated one, so an insert
+    that named no columns would write the mode into `n_patterns` on precisely the
+    databases that already hold rail.
+    """
+    path = tmp_path / "old.duckdb"
+    old = duckdb.connect(str(path))
+    old.execute(db.SCHEMA)
+    old.execute("ALTER TABLE track_services DROP COLUMN mode")
+    old.execute("INSERT INTO track_services VALUES (10, 'XC', 'CrossCountry', 1, NULL)")
+    old.close()
+
+    con = db.connect(path)
+    try:
+        assert db.scalar(con, "SELECT mode FROM track_services") == "rail"
+        db.set_meta(con, "feed_version", "F1")
+        con.execute(
+            "INSERT INTO patterns (pattern_id, route_id, short_name, mode, n_trips, "
+            "first_seen, last_seen) VALUES (1, 'osm:r9', 'XC', 'rail', NULL, 'F1', 'F1')"
+        )
+        con.execute(
+            "INSERT INTO traces (pattern_id, relation_id, way_ids, ways_cut, "
+            "lon_e6, lat_e6) VALUES (1, 9, [10], TRUE, [-1000000], [51000000])"
+        )
+        aggregate.build_track_services(con)
+        assert db.row(con, "SELECT mode, n_patterns FROM track_services") == ("rail", 1)
     finally:
         con.close()
 
