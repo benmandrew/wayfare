@@ -862,12 +862,78 @@ def test_every_width_keeps_zoom_at_the_top_of_its_interpolate():
     breaks the rule -- basemap, roads, every region. `trackWidth` wrapped its zoom
     interpolate in a `["+"]` to add the hover bump, so the viewer drew a blank page
     with one line in the console for every archive, from the day the track layer
-    landed. The bump belongs on each stop."""
+    landed. The bump belongs on each stop.
+
+    All three widths now come out of one model, so the rule is checked where it is
+    kept -- `widthOf` -- and each width is checked to go through it. The zoom term
+    is arithmetic done in JavaScript, which is what keeps `["zoom"]` out of the
+    stops: a model that reached for `["^", gain, ["-", ["zoom"], 6]]` instead would
+    read perfectly well and blank the page."""
+    text = (WEB / "index.html").read_text()
+    assert _const("index.html", "widthOf").startswith(
+        'const widthOf = (f, bump) => [ "interpolate", ["linear"], ["zoom"],'
+    )
     for name in ("width", "segWidth", "trackWidth"):
-        body = _const("index.html", name)
-        assert body.startswith(
-            f'const {name} = (bump) => [ "interpolate", ["linear"], ["zoom"],'
+        assert f"const {name} = (bump) => widthOf(WIDTH." in text
+    # One `["zoom"]` in the whole model, and it is that interpolate's input.
+    assert _const("index.html", "widthOf").count('["zoom"]') == 1
+
+
+def test_a_segment_with_no_timetable_keeps_its_mode():
+    """`trips` is absent on every segment `routes` builds, because a relation is the
+    service there and Britain publishes no rail timetable to count against it: the
+    tile over Crewe holds 50 rail segments carrying `mode` and `ref` and nothing
+    else. Drawn through `guarded` -- the road network's rule, where a missing weight
+    means "no answer here" -- that painted the whole national railway in the neutral
+    grey, next to the Republic's rail in full colour.
+
+    So a segment falls back to the middle of its own mode's ramp, flat, which is what
+    the track band does with the same absence. Grey goes back to meaning the one
+    thing it should: a mode this palette does not know.
+
+    The width falls the same way. `to-number`'s default was `quiet`, the bottom of
+    the range, so those lines were drawn at the width of a service running twice a
+    day as well as in the colour of one nobody could identify."""
+    text = (WEB / "index.html").read_text()
+    body = _const("index.html", "segColourExpr")
+    assert "shadedOrMid" in body and "guarded" not in body
+    assert 'const shadedOrMid = (t, m) => [ "case", ["has", RAMP.needs],' in _const(
+        "index.html", "shadedOrMid"
+    )
+    # The road network keeps the grey: a road has no mode colour to fall back to.
+    assert "const colourExpr = (t) => guarded(t, rampOver(RAMP_COLOURS[t]));" in text
+    assert '["to-number", ["get", f.weight], midOf(f)]' in text
+
+
+def test_a_shadow_takes_every_filter_the_line_above_it_takes():
+    """The shadows under the non-road modes are drawn and nothing else -- no hover
+    query, no legend count -- but they carry the same features, so every filter and
+    every dimming that reaches a line has to reach its shadow. A shadow the mode
+    switch misses is the outline of a mode the legend says is off, and a shadow the
+    search misses is the outline of a service the search said no to, drawn at full
+    strength under a line dimmed to a tenth.
+
+    They stay out of the hover query on purpose: a shadow is offset from its line,
+    so a cursor over one is a cursor beside the thing it would report."""
+    text = (WEB / "index.html").read_text()
+    for line, shadow in (("SEG", "SEG_SHADOW"), ("TRACK", "TRACK_SHADOW")):
+        assert f"for (const id of [...{line}, ...{shadow}])" in text
+        assert f"for (const id of {shadow})" in text
+    assert "for (const id of [...SEG_SHADOW, ...TRACK_SHADOW])" in text
+    # Above every road and under the line each belongs to.
+    order = [
+        text.index(f"layers.push({name}(r))")
+        for name in (
+            "busLayer",
+            "trackShadowLayer",
+            "trackLayer",
+            "segShadowLayer",
+            "segLayer",
         )
+    ]
+    assert order == sorted(order)
+    # The cursor asks the lines, never the shadows.
+    assert "at(SEG)" in text and "at(SEG_SHADOW)" not in text
 
 
 def test_every_legend_row_is_a_switch():

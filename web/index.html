@@ -465,6 +465,7 @@ a.btn { text-decoration: none; }
 // no index -- assuming it outright meant that renaming an archive, which is
 // exactly what holding two regions requires, left the page reporting no tiles.
 const WANTED = new URLSearchParams(location.search).get("tiles");
+
 let ARCHIVES = [];
 // One entry per archive that opened, carrying the ids it owns in the style. Ids
 // are per-archive because MapLibre needs one source per PMTiles file: the format
@@ -837,22 +838,101 @@ const guarded = (t, expr) => ["case", ["has", RAMP.needs], expr, UNAVAILABLE[t]]
 
 const colourExpr = (t) => guarded(t, rampOver(RAMP_COLOURS[t]));
 
-// Width ramps on service count, and the whole thing ramps on zoom so hairlines
-// at z6 grow into readable strokes at z16. `bump` is added at the leaf: a
-// ["zoom"] expression is only legal as the input to the outermost interpolate,
-// so the widened hover/match strokes cannot wrap this from outside.
-const byCount = (a, b, c, bump) => [
-  "+",
-  ["interpolate", ["linear"], ["to-number", ["get", "n"], 1], 1, a, 8, b, 40, c],
-  bump,
+// Every stroke on the map comes out of one rule: a base thickness, times how far
+// the map is zoomed in, times how much the thing carries.
+//
+//     width = hairline x of x zoomGain^((z - 6) / 10) x (weight / quiet)^grows
+//
+// Six tuned numbers where there were twenty-eight, and each one answers a
+// question somebody would ask. It is close to the same look: against the
+// twenty-eight it replaces, the worst stop moves 10.3% and most move under 5%,
+// because those tables were already following this rule. Fitted family by family
+// they each want the same zoom gain to within 2% -- 5.15, 5.05, 5.05 -- which is
+// the evidence that one shared curve is what all three meant. `hairline` and
+// `zoomGain` were then picked together, over two-decimal values, for the smallest
+// worst-case move; the residual is the one thing a shared curve cannot hold,
+// which is that the old quiet road grew x6.3 from z6 to z16 where the old busy
+// one grew x5.0.
+//
+// The fit is where these numbers started rather than where they stand. `grows` and
+// the two `of`s have since been moved by eye, which is what the model is for: the
+// old tables could not be argued with a number at a time.
+const WIDTH_ZOOMS = [6, 9, 12, 16];
+const WIDTH = {
+  // Pixels at z6 for the quietest road there is. Everything on the map is a
+  // multiple of this one number, so it is the one to move to thicken the lot.
+  hairline: 0.38,
+  // How much wider everything is at z16 than at z6, spread geometrically over the
+  // stops between, so each level is the same *ratio* wider than the last. Linear
+  // growth is what makes a map either bald at the top of the range or clogged at
+  // the bottom of it.
+  zoomGain: 5.30,
+
+  // `of` is thickness relative to a road, so the families keep their order when
+  // `hairline` moves. `grows` is how much the busy end outgrows the quiet one, as
+  // a power of the weight: 0.5 is a square root -- four times the service for
+  // twice the width -- and 0 is flat. `weight`, `quiet` and `busy` describe the
+  // attribute rather than tune it. They are the range over which a difference is
+  // worth drawing, and the ramp is clamped to it at both ends.
+  road: { of: 1.0, grows: 0.25, weight: "n", quiet: 1, busy: 40 },
+
+  // A segment carries no service count -- two trams over one street are two
+  // coincident lines, not one edge that knows about both -- so `trips` is the
+  // only weight it has, and it means trips per week on this one pattern rather
+  // than summed over everything on the track. The range sits where the modes do:
+  // a ferry runs tens of times a week, a metro over a thousand.
+  seg: { of: 1.00, grows: 0.25, weight: "trips", quiet: 20, busy: 1200 },
+
+  // Flat at every zoom, which is the decision its colour makes for the same
+  // reason: a way of track carries a count of how thoroughly a line is mapped,
+  // and that is not the journeys a day every other width here means. Reading
+  // `trips` instead would not have been neutral -- it is null over most of the
+  // track, and a null falls back to `quiet`, so every rail line in the country
+  // would draw at the width of a service running twice a day.
+  track: { of: 1.00, grows: 0, weight: null, quiet: 1, busy: 1 },
+};
+
+// Where a feature carries no weight at all. The middle of the family's range, on a
+// log scale, rather than either end: Great Britain's National Rail is built from
+// OSM relations by `routes`, where a relation *is* the service and there is no
+// timetable to count, so every one of those lines arrives with `trips` absent.
+// Falling back to `quiet` drew the whole national railway at the width of a service
+// running twice a day -- the same trap the track band was written to avoid, arrived
+// at through the segments band instead.
+const midOf = (f) => Math.sqrt(f.quiet * f.busy);
+
+// The weight term, clamped to the family's range before the power is taken. The
+// ramp has to end somewhere: a national feed carries roads with thousands of
+// services, and past `busy` one of them swallows its neighbours.
+const byWeight = (f) => [
+  "^",
+  [
+    "/",
+    ["max", f.quiet, ["min", f.busy, ["to-number", ["get", f.weight], midOf(f)]]],
+    f.quiet,
+  ],
+  f.grows,
 ];
-const width = (bump) => [
+
+// The zoom term is a plain number at each stop, so `["zoom"]` stays the input to
+// the outermost interpolate. It is legal nowhere else, and MapLibre rejects the
+// *whole style* for one paint property that breaks the rule -- basemap, roads and
+// all, which is a blank page with one line in the console. `bump` is added at the
+// leaf for that same reason, so the widened hover and match strokes cannot wrap
+// this from outside.
+const widthOf = (f, bump) => [
   "interpolate", ["linear"], ["zoom"],
-  6,  byCount(0.35, 1.0, 2.0, bump),
-  9,  byCount(0.60, 1.8, 3.4, bump),
-  12, byCount(1.10, 3.0, 5.6, bump),
-  16, byCount(2.20, 5.5, 10.0, bump),
+  ...WIDTH_ZOOMS.flatMap((z) => {
+    const first = WIDTH_ZOOMS[0];
+    const last = WIDTH_ZOOMS[WIDTH_ZOOMS.length - 1];
+    const at =
+      WIDTH.hairline * f.of * Math.pow(WIDTH.zoomGain, (z - first) / (last - first));
+    return [z, f.grows ? ["+", ["*", at, byWeight(f)], bump] : ["+", at, bump]];
+  }),
 ];
+const width = (bump) => widthOf(WIDTH.road, bump);
+const segWidth = (bump) => widthOf(WIDTH.seg, bump);
+const trackWidth = (bump) => widthOf(WIDTH.track, bump);
 const HOVER_BUMP = ["case", ["boolean", ["feature-state", "hover"], false], 2, 0];
 
 // Each mode shaded along its own colour, on the same scale as the road ramp, so
@@ -862,12 +942,30 @@ const HOVER_BUMP = ["case", ["boolean", ["feature-state", "hover"], false], 2, 0
 // A `match` per mode rather than one shared ramp, because the modes have to stay
 // told apart. `match` falls through to the fallback colour's ramp, so a feed that
 // starts publishing funiculars shades them in grey rather than not at all.
-const segColourExpr = (t) =>
-  guarded(t, [
-    "match", ["get", "mode"],
-    ...Object.keys(MODE_COLOUR[t]).flatMap((m) => [m, rampOver(modeRamp(t, m))]),
-    rampOver(modeRamp(t, "other")),
-  ]);
+//
+// A segment with no `trips` keeps its mode's colour and takes the middle of that
+// mode's ramp, rather than the neutral grey `guarded` gives the road network.
+// Great Britain's National Rail comes from `routes`, where a relation is the
+// service and no timetable exists to count: in the tile over Crewe, 50 of 50 rail
+// segments carry `mode` and `ref` and no `trips` at all. Through `guarded` that
+// drew the country's railway as "no answer here", in the grey that means an
+// unrecognised mode, beside Ireland's rail in full colour -- whose trips are there
+// because the Republic publishes a rail timetable and Britain does not.
+//
+// The middle rather than a ramp end, and flat rather than shaded, is the decision
+// `trackColourExpr` makes a few lines down and for the same reason: no count to
+// shade by is not the same as no mode.
+const shadedOrMid = (t, m) => [
+  "case",
+  ["has", RAMP.needs],
+  rampOver(modeRamp(t, m)),
+  modeMid(t, m),
+];
+const segColourExpr = (t) => [
+  "match", ["get", "mode"],
+  ...Object.keys(MODE_COLOUR[t]).flatMap((m) => [m, shadedOrMid(t, m)]),
+  shadedOrMid(t, "other"),
+];
 
 // Track takes the middle of each mode's ramp rather than shading along it, the
 // decision `modeMid` exists for, taken once per mode: a way of track carries a
@@ -878,45 +976,6 @@ const trackColourExpr = (t) => [
   "match", trackMode,
   ...Object.keys(MODE_COLOUR[t]).flatMap((m) => [m, modeMid(t, m)]),
   modeMid(t, "other"),
-];
-
-// A segment carries no service count -- two trams over one street are two
-// coincident lines, not one edge that knows about both -- so `trips` is the only
-// weight it has, and it means trips per week on this one pattern rather than
-// summed over everything on the track. The stops sit where the modes do: a ferry
-// runs tens of times a week, a metro over a thousand.
-const byTrips = (a, b, c, bump) => [
-  "+",
-  ["interpolate", ["linear"], ["to-number", ["get", "trips"], 20],
-   20, a, 200, b, 1200, c],
-  bump,
-];
-const segWidth = (bump) => [
-  "interpolate", ["linear"], ["zoom"],
-  6,  byTrips(0.25, 0.45, 0.75, bump),
-  9,  byTrips(0.45, 0.85, 1.35, bump),
-  12, byTrips(0.75, 1.35, 2.10, bump),
-  16, byTrips(1.30, 2.30, 3.60, bump),
-];
-
-// Track takes the middle of that same range at every zoom, for the reason its
-// colour takes the middle of the ramp: there is no count to widen it by. Letting
-// `byTrips` read a null `trips` would not have been neutral -- the fallback is 20,
-// the bottom of the scale, so every rail line in the country would have drawn at
-// the width of a service running twice a day.
-//
-// The bump goes on each stop rather than around the whole thing, the same as it
-// does for the other two widths and for the same rule: a ["zoom"] expression is
-// legal only as the input to the outermost interpolate, so wrapping this one in
-// an ["+"] made the style invalid. MapLibre rejects the *whole style* for one bad
-// paint property -- basemap, roads and all -- so the failure was a blank page with
-// one line in the console, on every archive, since the track layer was added.
-const trackWidth = (bump) => [
-  "interpolate", ["linear"], ["zoom"],
-  6,  ["+", 0.45, bump],
-  9,  ["+", 0.85, bump],
-  12, ["+", 1.35, bump],
-  16, ["+", 2.30, bump],
 ];
 
 // The hovered segment in the accent colour, everything else off the ramp. Shared
@@ -957,6 +1016,13 @@ const segOpacity = (tokens) =>
 // the line it named.
 const trackOpacity = (tokens) =>
   tokens.length ? ["case", tokenFilter(tokens), 0.95, 0.1] : 0.95;
+// A shadow dims with the line above it, on that line's own test. Left at full
+// strength it would be the outline of a service the search has just said no to --
+// and against a dimmed line it would be the darker of the two.
+const segShadowOpacity = (tokens) =>
+  tokens.length ? ["case", segTokenFilter(tokens), 1, 0.1] : 1;
+const trackShadowOpacity = (tokens) =>
+  tokens.length ? ["case", tokenFilter(tokens), 1, 0.1] : 1;
 const NEVER = ["==", ["id"], -1];
 
 // Every mode's traces share one layer per region, so switching a mode off is a
@@ -1119,7 +1185,9 @@ async function openArchive(name, i) {
       layer: `bus-${i}`,
       match: `bus-match-${i}`,
       seg: `seg-${i}`,
+      segShadow: `seg-shadow-${i}`,
       track: `track-${i}`,
+      trackShadow: `track-shadow-${i}`,
     };
   } catch (err) {
     console.error(`could not read ${url}`, err);
@@ -1230,6 +1298,63 @@ const busLayer = (r) => ({
   },
 });
 
+// A shadow under every non-road line, and the reason is that the road network is
+// a mesh rather than a background: a tram crossing a town centre is one coloured
+// line among fifty, and the mode palette has to stay outside both road ramps, so
+// the colours it is left with are the ones that sit awkwardly beside them. A
+// shadow separates a line from what it crosses without spending any more of the
+// palette -- it lifts the non-road modes off the mesh instead of trying to
+// out-shout it.
+//
+// Roads get none. Every road would cast one, over every other road, and a mesh of
+// shadows is a grey wash.
+//
+// Centred on the line rather than dropped below it. A map has no light source and
+// it rotates, so an offset is a direction the picture cannot justify: fixed to the
+// screen it slides around the line as the map turns, and fixed to the map it
+// leaves the line at some bearings and not others. Centred, the same darkening
+// reads from every side, and what the eye takes from it is depth all the same.
+//
+// Near-black in both themes, because what this separates a line from is the other
+// lines, not the backdrop: the clash is line against line, and a dark gap reads
+// between them on a pale map and a dark one alike.
+const SHADOW_INK = { light: "17,20,26", dark: "0,0,0" };
+const SHADOW = {
+  // Width relative to the line it sits under, so the shadow holds its proportion
+  // across the zooms rather than swallowing a hairline at z6 and vanishing at z16.
+  // It is the whole of the separation now that nothing is offset, so it carries
+  // the blur as well: too little and the blur eats it, too much and a busy line at
+  // z16 sits in a smear several pixels wider than itself.
+  spread: 2.50,
+  // And a floor in pixels, because a multiple of a very thin line is still very
+  // thin, and the thin end is where the modes are hardest to tell apart.
+  pad: 0.70,
+  blur: 1.5,
+  alpha: 0.6,
+};
+const shadowColour = (t) => `rgba(${SHADOW_INK[t]},${SHADOW.alpha})`;
+
+// The same width model, from a family widened by `spread`. Reusing `widthOf` is
+// what keeps the shadow tied to the line: every knob that moves one moves both.
+const shadowWidth = (f, bump) =>
+  widthOf({ ...f, of: f.of * SHADOW.spread }, ["+", SHADOW.pad, bump]);
+
+const shadowLayer = (r, id, source, f) => ({
+  id,
+  type: "line",
+  source: r.src,
+  "source-layer": source,
+  layout: { "line-cap": "round", "line-join": "round" },
+  paint: {
+    "line-color": shadowColour(theme),
+    "line-width": shadowWidth(f, HOVER_BUMP),
+    "line-blur": SHADOW.blur,
+    "line-opacity": 1,
+  },
+});
+const segShadowLayer = (r) => shadowLayer(r, r.segShadow, LAYER_SEG, WIDTH.seg);
+const trackShadowLayer = (r) => shadowLayer(r, r.trackShadow, LAYER_TRACK, WIDTH.track);
+
 // Trams, metros and ferries, drawn from the operator's own trace because nothing
 // map-matched them. Same source, different layer inside the archive.
 const segLayer = (r) => ({
@@ -1339,9 +1464,17 @@ function start(missing) {
   // Above the roads because a tram on a street would otherwise be buried under the
   // bus line sharing it; below the match highlight because a filtered service still
   // has to be the brightest thing on screen.
+  //
+  // Each shadow goes immediately under the line that casts it, and both pairs go
+  // above every region's roads: a shadow beneath the road mesh would be a shadow
+  // no road is ever moved by. The segment shadow falls across the track below it
+  // on purpose -- a tram over a railway is the pair this most needs to separate,
+  // and which one is on top is the answer the layer order already gives.
   const layers = [{ id: "basemap", type: "raster", source: "basemap" }];
   for (const r of REGIONS) layers.push(busLayer(r));
+  for (const r of REGIONS) layers.push(trackShadowLayer(r));
   for (const r of REGIONS) layers.push(trackLayer(r));
+  for (const r of REGIONS) layers.push(segShadowLayer(r));
   for (const r of REGIONS) layers.push(segLayer(r));
   for (const r of REGIONS) layers.push(matchLayer(r));
 
@@ -1349,6 +1482,12 @@ function start(missing) {
   const TRACK = REGIONS.map((r) => r.track);
   const SEG = REGIONS.map((r) => r.seg);
   const MATCH = REGIONS.map((r) => r.match);
+  // Kept apart from the lines they follow, because a shadow is drawn and nothing
+  // else: it is in no hover query, no legend count and no mode discovery. What it
+  // does share is every filter and every dimming, and a shadow that misses one is
+  // the ghost of a line the map is no longer drawing.
+  const SEG_SHADOW = REGIONS.map((r) => r.segShadow);
+  const TRACK_SHADOW = REGIONS.map((r) => r.trackShadow);
 
   const map = new maplibregl.Map({
     container: "map",
@@ -1547,6 +1686,13 @@ function start(missing) {
     // CrossCountry track as well as the coaches -- which is the point of the search
     // being national rather than per-layer.
     for (const id of TRACK) map.setPaintProperty(id, "line-opacity", trackOpacity(active));
+    // And each shadow with the line it belongs to.
+    for (const id of SEG_SHADOW) {
+      map.setPaintProperty(id, "line-opacity", segShadowOpacity(active));
+    }
+    for (const id of TRACK_SHADOW) {
+      map.setPaintProperty(id, "line-opacity", trackShadowOpacity(active));
+    }
 
     applyRows();
     if (on) {
@@ -1573,13 +1719,17 @@ function start(missing) {
     for (const id of MATCH) show(id, busOn && active.length > 0);
     const offRows = (prefix) =>
       [...hiddenRows].filter((k) => k.startsWith(prefix)).map((k) => k.slice(prefix.length));
+    // The shadows take every filter their lines take. A shadow the switch missed
+    // is the outline of a mode the legend says is off.
     const off = offRows("mode:");
-    for (const id of SEG) map.setFilter(id, off.length ? withoutModes(off) : null);
+    for (const id of [...SEG, ...SEG_SHADOW]) {
+      map.setFilter(id, off.length ? withoutModes(off) : null);
+    }
     // Track reads its mode through the same rail fallback the paint does, so a row
     // switched off clears the archives that name the mode and the older ones that
     // only imply it.
     const offTrack = offRows("track:");
-    for (const id of TRACK) {
+    for (const id of [...TRACK, ...TRACK_SHADOW]) {
       map.setFilter(id, offTrack.length ? withoutTrackModes(offTrack) : null);
     }
   }
@@ -1671,6 +1821,11 @@ function start(missing) {
     for (const id of SEG) map.setPaintProperty(id, "line-color", segColour);
     const trackColour = hoverOr(trackColourExpr(theme));
     for (const id of TRACK) map.setPaintProperty(id, "line-color", trackColour);
+    // The shadow's ink is the one colour here that is not off a ramp, and it still
+    // changes with the theme: near-black over a pale map, black over a dark one.
+    for (const id of [...SEG_SHADOW, ...TRACK_SHADOW]) {
+      map.setPaintProperty(id, "line-color", shadowColour(theme));
+    }
     paintLegend();
   }
 
