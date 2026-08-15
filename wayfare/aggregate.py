@@ -23,6 +23,19 @@ from . import db, logs
 
 log = logs.get("aggregate")
 
+# The patterns the track layer answers for, and so the ones `segments` must leave
+# alone. One expression rather than two, because the two arms have to partition:
+# written twice they can drift, and a pattern in both layers is the same track
+# painted over itself while a pattern in neither is a line that vanishes.
+#
+# The question is what `traces.way_ids` means for the row. Cut to this pattern, the
+# inversion is sound and the track layer draws it per way; the whole line's chain,
+# and inverting would attribute a short working to track it never reaches, so it
+# stays a polyline of its own. A trace this pipeline has not rewritten since the
+# tracer learned to cut is the second kind, and COALESCE is what reads a column
+# added to rows that predate it.
+_DRAWN_AS_TRACK = "COALESCE(t.ways_cut, FALSE)"
+
 
 def build(con: duckdb.DuckDBPyConnection) -> None:
     con.execute("DELETE FROM edge_services")
@@ -87,6 +100,19 @@ def build_segments(con: duckdb.DuckDBPyConnection) -> None:
     covers the patterns with no `shape_id` at all -- which is what keeps the two arms
     disjoint, and what lets `segments` keep its primary key on `pattern_id`.
 
+    **A pattern the track layer draws must not be drawn here as well**, which is
+    what `_DRAWN_AS_TRACK` partitions. Every relation-built pattern was drawn in
+    both, from the day `osmroutes` landed until the per-way inversion followed it:
+    an `osm:r` pattern is live, not matchable and carries no `shape_id`, so this arm
+    took it, and each one came out as a polyline lying over the very ways
+    `build_track_services` had just collapsed it into. Two coats of the same track
+    is the visible half of that; the hover is the worse half, because the viewer
+    asks the segments layer first and got one relation's own card where the track
+    layer would have answered for every service on the way.
+
+    What is left here is the operator's own recording plus the traces this pipeline
+    has not re-cut yet, and both of those are per pattern by nature.
+
     A non-road pattern with neither gets no row and is simply not drawn. That is the
     "bad geometry is worse than missing geometry" rule applied to the one case where
     inventing would be easy: the stops are known, and a straight line between them
@@ -106,6 +132,7 @@ def build_segments(con: duckdb.DuckDBPyConnection) -> None:
             JOIN traces t ON t.pattern_id = p.pattern_id
             WHERE {db.current_feed()} AND NOT {db.matchable()}
               AND p.shape_id IS NULL
+              AND NOT {_DRAWN_AS_TRACK}
         )
         SELECT pattern_id, mode, lon_e6, lat_e6,
                list_min(lon_e6), list_min(lat_e6),
@@ -119,7 +146,11 @@ def build_segments(con: duckdb.DuckDBPyConnection) -> None:
                (SELECT count(*) FROM patterns p
                 JOIN traces t ON t.pattern_id = p.pattern_id
                 WHERE {db.current_feed()} AND NOT {db.matchable()}
-                  AND p.shape_id IS NULL),
+                  AND p.shape_id IS NULL
+                  AND NOT {_DRAWN_AS_TRACK}),
+               -- No `_DRAWN_AS_TRACK` on this one and none is wanted: a pattern
+               -- with no trace at all is drawn by neither layer, which is what
+               -- this counts.
                (SELECT count(*) FROM patterns p
                 WHERE {db.current_feed()} AND NOT {db.matchable()}
                   AND p.shape_id IS NULL
@@ -299,38 +330,62 @@ def build_track_services(con: duckdb.DuckDBPyConnection) -> int:
     key on. `way_id` is also the more durable of the two -- an `edge_id` is valid
     only within one graph build.
 
-    **Only patterns this pipeline built from a relation are inverted**, which is
-    what `route_id LIKE 'osm:r%'` is doing, and leaving it out would ship a
-    confident lie. `trace` records `way_ids` as the whole candidate chain rather
-    than the ways inside the slice it cut, so a Northern line short working from
-    Edgware to Kennington is stored against every way of the Northern line. That is
-    harmless while the column only documents what was drawn; inverted, it attributes
-    a service to track it never runs on. An `osmroutes` pattern *is* its whole
-    relation, so for those the two are the same thing by construction.
+    **Only a trace whose `way_ids` are cut to its own pattern is inverted**, which
+    is what `_DRAWN_AS_TRACK` is doing. A trace written before `trace` learned to
+    cut holds the whole line's chain, so a Northern line short working from Edgware
+    to Kennington is stored against every way of the Northern line -- harmless while
+    the column only documented what was drawn, and a confident lie once a way is
+    asked which services use it. Those rows keep being drawn per pattern in
+    `segments` until the tracer runs over them again, which is the one place the two
+    layers divide anything other than by source.
+
+    Both kinds of pattern are inverted now. An `osmroutes` pattern is its whole
+    relation, so its ways are cut by construction; a timetable's pattern is cut by
+    `osm.ways_between` at the same distances `osm.slice_between` cuts its geometry.
+    What that buys is the Underground: 1,040 metro patterns over eleven lines were
+    1,040 coincident polylines, and a way of the Victoria line now carries its
+    service list the way a road carries its buses.
+
+    `mode` is in the key because the layer is no longer heavy rail alone and a way
+    is painted by its mode. It also keeps two networks over one alignment apart --
+    the Elizabeth line and the National Rail service beside it are two rows, drawn
+    twice, which is the one coincidence worth keeping.
 
     `n_trips` sums to NULL rather than to zero where no timetable has been
     attributed, because zero trips a week and an unknown number of trips a week are
-    different claims and only one of them is true.
+    different claims and only one of them is true. Where there is a timetable it
+    sums over distinct patterns of one service, exactly as `edge_services` does.
     """
     con.execute("DELETE FROM track_services")
     con.execute(f"""
+        -- Named columns, not positional. `mode` sits fourth in `SCHEMA` and lands
+        -- last on a database that gained it by ALTER, so a positional insert writes
+        -- the mode into `n_patterns` on exactly the databases that have been
+        -- through a migration -- which is every one already carrying rail.
         INSERT INTO track_services
-        SELECT way_id, short_name, agency_id,
+            (way_id, short_name, agency_id, mode, n_patterns, n_trips)
+        SELECT way_id, short_name, agency_id, mode,
                count(DISTINCT pattern_id)                  AS n_patterns,
                CASE WHEN count(n_trips) = 0 THEN NULL
                     ELSE sum(n_trips) END                  AS n_trips
         FROM (
             -- The subquery is what gives the fallback a name GROUP BY can refer
             -- to without repeating the expression, exactly as `build` does above.
-            SELECT u.way_id, p.pattern_id, p.agency_id, p.n_trips,
+            --
+            -- DISTINCT for `build`'s reason as well: a line that runs over one way
+            -- twice -- a loop, a reversal at a terminus -- lists it twice, and
+            -- summing trips over both would say the service runs twice as often
+            -- there. Everything but `way_id` follows from `pattern_id`, so this is
+            -- distinct pairs and nothing else.
+            SELECT DISTINCT u.way_id, p.pattern_id, p.agency_id, p.n_trips, p.mode,
                    COALESCE(NULLIF(trim(p.short_name), ''), p.route_id) AS short_name
             FROM traces t
             JOIN patterns p USING (pattern_id)
             CROSS JOIN unnest(t.way_ids) AS u(way_id)
             WHERE {db.current_feed()} AND NOT {db.matchable()}
-              AND p.route_id LIKE 'osm:r%'
+              AND {_DRAWN_AS_TRACK}
         )
-        GROUP BY way_id, short_name, agency_id
+        GROUP BY way_id, short_name, agency_id, mode
     """)
     n_ways, n_rows = db.row(
         con, "SELECT count(DISTINCT way_id), count(*) FROM track_services"

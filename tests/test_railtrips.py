@@ -170,14 +170,14 @@ def test_ways_between_names_both_ends_of_a_part_way_cut():
     chain = osm.chain(line_relation())
     metres = osm.to_metres(chain.points, chain.points[0][0])
     cum = osm.cumulative(metres)
-    assert osm.ways_between(chain, cum, 0.0, cum[-1]) == [10, 11]
-    assert osm.ways_between(chain, cum, 0.0, cum[1] / 2) == [10]
+    assert osm.ways_between(chain.way_at, cum, 0.0, cum[-1]) == [10, 11]
+    assert osm.ways_between(chain.way_at, cum, 0.0, cum[1] / 2) == [10]
 
 
 def test_ways_between_is_ordered_and_free_of_duplicates():
     chain = osm.chain(line_relation())
     cum = osm.cumulative(osm.to_metres(chain.points, chain.points[0][0]))
-    out = osm.ways_between(chain, cum, 0.0, cum[-1])
+    out = osm.ways_between(chain.way_at, cum, 0.0, cum[-1])
     assert out == sorted(set(out), key=out.index)
 
 

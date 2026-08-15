@@ -253,6 +253,67 @@ shape is unmeasured. Trams are the weakest mode at 34.2% of trips and nothing ha
 looked into there. 117 relations do not chain, 94 of them `route=train`, which is the
 mode where they will matter.
 
+## Done — rail drawn per way
+
+**Rail is drawn per way rather than per pattern** (2026-08-15). One polyline per
+pattern meant that many services over one stretch of track were many coincident lines,
+which is ugly and puts a hover on an arbitrary one of them.
+`aggregate.build_track_services` inverts a trace's way list into one row per way and
+mode, the way `edge_services` inverts a matched pattern into one row per edge, and
+`aggregate.build_segments` keeps only what cannot be inverted. The two partition on a
+new column, `traces.ways_cut`. Segments draws the operator's own shapes plus any trace
+whose way ids are still the whole line's chain; track draws everything whose way ids
+are cut to its own pattern. `mode` joins the track key, so a way carrying both a tube
+line and a National Rail service is two features drawn twice, deliberately, because
+they are different networks.
+
+**`trace` records the ways under the slice it cut** rather than the whole candidate
+chain. `osm.ways_between` already existed for `railtrips` and `osm.Chain.way_at` is
+what makes the cut recoverable; `slice_between` answers the same question in geometry,
+and this is the same cut in identity. `trace_status.n_ways` counts the slice's ways
+now. `traces.ways_cut` records which of the two a stored row holds, because nothing
+recoverable distinguishes them afterwards — the way boundaries are gone once the
+polyline is stored. The migration sets it TRUE for `osm:r%` patterns, where the
+relation is the pattern and the two lists are the same by construction, and FALSE for
+everything else; a FALSE row keeps being drawn per pattern, unchanged, until `wayfare
+trace --retry ok` re-cuts it.
+
+**Every `osmroutes` pattern had been drawn twice.** The segments trace arm selects
+live, non-matchable, shapeless patterns, and that is exactly what an `osm:r` pattern
+is, so each one came out as a whole polyline over the very ways the per-way inversion
+had just collapsed it into. It had been correct until the inversion landed after it.
+The visible half was two coats of the same track. The worse half was the hover, because
+the viewer queries segments before track, so a hover on National Rail answered with one
+relation's card reading "operator geometry" rather than the way's service list.
+
+**Three quieter faults came out with it.** `ways` is written by two stages now,
+`routes` and `trace`, so `osmroutes.write_ways` upserts instead of clearing the table
+and `osmroutes.prune_ways` drops the ways no `traces` row runs over; a blanket delete
+would have taken the tube's track out of the archive on the next `routes` run, and the
+track export joins `ways` inside, so that failure would have been track quietly not
+drawn rather than anything raising. The track tippecanoe pass now passes
+`--use-attribute-for-id=way_id`, where it had been taking the default `id`, which the
+track export does not write, so every track feature reached the viewer with no id at
+all and the hover highlight never lit, the id field being what `setFeatureState`
+addresses. And the viewer's search dim on the track layer tested `ref`, a property no
+track feature has, so a search dimmed the whole rail network to 0.1 without ever
+lighting the line it named; it reads the comma-joined `refs` now.
+
+**The viewer colours track by mode.** Each feature takes the middle of its own mode's
+ramp, with `rail` as the fallback for archives published before `mode` was on the
+feature. The legend gains a flat row per track mode ("Rail track", "Metro track"), and
+each switches its mode by filter. The card prints journeys a day where a timetable is
+attributed and says so where none is.
+
+**Nothing here has been run, measured or published.** There is no database in this
+worktree, so no served archive has been rebuilt and no new figure has been taken.
+Taking the Underground per-way on a served region is `wayfare trace --retry ok`, then
+`aggregate`, then `publish`. The figures the change is aimed at are already in the
+repo. 75.8% of Great Britain's rail ways carry two or more relations, and the National
+Rail relations are 1,569,495 vertices drawn per pattern against 443,126 per way. The
+national trace run resolved 1,127 patterns, 1,040 of 1,417 metro patterns over eleven
+Underground lines. 804 tests pass, ruff and mypy are clean.
+
 ## Next — National Rail
 
 **GB heavy rail is absent from BODS.** All three `route_type=2` routes in the national

@@ -434,6 +434,27 @@ station node sitting slightly behind its neighbour's projection and far short of
 turn. This is "bad geometry is worse than missing geometry" applied to a stage with
 no confidence score to fall back on.
 
+**What a resolved pattern records is the ways under the cut, not the ways of the
+line.** `osm.slice_between` answers in geometry where the first and last matched stops
+fall along the chain, and `osm.ways_between` answers the same question in identity by
+reading `osm.Chain.way_at`, which way each chain point came from, at the same two
+distances. It already existed for `railtrips`. Storing the whole candidate chain
+documented what was drawn and no more, which was enough while nothing read the column,
+and it became a confident lie once `aggregate` began inverting the list per way: a
+Northern line short working from Edgware to Kennington was stored against every way of
+the Northern line. `trace_status.n_ways` counts the slice's ways rather than the line's,
+and `traces.ways_cut` is TRUE on every row this stage writes.
+
+**`ways` has two writers now, so `osmroutes.write_ways` upserts rather than clearing
+the table.** `routes` writes the ways of every relation it keeps, and `trace` writes the
+ways of the relations its resolved patterns cut, in the same transaction as the traces
+that name them. The blanket delete `write_ways` used to open with would have taken the
+tube's track out of the archive on the next `routes` run, and
+`publish.export_track_geojsonl` joins `ways` inside, so that failure would have been
+track quietly not drawn rather than anything raising. `osmroutes.prune_ways` drops the
+ways no `traces` row runs over, which is what keeps a way that has left the network from
+being drawn for ever.
+
 **Six traps, and each one looks like missing data rather than a mistake.**
 
 - **Platform members must leave the way chain.** Leaving `role=platform`,
@@ -475,9 +496,12 @@ no confidence score to fall back on.
 `aggregate.build_segments` unions the operator shape of every live non-road pattern
 with the `traces` row of every live non-road pattern whose `shape_id` is NULL. That
 NULL is what keeps the two arms from overlapping, and it is what lets `segments`
-keep its primary key on `pattern_id`. A non-road pattern with neither source still
-gets no row and is still not drawn, so the log line reports all three counts and a
-region drawing fewer segments than it has patterns says so.
+keep its primary key on `pattern_id`. The trace arm is narrower than that now, taking
+only the rows `traces.ways_cut` marks as holding a whole line, because the rest are
+drawn per way by the track layer and the aggregate section has that partition. A
+non-road pattern with no source at all still gets no row and is still not drawn, so the
+log line reports all three counts and a region drawing fewer segments than it has
+patterns says so.
 
 **Every pattern gets a `trace_status` row, and one status is retryable.** The
 vocabulary is `match_status`'s for the reason the stage's shape is. A tracer that
@@ -643,15 +667,16 @@ stands, taken on a scratch database while the served archives were untouched.
 
 ## aggregate
 
-**A non-road mode has no road under it, so it is never matched and is drawn from the
-operator's own trace.** `db.matchable` is the predicate that keeps a tram, a metro, a
-train or a ferry away from Valhalla, and `aggregate.build_segments` is what draws it
-instead: one row in `segments` for each live non-road pattern, holding the shape its
-operator published, in the same integer micro-degrees `edges` uses. That path has no
-matcher, no routing and no snapping in it. A recording is the best geometry available
-for a mode with no way in the graph, and it is a survey rather than a schematic —
-Metrolink's traces run to a median 474 points against the bus feed's 849. A route
-therefore gets its geometry one of two ways. The mode decides which.
+**A non-road mode has no road under it, so it is never matched and is drawn from
+geometry somebody else recorded.** `db.matchable` is the predicate that keeps a tram, a
+metro, a train or a ferry away from Valhalla, and `aggregate` draws it two ways
+instead. `build_segments` writes one row in `segments` per pattern, holding the shape
+its operator published in the same integer micro-degrees `edges` uses, and
+`build_track_services` inverts the rest into one row per way. Neither path has a
+matcher, routing or snapping in it. A recording is the best geometry available for a
+mode with no way in the graph, and it is a survey rather than a schematic — Metrolink's
+traces run to a median 474 points against the bus feed's 849. A route therefore gets
+its geometry one of two ways. The mode decides which.
 
 **`segments` is rebuilt outright rather than merged, and a pattern with no shape gets
 no row.** The table is derived from `patterns` and `shapes` and costs one
@@ -662,6 +687,38 @@ the match section already gives: the stops are known, so a straight line between
 them would draw perfectly happily down the wrong side of a river. Great Britain's
 ferries are the worked example, 244 of 416 patterns carrying a trace and the other 172
 drawing nothing at all, and docs/data.md has the reasoning for that mode in particular.
+
+**One polyline per pattern cannot answer which services use a piece of track.**
+`build_track_services` is the inversion `edge_services` performs for roads, keyed one
+level up the identifier stack, straight on `way_id`, because nothing routed this track
+and there is no Valhalla GraphId to key on. A way id is also the more durable of the
+two, since an edge id is valid only within one graph build. 75.8% of Great Britain's
+rail ways carry two or more relations, so drawing per pattern puts coincident lines
+over most of the network and a hover lands on an arbitrary one of them.
+
+**`mode` is part of the track key, so one way carrying two networks is two features.**
+A way used by both a tube line and a National Rail service comes out as two rows and is
+drawn twice, deliberately, because they are different networks and the viewer paints a
+track feature by its own mode.
+
+**The two arms partition on `traces.ways_cut`.** Nothing may fall in both. A trace
+whose way ids are cut to its own pattern is inverted per way; a trace holding the whole
+line's chain would attribute a short working to track it never reaches, so it keeps its
+own polyline in `segments` until `wayfare trace --retry ok` re-cuts it. The column
+exists because nothing recoverable tells the two apart afterwards — the way boundaries
+are gone once the polyline is stored. The migration sets it TRUE for `osm:r%` patterns,
+where the relation is the pattern and the two lists are the same by construction, and
+FALSE for everything else, so nothing disappears on the next run and nothing is claimed
+that was not measured.
+
+**Every `osmroutes` pattern was drawn twice before that partition existed.** The
+segments trace arm selects live, non-matchable, shapeless patterns, and that is exactly
+what an `osm:r` pattern is, so each one came out as a whole polyline lying over the
+ways the per-way inversion had just collapsed it into. It had been correct until the
+inversion landed after it. The visible half was two coats of the same track. The worse
+half was the hover, because the viewer queries segments before track, so a hover on
+National Rail answered with one relation's card reading "operator geometry" rather than
+the way's service list.
 
 ## Storage
 

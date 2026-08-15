@@ -695,6 +695,13 @@ def build_tiles(
             parts.append(tiles)
         # Same single pass, same reasoning: 55,114 ways is not millions, and a
         # rail line thinned out of the only layer that draws it is just absent.
+        #
+        # The way id goes in the MVT feature id field, as it does for the detail
+        # band and for the same two reasons: it is what `setFeatureState` addresses,
+        # so a hover can light the track under the cursor, and a near-unique value is
+        # the one thing a tile's attribute pool cannot dedupe. It was in neither
+        # place before -- this pass took the default `id`, which the track export
+        # does not write, so every feature reached the viewer with no id at all.
         if track:
             tiles = tmp / "track.pmtiles"
             _tippecanoe(
@@ -706,6 +713,7 @@ def build_tiles(
                 attribution,
                 False,
                 layer=LAYER_TRACK,
+                id_attribute="way_id",
             )
             parts.append(tiles)
         if not parts:
@@ -917,13 +925,25 @@ def contents(con: duckdb.DuckDBPyConnection) -> dict[str, bool]:
 def _has_traced_segments(con: duckdb.DuckDBPyConnection) -> bool:
     """Whether anything actually drawn came from an OSM route relation.
 
-    The join is the point. `traces` is a cache keyed on pattern identity and keeps
-    its rows when a service leaves the timetable, exactly as `match_status` does, so
-    its being non-empty says what was once resolved rather than what this archive
-    holds. `segments` is rebuilt against the current feed every `aggregate`, so the
-    intersection is the honest answer -- and a credit has to describe the bytes
-    being published, not the database they came out of.
+    Two layers can carry that geometry and either one alone owes the credit, so
+    this asks both. `track_services` is the per-way inversion and is rebuilt every
+    `aggregate` against the live patterns, so its being non-empty is already a
+    statement about this archive.
+
+    The join on the other arm is the point. `traces` is a cache keyed on pattern
+    identity and keeps its rows when a service leaves the timetable, exactly as
+    `match_status` does, so its being non-empty says what was once resolved rather
+    than what this archive holds. `segments` is rebuilt against the current feed
+    every `aggregate`, so the intersection is the honest answer -- and a credit has
+    to describe the bytes being published, not the database they came out of.
+
+    Asking only the segments arm was correct exactly as long as a relation pattern
+    was drawn there too. It stopped being correct when that double draw was
+    removed, and the failure would have been an archive of nothing but relation
+    track crediting OpenStreetMap for none of it.
     """
+    if _has_rows(con, "track_services"):
+        return True
     if not (db.table_exists(con, "traces") and db.table_exists(con, "segments")):
         return False
     row = con.execute(
@@ -1005,12 +1025,21 @@ def export_track_geojsonl(
     relations. Nothing is lost in the reduction -- the service list is what the
     overlap was carrying, and it is right here on the feature.
 
-    `trips` is null where no timetable has been attributed, and stays null rather
-    than becoming zero. A viewer can style "unknown" and cannot style a lie.
+    One feature per way *and mode*, because the layer carries the traced modes too
+    now and a way is painted by its mode. Two networks over one alignment are two
+    features and are drawn twice, which is deliberate: an Underground line and the
+    National Rail service beside it are not the same railway.
+
+    `trips` comes from `way_trips` where a timetable was attributed per leg, and
+    from the services on the way where the timetable supplied the patterns
+    themselves. Summing the service column is only wrong for the first: there a
+    relation count multiplies a figure that belongs to the track, which is what
+    `way_trips` exists to keep separate. It stays null rather than becoming zero
+    where neither knows. A viewer can style "unknown" and cannot style a lie.
 
     `ORDER BY way_id` for the reason every other export sorts: a rebuild has to be
     byte-identical, and DuckDB's parallel hash join returns rows in a varying order
-    otherwise.
+    otherwise. `mode` joins the sort because a way is now more than one row.
     """
     if not (db.table_exists(con, "track_services") and _has_rows(con, "track_services")):
         return None
@@ -1021,29 +1050,38 @@ def export_track_geojsonl(
 
     rows = con.execute(
         """
-        SELECT w.way_id, w.lon_e6, w.lat_e6,
+        SELECT w.way_id, ts.mode, w.lon_e6, w.lat_e6,
                count(*)                                   AS n,
                list(ts.short_name ORDER BY ts.short_name)  AS refs,
-               -- From `way_trips`, not from the services: a leg's trips are a
-               -- property of the track, and summing a per-service column would
-               -- multiply them by however many relations happen to cover it.
-               any_value(wt.n_trips)                      AS trips
+               -- `way_trips` first, and it is the only source for the rail this
+               -- pipeline built out of relations: a leg's trips are a property of
+               -- the track, and summing a per-service column there would multiply
+               -- them by however many relations happen to cover it. Where the
+               -- timetable supplied the pattern and OSM only supplied its shape,
+               -- the services carry the count and summing them is what
+               -- `edge_services` does with the same numbers.
+               COALESCE(
+                   any_value(wt.n_trips),
+                   CASE WHEN count(ts.n_trips) = 0 THEN NULL
+                        ELSE sum(ts.n_trips) END
+               )                                          AS trips
         FROM track_services ts
         JOIN ways w USING (way_id)
         LEFT JOIN way_trips wt USING (way_id)
-        GROUP BY w.way_id, w.lon_e6, w.lat_e6
-        ORDER BY w.way_id
+        GROUP BY w.way_id, ts.mode, w.lon_e6, w.lat_e6
+        ORDER BY w.way_id, ts.mode
         """
     ).fetchall()
 
     with path.open("w") as fh:
-        for way_id, lon_e6, lat_e6, n, refs, trips in rows:
+        for way_id, mode, lon_e6, lat_e6, n, refs, trips in rows:
             fh.write(
                 json.dumps(
                     {
                         "type": "Feature",
                         "properties": {
                             "way_id": way_id,
+                            "mode": mode,
                             "n": n,
                             # Comma-joined, exactly as `export_geojsonl` writes it,
                             # because a JSON array is not a thing a vector tile can
@@ -1069,5 +1107,5 @@ def export_track_geojsonl(
             )
             fh.write("\n")
 
-    log.info("%d ways of relation track written to %s", len(rows), path)
+    log.info("%d features of relation track written to %s", len(rows), path)
     return path

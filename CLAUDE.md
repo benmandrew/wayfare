@@ -163,7 +163,10 @@ are never retried, but their edges are dropped.
 
 **`trace` refuses a relation that does not chain, or stops that do not run in order
 along it.** It cuts a pattern's geometry out of an OSM route relation's own chain, so
-it snaps nothing and has no confidence score to fall back on. A break in the chain and
+it snaps nothing and has no confidence score to fall back on. What it records against
+the pattern is the ways under that cut and not the ways of the line, because
+`aggregate` inverts that list per way and the whole chain would say a short working
+runs the length of the line it is a part of. A break in the chain and
 a sequence that turns round partway both draw confident track no service runs — a loop
 takes the wrong branch — so both end as an outcome in `trace_status` and write nothing
 to `traces`. That table is a permanent cache like `match_status`, `transport_error` is
@@ -178,6 +181,17 @@ a relation whose `operator` names only another region's rail while leaving one t
 names nobody to the window, which is what keeps every BODS slug drawing what it always
 drew. Bounds that never meet the region's live stops raise, because an empty box reports
 that nothing was discovered.
+
+**`segments` and `track_services` partition on `traces.ways_cut`, and a pattern in both
+is drawn twice.** A trace cut to its own pattern is inverted per way; a trace holding
+the whole line's chain keeps its polyline, because inverting it would attribute a short
+working to track it never reaches. The column exists because nothing recoverable tells
+the two apart once the polyline is stored, and a FALSE row keeps its polyline until
+`wayfare trace --retry ok` re-cuts it. Every `osmroutes` pattern sat in both arms for as
+long as the inversion had landed and the segments arm had not been narrowed, and what
+that looks like is a hover on a National Rail way answering with one relation's card
+rather than the way's service list. `mode` is in the track key, so a way carrying two
+networks is two features and is drawn twice on purpose.
 
 **A licence condition travels with the data, not with the page.** `publish` stamps the
 credit into the archive's own tileset metadata, derived from `config.Feed`, so a copied

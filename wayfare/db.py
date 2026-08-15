@@ -200,7 +200,7 @@ CREATE TABLE IF NOT EXISTS trace_status (
     status       VARCHAR,
     relation_id  BIGINT,   -- the OSM relation it resolved to, where one did
     osm_route    VARCHAR,  -- the relation's `route` tag: subway | train | tram | ...
-    n_ways       INTEGER,
+    n_ways       INTEGER,  -- ways under the cut, not ways of the line it came from
     n_stops      INTEGER,  -- pattern stops matched to relation stop nodes
     worst_stop_m DOUBLE,   -- furthest a matched stop sits from its OSM node
     length_m     DOUBLE,
@@ -216,14 +216,25 @@ CREATE TABLE IF NOT EXISTS trace_status (
 -- into it would break the one invariant the pipeline rests on. Keyed on pattern_id
 -- for the same reason `segments` is: there is exactly one path per pattern.
 --
--- `way_ids` is kept although nothing draws it. It is the durable identity of what
--- was drawn, it is what a later decision to invert relation track into
--- edge->services would build on, and it is the evidence for the ODbL credit this
--- table makes the archive owe.
+-- `way_ids` is the durable identity of what was drawn, the evidence for the ODbL
+-- credit this table makes the archive owe, and what `aggregate.build_track_services`
+-- inverts into one row per way.
+--
+-- `ways_cut` says whether that list is the ways under *this pattern's* geometry or
+-- the ways of the whole line it was cut from, and the inversion is only sound on
+-- the first. Rows written before `trace` learned to cut carry the whole chain, so a
+-- Northern line short working from Edgware to Kennington is stored against every
+-- way of the Northern line -- harmless while the column only documented what was
+-- drawn, and a lie about half the line once a way is asked which services use it.
+-- Nothing stored can tell the two apart after the fact, and nothing can recover the
+-- cut either: the way boundaries are gone by the time the polyline is stored. So it
+-- is recorded at write time and the two consumers split on it, which is what lets an
+-- old row keep being drawn per pattern until `trace` runs again over it.
 CREATE TABLE IF NOT EXISTS traces (
     pattern_id  BIGINT PRIMARY KEY,
     relation_id BIGINT,
     way_ids     BIGINT[],
+    ways_cut    BOOLEAN,
     -- Micro-degree integer lists, exactly as `edges` and `segments` store geometry.
     lon_e6      INTEGER[],
     lat_e6      INTEGER[]
@@ -264,14 +275,24 @@ CREATE TABLE IF NOT EXISTS ways (
 -- available with no timetable at all, under a licence the archive already carries.
 -- A timetable, where there is one, fills this column in and changes nothing else.
 --
--- `n_patterns` here counts *relations*, which is not the quantity
--- `edge_services.n_patterns` counts. A way carrying eight relations is a fact about
--- how thoroughly its line has been mapped rather than how busy it is, so the two
--- must never share a colour ramp -- which is why this is published as its own layer.
+-- `n_patterns` counts relations for the rail this pipeline built *from* relations,
+-- which is not the quantity `edge_services.n_patterns` counts. A way carrying eight
+-- relations is a fact about how thoroughly its line has been mapped rather than how
+-- busy it is, so the two must never share a colour ramp -- which is why this is
+-- published as its own layer. Where a timetable supplied the pattern and `trace`
+-- only supplied its geometry, it counts patterns and means what `edge_services`
+-- means.
+--
+-- `mode` is in the key because this table stopped being heavy rail alone once the
+-- traced modes joined it: the Underground, the DLR and the trams are drawn from
+-- relations too, and a way is painted by its mode. A way carrying both a tube line
+-- and a National Rail service is two rows and two features, which is the one place
+-- coincident track is drawn twice on purpose -- they are different networks.
 CREATE TABLE IF NOT EXISTS track_services (
     way_id      BIGINT,
     short_name  VARCHAR,
     agency_id   VARCHAR,
+    mode        VARCHAR,
     n_patterns  INTEGER,
     n_trips     INTEGER    -- NULL until a timetable has been attributed
 );
@@ -484,6 +505,39 @@ def migrate(con: duckdb.DuckDBPyConnection) -> None:
         # its rows and its match_status exactly like any other departed pattern.
         con.execute("ALTER TABLE routes ADD COLUMN route_type VARCHAR")
         logs.get("db").info("added routes.route_type; run `wayfare patterns` to fill it")
+
+    if "ways_cut" not in columns(con, "traces"):
+        # What a stored `way_ids` means. Everything written before this column
+        # existed holds the whole line's chain, except the rows `osmroutes` wrote:
+        # there the relation *is* the pattern, so its ways and the ways under its
+        # geometry are the same list by construction. Both are derivable from what
+        # is already stored, so this is a rewrite and not a re-run -- and the rows
+        # left FALSE keep being drawn per pattern, unchanged, until `trace` runs
+        # over them again and cuts them.
+        con.execute("ALTER TABLE traces ADD COLUMN ways_cut BOOLEAN")
+        con.execute("""
+            UPDATE traces SET ways_cut = EXISTS (
+                SELECT 1 FROM patterns p
+                WHERE p.pattern_id = traces.pattern_id
+                  AND p.route_id LIKE 'osm:r%'
+            )
+        """)
+        cut = scalar(con, "SELECT count(*) FROM traces WHERE ways_cut")
+        whole = scalar(con, "SELECT count(*) FROM traces WHERE NOT ways_cut")
+        logs.get("db").info(
+            "added traces.ways_cut: %d rows already cut to their pattern, %d hold "
+            "the whole line and are drawn per pattern until `wayfare trace` reruns",
+            cut,
+            whole,
+        )
+
+    if "mode" not in columns(con, "track_services"):
+        # Rebuilt outright by every `aggregate`, so this only has to exist before
+        # the next one inserts into it. Backfilled rather than left NULL because
+        # every row already there came from `route=train` and a NULL mode would
+        # draw in the fallback grey for exactly as long as it took to notice.
+        con.execute("ALTER TABLE track_services ADD COLUMN mode VARCHAR")
+        con.execute("UPDATE track_services SET mode = 'rail'")
 
     if "mode" not in columns(con, "patterns"):
         # Added empty for the same reason route_type was: nothing already stored can

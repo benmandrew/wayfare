@@ -211,7 +211,7 @@ def attribute(
                 continue
             legs_placed += 1
             placed += weekly
-            for way_id in osm.ways_between(best_line.chain, best_line.cum, *best):
+            for way_id in osm.ways_between(best_line.chain.way_at, best_line.cum, *best):
                 trips[way_id] += weekly
 
     out = Attributed(
