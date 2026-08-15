@@ -85,8 +85,8 @@ def test_pattern_id_is_the_same_under_a_new_feed(gtfs_dir: Path, con):
 
 
 def test_pattern_id_does_not_move_when_popularity_does(gtfs_dir: Path, con):
-    """The old id was a rank by trip count, so a route gaining a trip renumbered
-    its neighbours. Identity must not depend on how busy anything is."""
+    """`pattern_id` is a function of the pattern's identity alone, so it survives a
+    feed in which other routes' popularity has changed."""
     _build(gtfs_dir, con)
     before = _ids_by_stop_count(con)
 

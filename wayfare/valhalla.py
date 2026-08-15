@@ -125,10 +125,9 @@ class TransportError(RuntimeError):
 #   443  Exact route match algorithm failed to find path   (edge_walk)
 #   444  Map Match algorithm failed to find path           (map_snap)
 #
-# This used to be `"no route" in body.lower()`, which matched none of the prose
-# Valhalla actually sends, so NoRoute was never raised and every permanent no-path
-# was filed as a transient `error` instead. Match on the code, never on the words:
-# the message text is a third party's English and is free to change.
+# Match on the code, never on the words: the message text is a third party's English
+# and is free to change. A prose test that stops matching raises no NoRoute at all,
+# and every permanent no-path is filed as a transient `error` instead.
 NO_PATH_CODES = frozenset({154, 170, 171, 172, 440, 441, 442, 443, 444})
 
 # The one ValhallaError this module raises that did not come off the wire. Named

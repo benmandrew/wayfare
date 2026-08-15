@@ -309,13 +309,13 @@ def _near(a: tuple[float, float], b: tuple[float, float]) -> bool:
 # the two sequences can be compared. Measured: this takes the Victoria line from a
 # partial match to 16 of 16.
 #
-# The platform forms are the ones that are easy to miss, and missing them cost the
-# whole of the DLR on the first national run: a PTv2 stop member is a node on the
-# platform rather than a point for the station, so OSM writes "Lewisham Platform 6"
-# and "Canary Wharf Platforms 5 & 6" where BODS writes "Lewisham DLR Station". Both
-# sides carry a qualifier the other does not, both have to go, and with them gone
-# the two sequences agree 16 for 16. Before the fix every one of the 71 DLR patterns
-# was recorded `no_stop_match` against a relation that chains perfectly.
+# The platform forms are the ones that are easy to miss, and they carry the whole of
+# the DLR: a PTv2 stop member is a node on the platform rather than a point for the
+# station, so OSM writes "Lewisham Platform 6" and "Canary Wharf Platforms 5 & 6"
+# where BODS writes "Lewisham DLR Station". Both sides carry a qualifier the other
+# does not, both have to go, and with them gone the two sequences agree 16 for 16. A
+# DLR pattern that keeps either is recorded `no_stop_match` against a relation that
+# chains perfectly.
 #
 # Ordered longest first, because `re` alternation takes the first branch that
 # matches: "rail station" has to be offered before bare "station" or the pass leaves

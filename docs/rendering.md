@@ -1,514 +1,396 @@
 # Rendering (`art`)
 
-## The model
+`art` takes a longitude/latitude window onto the road network and draws every road
+that carries a service, weighted by how much service it carries. The output is a PNG
+or an SVG, written from the command line or served over HTTP by `wayfare serve`. It is
+separate from the tile publishing code on purpose: tiles are for reading, these are
+for looking at.
 
-**A render is a style and a query spec, and they know nothing about each other.**
-The style decides how an edge is painted; `art.QuerySpec` decides which edges
-exist, what their weight means, and what a group is. Three styles then cover the
-product of the two rather than three fixed pictures — `strands` grouped by operator
-or by road class is a genuinely different map with no new drawing code.
-`Style.needs_groups` is the only thing crossing the line: it says which *shape* of
-data a style consumes, flat edges or grouped paths, never what the groups are.
+It needs a built database and the `art` extra — `pycairo`, `numpy` and `pyarrow`. The
+pipeline and the tile server import none of the three.
 
-**The spec is a closed vocabulary, not a query language.** `WEIGHTS`, `GROUPS` and
-`ORDERS` are dicts of SQL fragments; substituted text is only ever a value looked up
-in one of them, and anything a caller supplies is a bound parameter. This is not
-fussiness: DuckDB's `read_only` applies to the database file and not the filesystem,
-so `read_csv` and `ATTACH` still work and user SQL would be an arbitrary file read on
-the server. There is a lockdown path (`enable_external_access=false`,
-`disabled_filesystems`) but no statement timeout, so a runaway query would need
-interrupting from another thread. Not worth it for four knobs. `MAX_GROUPS` refuses a
-spec that would draw one composited stroke per OSM way.
+## Drawing one
 
-**`Edge.weight`, not `Edge.n_trips`.** The field holds whatever `QuerySpec.weight`
-asked for, which may be a count of operators or traffic per metre. A field named for
-trips holding a count of operators is a lie, and the rename cost four lines.
+    wayfare art cardiff
+    wayfare art --bbox=-3.32,51.42,-3.08,51.57 --style spectrum
+    wayfare art uk --style strands --width 6000 --out /tmp/uk.png
 
-**Two `strands` behaviours are deliberate.** A service is weighted by the total
-traffic on every road it uses, not by its own trips, so a minor route along a busy
-corridor keeps a wide ribbon. A service registered by two operators covers each edge
-once, hence the DISTINCT on the service/edge pair. Neither is a bug to fix in
-passing; changing either changes the picture, so decide that first.
+The area is a preset name or a window written `minlon,minlat,maxlon,maxlat`. Twelve
+presets ship: `bristol`, `cardiff`, `edinburgh`, `greater_glasgow`, `liverpool`,
+`london`, `manchester`, `sheffield`, `tyne_and_wear`, `west_midlands`,
+`west_yorkshire` and `uk`. A window that starts west of Greenwich begins with a minus,
+which argparse reads as an option flag, so pass it attached —
+`--bbox=-3.3,51.4,-3.0,51.6` — rather than as a separate token.
 
-## Streaming
+The flags that change the picture:
 
-**Nothing holds a whole window or a whole table.** `Window` pulls geometry in chunks,
-and the percentile weight scale comes from a separate pass over trip counts alone — 8
-bytes an edge, held as two bounds rather than a list of normalised values. Holding
-every edge cost 439 MB for the `uk` preset on Wales alone, and the country is about
-25x Wales. Each style needed a different accommodation: `density` walks the window
-twice (ADD is commutative, so order is free); `spectrum` moved its quietest-first
-ordering into SQL, which is sound because weight is monotonic in trip count;
-`strands` strokes a service's edges as one cairo path, so the window hands back
-(service, edge) pairs already grouped and one ribbon is live at a time.
-`render(edges=...)` still works via `Held`, which presents a list through the same
-interface. Peak RSS on the `uk` window: density 479 -> 259 MB, strands 617 -> 312 MB.
-The Python side no longer grows with the window; what still grows is DuckDB's own
-aggregate, which spills to disk rather than failing.
+- **`--style`** — `density`, `spectrum` or `strands`; default `density`.
+- **`--width`** — canvas width in pixels, default 4,000. The height follows from the
+  window's aspect ratio.
+- **`--scale`** — surface multiplier for print, and 2.0 is roughly 192 dpi. PNG only,
+  since an SVG is resolution independent.
+- **`--caption`** — a line of text in the bottom-left corner.
+- **`--credit`** — burn the data credit into the corner too. Every render already
+  carries it in the file's metadata; this is for anywhere the metadata will not
+  survive the trip.
+- **`--coalesce`** — join edges that meet end to end into one stroke, so a shared node
+  is capped once rather than twice. `density` only, and it changes the picture.
+- **`--out`** — the output file, `.png` or `.svg`. The suffix picks the format, and
+  the default is `OUT/<area>-<style>.png`.
+- **`--workers`** — bands drawn in parallel; the default is one per physical core, and
+  `1` draws serially.
 
-**Geometry comes out of DuckDB as Arrow, not as rows.** The scan was never the
-problem and still is not — the London window scans in 4.4ms — but *materialising* it
-was: 303ms to turn the same rows into Python lists of ints, because an `INTEGER[]`
-column arrives over the row protocol as a list object per edge holding an int object
-per vertex. In Arrow that column is a flat child buffer plus offsets, which numpy
-adopts without copying. Over London at 3000px (197,276 edges, 585,287 vertices) the
-whole data path went 852ms → 358ms by fetching Arrow, and → 198ms by keeping it flat
-all the way to cairo — hence `Polyline`, which holds indices into a fetch's shared
-coordinate buffers rather than a list of tuples per edge. Whole renders: `strands`
-over London 5,449ms → 3,622ms, `density` 4,985ms → 4,423ms.
+## The three styles
 
-**The percentile pass belongs in SQL, and has to match `Weights.over` exactly.**
-Pulling every weight into Python to take two order statistics cost 1,918ms of a
-2,150ms pass at 4.2M edges. `bounds_query` reproduces the rank convention rather than
-using `quantile_disc`, which interpolates differently and would shift a render's
-contrast invisibly: `row_number()` and an explicit `floor(q * n)`, because `CAST(x AS
-BIGINT)` rounds where Python's `int()` truncates. Verified identical on 72 real
-database/window/spec combinations.
+**`density`** paints weekly trip volume as light — a wide dim halo under a narrow
+bright core, composited additively, so a corridor several services share burns out
+white. It is the one to reach for first, the only one whose line widths follow the
+canvas size, and the only one that reads `--coalesce`.
 
-## Determinism
+**`spectrum`** takes the hue of each segment from its compass bearing, which turns a
+gridded city into blocks of colour and a radial one into a wheel. It strokes each
+segment separately and never simplifies its geometry, so it is the most expensive of
+the three per vertex.
 
-**Every query the render path streams needs an ORDER BY, including the ones whose
-order looks irrelevant.** `edges_query` had none when not ordering by weight, and
-DuckDB's parallel hash join returns rows in an order that varies between runs of the
-same query against the same file — so `density` to SVG produced four distinct outputs
-in four runs, on real data. PNG hid it completely, because cairo's ADD is saturating
-and therefore commutative, so the buffer is identical whatever order the strokes
-arrive in; SVG records the strokes in the order they were issued and shows it. That is
-the same failure `_order_sql` was written to fix for `strands`, and the existing
-"byte-identical across two calls" test could not catch this one: three edges never
-reach a second thread, so an undefined order is a stable one. Test the order is
-*defined* rather than that two runs agree. The sort is close to free — +1.2 ms over
-cardiff, +10.1 ms over `uk`, +9.1 ms over London, against renders of 0.4 s to 4.4 s.
+**`strands`** gives every service its own translucent ribbon, screened over the
+others, so overlapping routes weave rather than merge. It is the only style that reads
+`QuerySpec.group`, which is what makes it more than one picture: grouped by operator or
+by road class it draws a genuinely different map with no new drawing code.
 
-**Every ORDER BY needs a unique tiebreak**, and a commutative compositing operator
-will hide a missing one from every check that looks at pixels. `strands` to SVG was
-never deterministic: the group query ordered by group with no tiebreak *within* a
-group, so the edges of one ribbon arrived in scan order. Three runs gave three
-different files at a constant 293,842 bytes, differing in 180,365 of them. Fixed by an
-`edge_id` tiebreak in `art._order_sql`. Same lesson as the refs ordering and `_chain`'s
-starting point in `publish`.
+Two `strands` behaviours are deliberate and neither is a bug to fix in passing. A
+service is weighted by the total traffic on every road it uses rather than by its own
+trips, so a minor route along a busy corridor keeps a wide ribbon. A service registered
+by two operators covers each edge once, hence the DISTINCT on the service/edge pair.
+Changing either changes the picture, so decide that first.
 
-**Which cairo you have decides whether an SVG is vectors or one embedded raster, and
-it changes what an SVG test can see.** The dev shell's libcairo 1.18.4 writes all three
-styles as real `<path>` strokes. The shipped image's 1.16.0 writes `spectrum` as 35,188
-paths but falls back to a *single* `<image>` for `density` and `strands` — cairo cannot
-express ADD or SCREEN in SVG, and 1.16 gives up where 1.18 does not. Two consequences.
-Any stroke-order bug is invisible in a 1.16 `density` SVG, because there are no strokes
-in it. And on 1.16 two SVGs rendered in *one process* never compare equal even when the
-pixels are identical, because the fallback names its elements from a process-wide
-counter: `id="image5"`/`id="surface1"` against `id="image11"`/`id="surface7"`, with
-byte-identical base64 between them. Compare SVGs across processes, or compare the
-payload rather than the file. Rendering the same window in three fresh 1.16 processes
-gives one hash.
+## Changing what is drawn
 
-## Line widths
+A render is a style and a *query spec*, and they know nothing about each other. The
+style decides how an edge is painted; `art.QuerySpec` decides which edges exist, what
+their weight means, and what a group is. `Style.needs_groups` is the only thing
+crossing the line, and it names the *shape* of data a style consumes — flat edges or
+grouped paths — never what the groups are.
 
-**A stroke width fixed in pixels is a different picture at every canvas size.** The map
-shrinks with the canvas and the lines do not, so the same window at 1,600px carries the
-4,000px line weight over 40% of the road length, and `density`'s two additive passes
-then clip to white through every town centre. That is why the `/art` default (1,600px)
-looked nothing like the CLI one (4,000px), and why a preview was a poor guide to the
-render it stands in for. `draw_density` quotes its widths against `DENSITY_REF_PX`
-(2,000) and multiplies by `width_px`. The ramp constants were halved to match, and
-halving then doubling is exact in binary, so the 4,000px render is byte-identical to
-the one before the change — verified on Cardiff — while every smaller canvas gets
-proportionally lighter. No floor: a small canvas *should* draw hairlines, the same way
-downsampling the big render would. `spectrum` and `strands` still hold their widths in
-pixels, which is only defensible because neither stacks light additively the way
-`density` does; the studio's Widths note says so.
+`weight` is the scalar the colour and width ramps see, per edge:
 
-**`Style.max_line_px` therefore has two regimes, and `ref_px` is which one.** The field
-exists for banding: a band draws and queries a *collar* past its own rows, half the
-widest stroke plus two pixels, so no stroke is ever cut at a raster boundary. Left
-`None`, `ref_px` means `max_line_px` is absolute pixels and the collar is fixed —
-`spectrum` at 4.0, `strands` at 3.9. Set, it means pixels at a canvas `ref_px` wide, and
-the collar scales with `width_px`. `density` is the only style in the second regime:
-`max_line_px=9.5`, `ref_px=DENSITY_REF_PX`, the halo ramp's `1.5 + 8.0` quoted against
-the same 2,000 the ramp itself is.
+| `weight` | what it measures |
+|---|---|
+| `trips` | weekly trips, the default |
+| `services` | distinct services |
+| `operators` | distinct operators |
+| `patterns` | distinct patterns |
+| `busiest` | the busiest single service on the edge |
+| `density` | trips per metre, so a long rural link and a short city block carrying the same buses no longer weigh the same |
 
-Getting this wrong is a seam, and it is one-sided. A collar wider than the stroke only
-costs work, so the old fixed 19.0 was merely wasteful below 4,000px and silently broken
-above it: half the stroke is `9.5 * line_scale * width_px / 4000` and the collar was
-`9.5 * line_scale + 2`, which crosses at `width_px > 4000 * (1 + 2 / (9.5 *
-line_scale))` — 4,842px at `line_scale=1`, 4,421px at 2, 4,211px at 4. The two-pixel
-slack is the only margin and it shrinks in relative terms as the lines widen, so a large
-export with the width knob raised sits closest to the edge. An edge whose centreline
-falls past the collar is never fetched, so the paint it owes the band is simply absent.
-Every banding test drew at 150 or 200px and passed;
-`test_banding_holds_at_a_canvas_wider_than_the_style_reference` renders at 6,000px and
-compares bytes. Its fixture alternates busy and quiet edges every row on purpose — only
-the busiest draw at the full width, and a fixture that puts those at one end makes the
-seam a matter of luck.
+`group` is what one ribbon is, for `strands`: `service` (the default), `operator`,
+`road_class`, `way` or `road_name`. A service key puts an edge in as many groups as it
+has services; an edge-level key puts it in exactly one. `MAX_GROUPS` is 20,000, which
+refuses a spec that would draw one composited stroke per OSM way.
 
-## Simplification and sampling
+`order` decides which group is drawn first, and so ends up underneath: `widest` (the
+default), `narrowest`, `busiest`, `quietest` or `name`. Unlike the other two
+vocabularies these are `(column, direction)` pairs rather than SQL fragments, because
+the same ordering has to be written against two different sets of table aliases.
 
-**`spectrum` must never simplify its geometry.** Every other style would draw the same
-line through fewer points. This one takes the *hue* from the angle between consecutive
-points, so dropping a vertex merges two bearings into their average and repaints that
-stretch a different colour. Half a pixel of tolerance moved 74% of the output bytes,
-against 0.05% for `density`. `draw_spectrum` therefore passes `tol=0.0` explicitly
-rather than reading `opts.simplify_px`. Any future style that derives colour, width or
-order from geometry inherits this problem — check before enabling simplification for it.
+Four filters narrow the picture: `operator`, `service`, `road_class` and `min_trips`.
+Any of them flips the join. Unfiltered, an edge with no services still draws, black and
+at weight zero; filtered to one operator, an edge that operator does not use has to
+vanish rather than render as a black line through the middle of the picture.
+`Edge.weight` holds whatever `weight` asked for, which may be a count of operators, so
+the field is not named for trips.
 
-**Sampling is the only preview lever, and the weight scales must not see it.**
-`QuerySpec.sample=n` adds `hash(edge_id) % n = 0` to the window CTE and is linear: 1/8
-takes `density` from 50.5s to 6.6s. `hash` rather than `random` so a preview is
-reproducible and does not flicker as it redraws. It lives on the spec rather than in
-`RenderOpts` because it decides *which edges there are* — but it is deliberately absent
-from `QuerySpec.selective`, since it narrows nothing semantically and must not flip the
-`LEFT JOIN` that keeps serviceless edges in the picture.
-
-`_Sql.window(sampled=True)` is asked for only by `edges_query`; `weights_query` and
-`group_query` take the whole window, and `grouped_query` puts the thinning on its final
-SELECT rather than in the shared CTE, because `gstat` is built from that CTE and decides
-every ribbon's width and draw order. Sampling upstream of it would make a preview weight
-its ribbons differently from the render it stands in for. This is the trap to watch:
-anything statistical must read the unsampled window, and only drawn geometry may be
-thinned. Alpha is compensated linearly (`alpha_scale * sample`, since ADD is linear),
-but the core pass already runs at alpha up to 0.90, so 8x pins it at 1.0 and the preview
-still comes back at about 62% brightness. Widening the lines would close that gap and
-destroy the point, since line weight is one of the knobs being judged. Hence the studio
-page labels the sampled pass and follows it with the real one.
-
-## Banding
-
-**A render is drawn in horizontal bands, one process each, and the output is
-byte-identical.** Everything else optimises one core; the box has eight. The canvas
-splits into bands, each band is drawn by its own process against its own read-only
-handle, and the rasters are pasted back. Measured over the `uk` window on the real
-2.75M-edge database at 2,000px: `density` 77–98s → 28–32s, `spectrum` 58–67s → 21–31s,
-`strands` 71–72s → 37–40s; at 4,000px `density` 98s → 42s. Verified byte-identical for
-all three styles, and on the awkward canvases — letterboxed, `scale=3`, filtered,
-sampled, `line_scale=6`. `strands` gains least because its cost is the (service, edge)
-fan-out, not vertices.
-
-Four things had to be true and each was a bug first:
-
-- **Cut on edge count, not on height.** Equal-height bands put 1,307,069 of 2,746,261
-  edges into one of eight, so seven cores idled while the eighth ran 35s. Latitude
-  quantiles over the window took the same render 37s → 27s.
-- **Spawn, not fork.** The parent holds an open DuckDB handle when the pool starts, and
-  DuckDB's background threads do not cross a fork. The child dies on first use and it
-  presents as `BrokenProcessPool` with no traceback, because it is killed rather than
-  raising.
-- **One band per worker, not more.** 24 balanced bands measured *slower* than 8, 36.7s
-  against 27.0s. This was first attributed to `edge_services` being unable to prune, so
-  that every band scans all 8.3M rows whatever its height. That floor is real and it is
-  not the reason. Timing a single band in isolation at 1, 2, 4, 8, 16 and 24 bands, with
-  the drawing suppressed to separate the data path, the per-band data cost halves every
-  time the bands double: 20.08s, 10.05s, 5.08s, 2.64s, 1.38s, 1.00s. Fitting a constant
-  to that gives a floor of **0.16s a band** — 4.6% of a 24-way band, about one second of
-  wall clock across all 24. Total CPU work across every band stays inside 10% from one
-  band to 24. What actually costs the 10s is spawn, at about a second each and 24 of them
-  on four cores, plus the oversubscription itself. Same shape for `strands` (floor 0.18s)
-  and for a filtered spec (0.13s), so it is not a quirk of one style.
-- **Draw past the cut and paste only the middle.** Clipping to the band splits a stroke
-  at a raster boundary, and cairo tessellates in 24.8 fixed point, so the two halves'
-  coverage does not always re-add to the whole shape's — one row of one Cardiff render
-  came out 1/255 off. The band surface therefore carries a margin of half a line width,
-  drawn and discarded, and the only clip is the serial path's own window rect. That
-  margin is `_band_pad`; how wide it has to be depends on the width regime above.
-
-**Two scales must be the window's, never the band's.** `Weights` is injected into each
-band. So are the *group* statistics, through `Source.groups`, which names an optional
-pre-computed `(grp, n_edges, trips)` relation — registered as an Arrow table, because
-inserting 20,000 rows through bound parameters would cost seven seconds a band. `gstat`
-sets both ribbon width and draw order. Width being per-band is visibly wrong; order is
-the subtle one, because SCREEN is commutative in real arithmetic and *rounds* in
-eight-bit, so reordering moved 2.8% of the pixels by up to 4/255 — diffuse, across the
-whole image, nothing like a seam, and exactly the kind of difference that gets waved
-through.
-
-**Banding declines rather than fails, and the cases matter.** SVG (nothing to paste),
-`render(edges=...)` (the list lives in the parent), a window under `MIN_BAND_EDGES`
-(spawn costs about a second whatever the picture — Cardiff at 1,200px is 0.75s serial
-and banding made it twice as slow), and a connection a worker could not reopen.
-`band_source` asks the *connection* for its path via `duckdb_databases()` rather than
-assuming `config.DB_PATH` — a caller may hand `render` any database, and a band opening
-the configured one instead would quietly draw a different picture in the parallel path
-only — then probes it with a read-only open. That probe is what catches a writable
-handle: DuckDB gives a writer an exclusive lock, so bands could not open the file at
-all. The count that `MIN_BAND_EDGES` is compared against comes from the render's own
-`WHERE`, so a spec filtered to one road class does not start eight processes for a
-picture one core finishes in a tenth of a second.
-
-**`default_workers` reads the cgroup, not `os.cpu_count()`.** The render service runs at
-`cpus: 4` on an eight-core box and `os.cpu_count()` reports the host's, so it would start
-eight processes to share four cores' quota and a 3 GB memory limit.
-`WAYFARE_RENDER_WORKERS` overrides. Each band also does `SET threads=1`: DuckDB defaults
-to a thread per core *per process*, and eight bands would put sixty-four on eight cores.
-
-**And it counts physical cores, not hardware threads.** The box is four cores of eight
-threads, and the second thread of a core draws no faster: `uk` `density` at 2,000px is
-78.1s on one worker, 44.9s on two, **26.9s on four**, 27.2s on six, 28.1s on eight,
-30.9s on twelve, 33.2s on sixteen, 37.5s on 24. Speed-up tops out at 2.90x on four,
-which is the core count and not the thread count — tessellating round caps is ALU- and
-branch-bound, so there are no memory stalls for a sibling thread to fill. The 4.6%
-between eight workers and four is the smaller half of it; eight interpreters and eight
-DuckDB connections against a 3 GB container limit is the half that bites.
-`_physical_cpus` reads distinct `(physical id, core id)` pairs from `/proc/cpuinfo` and
-returns None anywhere that file is absent, where the logical count stands as before.
-
-## Where a render's time goes
-
-**A render costs per edge and per vertex, never per pixel.** Over a synthetic 1M edges,
-`density` took 52.7s at 900px and 59.0s at 4,000px — a 20x cut in pixels bought 11%,
-because the cost is cairo tessellating round joins and caps once per *vertex*. A smaller
-preview is therefore not a cheaper one, which is the whole reason `sample` exists.
-Batching cairo state changes was tried and rejected: 128 weight buckets delivered in
-bucket order by SQL, one path and one state change each, moved 50.2s to 45.6s —
-per-stroke setup was never the cost either.
-
-The three things that did work, in order of how much they buy and how little they cost:
-`RenderOpts.simplify_px` drops vertices within half a pixel of the last one kept (36% of
-vertices survive at preview width, 30% off the clock, 0.05% of output bytes changed);
-`density` draws its halo and core in one walk instead of two, which is byte-identical
-because cairo's ADD is saturating and therefore commutative; and `Projection.batch`
-projects a whole 20,000-row fetch with numpy at once. Per edge numpy would lose — 4.14
-vertices is far too few to pay for array setup — so the batching is the point, not the
-library. Together, 53.2s to 25.8s.
-
-**Round caps are what a render costs, and this is where the rest of the time is.**
-Measured by replaying the whole `uk` window through cairo under different settings: butt
-caps and mitre joins take 55.4s to 25.5s — a 54% cut — because at national scale an edge
-has already simplified to 2.08 vertices, so nearly every stroke is one tiny segment whose
-cost is tessellating two round caps. `ctx.set_tolerance` coarsens that arc: 1.0 gives
-78.5%, 2.0 gives 73.7%. `Antialias.FAST` gives 74.4%; `GOOD` and `DEFAULT` are
-byte-identical to `BEST` and buy nothing, so the antialias setting is not a lever. None
-of these are taken — they all change the picture, and banding was available and does not.
-
-**Cairo is 76% of a band at every band count**: 62.21s of 82.29s at one band, 8.23s of
-10.87s at eight, 2.50s of 3.50s at 24. Banding changed the wall clock and not the
-composition, so coalescing attacks the same three quarters whether a render is banded or
-not.
-
-**A render is 75% cairo, and the scan is not the problem.** Measured on a synthetic
-4.2M-edge / 10.25M-service database (`scripts/bench_window.py`), `density` at 800px:
-Cardiff 56,251 edges takes 2,363 ms — weights pass 55 ms, two window walks 532 ms, cairo
-1,776 ms. London 752,561 edges takes 28,589 ms, split 516 / 6,558 / 21,515 the same way.
-So the whole database side is about a quarter of a render and the percentile pass under
-2%. Optimise the drawing, not the query.
-
-That conclusion held and the reasoning behind it did not, which is worth keeping both
-halves of. "The scan is not the problem" is true — but the quarter that is not cairo was
-almost none of it *scanning*. It was DuckDB rows becoming Python objects, which is a
-different thing with a different fix, and the reason a "query optimisation" like
-clustering `edges` moved 14ms while changing how the rows are fetched moved 650ms.
-
-**Rejected read-path changes**, so they do not get tried again:
-
-- **Extracting a window to Parquet.** The idea was that iterating on a design should cost
-  the window rather than the national table. Cardiff went 2,347 ms -> 2,320 ms and London
-  28,978 -> 28,619, and a filtered spec got *slower* (37 -> 101 ms) because the extract
-  cost more than the scan it saved. `art.Source` survives as the substitution seam; do
-  not reintroduce the extract without first making the drawing cheaper.
-- **Materialising the shared `_grouped_base` CTEs into temp tables** so the two grouped
-  queries stop recomputing them: 1.20x on London and 1.04x on `uk`, worth about 48ms of a
-  3.6s render, against three temp tables and a second copy of SQL whose parameter
-  ordering is already the fragile part of the builder.
-- **A bounding box on `edge_services`** so the weights pass can prune — see
-  docs/pipeline.md.
-
-## Coalescing
-
-**Coalescing runs of edges into one stroke is `RenderOpts.coalesce`, off by default.**
-`art` strokes one path per directed edge and an edge is 4.14 coordinates over tens of
-metres, so a road is dozens of short strokes end to end, each with a round cap at both
-ends, and `density` composites with ADD. Joining runs that meet head to tail into one
-stroke removes the duplicate. Cardiff 11,644 edges → 2,113 runs, London 197,276 →
-28,597, `uk` over Wales 169,857 → 59,309. Serial `density` at 4,000px: Cardiff 0.88s →
-0.73s, London 5.05s → 2.54s. Peak RSS on `uk` 277 → 281 MB — the assignment is ~20 bytes
-an edge in Arrow and is released before the drawing stream opens, so the streaming rule
-holds.
-
-**It is not picture-preserving for `density`, and that has to be a decision rather than
-a discovery.** Two edges meeting end to end each lay a round cap at the shared node, and
-ADD counts the overlap twice; one continuous subpath counts it once. Measured at
-density's own widths and alphas, the junction pixel drops 85 → 53 at t=0.25, 200 → 108 at
-t=0.5, and 255 → 230 at t=1.0, while mid-edge is unchanged to the byte. The effect peaks
-in the middle because a doubled value saturates at the top. Nationally that is a bright
-dot at every one of millions of nodes, so what coalescing removes is arguably an artefact
-of drawing per edge rather than anything in the data — but every existing render changes,
-and `publish`'s chaining is not the precedent it looks like: an MVT feature carries
-attributes, not additive light, so that merge really was lossless and this one is not.
-
-Three more things are worth knowing before looking at a render.
-
-*The junction dot is not the biggest thing it removes.* `density`'s halo pass is 9.5px
-wide at `DENSITY_REF_PX` and an edge is a couple of pixels long at city scale, so
-consecutive halos overlap along the *whole* road, not just at the node. Coalescing
-therefore drops mean brightness to 82% on a Cardiff crop and 63% on a West End one, and
-the lit footprint is unchanged (0.6% and 0.9% of lit pixels lost, all fringe). So the
-plain render's glow is partly a picture of how finely Valhalla chopped the road. Compare
-at matched exposure — `alpha_scale` about 1.35 for Cardiff, 1.9 for London — or you are
-judging the exposure and not the change.
-
-*Chaining is directed, unlike `publish._chain`.* A two-way street is two coincident edges
-pointing opposite ways, so at a node where two roads meet there are four incidences and
-the undirected "exactly two meet here" rule fires on nothing. Head to tail, each
-direction chains independently, and the doubling-back trap `publish` records cannot
-arise. Directed pairs are *not* collapsed the way `publish` does: that would halve the
-light on every two-way road, which is a different picture rather than a repaired one. The
-group key is the drawn weight, because that is what the paint is a function of.
-
-*Banding survives, but only because the parent ships the assignment.* Whether two edges
-share a stroke is a fact about the graph, and a band that worked it out from its own
-collar sees a fork as a through node wherever the third edge fell outside — and under ADD
-that is not a local error, since two strokes double-count wherever they overlap.
-Measured: London at 6,000px differed in 356 pixels by up to 89/255, all within 40 rows of
-a cut, and was byte-identical at 2,000px, which is exactly the kind of fault that gets
-waved through. `Source.chains` is the fix and it is the same arrangement `Source.groups`
-already uses for `gstat`. With it, serial and banded are byte-identical on the real
-databases at 2,000px, 4,000px and 6,000px, at 4 and 8 workers, under `scale`,
-`line_scale=6`, a letterbox and `sample=4`. Simplification stays *per edge* rather than
-per run for the same family of reason: `simplify` compares against the last vertex kept,
-so a run-level pass would depend on where the run started, and a band's runs start where
-its collar cut them.
-
-*`spectrum` and `strands` both decline, for opposite reasons.* `spectrum` strokes each
-segment separately to colour it by its own bearing, so it has a cap at every vertex and
-no chaining removes them. `strands` already puts a service's edges into one cairo path,
-and cairo fills a stroke's outline once with nonzero winding, so caps overlapping inside
-a single stroke never accumulated. `Style.coalesces` says which is which, and a request
-against a style that ignores it warns.
+The spec is a closed vocabulary and never a query language. Substituted text is only
+ever a value looked up in `WEIGHTS`, `GROUPS` or `ORDERS`, and anything a caller
+supplies is a bound parameter. That matters because DuckDB's `read_only` applies to the
+database file and not to the filesystem, so `read_csv` and `ATTACH` still work and user
+SQL would be an arbitrary file read on the server. This is DuckDB's behaviour rather
+than this code's, and its lockdown path (`enable_external_access=false`,
+`disabled_filesystems`) carries no statement timeout, so a runaway query would still
+need interrupting from another thread. Not worth it for four knobs.
 
 ## Serving
 
-**Serving is `wayfare serve`, in the package, not a script.** `server.py` answers three
-things on one port: the static viewer, the PMTiles archives with byte ranges, and `GET
-/art`. It moved out of `scripts/serve.py` when it gained the render endpoint — serving
-bytes off disk is fine unchecked, taking parameters from a URL and running cairo is not,
-and pyproject puts only `wayfare` under mypy and ruff. `scripts/serve.py` is a deprecated
-shim so a deployed compose file keeps working.
+`wayfare serve` answers three things on one port, 8099 by default: the static viewer,
+the PMTiles archives with byte ranges, and `GET /art`. `--no-art` switches the render
+endpoint off and answers it 501, and `WAYFARE_ART=off` does the same for a deployment
+that cannot change the command.
 
-**`/art` exists because the data is on the server and the design work is not.** Every
-expensive stage runs where the disk is, so iterating on a style used to mean copying tens
-of gigabytes to a laptop or editing a style and watching a deploy. `art.render_bytes` is
-the same `_render` as the file path with a `BytesIO` for a sink, deliberately — there is
-no second drawing path to diverge.
+`/art` exists because the data is on the server and the design work is not: iterating on
+a style otherwise means copying tens of gigabytes to a laptop. `art.render_bytes` is the
+same `_render` as the file path with a `BytesIO` for a sink, so there is no second
+drawing path to diverge.
 
-**The render server never holds the database open.** DuckDB gives a writer an exclusive
+The query string takes the window as `area=<preset>` or
+`bbox=minlon,minlat,maxlon,maxlat`, plus `style`, `format` (`png` or `svg`), `width`
+(default 1,600), `height`, `scale`, `caption`, `credit`, `background` (`#rrggbb` or
+three 0–1 floats), `hue`, `line_scale`, `alpha_scale` and `coalesce`. The query spec
+arrives through `weight`, `group`, `order`, `operator`, `service`, `class`, `min_trips`
+and `sample`; `class` is short for `road_class`, because the query string is written by
+hand often enough to be worth the mapping. Filters repeat or comma-separate, and are
+sorted and deduplicated so that `operator=A,B` and `operator=B,A` are one cache entry.
+
+Everything is range-checked at parse time, so a bad request costs a parse rather than a
+window query. `width` caps at 12,000, `scale` at 4.0, a caption at 120 characters, a
+filter at 64 values, `min_trips` at 1,000,000 and `sample` at 16. The bound that
+binds is 64 megapixels, because the window's aspect ratio sets the height
+and `scale` multiplies both: `width=4000&scale=4` over a tall window is 200 megapixels
+and looks modest.
+
+`GET /art/meta` serves what the studio page builds its controls from — the styles and their
+blurbs, the presets, the three spec vocabularies, the defaults, the limits, the credit, and
+this database's own operator and road-class lists, bounded at 500 values each. Served rather
+than compiled into the page, so a style or preset added in [`art.py`](../wayfare/art.py)
+reaches the interface without touching any HTML.
+
+Renders are serialised one at a time, because a render is CPU-bound cairo over a full
+scan of `edges` and the same box is usually also matching. A request waits up to 90
+seconds for the slot, and past four waiters the answer is 503. Recent renders are cached
+in 96 MB of memory, keyed on every parameter plus the database file's size and mtime.
+
+The render server never holds the database open. DuckDB gives a writer an exclusive
 lock on the file, so one read-only handle kept alive by a viewer nobody is looking at
-would stop the next `match` or `aggregate` from starting. `/art` opens read-only for the
-length of one render and closes it, and reports a held lock as 503 with the reason rather
-than a traceback. Never cache the connection to save the open — the open is metadata, the
-lock is the pipeline.
+would stop the next `match` or `aggregate` from starting. `/art` opens read-only for
+the length of one render, closes it, and reports a held lock as 503 with the reason
+rather than a traceback. Never cache the connection to save the open — the open is
+metadata, the lock is the pipeline.
 
-**Renders are serialised, and the cap is pixels, not width.** One at a time because a
-render is CPU-bound cairo over a full scan of `edges` and the same box is usually also
-matching; two would not finish either sooner. That holds all the more now one render uses
-every core it is allowed. The bound is `width` x derived height x `scale`², because the
-window's aspect ratio sets the height and `scale` multiplies both — `width=4000&scale=4`
-over a tall window is 200 megapixels and looks modest. Past `QUEUE_LIMIT` waiters the
-answer is 503, since a studio page re-rendering on every slider move would otherwise
-queue renders nobody will look at.
-
-**There is still no spatial index on `edges`.** A national window therefore reads the
-whole table, over HTTP as much as on the command line. The pixel cap does nothing about
-that; the serialisation and the queue limit are the only protection. Clustering is what
-prunes — see docs/pipeline.md — and the scan is not where the time goes anyway.
-
-**Every `/art` error is JSON, and the message is the interface.** `send_error` writes an
-HTML page, which an `<img>` renders as a broken-image icon with the reason nowhere anyone
-can see it. A lat,lon-swapped window is the case that cannot raise — it is a legal window
-that draws nothing — so it comes back 200 with `X-Wayfare-Warning`, which is the CLI's log
-line put somewhere a browser can read.
-
-## Provenance
-
-**A rendered PNG or SVG used to carry no attribution at all.** The map and the tiles
-had theirs — `publish` stamps the credit into the PMTiles metadata, where it survives a
-copy to somebody else's bucket (see docs/data.md) — and `art` wrote a file with nothing
-in it. `/art` is served over HTTP and the studio page has a download control, so a
-render leaves the machine as a matter of course. What leaves is a derivative work of
-Creative Commons Attribution 4.0 (CC BY 4.0) timetable data and Open Database License
-(ODbL) road geometry, and no part of the file said so.
-
-**The metadata is unconditional and the visible caption is opt-in**, which is two
-mechanisms rather than one, deliberately. Metadata costs nothing, cannot alter the
-picture, and means every render leaves the server carrying its provenance even where
-nobody thought about it. A credit burned into a corner *is* a change to the artwork, and
-the person who knows whether an image is going somewhere public is the one asking for
-it, so the caption is off by default: `RenderOpts.credit`, `wayfare art --credit`,
-`credit=1` on `/art`. Both sit in `art._render`, the single funnel the file path and the
-`BytesIO` path share — the same reason `render_bytes` exists rather than a second
-drawing path.
-
-**Four fields go in.** `Title` is "wayfare density: cardiff"; `Description` carries the
-window as `minlon,minlat,maxlon,maxlat`; `Software` is "wayfare", bare; `Copyright` is
-`config.credit_text()`. The style and the window are in there because a render that has
-been through a chat client and back is otherwise a picture of somewhere nobody can name,
-and because both are arguments the caller supplied, so neither can move under a
-re-render. The feed version was considered and left out. It would have to be queried,
-which `render(edges=...)` has no connection to do, and it would make a render's bytes a
-function of when the timetable was downloaded rather than of what was asked for.
-
-**Nothing in the metadata may move.** That is the constraint the whole design bends
-around, because renders are asserted byte-identical run to run (see Determinism above).
-No timestamp, no hostname, no output path, and no version string — which is why
-`Software` is the bare name.
-`test_the_metadata_holds_nothing_that_moves` checks the four fields for a date, a year
-and a dotted version, and for the output path the render was written to.
-
-**pycairo writes neither format's metadata, so both are post-processes on finished
-bytes**, and cairo now draws into a buffer rather than straight into the sink. A PNG is
-a signature and a run of chunks — length, type, data, then a 32-bit cyclic redundancy
-check (CRC32) over the type and the data — so the chunk is written by hand rather than
-adding to a dependency set that is deliberately three packages (`pycairo`, `numpy`,
-`pyarrow`). It is spliced in after IHDR, where a reader looking for a copyright expects
-one, rather than after however many megabytes of IDAT. `tEXt` is Latin-1 and covers the
-copyright sign, so it covers the credit as it stands; a publisher whose name is not
-Latin-1 is one `config.FEEDS` entry away, so an unencodable value widens to `iTXt`
-(UTF-8) rather than raising a `UnicodeEncodeError` in the middle of a render. An SVG
-gets a Resource Description Framework (RDF) `<metadata>` block of Dublin Core elements
-inserted after the opening `<svg>` tag, the same four fields mapped through
-`_DC_ELEMENTS`.
-
-**The caption is drawn once, in the serial parent, after every band has been pasted
-in.** That is the banding trap: laid down inside `_draw_band` it would appear once per
-band, and each band would clip it to its own rows. It is also why the captions are the
-last thing to touch the surface — they composite with OVER, and the additive (`density`)
-and screening (`strands`) styles would otherwise take the text as light to accumulate.
-It reads the projection for a canvas size and nothing else: no weight scale, no window,
-no band collar, so a credited render draws the same map as an uncredited one.
-`spectrum`'s rule about never simplifying its geometry does not reach it, because a
-caption is drawn and not geometry.
-
-**One line per thing credited, so two lines**, bottom left, below the user's own
-caption, at `width_px / 220` against the canvas and shrunk further to fit between the
-margins. It drops the licence URIs through `config.credit_lines(links=False)`, the same
-builder as `credit_text` rather than a second string, because a URI in 7px text is
-unclickable, doubles a line that has to fit across the canvas, and is spelled out in
-full in the same file's metadata. **No floor on the shrinking**, for the reason
-`density`'s line widths have none: a thumbnail should look like the render reduced, and
-text that holds its point size while the canvas halves is the same mistake as a stroke
-width that does. Below a few hundred pixels it is a grey mark rather than a readable
-line, and the metadata is what carries the obligation at that size.
-
-`credit` reaches the `/art` cache key, because a credited render and a plain one are
-different pictures and an ETag covering both would hand out one for the other. The whole
-arrangement turns on a single asymmetry: a caption is a decision about a picture and
-belongs to whoever is publishing it, while the metadata is a fact about the file and
-belongs in every one of them.
+Every `/art` error is JSON, and the message is the interface. `send_error` writes an
+HTML page, which an `<img>` renders as a broken-image icon with the reason nowhere
+anyone can see it. A lat,lon-swapped window is the case that cannot raise, being a
+legal window that draws nothing, so it comes back 200 with `X-Wayfare-Warning`. There
+is still no spatial index on `edges`, so a national window reads the whole table over
+HTTP as much as on the command line; the serialisation and the queue limit are the only
+protection.
 
 ## The studio page
 
-**The preview is measured from the stage, not guessed at from the viewport.** It used to
-be a fraction of `innerWidth` capped at 1,400px, and a cap is what leaves empty ground: an
-`<img>` only ever shrinks to its container, so on a wide screen the render sat in the
-middle of a much larger panel. `fitWidth` takes the frame's box and the window's own
-aspect — through `canvasHeight`, which is the server's arithmetic — so the picture is
-drawn at the size it is displayed at. Cardiff on a 2,200px screen went from a 1,842x1,849
-render shown inside an 1,842x1,112 box to a 1,108x1,112 one drawn 1:1. A typed width
-switches the fitting off (`previewWidthAuto`) and is the only width that reaches a shared
-link, since an automatic one is the sender's screen rather than a decision.
+[`art.html`](../web/art.html), at `http://localhost:8099/art.html`, is the page for
+iterating on a design. It drives `/art` from controls built out of `/art/meta`: style, area
+or hand-drawn window, the whole query spec, the colour and line knobs, a caption, the credit
+checkbox, and PNG and SVG download links. Only what differs from the defaults reaches the
+URL hash, so a shared link says what was changed. It loads `vendor/maplibre-gl.js` and
+`vendor/pmtiles.js` from disk, like the viewer does, so no content delivery network is
+involved.
 
-**A percentage height against an implicit grid track silently becomes `auto`.** `.frame`
-was `display: grid; place-items: center` with no `grid-template`, so its row was
-content-sized and therefore indefinite, and both `max-height: 100%` and `height: 100%` on
-the picture resolved to nothing. A render taller than the panel hung out of the bottom of
-it, scrolled to the top, which reads as a cropped and off-centre picture rather than as a
-layout bug. `grid-template: minmax(0, 1fr) / minmax(0, 1fr)` is the definite version.
-Found by measuring the computed boxes in a headless Chrome rather than by reading the CSS:
-the img reported its natural 1,849px height inside a 1,112px frame, which no reading of
-`max-height: 100%` would have predicted.
+While a control is being dragged the page asks for `sample=8` and labels the pass, then
+follows it with the real one, because a preview is only cheap if it draws fewer edges.
+The preview width is measured from the stage rather than guessed at from the viewport:
+`fitWidth` takes the frame's box and the window's own aspect through `canvasHeight`,
+the server's arithmetic, so the picture is drawn at the size it is displayed at.
+Cardiff on a 2,200px screen went from a 1,842x1,849 render shown inside an 1,842x1,112
+box to a 1,108x1,112 one drawn 1:1. A typed width switches the fitting off and is the
+only width that reaches a shared link, since an automatic one is the sender's screen
+rather than a decision.
+
+## How long a render takes
+
+A render costs per edge and per vertex, never per pixel. Over a synthetic 1M edges,
+`density` took 52.7s at 900px and 59.0s at 4,000px — a 20x cut in pixels bought 11%,
+because the cost is cairo tessellating round joins and caps once per *vertex*. A
+smaller preview is therefore not a cheaper one, which is the whole reason `sample`
+exists. `QuerySpec.sample=n` adds `hash(edge_id) % n = 0` to the window CTE and is
+linear: 1/8 takes `density` from 50.5s to 6.6s. It hashes rather than randomises so a
+preview is reproducible and does not flicker as it redraws. Alpha is compensated
+linearly, but the core pass already runs at alpha up to 0.90, so 8x pins it at 1.0 and
+the preview comes back at about 62% brightness.
+
+A render is drawn in horizontal bands, one process each, and the output is
+byte-identical to the serial path. Measured over the `uk` window on the real 2.75M-edge
+database at 2,000px: `density` 77–98s to 28–32s, `spectrum` 58–67s to 21–31s, `strands`
+71–72s to 37–40s; at 4,000px `density` 98s to 42s. Byte-identity was verified for all
+three styles and on the awkward canvases — letterboxed, `scale=3`, filtered, sampled,
+`line_scale=6`. `strands` gains least, because its cost is the (service, edge) fan-out
+rather than vertices.
+
+`default_workers` reads the worker count off the cgroup rather than `os.cpu_count()`,
+which reports the host's cores and not the render service's quota.
+`WAYFARE_RENDER_WORKERS` overrides it. Each band also does `SET threads=1`, because
+DuckDB defaults to a thread per core *per process* and eight bands would put sixty-four
+threads on eight cores.
+
+It counts physical cores rather than hardware threads, and that is measured. On the
+four-core, eight-thread box that serves this, `uk` `density` at 2,000px is 78.1s on one
+worker, 44.9s on two, 26.9s on four, 27.2s on six, 28.1s on eight, 30.9s on twelve,
+33.2s on sixteen and 37.5s on 24. Speed-up tops out at 2.90x, at the core count rather
+than the thread count, because tessellating round caps is ALU- and branch-bound and
+leaves no memory stalls for a sibling thread to fill. The 4.6% between eight workers
+and four is the smaller half of the reason to stop at four; eight interpreters and
+eight DuckDB connections against the container's memory limit is the half that bites.
+`_physical_cpus` reads `/proc/cpuinfo` and returns None where that file is absent, so
+the logical count stands elsewhere.
+
+Banding declines rather than fails, and the cases are SVG (nothing to paste),
+`render(edges=...)` (the list lives in the parent), a window under `MIN_BAND_EDGES` of
+150,000, and a connection a worker could not reopen. Spawning a worker costs about a
+second whatever the picture, so Cardiff at 1,200px is 0.75s serial and banding made it
+twice as slow. The count comes from the render's own `WHERE`, so a spec filtered to one
+road class does not start eight processes for a tenth of a second's work.
+
+Memory is bounded rather than proportional to the window. Peak RSS on the `uk` window
+is 259 MB for `density` and 312 MB for `strands`, down from 479 MB and 617 MB before
+the streaming rewrite. What still grows is DuckDB's own aggregate, which spills to disk
+rather than failing.
+
+## Line widths and canvas size
+
+A stroke width fixed in pixels is a different picture at every canvas size. The map
+shrinks with the canvas and the lines do not, so the same window at 1,600px carries the
+4,000px line weight over 40% of the road length, and `density` then clips to white
+through every town centre. That is why the `/art` default at 1,600px looked nothing like
+the command line's 4,000px. `draw_density` quotes its widths against `DENSITY_REF_PX`
+(2,000) and multiplies by `width_px`; the ramp constants were halved to match, and
+halving then doubling is exact in binary, so the 4,000px render is byte-identical to the
+one before the change while every smaller canvas gets proportionally lighter. There is
+no floor, because a small canvas *should* draw hairlines. `spectrum` and `strands` still
+hold their widths in pixels, which is defensible only because neither stacks light
+additively.
+
+`Style.max_line_px` therefore has two regimes and `ref_px` is which one. The field
+exists for banding: a band draws and queries a *collar* past its own rows, half the
+widest stroke plus two pixels, so no stroke is cut at a raster boundary. Left `None`,
+`max_line_px` is absolute pixels and the collar is fixed — `spectrum` at 4.0, `strands`
+at 3.9. Set, it means pixels at a canvas `ref_px` wide and the collar scales with
+`width_px`, which is `density` at `max_line_px=9.5`. Getting it wrong is a one-sided
+fault: a collar wider than the stroke only costs work, so the old fixed 19.0 was merely
+wasteful below 4,000px and silently broken above it, crossing over at 4,842px with
+`line_scale=1`. An edge whose centreline falls past the collar is never fetched, so the
+paint it owes the band is simply absent, and every banding test drew at 150 or 200px and
+passed.
+
+## Provenance
+
+Every render carries its credit in the file's metadata, unconditionally, and the
+visible caption is opt-in. That is two mechanisms rather than one, deliberately.
+Metadata costs nothing, cannot alter the picture, and means every render leaving the
+server carries its provenance even where nobody thought about it. A credit burned into
+a corner *is* a change to the artwork, and the person who knows whether an image is
+going somewhere public is the one asking for it — hence `RenderOpts.credit`, `wayfare
+art --credit` and `credit=1` on `/art`.
+
+What leaves the machine is a derivative work of the publisher's timetable data and of
+Open Database License (ODbL) road geometry. Which timetable licence applies follows the
+region: `config.feed()` with no region returns the Bus Open Data Service (BODS) feed
+under Open Government Licence v3.0 (OGL), so that is what a default render owes.
+Creative Commons Attribution 4.0 (CC BY 4.0) covers only the Republic's National
+Transport Authority feed. The ODbL credit is conditional on the render holding matched
+road or traced track.
+
+Four fields go in. `Title` is "wayfare density: cardiff", `Description` carries the
+window as `minlon,minlat,maxlon,maxlat`, `Software` is "wayfare" bare, and `Copyright`
+is `config.credit_text()`. Style and window are in there because a render that has been
+through a chat client and back is otherwise a picture of somewhere nobody can name. The
+feed version was left out: it would make a render's bytes a function of when the
+timetable was downloaded rather than of what was asked for.
+
+Nothing in the metadata may move, because renders are asserted byte-identical run to
+run: no timestamp, no hostname, no output path and no version string, which is why
+`Software` is the bare name. `test_the_metadata_holds_nothing_that_moves` checks all
+four fields for a date, a year, a dotted version and the output path.
+
+pycairo writes neither format's metadata, so both are post-processes on finished bytes.
+The PNG `tEXt` chunk is written by hand and spliced in after IHDR, where a reader
+looking for a copyright expects one; an unencodable publisher name widens it to `iTXt`
+(UTF-8) rather than raising in the middle of a render. An SVG gets a Resource
+Description Framework (RDF) `<metadata>` block of Dublin Core elements after the
+opening `<svg>` tag.
+
+The caption and the credit are drawn once, in the serial parent, after every band has
+been pasted in. Laid down inside `_draw_band` they would appear once per band, each
+clipped to its own rows, and they have to be the last thing to touch the surface
+because they composite with OVER — the additive and screening styles would otherwise
+take the text as light to accumulate.
+
+The credit is one line per thing credited, bottom left, below the user's own caption.
+It starts at `max(CREDIT_MIN_PX, proj.width / CREDIT_REF_PX)` — 6.5px, or `width_px`
+over 220 where that is larger — so a narrow canvas begins at 6.5px rather than at a
+fraction too small to see. That starting size is then shrunk to fit between the margins,
+and *that* shrink has no floor, for the reason `density`'s line widths have none: a
+thumbnail should look like the render reduced, and the metadata carries the obligation
+once the text is a grey mark. The licence URIs are dropped through
+`config.credit_lines(links=False)`, because a URI in 7px text is unclickable and is
+spelled out in full in the same file's metadata. `credit` reaches the `/art` cache key,
+since a credited render and a plain one are different pictures.
+
+## Design notes
+
+These are the constraints the code is shaped by. Each was a bug before it was a rule.
+
+**Nothing holds a whole window or a whole table.** `Window` pulls geometry in chunks of
+20,000 rows, because holding every edge cost 439 MB for the `uk` preset on Wales alone
+and the country is about 25x Wales. It arrives from DuckDB as Arrow rather than as rows:
+materialising an `INTEGER[]` column over the row protocol builds a list object per edge
+and an int object per vertex, and dropping that took London's data path from 852ms to
+198ms.
+
+**Only queries that produce drawn geometry may be sampled**, plus the band-cut count
+that has to agree with them. Everything statistical reads the *unsampled* window, which
+is why `grouped_query` thins on its final SELECT rather than in the shared CTE that
+`gstat` is built from, and why `bounds_query` reproduces `Weights.over`'s rank
+convention rather than using `quantile_disc`, whose interpolation would shift a render's
+contrast invisibly.
+
+**Every query the render path streams needs an ORDER BY with a unique tiebreak**, even
+where the order looks irrelevant. DuckDB's parallel hash join returns rows in a varying
+order — third-party behaviour, and enough to make `density` to SVG produce four distinct
+outputs in four runs on real data. PNG hid it completely, because cairo's ADD is
+saturating and therefore commutative. Test that the order is *defined* rather than that
+two runs agree.
+
+**Two scales must be the window's and never the band's.** `Weights` is injected into
+each band, and so are the group statistics through `Source.groups`, registered as an
+Arrow table because inserting 20,000 rows through bound parameters would cost seven
+seconds a band. Width being per-band is visibly wrong; draw order is the subtle one,
+because SCREEN is commutative in real arithmetic and *rounds* in eight-bit, so
+reordering moved 2.8% of the pixels by up to 4/255.
+
+**Which cairo is installed decides whether an SVG is vectors or one embedded raster**,
+which is libcairo's behaviour rather than `art`'s. The dev shell's 1.18.4 writes all
+three styles as real `<path>` strokes; the shipped image's 1.16.0 writes `spectrum` as
+35,188 paths and falls back to a single `<image>` for `density` and `strands`, since
+cairo cannot express ADD or SCREEN in SVG. So a stroke-order bug is invisible in a 1.16
+`density` SVG, and two SVGs from one 1.16 process never compare equal even with
+identical pixels, because the fallback names its elements from a process-wide counter.
+
+**Bands cut on edge count, spawn rather than fork, and paste only their middles.**
+Equal-height bands put 1,307,069 of 2,746,261 edges into one of eight, so latitude
+quantiles took the same render 37s to 27s. DuckDB's background threads do not cross a
+fork, so a forked child dies on first use as a `BrokenProcessPool` with no traceback.
+And a stroke clipped at a raster boundary does not always re-add to the whole shape's
+coverage in cairo's 24.8 fixed point, so each band draws a discarded margin.
+
+**Round caps are what a render costs.** Replaying the `uk` window through cairo, butt
+caps and mitre joins take 55.4s to 25.5s, because at national scale an edge has already
+simplified to 2.08 vertices and nearly every stroke is one tiny segment with two round
+caps. Coarser tolerance and `Antialias.FAST` buy a further quarter each and are not
+taken, since they change the picture where banding does not.
+
+**Optimise the drawing, not the query — and the quarter that is not cairo was never
+scanning.** It was DuckDB rows becoming Python objects, which is why clustering `edges`
+moved 14ms while changing how the rows are fetched moved 650ms. Three changes bought
+time, together taking 53.2s to 25.8s: `simplify_px` drops vertices within half a pixel
+of the last one kept, `density` draws its halo and core in one walk, and
+`Projection.batch` projects a whole fetch with numpy at once. `spectrum` is exempt from
+simplification and must stay so, since half a pixel of tolerance moved 74% of its output
+bytes. Four other read-path changes were tried and rejected: a Parquet extract of the
+window, which made a filtered spec *slower* at 37 ms to 101 ms; temp tables for the
+shared `_grouped_base` CTEs, worth about 48ms of a 3.6s render; 128 cairo state-change
+buckets, 50.2s to 45.6s; and a bounding box on `edge_services`, covered in
+[docs/pipeline.md](pipeline.md).
+
+**Coalescing is not picture-preserving for `density`, which is why it is off by
+default.** Two edges meeting end to end each lay a round cap at the shared node and ADD
+counts the overlap twice, so the junction pixel drops 200 to 108 at mid-weight while
+mid-edge is unchanged to the byte. The halo pass matters more than the junction dot:
+consecutive halos overlap along the *whole* road, so coalescing drops mean brightness to
+82% on a Cardiff crop and 63% on a West End one, with the lit footprint unchanged.
+Compare at matched exposure — `alpha_scale` about 1.35 for Cardiff, 1.9 for London — or
+the judgement is about the exposure. What it buys is speed: serial `density` at 4,000px
+goes 0.88s to 0.73s over Cardiff and 5.05s to 2.54s over London. The parent ships the
+chain assignment through `Source.chains`, because a band inferring it from its own
+collar sees a fork as a through node.
+
+Most of what is written down here began as a picture that looked right and was not — a
+seam at a band edge, a glow that turned out to be an artefact of how finely Valhalla
+chopped the road, an SVG that differed from itself between two runs. Drawing the
+geometry and looking at it is still the only check that catches those, and every number
+above exists because looking came first.

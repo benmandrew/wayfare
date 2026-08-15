@@ -333,9 +333,9 @@ def build_patterns(
 
     con.execute(
         """
-        -- Columns are named rather than positional. They used to be positional,
-        -- which meant adding one to the middle of the table silently shifted every
-        -- value after it into the wrong column.
+        -- Columns are named rather than positional, so a column added to the middle
+        -- of `patterns` leaves this insert correct. Positionally, it would silently
+        -- shift every value after the new column into the wrong one.
         INSERT INTO patterns (
             pattern_id, route_id, agency_id, short_name, direction, shape_id,
             n_stops, n_trips, span_m, mode, first_seen, last_seen

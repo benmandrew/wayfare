@@ -76,11 +76,11 @@ COMPRESSIBLE = frozenset(
 )
 COMPRESS_MAX = 1 << 20
 
-# How many compressed bodies to keep. Compressing was being done per request, and
-# it is not cheap: the vendored maplibre build is 784 KB and takes 15.8 ms of CPU
-# to gzip, against 0.04 ms to read off disk and hand to the socket. The page loads
-# the same five or six files every time, so essentially all of that was spent
-# producing bytes gzip had already produced moments earlier.
+# How many compressed bodies to keep. Compressing per request is not cheap: the
+# vendored maplibre build is 784 KB and takes 15.8 ms of CPU to gzip, against
+# 0.04 ms to read off disk and hand to the socket. The page loads the same five or
+# six files every time, so nearly all of that goes on producing bytes gzip has
+# already produced moments earlier.
 #
 # A count rather than a byte budget, because `_gzip_wanted` already refuses
 # anything over COMPRESS_MAX: sixteen entries is a 16 MB ceiling by construction
@@ -797,9 +797,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     # to arrive after the peer's acknowledgement does not.
     disable_nagle_algorithm = True
 
-    # A connection now holds a thread for its whole life rather than for one
-    # request, and ThreadingTCPServer is thread-per-connection and unbounded, so an
-    # idle browser tab would otherwise pin a thread indefinitely. The stdlib applies
+    # Keep-alive holds a thread for the whole life of a connection, and
+    # ThreadingTCPServer is thread-per-connection and unbounded, so an idle browser
+    # tab would otherwise pin a thread indefinitely. The stdlib applies
     # this to the socket in `setup()` and turns the resulting timeout into a closed
     # connection in `handle_one_request`.
     #
@@ -1061,10 +1061,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
         first, last = m.group(1), m.group(2)
         # `bytes=-` matches the pattern -- both halves are `\d*` -- and names no
-        # range at all. It used to fall into the suffix branch below and raise
-        # ValueError out of `int("")`, which under HTTP/1.0 cost one aborted
-        # connection and a traceback. On a connection the client means to reuse it
-        # is worth more than that, so it joins the other malformed spellings.
+        # range at all, so it belongs with the other malformed spellings and gets a
+        # 400. Left to the suffix branch below it raises ValueError out of `int("")`,
+        # which costs a traceback and an aborted connection the client means to reuse.
         if not first and not last:
             f.close()
             self.send_error(400, "malformed Range")

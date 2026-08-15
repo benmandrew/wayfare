@@ -419,11 +419,9 @@ def write_ways(con: duckdb.DuckDBPyConnection, relations: list[osm.Relation]) ->
 def prune_ways(con: duckdb.DuckDBPyConnection) -> int:
     """Drop the ways no trace runs over any more.
 
-    The blanket delete `write_ways` used to open with, expressed against what the
-    table is actually for. A way is drawn because some pattern's geometry runs over
-    it, so a way no `traces` row names is drawn by nothing -- a relation retired
-    from OpenStreetMap, or one that stopped chaining, or a line the mode selection
-    no longer admits.
+    A way is in the table because some pattern's geometry runs over it, so a way no
+    `traces` row names is drawn by nothing -- a relation retired from OpenStreetMap,
+    or one that stopped chaining, or a line the mode selection no longer admits.
 
     Against `traces` rather than against live patterns, because that table is a
     permanent cache and a departed service's row stays in it: the way is still the

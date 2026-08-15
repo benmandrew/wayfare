@@ -308,8 +308,8 @@ def simplify(pts: list[tuple[float, float]], tol: float) -> list[tuple[float, fl
 
     A Valhalla directed edge averages 4.14 coordinates over tens of metres, so at a
     preview width most of an edge is smaller than a pixel and collapses to its two
-    endpoints. That matters because the cost of a render turned out to be cairo
-    tessellating joins and caps once per vertex -- not per pixel, and not per stroke.
+    endpoints. That matters because cairo's cost is tessellating joins and caps once
+    per vertex -- not per pixel, and not per stroke.
     Over a million edges this drops 64% of the vertices and 30% of the draw time,
     for a difference in 0.05% of the output bytes.
 
@@ -442,9 +442,9 @@ class Edge:
 #
 # What a style paints is one half of a render; the other half is which edges are in
 # frame, what scalar drives the ramps, and what a "group" means. That second half
-# used to be hard-coded -- traffic, and groups are services -- and it is the half
-# that reaches pictures no paint knob can: the same three styles grouped by operator
-# or filtered to one road class are genuinely different maps.
+# lives in the spec because it is the half that reaches pictures no paint knob can:
+# the same three styles grouped by operator or filtered to one road class are
+# genuinely different maps.
 #
 # It is exposed as a closed vocabulary rather than a query language. Substituted text
 # is only ever a value looked up in one of the dicts below; anything the caller
@@ -511,8 +511,8 @@ CHAIN_VIEW = "wf_chain"
 class QuerySpec:
     """Which edges, weighted how, grouped by what.
 
-    Defaults reproduce the original hard-coded query exactly, so a render that does
-    not ask for anything is byte-identical to one from before this existed.
+    Defaults reproduce the plain traffic-by-service query exactly, so a render that
+    does not ask for anything is unaffected by the spec.
     """
 
     weight: str = "trips"
@@ -598,11 +598,9 @@ class Source:
     query builder, and the bbox predicate is applied either way, so correctness never
     depends on the substitute being exactly right -- only speed.
 
-    A Parquet extract of the window was the substitution this was built for, and it
-    was measured and dropped: against 4.2M edges it moved a Cardiff render from
-    2347ms to 2320ms, because the scan is not where the time goes. A density render
-    is 75% cairo, and the whole database scan is a quarter of the rest. Anything
-    plugged in here can only ever address that quarter.
+    What a substitution can win is bounded, and narrowly. A density render is 75%
+    cairo, and the whole database scan is a quarter of the rest, so anything plugged
+    in here can only ever address that quarter.
     """
 
     edges: str = "edges"
@@ -636,9 +634,9 @@ DEFAULT_SOURCE = Source()
 class _Sql:
     """The query skeleton, with its holes filled from the spec.
 
-    One builder rather than module-level f-strings, because the holes are no longer
-    independent: a filter decides a join type, and the group key decides which table
-    the strand queries group on.
+    One builder rather than module-level f-strings, because the holes depend on each
+    other: a filter decides a join type, and the group key decides which table the
+    strand queries group on.
     """
 
     def __init__(self, spec: QuerySpec, source: Source, bbox: Sequence[int]) -> None:
@@ -768,9 +766,9 @@ class _Sql:
         #
         # Which order hardly matters -- no style whose geometry comes through here
         # draws differently for it -- so it is edge_id, matching the tiebreak above.
-        # It costs a sort the scan did not previously pay for: measured on the real
-        # databases at +1.2 ms over cardiff, +10.1 ms over `uk` and +9.1 ms over
-        # London, against renders of 0.4 s to 4.4 s. Reproducibility is worth 0.2%.
+        # The sort is what it costs: +1.2 ms over cardiff, +10.1 ms over `uk` and
+        # +9.1 ms over London on the real databases, against renders of 0.4 s to
+        # 4.4 s. Reproducibility is worth 0.2%.
         order = (
             "ORDER BY coalesce(svc.weight, 0), win.edge_id"
             if by_weight
@@ -1200,9 +1198,9 @@ class Window:
     def edges(self, *, by_weight: bool = False) -> Iterator[Edge]:
         """Every edge whose bbox overlaps the window.
 
-        `by_weight` orders quietest first in SQL, which is what `spectrum` used to
-        get by sorting the whole list in memory. The weight is monotonic in the trip
-        count, so ordering by one orders by the other.
+        `by_weight` orders quietest first in SQL, because `spectrum` needs that order
+        and nothing here may hold the whole window to sort it. The weight is monotonic
+        in the trip count, so ordering by one orders by the other.
         """
         query, params = self.sql.edges_query(
             with_groups=self.with_groups, by_weight=by_weight
@@ -2187,8 +2185,11 @@ def _captions(
 # --- Provenance -------------------------------------------------------------
 #
 # Every render carries its credit whether or not anyone asked for one: an image
-# served over HTTP leaves this machine, and a picture drawn from CC BY timetables
-# and ODbL road geometry that says so nowhere is an uncredited derivative work.
+# served over HTTP leaves this machine, and a picture drawn from timetables under
+# attribution and ODbL road geometry that says so nowhere is an uncredited
+# derivative work. The timetable's licence varies by region -- OGL v3.0 for BODS
+# and Translink, CC BY 4.0 for the Republic's NTA feed -- so the text comes from
+# `config.credit_text()` rather than being named here.
 # Metadata costs nothing, cannot alter the picture, and needs no flag. The visible
 # caption above does alter the picture, so that one is opt-in.
 #
@@ -2398,9 +2399,9 @@ def _physical_cpus() -> int | None:
 
     Linux only, and deliberately: it reads the distinct `core_id`/`physical_id`
     pairs out of `/proc/cpuinfo`, which is where the render actually runs. Anywhere
-    else this returns None and the logical count stands, which is the old
-    behaviour -- over-counting costs a few percent, and guessing wrong in the other
-    direction would leave half the box idle.
+    else there is no reliable physical count, so this returns None and the logical
+    count stands -- over-counting costs a few percent, and guessing wrong in the
+    other direction would leave half the box idle.
     """
     try:
         text = Path("/proc/cpuinfo").read_text()

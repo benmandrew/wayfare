@@ -5,9 +5,9 @@ runtime.
 
 | File | Version | Licence |
 |------|---------|---------|
-| `maplibre-gl.js` | 4.7.1 | 3-Clause BSD |
-| `maplibre-gl.css` | 4.7.1 | 3-Clause BSD |
-| `pmtiles.js` | 4.4.1 | 3-Clause BSD |
+| [`maplibre-gl.js`](maplibre-gl.js) | 4.7.1 | 3-Clause BSD |
+| [`maplibre-gl.css`](maplibre-gl.css) | 4.7.1 | 3-Clause BSD |
+| [`pmtiles.js`](pmtiles.js) | 4.4.1 | 3-Clause BSD |
 
 The page is normally served on a private network. Loading these from `unpkg.com`
 made a public CDN a hard runtime dependency of a deployment that otherwise has

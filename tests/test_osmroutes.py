@@ -271,8 +271,8 @@ def test_two_writers_both_reach_the_table(seeded):
 
 
 def test_a_way_no_trace_runs_over_is_pruned(seeded):
-    """What the blanket delete used to do, said against what the table is for: a
-    way is drawn because some pattern's geometry runs over it."""
+    """A way is in the table because some pattern's geometry runs over it, so one
+    named by no `traces` row is drawn by nothing and is dead weight."""
     osmroutes.write(seeded, osmroutes.candidates([relation()])[0])
     osmroutes.write_ways(seeded, [relation()])
     osmroutes.write_ways(seeded, [relation(ways=[way(99, [(50.0, 0.0), (50.1, 0.0)])])])

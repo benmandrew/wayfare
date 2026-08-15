@@ -284,13 +284,13 @@ def _traced(con: duckdb.DuckDBPyConnection, live: str) -> dict[str, object]:
     funnel counts matchable patterns, and every pattern counted here is one Valhalla
     will never be asked about. Folding an unresolvable relation into
     `patterns_pending` would put a permanent floor under the number
-    `deploy/refresh.sh` gates a publish on, which is exactly the mistake the mode
-    filter already made once.
+    `deploy/refresh.sh` gates a publish on, and stop a scheduled region publishing
+    again for good.
 
     A database with no `trace_status` table reports nothing rather than raising.
-    `status` connects read-only, so a data root that has not been opened for writing
-    since this stage landed still has the old schema -- the same trap `db.matchable`
-    carries a connection to survive.
+    `status` connects read-only and `connect` runs `migrate` only when it is not, so
+    the table may be absent from a data root this stage has never written to -- the
+    same trap `db.matchable` carries a connection to survive.
     """
     if not db.table_exists(con, "trace_status"):
         return {}
@@ -346,8 +346,8 @@ def build_track_services(con: duckdb.DuckDBPyConnection) -> int:
     1,040 coincident polylines, and a way of the Victoria line now carries its
     service list the way a road carries its buses.
 
-    `mode` is in the key because the layer is no longer heavy rail alone and a way
-    is painted by its mode. It also keeps two networks over one alignment apart --
+    `mode` is in the key because the layer carries several modes and a way is
+    painted by its mode. It also keeps two networks over one alignment apart --
     the Elizabeth line and the National Rail service beside it are two rows, drawn
     twice, which is the one coincidence worth keeping.
 
