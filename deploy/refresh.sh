@@ -124,5 +124,5 @@ wayfare cluster
 # its own name, and three of them are served from one directory. Without the flag
 # `publish` writes bus.pmtiles, which is the name nothing here serves -- and it
 # refuses outright rather than writing it, so a refresh without this cannot finish
-# at all. It exited here on 2026-08-12, which is how long the flag had been missing.
+# at all.
 wayfare publish --name-by-region

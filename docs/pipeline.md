@@ -1,1071 +1,636 @@
 # Pipeline
 
-Seven stages, each reading what the last wrote, each independently re-runnable:
+An operator's reference. Each section covers one stage: what it does, how to run it, the
+flags that change the outcome, what it costs, how it fails and whether it is safe to
+interrupt.
+
+The stages run in this order, each reading what the last one wrote:
 
     acquire  -> raw downloads
-    patterns -> 1.55M trips collapse to distinct ordered stop sequences
+    patterns -> trips collapse to distinct ordered stop sequences
     match    -> Valhalla; the stage that runs for a day or two
-    trace    -> OSM route relations for the modes with no road and no shape
-    routes   -> OSM route relations as services, for the modes with no timetable
+    trace    -> OSM route relations as geometry for patterns with none
+    routes   -> OSM route relations as services, for modes with no timetable
     aggregate-> invert pattern->edges into edge->services
     publish  -> GeoJSONL -> tippecanoe -> PMTiles
 
+`acquire` is covered in [docs/data.md](data.md) and `art` in
+[docs/rendering.md](rendering.md). `wayfare all` chains acquire, patterns, match, trace,
+aggregate and publish. It does not run `routes`, which is invoked on its own or from
+[`deploy/refresh.sh`](../deploy/refresh.sh). Every stage checkpoints, and an interrupt is
+caught and reported; re-running the same command resumes.
+
 ## patterns
 
-**A pattern is the unit of work.** Grouping trips by `(route_id, direction,
-ordered stop sequence)` is what makes national scale affordable — most trips are
-the same physical journey repeated through the day.
+**What it does.** Reads the unpacked General Transit Feed Specification (GTFS) feed from
+`work/gtfs` and groups trips by `(route_id, direction, ordered stop sequence)`. Most trips
+are one physical journey repeated through the day, so this collapse is what makes national
+scale affordable. It writes `patterns`, `pattern_stops`, `routes`, `stops` and `shapes`,
+and rebuilds `meta.modes`.
 
-**`pattern_id` is an identity hash, not a popularity rank.** It used to be
-`row_number() OVER (ORDER BY count(*) DESC)` in `gtfs.py`, recomputed every run, so
-a journey got a different id whenever some other route gained a trip. `patterns`
-also did `DELETE FROM patterns` while leaving `match_status` and `pattern_edges`
-alone, so a second run against an existing database would have silently re-pointed
-matched edges at the wrong patterns. Nobody had hit it because each region so far
-used a fresh data root. It is now `hash(route_id || direction || ordered stop ids)
->> 1` cast to BIGINT — the shift keeps it inside a signed BIGINT — built by
-`db.pattern_id_sql`. Nothing that varies between feeds may enter the identity: not
-trip counts, not shape ids, not operator, or the cache misses.
-`gtfs._check_unique_ids` refuses to build on a collision rather than merging two
-patterns.
+    wayfare patterns
+    wayfare patterns --modes bus,coach,tram --memory 12GB
 
-**`match_status` is a permanent cache keyed on pattern identity**, not a per-run
-table. `patterns` carries `first_seen`/`last_seen` feed-version columns and merges
-rather than deletes. A pattern that leaves the timetable keeps its row and its
-match results; a seasonal service that returns is already matched and costs
-nothing. Every consumer of `patterns` filters on `db.current_feed()` — match work
-selection, aggregate, coverage, prune and shape loading — so departed patterns are
-never matched, aggregated or rendered.
+**Flags.** `--modes` is a comma-separated selection out of `config.MODES`, defaulting to
+whatever this database was last built with. The selection lives in `meta.modes`, never in
+the invocation, so [`deploy/refresh.sh`](../deploy/refresh.sh) passes none and inherits the
+stored set. Narrowing it retires the deselected patterns, because rebuilding against the
+feed already on disk leaves them live. `--memory` overrides `WAYFARE_MEM`, itself 8GB.
+`--upgrade-shapes` re-matches patterns matched from bare stops that have since gained
+operator geometry.
 
-**Old databases migrate in place; they are not re-matched.**
-`db._migrate_pattern_ids` recovers each pattern's identity from the `pattern_stops`
-rows already stored and renumbers `patterns`, `pattern_stops`, `match_status` and
-`pattern_edges` together. It aborts loudly on a collision or on a pattern whose
-stops are missing. A national match run costs a day or two, so every migration must
-be a rewrite rather than a re-run.
+**Cost.** Minutes. London's feed, 480,412 trips over a 1.5 GB `stop_times.txt`, collapses
+17,611,239 stop times in 6 seconds inside an 8 GB limit. `stop_times.txt` is 5.09 GB
+nationally.
 
-**The number that decides everything is *feed churn*** — how many patterns are new
-from one feed to the next — and it is now measured. Two Wales feeds two days apart,
-`20260806_023912` then `20260808_024504`, took 3,584 patterns to 3,541. `patterns`
-logs new / carried over still unmatched / departed every run: 30 new, 0 carried over
-still unmatched, 73 departed, and 3,584 − 73 + 30 = 3,541 closes the accounting
-exactly. `wayfare status` then reported `patterns_pending` 30 and
-`patterns_departed` 73. Catching up cost 30 patterns at Wales's measured 3.6/s,
-about 8 seconds, against 16m23s for the original full run. That is a two-day delta
-on one region rather than a month across the nation; the caveats are in
-docs/results.md.
+**Interrupting.** Safe. The stage is a rebuild, so a killed run leaves the previous
+database and the next run redoes it from the start.
 
-**GTFS ids stay strings.** Route "07" must not become 7, or the join silently loses
-every service with a leading zero. Hence `all_varchar=true` on every `read_csv`.
+**`pattern_id` is an identity hash, not a rank.** It is
+`hash(route_id || direction || ordered stop ids) >> 1` cast to BIGINT, from
+`db.pattern_id_sql`. Nothing that varies between feeds may enter it: not trip counts, not
+shape ids, not operator, or `match_status` misses on every run. `gtfs._check_unique_ids`
+refuses to build on a collision rather than merging two patterns.
+
+**`patterns` merges rather than deletes.** Rows carry `first_seen` and `last_seen` feed
+versions, so a pattern that leaves the timetable keeps its match results and a seasonal
+service that returns is already matched. Every consumer filters on `db.current_feed()`.
+
+**Trips are weighted per week, and `calendar_dates` exceptions are ignored.** `n_trips`
+sums `calendar.txt`'s days-per-week over the pattern's trips. An exception that adds or
+removes a single date is not read, so a service running only on bank holidays is weighted
+as though it ran a normal week. The number is only ever a rendering weight, and nothing
+routes, matches or gates on it.
+
+**What goes wrong.**
+
+- *No unpacked feed.* The stage names the missing `work/gtfs/stop_times.txt` and exits 1.
+  Run `wayfare acquire` first.
+- *An empty `--modes`.* Refused rather than read as "everything", which would build a
+  database with no patterns and report success.
+- *A leading zero lost from a GTFS id.* Route "07" must not become 7. `all_varchar=true`
+  on every GTFS `read_csv` in [`gtfs.py`](../wayfare/gtfs.py) is the only thing stopping it.
+- *A stop outside these islands.* Bus Open Data Service (BODS) carries international
+  coach, so live stops sit between Calais and Warsaw at coordinates that are entirely
+  correct. `config.british_isles_sql` is the boundary, and the whole pattern is dropped
+  rather than the stop.
+
+**Feed churn is small.** Two Wales feeds two days apart, `20260806_023912` then
+`20260808_024504`, took 3,584 patterns to 3,541: 30 new, 73 departed. Catching up cost about
+8 seconds of matching at Wales's measured 3.6 patterns/s, against 16m23s for the original
+full run. That is a two-day delta on one region; [docs/results.md](results.md) has the
+caveats.
 
 ## match
 
-**Valhalla is the only engine that returns OSM way ids from map matching** without
-a custom graph build. `/trace_attributes` exposes `edge.way_id` directly. OSRM
-discards way ids at extract time and can only return node ids; GraphHopper needs
-`osm_way_id` added as an encoded value and the graph reimported.
+**What it does.** Map-matches every pending road pattern onto the Valhalla graph and
+writes `pattern_edges` and `edges`. This is the primary geometry path rather than a
+fallback, because only 48.3% of trips carry a `shape_id` and the split is per-operator and
+all-or-nothing.
 
-**Way ids appear only in Valhalla's native response.** Asking for `format=osrm`
-silently drops them. This is the kind of failure that looks like empty data rather
-than an error.
+    wayfare match
+    wayfare match --max-seconds 1800 --workers 8
+    wayfare match --retry transient
 
-**Valhalla `edge.id` is a GraphId, stable only within one graph build.** It is the
-join key for the whole pipeline, so the OSM extract is pinned for the duration of a
-run (`force_rebuild: "False"` in docker-compose.yml). Rebuild the graph and every
-`edge_id` in the database becomes meaningless. `way_id` is the durable identity;
-keep it. Geofabrik rebuilds daily, so this is not hypothetical.
+**Flags.** `--workers` defaults to `WAYFARE_WORKERS`, itself 6. `--limit N` stops after N
+patterns and `--max-seconds` stops at the next batch boundary, so the budget is a floor on
+run length rather than a ceiling. `--valhalla` overrides the base URL. `--retry` takes
+comma-separated statuses or the alias `transient`.
 
-**A graph rebuild is a full re-match, and is guarded rather than silent.**
-`match.pin_graph` records Valhalla's `tileset_last_modified` in `meta.graph_id` on
-the first run and refuses to add to the database against a different build;
-`--force-graph` overrides. Mixing two GraphId spaces in one table renders fine and
-is wrong. If Valhalla reports no tileset timestamp the guard warns and stands down
-rather than pretending to work.
+**Cost.** Days nationally. Wales measured 3.6 patterns/s over 983 seconds, of which
+roughly 450 seconds went on inserting rather than matching, with Valhalla under 1% CPU
+throughout. Work is handed out `ORDER BY n_trips DESC`, so a partially drained queue has
+already drawn the busiest roads.
 
-**Two matching strategies**, chosen per pattern in `valhalla.Client`:
+**Interrupting.** Safe, and expected. Results commit every `config.CHECKPOINT_EVERY`
+patterns, currently 200, and work is selected by the *absence* of a `match_status` row, so
+a run stopped by the budget is indistinguishable from one that was killed.
 
-- `shape`: operator geometry exists. Dense trace, `map_snap`, one call.
-- `stops`: no geometry. Route the stops with `bus` costing and `break_through`
-  locations to synthesise road geometry, then `edge_walk` that result to recover
-  edges exactly. Two calls. Falls back to `map_snap` if `edge_walk` refuses on a
-  chunk-stitch discontinuity.
+**A batch is both the unit of concurrency and the unit of checkpointing.** A batch still
+in flight is still selectable, so loading the next batch before committing the last hands
+the same patterns out twice. Do not reintroduce pipelining across batch boundaries without
+an in-flight exclusion. `--retry` and `--reclassify-transport` both rewrite `match_status`
+and both land before the first batch loads, for the same reason.
 
-Confidence from the `stops` path is deliberately reported as 0.0, not 1.0: it is a
-guess about which roads the bus takes, not an observation of it, and `edge_walk`
-returns 1.0 by construction.
+**Two strategies, chosen per pattern.** With operator geometry, `shape` submits a dense
+trace to `/trace_attributes` under `map_snap`, one call. Without it, `stops` routes the
+stops with `bus` costing and `break_through` locations to synthesise road geometry, then
+`edge_walk` that result to recover edges exactly, falling back to `map_snap` on a
+chunk-stitch discontinuity. Confidence from the `stops` path is reported as 0.0, since it
+is a guess about which roads the bus takes. Measured against Wales's 3,052 shaped patterns
+with the geometry withheld, the `stops` path has pooled length recall 0.951 and precision
+0.892, so it over-draws by 7.4%, or 1,456 km of phantom road at network level.
 
-**The `stops` path recovers 95.1% of the road an operator trace covers, and the way it
-fails is by inventing.** Wales is 85% `shape`, which makes it ground truth for the
-strategy that has to carry the other half of the country. All 3,052 Wales patterns
-that carry operator geometry and matched ok on the `shape` path were matched *both*
-ways in one run against one live Valhalla — once normally, once with the geometry
-withheld so `match_one` takes the `stops` branch — and the edge sets compared. Pooled
-length recall 0.951, 0.960 trip-weighted; pooled precision 0.892. So the synthesised
-route under-recovers by 4.4% and over-draws by 7.4%, which is 1,456 km of phantom road
-at network level. Invention is the larger error, and bad geometry is worse than
-missing geometry — the entry below. Span predicts quality and stop spacing does not:
-under 2 km scores 0.907 and over 20 km scores 0.959, because a short urban pattern's
-length is dominated by a town centre where one wrong block is a large share of the
-route. That is not reassuring for London, which is entirely `stops` path and entirely
-dense urban. The harness is a census rather than a sample and takes 84 s a pass, so
-re-running it is the cheap way to judge any change to the matcher.
+**Failures are recorded rather than retried, which needs "failed" to mean "impossible".**
+A matcher that retries the unroutable never finishes. Every outcome gets a row.
 
-**`break_through` is wrong wherever a pattern doubles back, and the answer is 50 m
-wide.** Valhalla's `break_through` location type forbids a U-turn at the stop, which
-is what a bus does at an ordinary stop and not what it does on an out-and-back spur.
-Refused the turn, the router replies with a lap of the block: service 86B in Newtown
-routed 24.3 km over a 5.9 km span, was thrown out by the detour guard, and drew
-nothing at all across three patterns. `_location_types` now relaxes the stops
-*between* a stop and its return to plain `break`, which permits the turn without
-asking for one — Valhalla still pays the turn cost. Everything else keeps
-`break_through`, because that is what lets the `edge_walk` second pass recover edges
-exactly.
+    ok               matched, edges kept
+    low_confidence   matched, edges dropped
+    no_route         Valhalla found no path; permanent
+    skipped          a stop gap past the bound, or too few stops
+    error            a bug or a malformed reply; permanent until the code moves
+    transport_error  the request never reached Valhalla; the one retryable status
 
-**The two visits are separate stops tens of metres apart, so an exact coordinate test
-finds none of them.** 86B returns to Montgomeryshire Infirmary 28 m from where it left
-it and to Tan-y-Graig 7 m away, on different NaPTAN ids — the two kerbs of one road.
-`REVISIT_M` is 50 m, wider than a road and well inside the gap between stops — Wales's
-118,676 consecutive pairs are 126 m apart at the fifth percentile, and only 0.38% of
-stop-to-stop-after-next pairs, the closest two the rule can even consider, fall within
-50 m. Adjacent stops are excluded, since those are a junction rather than a turn, and
-so is the first-to-last pair, or every circular in the country would relax end to end.
-1,018 of Wales's 3,584 patterns carry at least one revisit.
+**Permanence is decided by Valhalla's numeric `error_code`, never its English.** Every
+failure arrives as HTTP 400, and `src/exceptions.cc` gives codes 154, 170, 171, 172, 440,
+441, 442, 443 and 444 the same status, so the status line carries no information.
+`valhalla.NO_PATH_CODES` is the set that means no path. An earlier test for
+`"no route" in body.lower()` matched nothing Valhalla ever says, which is why Wales,
+London and Great Britain all hold zero `no_route` rows.
 
-**The fix trades 21 km of real road for 465 km of invented road, and that is the whole
-argument for it.** Measured by re-running the census above with the shipped matcher
-under each rule, paired pattern by pattern in one process against one graph build:
-pooled length recall 0.9513 → 0.9510, trip-weighted 0.9601 → 0.9601, pooled precision
-0.8748 → 0.8802. Phantom road falls 9,309 km → 8,844 km and three patterns stop being
-rejected. Recall alone reads as a loss — 191 patterns improve and 268 regress —
-because the relaxation mostly *removes* road, and removing road can only lower recall.
-The symmetric measures are the ones to read: Jaccard improves on 353 patterns against
-191, the harmonic mean of precision and recall on 354 against 182, and its
-trip-weighted mean goes 0.9212 → 0.9242. Nothing predicts which patterns regress.
-Bucketed by revisit span, by number of revisits and by the fraction of stops relaxed,
-every bucket shows a small negative recall delta and a positive precision delta.
+**A refused connection is `transport_error`, the only status safe to clear unattended.**
+`valhalla.TransportError` is deliberately not a `ValhallaError`, so `match_stops` does not
+retry an `edge_walk` refusal down a dead socket. HTTP 5xx joins it, because codes 102, 203
+and 402 all mean the service is shutting down. Great Britain's national run recorded 462
+error rows of which 262 were transport faults carrying 4,127 trips, all against one host,
+and 227 of those were connection refusals: Valhalla was down or restarting while patterns
+were being handed out.
 
-**Two narrower rules were measured and rejected, and the tempting one is the retry.**
-Relaxing the two visits as well as the stops between them costs 36.6 km of real road
-against 20.8 km for the same phantom saving, and regresses 283 patterns rather than
-268. Applying the relaxation only after the detour guard fires has a blast radius of
-exactly three patterns and no regressions at all, which sounds ideal until the numbers
-land: it rescues the same three 86B patterns and forfeits the entire 465 km of
-precision gain. Three rescues are worth 85 trips. The precision gain is worth 5% of
-every invented metre in Wales.
+**Bad geometry is worse than missing geometry.** A wrong match draws a confident-looking
+line down a road no bus uses. `low_confidence` rows are kept so they are never retried,
+and their edges are dropped. The detour check needs both `MAX_DETOUR_RATIO` (3.0) and
+`DETOUR_SLACK_M` (1,000 m) exceeded, because on a short pattern a ratio alone is
+meaningless, a one-way system around one block tripling a 300 m span.
 
-**Half the named tail is not this bug, and one case was misfiled.** Patterns 1790 and
-1346 route 95.9 km and 26.2 km because stops fall outside the Wales extract, not
-because they double back — 1346 carries no revisit within 50 m at all, and six of its
-ten stops are Gloucestershire ATCO codes. Both are unchanged by the fix and both stay
-rejected, which is correct: `map_snap` on an operator shape degrades gracefully when
-the graph does not cover the route and `break_through` cannot, so the detour guard is
-the only thing standing between a regional extract and 95 km of confident-looking
-phantom. Pattern 1 (Cardiff service 6, 1,360 trips, recall 0.808) is unchanged too. It
-takes Callaghan Square where the bus takes Bute Street, two ways round one block, both
-plausible to a router. Nothing detects that.
+**The stop-gap bound applies to unshaped patterns only.** `config.MAX_STOP_GAP_M` is 180 km,
+derived as `VALHALLA_MAX_DISTANCE_M` (200,000) times `VALHALLA_DISTANCE_HEADROOM` (0.9). The
+reasoning is about guesswork, so it holds for `stops` and not for `shape`: with an operator
+trace there is no routing, and the distance between two timing points says nothing about the
+recording's quality. [`match.py`](../wayfare/match.py) tests `if not p.shape and p.max_gap_m
+> config.MAX_STOP_GAP_M`, and counts shaped patterns over the bound separately. Any figure
+quoted against the older 25 km bound is historic.
 
-**The match stage must survive interruption.** It runs for days on a server that
-may reboot. Work is selected by the *absence* of a `match_status` row. This means
-one batch is both the unit of concurrency and the unit of checkpointing, and they
-cannot be separated: a batch still in flight is still selectable, so loading the
-next batch before committing the last hands the same patterns out twice. This was a
-real bug, caught in testing. Do not reintroduce pipelining across batch boundaries
-without adding an in-flight exclusion.
+**Valhalla's two 200 km limits bite in different places.**
+`service_limits.bus.max_distance` is checked against the straight-line chain through a
+`/route` request's locations; `service_limits.trace.max_distance` is checked along the
+shape a `/trace_attributes` request submits. Road is longer than the line it follows, by
+1.26x and 1.58x on the two long Welsh patterns measured, so a 183.7 km stop chain routes
+without complaint and then fails 154 on the 232.2 km shape that came back.
+`valhalla._chunks` therefore runs twice, on the stops before routing and on the
+synthesised road before walking it. Parts overlap by one point and the merge keeps the
+first occurrence, which loses the tail of one edge's geometry and no edge identity.
 
-**Failures are recorded, not retried, and that needs "failed" to mean
-"impossible".** A pattern whose stops cannot be connected by road will never
-succeed. A matcher that retries it on every restart never finishes. Every outcome
-gets a row: `ok`, `low_confidence`, `no_route`, `skipped` and `error` are all
-permanent, and `transport_error` is the one that is not. Two of the three things
-that used to share `error` were never permanent at all, and the national run is what
-exposed both.
+**A graph rebuild is a full re-match, and nothing reuses matches across builds.**
+Valhalla's `edge.id` is a *GraphId*, valid only within one graph build, and it is the join
+key for the whole pipeline. `match.pin_graph` records Valhalla's `tileset_last_modified`
+in `meta.graph_id` on the first run and refuses to add rows against a different build;
+`--force-graph` overrides, and mixing two GraphId spaces in one table renders fine and is
+wrong. Where Valhalla reports no tileset timestamp the guard warns and stands down. The
+extract is pinned for the duration of a run (`force_rebuild: "False"` in
+docker-compose.yml) and Geofabrik rebuilds daily, so this is not hypothetical. `way_id` is
+the durable identity and is kept for that reason.
 
-**`NoRoute` was never once raised.** `_post` tested for `"no route" in body.lower()`,
-and Valhalla's 442 says "No path could be found for input", so `no_route` has zero
-rows in Wales, in London and in Great Britain — 70 of 82 local error rows are a
-permanent no-path filed as a fault. Every failure Valhalla reports arrives as HTTP
-400. Its `src/exceptions.cc` gives 154, 170, 171, 172, 440, 441, 442, 443 and 444 the
-same status, so the status line carries no meaning and `error_code` in the JSON body
-carries all of it. That set is `valhalla.NO_PATH_CODES`, and 444 is the ferry code in
-`docs/data.md`. Matching a third party's English is what broke this; do not replace
-one prose match with another.
+**Recovery on a database matched before transport faults had a status of their own.**
 
-**A refused connection is `transport_error`, and it is retryable.** `match.py` caught
-bare `Exception` and wrote `error`, so a `requests.ConnectionError` or `Timeout`
-landed with the genuinely impossible: 262 of Great Britain's 462 error rows (56.7%),
-carrying 4,127 trips — 120 connection refusals on `/trace_attributes` (2,107 trips),
-107 on `/route` (1,696), 22 read timeouts (55) and 13 `RemoteDisconnected` (269), all
-against one host. 227 refusals means Valhalla was down or restarting, and every
-pattern handed out in that window became a silent hole in the map with nothing that
-would ever retry it.
+    wayfare match --reclassify-transport
+    wayfare match --retry transient
 
-`valhalla.TransportError` is deliberately *not* a `ValhallaError`. `match_stops`
-retries an `edge_walk` refusal as a `map_snap` on `except ValhallaError`, and a
-second call down a dead socket is pointless. HTTP 5xx joins it, because codes 102,
-203 and 402 all mean "The service is shutting down". `_match_batch` catches
-`requests.RequestException` explicitly and leaves the bare `except` as the last
-resort for a bug in this code, which stays permanent: a defect that retries for ever
-is worse than one that records the traceback and moves on.
+Old rows are told apart by the shape of the stored detail rather than by anyone's wording.
+A reply from Valhalla is stored as `"<http status>: <json body>"`, so
+`status = 'error' AND NOT regexp_matches(detail, '^[0-9]{3}: ')` is every row that never
+got one, and the `confidence_score` misconfiguration is excluded by name through
+`valhalla.NO_SCORE_MESSAGE`. `run` warns when transport rows are present rather than
+clearing them itself, so a run stays reproducible and the hole stays visible.
 
-**`--retry transient` is the alias for the statuses safe to clear unattended**, and it
-holds `transport_error` alone. A literal status is still accepted and is still for
-after fixing the matcher. `run` warns when transport rows are present rather than
-clearing them itself, so a run stays reproducible and the hole stays visible. Both
-the retry and the reclassify below must land before the first batch loads, for the
-in-flight reason above.
-
-**An existing database needs `wayfare match --reclassify-transport` once.** The old
-rows are told apart by the shape of the detail this codebase writes rather than by
-anyone's wording: a reply from Valhalla is stored as `"<http status>: <json body>"`,
-so `status = 'error' AND NOT regexp_matches(detail, '^[0-9]{3}: ')` is every row that
-never got one. The `confidence_score` misconfiguration is the one ValhallaError
-raised without a reply to quote, and it is excluded by name through
-`valhalla.NO_SCORE_MESSAGE`. Reclassify, then `--retry transient`. It is a command
-rather than a migration on connect because it decides what gets re-matched, and a
-national match run costs a day or two.
-
-**Bad geometry is worse than missing geometry.** A wrong match produces a
-confident-looking line down a road no bus uses. `low_confidence` rows are kept (so
-they are never retried) but their edges are dropped.
-
-**The detour check needs both a ratio and an absolute slack.** On a short pattern a
-ratio alone is meaningless — a one-way system that sends the bus around one block
-triples a 300 m span. Both `MAX_DETOUR_RATIO` and `DETOUR_SLACK_M` must be
-exceeded.
-
-**The stop-gap bound was a bound on long-distance coach, not on bad data.**
-`config.MAX_STOP_GAP_M` was 25 km, and a pattern with any consecutive stop pair
-further apart than that was recorded `skipped` without ever being matched. Nationally
-that skipped 1,555 patterns and 63,341 trips, 1.64% of every trip in the feed. Triage
-of all 1,555 turned up no null-island stops, and the only stops outside GB are real
-international coach halts — Paris Bercy, Amsterdam Sloterdijk, Brussels-North. 1,299
-of the 1,555 are National Express or FlixBus, median 6 stops, median longest leg
-147 km. The bound is now 180 km, and it is derived rather than chosen:
-`config.VALHALLA_MAX_DISTANCE_M` (200,000) times `VALHALLA_DISTANCE_HEADROOM` (0.9).
-Recovery measured against the completed national run, where *routable* means every
-stop in GB and the chain inside the cap:
-
-    50 km    356 patterns    15,566 trips    325 routable    14,186 routable trips
-    100 km   769             32,122          619             24,074
-    150 km   1,120           47,114          744             29,552
-    180 km   1,319           56,720          808             34,851
-
-200 km is Valhalla's own `service_limits.bus.max_distance`, past which it refuses with
-error 154, and 630 of the 1,555 span more than 200 km and cannot be routed at any
-setting. Filling the cap exactly buys nothing and only converts an honest `skipped`
-row into an `error` one.
-
-**The 200 km cap bites in two places, and it is the second one that actually bit.**
-Two Valhalla limits ship at 200 km. `service_limits.bus.max_distance` is checked by
-`/route` against the straight-line chain through the request's locations;
-`service_limits.trace.max_distance` is checked by `/trace_attributes` along the shape
-the request submits. The `stops` path calls both — route the stops to synthesise road,
-then walk that road. The expectation was that a 40-location chunk of a long pattern
-would blow the route cap, so `valhalla._chunks` gained a cumulative-distance bound
-alongside its existing location count (40, which exists for request size and is a
-different constraint). That is right and necessary — 40 coach stops are half the
-country and 40 city stops are a suburb — but it is not what was failing. What fails is
-the walk. Road is longer than the straight line it follows, by 1.26x and 1.58x on the
-two long Welsh patterns tested. A Welsh pattern with a 183.7 km stop chain routes
-without complaint as one 17-location request, then fails 154 on the trace of the
-232.2 km shape that came back; another, 173.4 km of chain, produced 273.8 km of road.
-So `_chunks` is now used twice, on the stops before routing and on the synthesised
-road before walking it, with the same ceiling both times. Chunking only the route
-would have converted `skipped` rows into `error` rows, which is the net loss the whole
-change exists to avoid. Parts overlap by one point, so a boundary falling inside an
-edge puts that edge at the end of one walk and the start of the next; the merge keeps
-the first occurrence, which loses the tail of one edge's geometry and no edge
-identity. Counting it twice would inflate `road_m` instead.
-
-Splitting the walk moves the `edge_walk` fallback rather than adding to it. Over 50 of
-Wales's 348 `stops` patterns, every single one falls back to `map_snap` today — the
-exact walk refuses on all 50 — and every single one still comes back as one part under
-the distance bound, reproducing its stored `pattern_edges` row for row. Where the walk
-does split, a chunk-stitch discontinuity now downgrades the part it falls in instead
-of the whole trace, so the fallback covers less geometry than it did rather than more.
-
-**Route 461's error 154 is the Wales extract, not the chunking.** All 10 of the Wales
-run's error-154 rows are route 461, 55 to 63 stops over 60-70 km chains. It is a
-cross-border service, Llandrindod Wells to Hereford, and the Wales-only OpenStreetMap
-extract has no roads east of the border, so its English stops snap back to the nearest
-Welsh road. Per-leg routing shows six legs of 21 to 78 km of road for 0.5 to 7 km of
-straight line, and several consecutive legs of 0.00 km where two stops snap to the
-same node. The whole 63 km chain routes as 260 km. Chunking cannot shorten it:
-measured at chunk sizes 40, 20, 10, 5, 3 and 2 the road stays 260.0 km, so the length
-is the graph's and not the request's. With the walk split it now traces rather than
-erroring — 1,266 edges — and lands in `low_confidence` at a detour ratio of 4.1, edges
-dropped, row kept. That is the right answer for geometry that is an artefact of the
-extract, and a better one than `error`, which reads as a bug.
-
-**The gap bound guards guesswork, so it must not be applied before the strategy is
-chosen.** `match_one` tested the gap several lines before it chose between
-`match_shape` and `match_stops`, so the bound was deciding for a path it was never
-written for. The reasoning on it — routing a long leg invents a plausible-but-wrong
-motorway — holds for `stops` and does not hold at all for `shape`: with an operator
-trace there is no routing and no guess, `map_snap` follows geometry the operator
-recorded, and the distance between two timing points says nothing about whether that
-geometry is good. This qualifies the "bad geometry is worse than missing geometry"
-entry above: that reasoning is about a guess, not about a recording. The test is now
-gated on `p.shape`. GB was losing 153 patterns and 6,062 trips to it, and the Republic
-of Ireland's feed loses 333 of 2,853 patterns, 11.7%, and 8,395 of 148,255 weekly
-trips — proportionally far worse only because that feed carries a shape on every trip,
-so it cannot lose the argument on the other path. The detour check does not catch
-them, which was the obvious risk and was measured. Wales shape-path detour ratio by
-longest-leg band: under 2 km, median 1.17, max 3.78; 2-5 km, 1.13 and 1.86; 5-10 km,
-1.13 and 1.60; 10-25 km, 1.14 and 1.34. A long leg makes a traced match straighter,
-not wilder, and the one Welsh shape-path `low_confidence` sits in the under-2 km band,
-which is the regime `DETOUR_SLACK_M` was written for. The two long patterns the raised
-bound admits measure 1.26 and 1.58 against a ratio of 3.0, so `MAX_DETOUR_RATIO` and
-`DETOUR_SLACK_M` are unchanged. `p.max_gap_m` is still computed for every pattern, and
-`load_batch` logs how many carry a trace across a leg past the bound, because a leg
-that long is still the thing that drops a pattern on the other path and a trace does
-not rule out the stop coordinate that produced it being wrong. The bound was never
-wrong about long legs; it was wrong about what a long leg is evidence of.
-
-**Spreading the work is `--max-seconds`.** Checked between batches, never inside
-one, because a batch is the unit of checkpointing — so the budget is a floor on run
-length, not a ceiling. It composes with the existing absence-of-a-status-row work
-selection with no other bookkeeping: a run stopped by the budget is
-indistinguishable from one that was killed. Combined with `ORDER BY n_trips DESC`,
-a nightly job with a half-hour budget spends it on the busiest roads first, so a
-partially drained queue degrades gracefully. `publish` can be spread by rebuilding
-one region's PMTiles per night, which the multi-region viewer already supports.
+**A regional extract makes a cross-border service look like a matcher fault.** Wales's
+error-154 rows were all route 461, whose English stops snap back to the nearest Welsh road
+because the extract has no roads east of the border. Its 63 km chain routes as 260 km at
+every chunk size from 40 down to 2, so the length belongs to the graph. It now traces and
+lands in `low_confidence` at a detour ratio of 4.1, edges dropped and row kept.
 
 ## trace
 
-**A mode can publish a complete stop sequence and no geometry at all, and the
-largest one in the country does.** Great Britain's `routes.txt` carries
-`route_type=1` on 54 routes, 61,288 trips over 1,525 patterns, and 1,417 of those
-patterns (92.9%) have no `shape_id`. `route_type=2` is three routes, all of them
-the Docklands Light Railway (DLR), 71 patterns, not one with a shape. Seventeen
-named lines arrive this way. The London Underground contributes 41 line records
-over 11 named lines and 58,560 trips, the DLR 6,630 trips, and beside them sit
-London Trams, West Midlands Metro, Blackpool, the Air-Rail Link and the IFS Cloud
-Cable Car. Measured against Bus Open Data Service (BODS) feed `20260806_022608`.
+**What it does.** Draws the non-road patterns that carry no operator geometry, from
+OpenStreetMap *route relations*. `db.matchable` keeps a metro away from Valhalla, since
+there is no road under a tube tunnel, and `aggregate.build_segments` can only copy a trace
+the feed carries. Great Britain's `route_type=1` patterns are 92.9% shapeless and the
+Docklands Light Railway (DLR) publishes no shape at all. It writes `traces`,
+`trace_status` and `ways`.
 
-**Both of the other geometry paths refuse them.** `db.matchable` keeps a metro away
-from Valhalla, because there is no road under a tube tunnel to match onto, and
-`aggregate.build_segments` copies an operator trace that the feed does not carry.
-Those patterns were counted by mode and drawn nowhere. `wayfare trace` is the third
-path, and its source is OpenStreetMap *route relations*.
+    wayfare trace
+    wayfare trace --refresh
+    wayfare trace --retry transient
 
-**A route relation is already ordered, which makes this an ingestion job.** Its
-`role=""` way members chain end to end into one continuous path in the order the
-service runs them, so a pattern's geometry is a cut of that chain between the first
-stop it calls at and the last. Nothing is snapped. There is no shortest path, no
-*hidden Markov model* and nothing to disambiguate, and `wayfare/osm.py` is a fetch, a
-walk and a projection.
+**Flags.** `--relations PATH` moves the Overpass cache, default `raw/osm_relations.json`.
+`--refresh` re-queries Overpass even with a cached body present, for after the relations
+themselves have moved. `--limit N` stops after N patterns. `--retry` takes statuses or
+`transient`; `--retry ok` redraws what already worked, which is what re-cuts a trace
+stored before the tracer kept the ways under its own slice.
 
-**The relations exist and the chains are clean.** The Greater London bounding box
-holds 556 route relations. Each of the eleven Underground lines has a
-`route_master`, as do the DLR (5), London Trams (3) and the Elizabeth line (5).
-Walking the `role=""` ways in member order breaks nowhere on any line tested:
-Victoria 24 ways over 21.69 km against an official 21 km, Central 125 ways over
-54.75 km, Jubilee 59 ways over 37.15 km, and the DLR's Lewisham to Stratford
-relation 81 ways over 11.02 km.
+**Cost.** Minutes. The national run of 2026-08-12, against BODS `20260807_022616` on a
+copy of the server's database, fetched 131 MB and 1,022 relations in 27 seconds and spent
+182 seconds fitting. It resolved 1,127 of 1,737 pending patterns: 86.9% of Underground
+trips, 60.6% of the DLR's and 34.2% of trams.
 
-**Work selection is `match`'s, and its three conditions are each load-bearing.** A
-pattern is owed a trace when it is in the current feed, when `db.matchable` is false
-for it, and when its `shape_id` is NULL. The first keeps departed journeys out, the
-second leaves the road to Valhalla, and the third keeps the operator's own recording
-ahead of anything reassembled from OpenStreetMap — a feed trace records where the
-vehicle goes, a relation records where the track is, and the two differ at a depot
-or a turnback. Work is then selected by the absence of a `trace_status` row, exactly
-as `match` selects on the absence of a `match_status` row. Patterns are handed out
-busiest first, so a run cut short leaves the busiest lines drawn.
+**Interrupting.** Safe. Work is selected by the absence of a `trace_status` row, exactly
+as `match` selects on `match_status`, and patterns are handed out busiest first.
 
-**Overpass rather than the OpenStreetMap application programming interface (API),
-because the stage has to *discover* relations over an area.** The API answers for an
-id that is already known, and nothing in a timetable carries a relation id. One
-request per run is enough. The first `out body geom` statement inlines every member
-way's coordinates, which is what replaces thousands of per-way fetches, and a second
-`out` statement returns the member nodes with their tags. That second statement is
-not redundant. A relation member carries a role and an id, never the tags of the
-thing it points at, and the station names are the join key. The window asked for is
-the pending patterns' stop extent padded by 0.2 degrees, about 22 km, because a line
-runs well past the box its stops sit in — the Central line reaches Epping. The
-response body is cached to `raw/osm_relations.json` as raw bytes, so a parser fix
-applies to bytes already paid for.
+**A route relation is already ordered, which makes this an ingestion job.** Its `role=""`
+way members chain end to end in the order the service runs them, so a pattern's geometry
+is a cut of that chain between its first and last calling points. Nothing is snapped, and
+there is no confidence score to fall back on.
 
-**The fit is a subsequence search over normalised station names.** Great Britain's
-1,417 Underground patterns come from 459 distinct station sequences over 11 lines,
-and every one of them is a contiguous sub-path of its line, since a short working of
-the Northern line still runs on Northern line track. A pattern is therefore tested
-against the relations calling at either of its ends, its stop names are looked for
-as a contiguous run through the relation's, and the reverse order is tried as well
-because a relation is per direction. Every placement is tried rather than the first.
-A relation calling at one station twice offers more than one, and only one of them
-projects in order along the track.
+**Overpass rather than the OpenStreetMap application programming interface (API), because
+the stage has to discover relations over an area.** Nothing in a timetable carries a
+relation id. One request per run is enough: `out body geom` inlines every member way's
+coordinates, and a second `out` returns the member nodes with their tags, which is where
+the station names come from, since a relation member carries a role and an id and never
+the tags of the thing it points at. The window is the pending patterns' stop extent padded
+by 0.2 degrees, about 22 km, because a line runs past the box its stops sit in. The body
+is cached as raw bytes, so a parser fix applies to bytes already paid for.
 
-**There is no `naptan:AtcoCode` on an Underground stop node, so the join is by name
-with a coordinate check.** The identifier that would settle it is absent, which
-leaves the station name, and the two publishers spell it differently. BODS writes
-"Blackhorse Road Station", "Pimlico Station" and "King's Cross St. Pancras
-Underground Station" where OpenStreetMap has "Blackhorse Road station", "Pimlico"
-and "King's Cross St Pancras". `osm.normalise` folds case, expands the ampersand,
-deletes apostrophes, turns the remaining punctuation into spaces and strips a
-station suffix twice — twice, because "Edgware Road Station Station" is in one
-feed's stop register. Measured on the Victoria line, that takes the join from
-partial to 16 of 16.
-
-**The coordinate check is what stops a name matching the wrong line, and it is set
-at 400 m.** 15 of the Victoria line's 16 stops sit within 150 m of the node they
-matched. The exception is Highbury & Islington at 216 m, where the timetable's point
-is the National Rail entrance and the OpenStreetMap node is the tube platform. A
-large interchange is where the two publishers disagree most, so `TRACE_STOP_MAX_M`
-has to clear that case, and 400 m does while staying well under the roughly 1.2 km
-spacing between Underground stations.
-
-**What gets projected onto the chain is the relation's own stop nodes.** The node is
-on the track by construction, where the feed's point can be a station entrance 216 m
-away on the National Rail side of an interchange. Projecting the further of the two
-risks landing on a parallel line and cutting the chain in the wrong place. The
-feed's coordinate does the other job, which is checking that the name join found the
+**The fit is a subsequence search over normalised station names.** A pattern is tested
+against the relations calling at either of its ends, and the reverse order is tried too
+because a relation is per direction. Every placement is tried rather than the first, since
+a relation calling at one station twice offers more than one and only one projects in
+order along the track. What gets projected is the relation's own stop nodes, which are on
+the track by construction; the feed's coordinate only checks that the name join found the
 right station.
 
-**A sequence that turns round partway is refused rather than drawn.** The matched
-stops must project one way along the chain, and either way will do, since a relation
-is per direction and half a line's patterns run from its far end back towards its
-first way. What is refused is a sequence that reverses in the middle, which is a
-loop — the New Addington branch is one — or a placement that doubles back. Slicing
-between the two ends of such a sequence takes the wrong branch and draws confident
-track no service runs on. `TRACE_MONOTONIC_SLACK_M` is 250 m, wide enough for a
-station node sitting slightly behind its neighbour's projection and far short of a
-turn. This is "bad geometry is worse than missing geometry" applied to a stage with
-no confidence score to fall back on.
+**The join is by name with a coordinate check, because there is no `naptan:AtcoCode` on an
+Underground stop node.** `osm.normalise` folds case, expands the ampersand, deletes
+apostrophes, turns remaining punctuation into spaces and strips qualifiers in a loop until
+the result stops changing, bounded at four passes, refusing any strip that would empty the
+string. The loop is not decoration, since "Edgware Road Station Station" is in one feed's
+stop register. `config.TRACE_STOP_MAX_M` is 400 m, which clears Highbury & Islington at
+216 m, where the timetable's point is the National Rail entrance and the OpenStreetMap
+node is the tube platform, while staying under the roughly 1.2 km station spacing.
 
-**What a resolved pattern records is the ways under the cut, not the ways of the
-line.** `osm.slice_between` answers in geometry where the first and last matched stops
-fall along the chain, and `osm.ways_between` answers the same question in identity by
-reading `osm.Chain.way_at`, which way each chain point came from, at the same two
-distances. It already existed for `railtrips`. Storing the whole candidate chain
-documented what was drawn and no more, which was enough while nothing read the column,
-and it became a confident lie once `aggregate` began inverting the list per way: a
-Northern line short working from Edgware to Kennington was stored against every way of
-the Northern line. `trace_status.n_ways` counts the slice's ways rather than the line's,
-and `traces.ways_cut` is TRUE on every row this stage writes.
+**A sequence that turns round partway is refused rather than drawn.** The matched stops
+must project one way along the chain, either way. What is refused is a reversal in the
+middle, which is a loop or a doubled-back placement, and slicing between the two ends of
+one takes the wrong branch and draws confident track no service runs.
+`config.TRACE_MONOTONIC_SLACK_M` is 250 m, wide enough for a station node sitting slightly
+behind its neighbour's projection and far short of a turn.
 
-**`ways` has two writers now, so `osmroutes.write_ways` upserts rather than clearing
-the table.** `routes` writes the ways of every relation it keeps, and `trace` writes the
-ways of the relations its resolved patterns cut, in the same transaction as the traces
-that name them. The blanket delete `write_ways` used to open with would have taken the
-tube's track out of the archive on the next `routes` run, and
-`publish.export_track_geojsonl` joins `ways` inside, so that failure would have been
-track quietly not drawn rather than anything raising. `osmroutes.prune_ways` drops the
-ways no `traces` row runs over, which is what keeps a way that has left the network from
-being drawn for ever.
+**A resolved pattern records the ways under the cut, not the ways of the line.**
+`osm.ways_between` reads `osm.Chain.way_at` at the same two distances `osm.slice_between`
+cuts the geometry. Storing the whole candidate chain became a confident lie once
+`aggregate` began inverting the list per way: a Northern line short working from Edgware
+to Kennington was stored against every way of the Northern line. `traces.ways_cut` is TRUE
+on every row this stage writes.
 
-**Six traps, and each one looks like missing data rather than a mistake.**
-
-- **Platform members must leave the way chain.** Leaving `role=platform`,
-  `platform_entry_only` and `platform_exit_only` in produces 11 to 25 spurious
-  breaks per relation, which reads as broken mapping across the whole of London.
-  `config.OSM_STOP_ROLES` names the three roles that are calling points, and the
-  chain takes `role=""` and nothing else.
-- **The two publishers qualify a station name in different ways, and neither
-  qualifier appears on the other side.** A Public Transport version 2 (PTv2) stop
-  member is a node on the platform, so OpenStreetMap writes "Lewisham Platform 6"
-  and "Canary Wharf Platforms 5 & 6"; BODS qualifies the same station by mode,
-  "Lewisham DLR Station" and "Shadwell DLR". One mismatched stop refuses the whole
-  contiguous run, so this cost every one of the 71 DLR patterns against relations
-  that chain with zero breaks. `osm.normalise` strips both forms.
-- **A station needs more than one spelling.** Two Edgware Road stations sit a few
-  hundred metres apart, so BODS disambiguates in the name — "Edgware Road (Bakerloo)"
-  — where OpenStreetMap writes "Edgware Road" twice and lets the relation say which is
-  which. Flattening the brackets matches neither, so `osm.spellings` offers the
-  bracketed and the unbracketed form and a stop matches if any spelling agrees. The
-  looser join is safe because the matched node still has to sit within
-  `TRACE_STOP_MAX_M` of the timetable's coordinate, which is what keeps Edgware Road
-  apart from Edgware, 8 km up the Northern line.
-- **The Elizabeth line is `route=train`, not `route=subway`.** A mode filter written
-  from the obvious names misses it outright. `config.OSM_ROUTE_VALUES` is therefore
-  deliberately wide — subway, light rail, tram, train, monorail, funicular and
-  aerialway — and the stop-sequence join is what decides which relation a pattern
-  belongs to. A few thousand extra relations in one request is the cheaper mistake.
-- **Way tags are not a join key.** `ref` is on 2.4% of subway ways and carries
-  signalling codes rather than line names. `line` reaches 62.1% and is multi-valued
-  on shared track, with separators that vary by mapper. Ways are reached through the
-  relation in member order, never through their own tags.
-- **The coverage argument against OpenStreetMap bus relations does not transfer.**
-  docs/data.md rejects `route=bus` as a source on 12,968 relations and 818 route
-  masters against the whole bus network. Rail inverts every term of it: roughly
-  1,000 relations cover roughly 1,000 GB rail services, every London line carries a
-  `route_master`, and they are among the best-maintained relations in the country.
-
-**`segments` now has two sources, and they are disjoint by construction.**
-`aggregate.build_segments` unions the operator shape of every live non-road pattern
-with the `traces` row of every live non-road pattern whose `shape_id` is NULL. That
-NULL is what keeps the two arms from overlapping, and it is what lets `segments`
-keep its primary key on `pattern_id`. The trace arm is narrower than that now, taking
-only the rows `traces.ways_cut` marks as holding a whole line, because the rest are
-drawn per way by the track layer and the aggregate section has that partition. A
-non-road pattern with no source at all still gets no row and is still not drawn, so the
-log line reports all three counts and a region drawing fewer segments than it has
-patterns says so.
-
-**Every pattern gets a `trace_status` row, and one status is retryable.** The
-vocabulary is `match_status`'s for the reason the stage's shape is. A tracer that
-re-fetches every unresolvable pattern on every run never finishes, which needs
-"failed" to mean "impossible".
+**Statuses.**
 
     ok               the relation chained and carried the pattern's stop sequence
     no_relation      nothing fetched calls at either of this pattern's ends
-    chain_break      the relation's ways do not form one continuous path
+    chain_break      the relation serving it does not chain into one path
     no_stop_match    a relation shares a terminus and not the sequence
     not_monotonic    the stops matched and project out of order along the chain
     skipped          fewer than two stops to fit
     error            a bug or a malformed response, permanent until the code moves
     transport_error  the request never got an answer, so nothing was learned
 
-`chain_break` describes a relation rather than a pattern, and the run reports it as
-a count. `trace.prepare` chains every relation once and drops the ones that break
-before any pattern is fitted, so a pattern whose only candidate broke is recorded
-`no_relation`. `wayfare trace --retry transient` clears `transport_error` and
-nothing else, exactly as `match --retry transient` does, and both must land before
-the first work is selected: a row deleted while its pattern is in flight hands that
-pattern out twice.
+`chain_break` is written against the pattern, through `_STATUS_OF_REASON`, and not merely
+counted per relation. `trace.prepare` chains every relation once and drops the broken ones
+before any pattern is fitted, so `resolve` tests the pattern's terminus names against
+`prepared.broken_names` to tell a line that is mapped and does not chain from one nobody
+has mapped. `_REASON_RANK` picks the most specific near-miss where several relations
+refuse one pattern.
 
-**A failure to reach Overpass at all is deliberately not written down.** Nothing was
-learned about any pattern, so a permanent row would be a lie about all of them at
-once. `wayfare all` logs a warning and carries on rather than throwing away a match
-run that has just cost a day or two, and the patterns keep no status row, so the
-next `wayfare trace` picks them up unchanged. Trace failures also stay out of the
-publish gate, which counts matchable patterns only; docs/deploy.md has that
+**Failure to reach Overpass at all is deliberately not written down.** Nothing was learned
+about any pattern, so a permanent row would be a lie about all of them at once. `wayfare
+all` logs a warning and carries on rather than throwing away a match run that has just cost
+a day or two, and the patterns keep no status row. Trace failures also stay out of the
+publish gate, which counts matchable patterns only; [docs/deploy.md](deploy.md) has that
 reasoning.
 
-**The stage has now run nationally, and it resolved 1,127 of 1,737 patterns.**
-Against BODS `20260807_022616`, on a copy of the server's database: one Overpass query
-over the pending patterns' bounding box returned 131 MB and 1,022 relations in 27
-seconds, and fitting took 182 seconds. 86.9% of Underground trips and 60.6% of the
-DLR's are drawn, trams 34.2%, and ferries nothing at all — 166 of the 170
-`no_relation` rows are ferries, which is `route=ferry` sitting outside
-`config.OSM_ROUTE_VALUES` on purpose rather than a failure. The two naming traps above
-are what that run found; before they were fixed the total was 713. The chain also
-turns out to need no detour guard of the kind `match` carries: 1,102 of the 1,127
-traces draw between 1.0 and 1.3 times the straight-line chain through their own stops,
-and the four over 2.5 are all the Piccadilly line's Heathrow Terminal 4 loop, which is
-genuinely one-way. Figures, correctness checks and the 440 patterns still refused are
-in docs/results.md.
+**Six traps, each of which looks like missing data rather than a mistake.**
+
+- **Platform members must leave the way chain.** Leaving `role=platform`,
+  `platform_entry_only` and `platform_exit_only` in produces 11 to 25 spurious breaks per
+  relation, which reads as broken mapping across the whole of London.
+  `config.OSM_STOP_ROLES` names the three roles that are calling points.
+- **The two publishers qualify a station name differently.** A Public Transport version 2
+  (PTv2) stop member is a node on the platform, so OpenStreetMap writes "Lewisham Platform
+  6" where BODS qualifies by mode, "Lewisham DLR Station". One mismatched stop refuses the
+  whole contiguous run, which cost all 71 DLR patterns. `osm.normalise` strips both forms.
+- **A station needs more than one spelling.** BODS writes "Edgware Road (Bakerloo)" where
+  OpenStreetMap writes "Edgware Road" twice and lets the relation say which is which.
+  `osm.spellings` offers both forms and a stop matches if any spelling agrees, which is
+  safe because the node still has to sit within `TRACE_STOP_MAX_M` of the feed's point.
+- **The Elizabeth line is `route=train`, not `route=subway`.** A mode filter written from
+  the obvious names misses it, so `config.OSM_ROUTE_VALUES` is deliberately wide and the
+  stop-sequence join decides which relation a pattern belongs to.
+- **Way tags are not a join key.** `ref` is on 2.4% of subway ways and carries signalling
+  codes; `line` reaches 62.1% and is multi-valued on shared track. Ways are reached
+  through the relation in member order.
+- **Ferries resolve to nothing by design.** `route=ferry` sits outside
+  `config.OSM_ROUTE_VALUES`, so 166 of the national run's 170 `no_relation` rows are
+  ferries.
 
 ## routes
 
-**A route relation can stand as the service itself, with no timetable behind it.**
-`trace` uses one as *geometry* for a pattern a feed already carries. `routes` uses one
-as the pattern. That is what makes Great Britain's National Rail drawable at all,
-because BODS does not carry it and every timetable source for it sits behind a login
-or a licence negotiation. `wayfare/osmroutes.py` has the reasoning for the gate and
-for leaving `n_trips` null; this section is about what the stage costs.
+**What it does.** Turns OpenStreetMap route relations into services in their own right, for
+modes with no timetable behind them at all. Great Britain's National Rail is the case: BODS
+does not carry it and every timetable source sits behind a login or a licence negotiation.
+`trace` uses a relation as geometry for a pattern a feed already carries; `routes` uses the
+relation as the pattern. The module is [`wayfare/osmroutes.py`](../wayfare/osmroutes.py),
+the command line interface (CLI) subcommand is `wayfare routes`, and `routes` is also a GTFS
+table name; the subcommand is what this section means throughout.
 
-**It costs 54m43s nationally, and 99.8% of that is two insert loops.** Profiled on the
-server, 8 cores, against the cached 121.5 MB Overpass body already on disk:
+    wayfare routes
+    wayfare routes --refresh
+    wayfare routes --cif schedule.cif --on 2026-08-15
 
-```
-json.loads                             3.23s     121.5 MB, 8,502 elements
-osm.parse                              1.90s     1,312 relations, 2,310,035 way points
-candidates (chaining)                  1.14s     935 candidates, 1,786,403 chain points
-write (patterns/traces/trace_status)  543.17s     935 patterns
-write_ways                          2733.06s     68,369 ways, 566,572 points
-                                    ─────────
-                                    3282.50s     54m 43s
-```
+**Flags.** `--relations PATH` moves the Overpass cache, default `raw/osm_routes.json`,
+deliberately not the file `trace` uses: the two stages ask for different windows, and
+sharing one body would let whichever ran first decide the other's coverage. `--refresh`
+re-queries. `--cif` attributes trips from a Network Rail Common Interface File (CIF)
+schedule and is optional, with `--stops` naming the National Public Transport Access Nodes
+(NaPTAN) CSV that turns a TIPLOC into a place and `--on` the date whose service to count.
+Without `--cif` the track draws and `trips` stays null.
 
-`write_ways` is 83.3% and `write` is 16.5%. Reading, parsing and chaining the whole
-national body together take 6.3 seconds. Building the 68,369 row tuples inside
-`write_ways` takes 0.78s of its 2,733, so the rest is the insert and nothing else.
+**Cost.** 54m43s nationally when profiled on the server against a cached 121.5 MB Overpass
+body, of which 99.8% was two insert loops: `write_ways` took 2,733 seconds for 68,369 ways
+and `write` 543 seconds for 935 patterns. Fetching, parsing and chaining the whole body
+together took 6.3 seconds. That profile predates the territory gate, so 68,369 rows is an
+upper bound rather than the figure; `write_ways` is handed only the relations that became
+patterns. `write_ways` has no `BEGIN`/`COMMIT` around its `executemany`, which is 90% of
+its cost, and `write` is per-point rather than per-row bound, its 935 rows carrying 1.79M
+list elements across the binding layer one at a time.
 
-**That profile predates the territory gate**, which docs/data.md covers. `write_ways`
-now writes the relations that became patterns rather than every relation the window
-returned, so 68,369 rows is an upper bound on what a national run writes now rather
-than the figure. The stage has not been re-profiled since.
+**Interrupting.** The stage has no incremental path. `run()` chains every relation and
+rewrites every pattern and way on every invocation, consulting no existing `traces` or
+`trace_status` row, which is what stops a line retired in OpenStreetMap being drawn for
+ever. An interrupted run leaves the previous rows and the next run redoes all of it.
 
-**The stage has no incremental path.** `run()` chains every relation and rewrites
-every pattern and way on every invocation. Nothing consults an existing `traces` or
-`trace_status` row, which is what makes the neighbouring stages cheap on a re-run:
-`match` selects work by the absence of a `match_status` row and `trace` selects
-pending patterns. Rebuilding rather than carrying forward is deliberate and it is
-correct, because it is what stops a line retired in OpenStreetMap being drawn for
-ever. The semantics are not the problem. The price of them is.
+**The scheduled path never re-queries Overpass.**
+[`deploy/refresh.sh`](../deploy/refresh.sh) runs `wayfare routes` with no `--refresh`, and
+nothing in the script or in `acquire` deletes `raw/osm_routes.json`, since `acquire`'s `osm`
+source is the Geofabrik pbf for Valhalla. So every weekly run re-parses the same bytes and
+rewrites the same rows, and the only thing that legitimately differs is `last_seen` moving
+to the new feed version. The rail layer's OpenStreetMap content is frozen at whatever was
+last cached until someone passes `--refresh` by hand.
 
-**`deploy/refresh.sh` pays that price every week, to reach an answer it already had.**
-Line 89 runs `wayfare routes` with no `--refresh`, and nothing in the script or in
-`acquire` deletes `raw/osm_routes.json` — `acquire`'s `osm` source is the Geofabrik
-pbf for Valhalla, a different file. So the scheduled path never re-queries Overpass.
-It re-parses the same bytes, re-chains the same relations and rewrites the same rows.
-The output is a pure function of a file that cannot change between runs, and the only
-thing that legitimately differs is the `last_seen` stamp moving to the new feed
-version. The rail layer's OpenStreetMap content is therefore frozen at whatever was
-last cached until someone passes `--refresh` by hand, which is a coverage fact worth
-knowing rather than a bug.
+**What goes wrong.**
 
-**The two writers are slow for different reasons.** Baselines on a subset, extrapolated;
-the extrapolation checks out against the full run at 2,419s predicted for `write_ways`
-against 2,733s measured, and 458s predicted for `write` against the 543s it took
-including the SQL that follows its staging insert.
-
-```
-ways 68,369 rows / 566,572 points
-ways executemany, autocommit (n=5000)      176.93s   (x13.7 -> 2419s)
-ways executemany, one transaction (n=5000)  17.87s   (x13.7 ->  244s)
-ways executemany, txn, no PK (n=5000)       17.47s   (x13.7 ->  239s)
-ways CSV staging, all 68,369                 1.46s
-ways arrow, all 68,369                       0.53s
-
-osm_route_raw 935 rows / 1,786,403 points
-osm_route_raw executemany (n=100)           48.95s   (x9.3  ->  458s)
-osm_route_raw arrow, all 935                 0.21s
-```
-
-**A missing `BEGIN`/`COMMIT` is 90% of `write_ways`.** 2,419s falls to 244s from the
-transaction alone. `write` has one and `write_ways` does not, and that is the whole
-difference between 40ms and 3.6ms per row.
-
-**The primary key on `way_id` costs nothing, and that hypothesis was wrong.** 17.47s
-into a table with no key against 17.87s into `ways` as it stands. An *adaptive radix
-tree* (ART) index maintained over 68,369 inserts sounds expensive and is not the
-cost here. Recorded so the next reader does not re-test it.
-
-**A transaction is still not the fix.** At 244s, `executemany` remains 167× slower
-than staging the points to a file and 460× slower than handing DuckDB one Arrow
-table, and it does nothing at all for `write`. The per-unit rates separate the two:
-`write_ways` is per-row bound at 8.3 points per row, where `write` is per-point bound
-at 0.30ms over only 935 rows. Its 458s is 1.79M list elements crossing the binding
-layer one at a time, which Arrow moves in 0.21s.
-
-| | now | + transaction | + columnar |
-|---|---|---|---|
-| fetch, parse, chain | 6.3s | 6.3s | 6.3s |
-| `write` | 543s | 543s | ~85s |
-| `write_ways` | 2,733s | ~244s | ~1s |
-| total | 54m 43s | 13m 13s | ~1m 32s |
-
-The residual ~85s in the columnar column is the SQL after the staging insert, the
-`pattern_id` hashing and the three inserts. It was not timed separately and is an
-estimate rather than a measurement. Timing it is the next step if 1m32s is not enough.
-
-**Choosing between Arrow and file staging is a dependency question, not a speed one.**
-Arrow is 2.8× faster on `ways` and needs no temporary file, and for `write` there is
-no clean flat shape to stage at all: the row carries `way_ids`, `lon_e6` and `lat_e6`
-as three parallel lists of different lengths, so a file means three of them or a
-synthetic join key. Against that, `pycairo`, `numpy` and `pyarrow` are the `art` extra
-and the pipeline does not import them, so reaching for Arrow here moves that boundary.
-Staying inside it costs roughly a further minute, at about 2m30s.
-
-**Skipping the stage outright is the larger win and is independent of the writers.**
-The output is a pure function of the cache bytes, `ROUTE_MODES` and the derivation
-code, so a digest of the cache file held in `meta` lets a matching run carry its rows
-forward with one UPDATE stamping `last_seen` on the `route_id LIKE 'osm:r%'` rows.
-`traces`, `trace_status` and `ways` are keyed on `pattern_id` and `way_id` and hold no
-feed version, so they need nothing. Two guards make it safe. The digest has to include
-a derivation-version constant, bumped when `candidates`, `osm.chain` or `osm.normalise`
-change, which is the discipline `pattern_id` already carries and the thing that stops a
-parser fix being silently ignored. And an UPDATE that touches zero rows has to fall
-through to the full rebuild, so a restored or re-clustered database cannot end up
-holding a matching digest and no rail.
-
-None of this is implemented. The numbers above are a measurement of the stage as it
-stands, taken on a scratch database while the served archives were untouched.
+- *No live patterns.* `bbox` returns None and the stage raises rather than querying an
+  unbounded window.
+- *Another region's rail.* `config.Feed.bounds` narrows the window per region and
+  `config.Feed.operators` refuses a relation whose `operator` names only another region's
+  rail. The stage logs the region it thinks it is in, because a run against the wrong data
+  root draws another region's rail into this one's archive.
+- *Track that quietly stops being drawn.* `write_ways` upserts rather than clearing,
+  because `trace` writes into the same table. A blanket delete would take the tube's track
+  out of the archive on the next `routes` run, and `publish.export_track_geojsonl` joins
+  `ways` inside, so nothing would raise. `osmroutes.prune_ways` runs after every writer and
+  drops the ways no `traces` row runs over.
 
 ## aggregate
 
-**A non-road mode has no road under it, so it is never matched and is drawn from
-geometry somebody else recorded.** `db.matchable` is the predicate that keeps a tram, a
-metro, a train or a ferry away from Valhalla, and `aggregate` draws it two ways
-instead. `build_segments` writes one row in `segments` per pattern, holding the shape
-its operator published in the same integer micro-degrees `edges` uses, and
-`build_track_services` inverts the rest into one row per way. Neither path has a
-matcher, routing or snapping in it. A recording is the best geometry available for a
-mode with no way in the graph, and it is a survey rather than a schematic — Metrolink's
-traces run to a median 474 points against the bus feed's 849. A route therefore gets
-its geometry one of two ways. The mode decides which.
+**What it does.** Inverts pattern-to-edges into edge-to-services and rebuilds the two
+tables that draw the non-road modes. `build` writes `edge_services`, then `build_segments`,
+then `build_track_services`. It is a handful of SQL statements, costs minutes and takes no
+flags. Safe to interrupt: each table is deleted and rebuilt in one statement.
 
-**`segments` is rebuilt outright rather than merged, and a pattern with no shape gets
-no row.** The table is derived from `patterns` and `shapes` and costs one
-`INSERT ... SELECT` to recompute, where a match costs a Valhalla call and is cached for
-ever, so it holds the current feed only exactly as `pattern_stops` does and a departed
-tram stops being drawn on the next run. Missing geometry is left missing for the reason
-the match section already gives: the stops are known, so a straight line between two of
-them would draw perfectly happily down the wrong side of a river. Great Britain's
-ferries are the worked example, 244 of 416 patterns carrying a trace and the other 172
-drawing nothing at all, and docs/data.md has the reasoning for that mode in particular.
+    wayfare aggregate
 
-**One polyline per pattern cannot answer which services use a piece of track.**
-`build_track_services` is the inversion `edge_services` performs for roads, keyed one
-level up the identifier stack, straight on `way_id`, because nothing routed this track
-and there is no Valhalla GraphId to key on. A way id is also the more durable of the
-two, since an edge id is valid only within one graph build. 75.8% of Great Britain's
-rail ways carry two or more relations, so drawing per pattern puts coincident lines
-over most of the network and a hover lands on an arbitrary one of them.
+**Two filters on `edge_services`, and both are load-bearing.** The join to `patterns` under
+`db.current_feed()` drops departed services, because `pattern_edges` keeps the matched
+geometry of a pattern that has left the timetable and a road nobody runs on must not still
+be drawn. `db.matchable` is the same rule pointed at the past: a database matched before
+the mode filter existed holds `pattern_edges` for patterns that should never have reached
+Valhalla, 1,726,822 of them for the Underground alone, plus ferries snapped to coast roads.
 
-**`mode` is part of the track key, so one way carrying two networks is two features.**
-A way used by both a tube line and a National Rail service comes out as two rows and is
-drawn twice, deliberately, because they are different networks and the viewer paints a
-track feature by its own mode.
+**`segments` holds one polyline per non-road pattern, and a pattern with no geometry gets no
+row.** It is rebuilt outright rather than merged, being derived from `patterns` and `shapes`
+at the cost of one `INSERT ... SELECT`, so it holds the current feed only and a departed
+tram stops being drawn on the next run. Missing geometry is left missing: the stops are
+known, and a straight line between two of them would draw perfectly happily down the wrong
+side of a river. Great Britain's ferries are the worked example, and [docs/data.md](data.md)
+has the reasoning for that mode.
 
-**The two arms partition on `traces.ways_cut`.** Nothing may fall in both. A trace
-whose way ids are cut to its own pattern is inverted per way; a trace holding the whole
-line's chain would attribute a short working to track it never reaches, so it keeps its
-own polyline in `segments` until `wayfare trace --retry ok` re-cuts it. The column
-exists because nothing recoverable tells the two apart afterwards — the way boundaries
-are gone once the polyline is stored. The migration sets it TRUE for `osm:r%` patterns,
-where the relation is the pattern and the two lists are the same by construction, and
-FALSE for everything else, so nothing disappears on the next run and nothing is claimed
-that was not measured.
+**`build_track_services` inverts relation track per way, keyed on `(way_id, short_name,
+agency_id, mode)`.** One polyline per pattern cannot answer which services use a piece of
+track: 75.8% of Great Britain's rail ways carry two or more relations, so drawing per
+pattern puts coincident lines over most of the network and a hover lands on an arbitrary
+one. The key is a `way_id` rather than an `edge_id` because nothing routed this track and a
+GraphId is valid only within one graph build. `mode` is in the key on purpose, so a way
+carrying both a tube line and a National Rail service is two features and is drawn twice.
+`n_trips` sums to NULL rather than zero where no timetable has been attributed, because
+zero trips a week and an unknown number are different claims.
 
-**Every `osmroutes` pattern was drawn twice before that partition existed.** The
-segments trace arm selects live, non-matchable, shapeless patterns, and that is exactly
-what an `osm:r` pattern is, so each one came out as a whole polyline lying over the
-ways the per-way inversion had just collapsed it into. It had been correct until the
-inversion landed after it. The visible half was two coats of the same track. The worse
-half was the hover, because the viewer queries segments before track, so a hover on
-National Rail answered with one relation's card reading "operator geometry" rather than
-the way's service list.
-
-## Storage
-
-**Storage is one DuckDB file** (`work/wayfare.duckdb`). DuckDB rather than SQLite
-because the central operation is a group-by over a 5 GB CSV, done out of core. The
-minimal-dependency discipline that governs `ontime` does not apply here — this is an
-offline batch pipeline, not a 62 MB container.
-
-**Geometry is stored as integer micro-degrees, not WKT.** `edges` carries
-`lon_e6`/`lat_e6` INTEGER lists plus four bbox columns; 1e-6 of a degree is 11 cm.
-This deleted the first-vertex regex, the pad-by-longest-edge collar and the Python
-re-test that the art window query needed — the window test is now an exact integer
-overlap. `shapes` is one row per shape rather than one row per point: 1.7M rows for
-Wales, on the order of 100M nationally. It is input to `match` and nothing else, so
-`wayfare prune` drops it once matching completes. Wales: 160 MB -> 114 MB compacted.
-Migration runs on connect and rewrites in place, because a national match run costs
-a day or two and a schema change it cannot survive is one nobody applies.
-
-**DuckDB takes a single writer.** Match workers do HTTP only; the main thread
-writes.
-
-**DuckDB cannot spill an ordered list aggregate.** `list(x ORDER BY y)` pins its
-per-group sort state in memory. Collapsing trips to stop sequences died on the
-London feed (480,412 trips, 1.5 GB `stop_times.txt`) at "failed to pin block",
-identically at a 7.4 GB limit and at a 10.2 GB limit on a 17 GB machine. Raising the
-limit is not a fix, it only moves the wall. The fix is to project the needed columns
-into a table in one streaming scan (which does spill), then aggregate in 16
-partitions keyed on `hash(trip_id)`. London then collapsed 17,611,239 stop times in
-6 seconds inside an 8 GB limit. `stop_times.txt` is 5.09 GB nationally, so this
-would have hit there too. `WAYFARE_MEM` defaults to 8 GB and DuckDB spills to
-`temp_directory`, so that path needs room.
-
-**A DuckDB connection holds one result at a time, and a second query abandons the
-first silently.** Not an error, not a short read anything notices — a 200,000-row
-stream interrupted after its first batch simply ends at 20,000 and looks complete.
-This is why `Window.paths` resolves `self.weights` *before* it opens its stream:
-making that scale lazy put its query inside the draw loop, where it truncated every
-`density` and `spectrum` render to its first fetch. The renders were stable,
-plausible, and wrong. Anything else that becomes lazy on this connection inherits
-the same trap.
-
-**DuckDB inserts about 2,700 rows/s through executemany, and 1.6M/s from a file.**
-It is columnar; every bound-parameter insert pays the full per-statement machinery.
-This is not a small constant — roughly 450 of the Wales match run's 983 seconds went
-on inserting rather than matching, with Valhalla under 1% CPU throughout. `match`
-stages each batch to a file and reads it back: CSV for `pattern_edges`,
-newline-delimited JSON for `edges` because it carries INTEGER[] geometry and road
-names holding quotes and commas. Multi-row VALUES and unnest of parallel arrays are
-no better than executemany. Never add a row-at-a-time insert loop on a table that
-grows with the network.
-
-**That 2,700 rows/s assumes the insert sits inside a transaction, and without one it
-is 25 rows/s.** Each bound insert then commits on its own. `routes.write_ways` is the
-worked example: 68,369 rows in 2,733 seconds, 40ms each, 108× below the figure above,
-and one `BEGIN`/`COMMIT` around it recovers 90% of that. The rule above still holds
-afterwards — a transaction takes the loop from unusable to merely slow, and staging to
-a file is 167× faster again. The routes section has the full comparison.
-
-## Clustering
-
-**Clustering `edges` on a space-filling curve does prune, and it is `wayfare
-cluster`.** DuckDB keeps min/max zonemaps per 122,880-row group, and `match` inserts
-edges in batch order, which is spatially random, so unclustered they prune nothing.
-Ordering the table by a Morton code over the bbox centre makes a city window touch a
-handful of groups: Cardiff read 100% -> 11.7% of `edges`, 22 ms -> 4.4 ms; London
-100% -> 26.3%, 30 ms -> 16 ms. It also shrinks the file, 528 -> 453 MB. Verified from
-DuckDB's own `operator_rows_scanned`, not inferred from wall time. Hilbert reaches
-5.9% on Cardiff but only beats Morton on the smallest window, so it is not worth the
-`spatial` extension on its own and is benchmark-only. But this is a 5x improvement to
-a quarter of the cost, and Wales at ~2 row groups cannot show it at all.
-
-`db.morton_sql` is the one implementation; `scripts/bench_window.py` calls it rather
-than keeping its own, so what the benchmark measures and what the command does cannot
-drift. `db.CLUSTER_BOX` is a fixed grid over Great Britain rather than the data's
-extent, so a region's layout does not depend on which region it is; the code is a
-physical row order and never an identity, so changing the box is harmless beyond
-needing a re-run.
-
-**DuckDB never gives space back below a file's high-water mark, so `cluster` has to
-write a new file.** Reordering in place is the obvious implementation and it makes
-the database *bigger*: the dropped table's blocks stay allocated, and neither
-`CHECKPOINT` nor `VACUUM` reclaims them — measured at 505 MB going to 730. `COPY FROM
-DATABASE` into a freshly attached file is what actually reclaims them, and it
-preserves row order, so the curve survives the copy. `db.cluster` therefore reorders
-in place, copies to `<db>.compacting`, reopens and counts it, re-asserts the indexes
-(the copy carries data, not necessarily every index), and only then does an atomic
-rename. 529 MB -> 471 MB on the benchmark's 4.2M edges. It needs room for a second
-copy while it runs, and an interruption at any point leaves the original untouched.
-
-**Clustering goes stale rather than off, and `wayfare status` says so.**
-`cluster_edges` records the row count it sorted in `meta.edges_clustered`. Rows
-`match` adds afterwards land unsorted on the end, where no zonemap can help, so
-`status` reports `yes`, `no`, or `stale (N of M edges sorted)`. It is a separate
-command rather than a step in `aggregate` for the same reason `prune` is: it rewrites
-the whole table, needs room for a second copy of `edges` while it does, and is worth
-doing once after a match run rather than on every re-aggregation.
-
-**`edge_services` cannot prune, and giving it a bbox column is not worth it.** It
-carries no bbox column and DuckDB pushes no min/max filter through the join, so the
-weights pass reads all 10.25M rows under every layout. The bbox column was the obvious
-way through and has been measured: it prunes almost exactly as hoped — cardiff
-10,250,638 rows → 614,400, London → 2,457,600 — and buys 40.9ms → 31.1ms on cardiff,
-356.1ms → 357.6ms on London, and nothing nationally. Four `INTEGER` columns on the
-largest table in the database for 10ms on the smallest window. The scan was never what
-cost anything; see docs/rendering.md.
+**The two arms partition on `traces.ways_cut`, and a pattern in both is drawn twice.** A
+trace cut to its own pattern is inverted per way. A trace holding the whole line's chain
+keeps its polyline in `segments`, because inverting it would attribute a short working to
+track it never reaches, until `wayfare trace --retry ok` re-cuts it. Nothing recoverable
+tells the two apart once the polyline is stored, which is why the column exists. What a
+pattern in both arms looks like is a hover on a National Rail way answering with one
+relation's card rather than the way's service list.
 
 ## publish
 
-**In Mapbox Vector Tiles (MVT) the cost that matters is per feature, not per
-attribute value.** MVT pools attribute values per layer per tile, so a feature pays
-two varints to point into the pool. Long service lists are cheap; feature counts are
-not. A Valhalla directed edge averages 4.14 coordinates and tens of metres, so one
-feature per edge was the root cost — and at four points a feature `--simplification=4`
-had nothing to remove, so low zooms carry full-detail geometry. What a low zoom holds
-is therefore decided by a feature quota applied to the input, not by
-`--drop-densest-as-needed` shedding whole roads.
+**What it does.** Streams the network out as GeoJSONL, builds up to six tippecanoe passes
+and joins them into one PMTiles archive, with the data credit stamped into the archive's
+own tileset metadata.
 
-**Tile features are coalesced, and coalescing must stay lossless.** Runs of edges that
-share every tile attribute (`way_id`, road name, service set, trip count) and meet end
-to end merge into one feature. Chaining stops where three of a group's edges meet: at a
-fork, picking a continuation draws a line that doubles back. Directed pairs collapse
-only where the service sets agree, so a one-way pair carrying different buses each way
-still renders as two lines, while an ordinary two-way street no longer renders one line
-invisibly under another. Wales: 169,857 directed edges -> 102,925 after collapsing
-pairs -> 53,013 after chaining. This is a publish-stage concern only; `art` reads raw
+    wayfare publish
+    wayfare publish --region ireland --name-by-region
+    wayfare publish --from-export
+
+**Flags.** `--region` decides which feed's credit is stamped, defaulting to the
+`WAYFARE_REGION` the data root was acquired with; the licence is a condition rather than a
+label, so it has to match the data. `--out PATH` names the archive outright and
+`--name-by-region` writes `<name>.pmtiles` through `config.archive_name`, with region `all`
+becoming `great_britain.pmtiles`; the two are mutually exclusive. Given neither, the
+archive is `bus.pmtiles` in the data root's `out/`, and `publish.default_out` raises only
+where a region-named archive already exists there, since writing the default beside it
+would update nothing anyone serves. `--from-export` builds from a GeoJSONL a previous
+publish wrote and needs no database, for a data root whose database has been pruned away;
+it rebuilds the same tiles and does not refresh the region.
+
+**Cost.** Tens of minutes nationally, dominated by tippecanoe. `export_geojsonl` streams by
+`way_id` rather than materialising, measured at 617 MB down to 372 MB peak resident set
+size on Wales. `tippecanoe` and `tile-join` must be on `PATH`, from felt/tippecanoe; the
+mapbox fork cannot write PMTiles.
+
+**Interrupting.** Safe. Every intermediate goes in a scratch directory under the output
+directory and only the finished archive is renamed into place, atomically and on one
+filesystem, so a killed run leaves whatever is being served untouched.
+
+**Four road bands, then segments, then track.** `far` covers z5-z7, `mid` z8-z9, `near` z10
+alone and `detail` z11-z14. The fifth pass is `segments` and the sixth is `track`, each one
+band over z5-z14, and `tile-join` concatenates whatever exists. The archive holds three
+layers: the banded road layer, `segments` and `track`. Either of the last two can be
+absent, and each is skipped rather than joined in empty, because tippecanoe exits 110 on an
+empty input. A region with no matched edges gets no road bands at all.
+
+**`_DETAIL_ONLY` is `("way", "refs", "name")`, stripped from the three overview bands.**
+Those are the attributes only the info card opens, and the card does not open below
+`DETAIL_ZOOM`. `trips` is published at every zoom, because the viewer's colour ramp reads
+it and an attribute a paint property cannot find is not an error MapLibre reports: it takes
+the fallback out of `to-number` and draws a whole country in the first ramp colour. An
+archive published before that change is handled by the viewer's `["has", "trips"]` guard,
+which never fires against a newer build.
+
+**The detail band's feature id is the OpenStreetMap way id, and the overview bands' is the
+Valhalla edge id.** `way` is therefore an attribute of no band and neither is `id`, and the
+viewer tells the two ranges apart by reading `refs`. Put `way` back as an attribute, or
+strip `refs` from a band, and the viewer hovers in the wrong id space with no error to show
+for it. A way whose service set changes along it is several features sharing one id, so a
+hover selects the whole way, which the Mapbox Vector Tile (MVT) specification asks for and
+does not require.
+
+**Tile features are coalesced, and coalescing must stay lossless.** Runs of edges sharing
+every tile attribute and meeting end to end merge into one feature. Chaining stops where
+three of a group's edges meet, since picking a continuation at a fork draws a line that
+doubles back, and directed pairs collapse only where the service sets agree. Wales: 169,857
+directed edges to 102,925 after collapsing pairs to 53,013 after chaining. `art` reads raw
 directed edges and is unaffected.
 
-**The `refs` cap is 64 and there is no overflow sidecar.** Only 1,405 of Wales's
-169,857 edges held more than 12 services and the longest held 53, so 64 clears Wales
-outright. Raise the cap again rather than reintroducing a sidecar — pooling makes the
-list cheap. Card-only attributes are confined to z11+. Bucketing `trips` to a log scale
-was tried and rejected: it saves a further 2.1%, because MVT already pools the 1,759
-distinct values, and costs an approximate figure in the info card.
+**The export is deterministic and must stay that way.** Every ORDER BY needs a unique
+tiebreak, including the ones whose order looks irrelevant, because DuckDB's parallel hash
+join returns rows in a varying order. Two things broke this: `list(short_name ORDER BY
+n_trips DESC)` with no tiebreak, whose arbitrary order was part of the coalescing key, and
+`_chain` starting a closed loop wherever the scan began. A rebuild now produces
+byte-identical output.
 
-**What "card-only" covers is `way`, `refs` and `name`, and `trips` is no longer one
-of them.** It was, for as long as the info card was its only reader. The viewer's
-colour ramp reads it at every zoom, and an attribute a paint property cannot find is
-not an error MapLibre reports: it takes the fallback out of `to-number` and draws every road
-in the first ramp colour, so a whole country below z11 came out one flat blue and read
-as a region with no buses. `_DETAIL_ONLY` is now the three the card alone opens, and
-the card does not open below `DETAIL_ZOOM`. The cost is a key and a varint per feature
-in the three overview bands; `refs`, which is a whole comma-joined service list, is
-still excluded and is where the saving actually was. `way` has since left the
-attributes altogether: it is the detail band's feature id, below.
+**Measured savings on the current build.** Great Britain published from a copy of the
+server's database, against an archive built the old way from byte-identical inputs, goes
+166,165,053 bytes to 136,786,795, or 17.7%. Per zoom, z5-z10 are unchanged, z11 saves
+30.9%, z12 28.7%, z13 26.7% and z14 14.6%, since `-D` never touches a band's maximum zoom.
+`config.SIMPLIFICATION` is the largest single geometry saving: turning simplification off
+costs 25.89% on Ireland's detail band. Feature ordering, tippecanoe's coalescing flags and
+gzip are all exhausted, landing between +0.00% and +1.29%.
 
-An archive published before that change answers its low zooms without `trips`, so the
-viewer guards the journeys ramp with `["has", "trips"]` and draws grey where the
-attribute is absent. The guard is transitional and self-clearing: it never fires
-against an archive built since, and republishing is a `publish` run, not a re-match.
+**What a low zoom holds is left to tippecanoe, and four attempts to take that decision away
+all made the map worse.** `config.OVERVIEW_CAP_FAR` and `config.OVERVIEW_CAP_MID` are both
+`None`, and the quota machinery under them is switched off, kept only because z5 is still
+thinner than Ireland. Read the block in `config` before reviving any of it.
+`--drop-densest-as-needed` picks by density rather than service level, which is a real
+fault, but it thins only the tiles that will not fit: 18 at z5-z7 and 4 at z8-z9, where
+every cap tried thinned the whole country to spare those.
 
-**The export is deterministic, and must stay that way.** Two things made it not be:
-`list(short_name ORDER BY n_trips DESC)` with no tiebreak, so equally busy services came
-back in arbitrary order and that order was part of the coalescing key; and `_chain`
-starting a closed loop wherever the scan happened to begin. A rebuild now produces
-byte-identical output, which is what makes tiles cacheable and two runs comparable.
+**Judge a low zoom by lit pixels, never by feature counts.** A cap keeps many short
+features spread over many cells and no cap keeps fewer, longer ones. Features per zoom,
+populated cells, features per cell and bins-holding-anything all reward the first, and only
+the second reaches the screen, so every round shipped on numbers that rose while the map
+got worse. `wayfare coverage` counts the same way and inherits the same blind spot. Draw
+the geometry and look at it. Rasterised around London, the uncapped archive lights 3.8% of
+the window at z5, 7.0% at z6 and 9.3% at z7 against the capped build's 2.7%, 3.7% and 3.7%;
+at z8 it is 8.2% against 5.0%, where the capped render hollowed the city into a skeleton.
 
-**Archive size, same data throughout** (Wales): 23.8 MB baseline -> 20.9 MB with the
-edge id moved into the MVT feature id field (`--use-attribute-for-id`) -> 13.7 MB with
-coalescing -> 11.1 MB with card-only attributes confined to z11+ -> 9.5 MB once the
-refs-ordering bug stopped splitting segments. 60% in total. Tippecanoe reports no
-features dropped and every zoom holds the full network; the first build was thinning
-the densest tiles to 27% of their features.
+**Three silent failures guard the rest.** Tippecanoe applies `-x` before `-j`, so a filter
+naming an excluded attribute matches nothing and writes an empty band, measured on London
+as a 2.4 KB archive holding no tiles and no error. `--extend-zooms-if-still-dropping`
+treats `-z` as a ceiling it may raise, and a `far` band asked for z5-z7 came back covering
+z5-z9, which overlaps the next band and has `tile-join` merge both copies of every road;
+the flag is passed to the last band only. A longitude within about a kilometre of the prime
+meridian is written `-1.1e-05`, and Great Britain has 63 such features around Greenwich,
+which a number pattern without an exponent skips without a word.
 
-`publish.export_geojsonl` streams by `way_id` rather than materialising the table: 617
--> 372 MB peak RSS on Wales.
+**Checking a built archive needs no database.**
 
-**The archive is three tippecanoe builds joined by `tile-join`, not two.** `far` covers
-z5-z7 and reads a filtered copy of the export, `near` covers z8-z10 and reads all of it,
-`detail` covers z11-z14. The first two exclude the card-only attributes, which is how the
-z11+ confinement above is implemented. Splitting the low zooms into their own *band* is
-what lets them take a different input from the rest.
+    wayfare coverage out/great_britain.pmtiles
+    wayfare draw out/great_britain.pmtiles look.png --zoom 6 --window -6 50 2 59
 
-**A region with non-road modes gets a fourth pass, and its segments go in a layer of
-their own.** The two layers carry different attributes and are drawn differently: the
-viewer colours a road by how many distinct services use it, and a segment by its mode,
-with a legend listing the modes actually drawn. `tile-join` keeps distinct layer names,
-so the second layer costs one tippecanoe pass and nothing else. That pass covers z5-z14
-in one band rather than three. Banding exists to keep info-card attributes off millions
-of edges at zooms nobody reads them at and to thin the quietest roads out of the far
-view; Great Britain holds 630 segments against 2.7M edges, and a tram line thinned out
-of its own layer would only be missing. Either half can be absent, and each is skipped
-rather than joined in empty: a bus-only region gets no segments pass, and a region with
-no matched edges gets no road bands, because tippecanoe exits 110 on an empty input
-rather than writing an empty archive. Irish Rail on its own is 331 patterns and not one
-of them is a road.
+`coverage` reports features per cell for each quarter of the country, ranked by how much
+the cell holds at z14, and the figure to read is the emptiest quarter's against a region
+that is not filtered. `draw` rasterises a zoom so it can be looked at, which is the check
+the feature counts cannot make.
 
-**The detail band's feature id is the OSM way id, and moving it there saves more than
-deleting it would.** MVT pools attribute values per layer per tile, so what a repeated
-value costs after the first is two varints. The pool dedupes `refs` 5.9x and `name`
-6.1x within a tile against 1.37x for `way`: a way id is near-unique per feature, which
-makes it the one attribute pooling cannot help.
-`--use-attribute-for-id=way -x way -x id` takes Great Britain's detail band from
-106,221,548 bytes to 84,677,158, 20.28%, where excluding `way` outright and leaving the
-GraphId in the id field takes 19.39%. Deleting an attribute saving less than moving it
-is the surprise, and the export's `ORDER BY way_id` is the reason: a sorted way id
-compresses where the GraphId it displaces did not. It costs uniqueness, since a way is
-several features wherever its service set changes along it and those features now share
-an id, which the MVT specification asks for and does not require. A hover therefore
-lights the whole way rather than one segment of it.
+**A licence condition travels with the data, not with the page.** The credit is derived
+from `config.Feed` and written into the archive's tileset metadata, so a copied archive
+keeps it. `publish.contents` reads off the database which of `road`, `operator` and `track`
+the archive holds, and the Open Database Licence (ODbL) credit to OpenStreetMap is owed
+only where a route was matched onto its ways or drawn from its track. The viewer needs
+`pmtiles.Protocol({ metadata: true })` or MapLibre never sees any of it, which looks like a
+viewer crediting only its basemap rather than an error.
 
-**The viewer tells the two id ranges apart by `refs`, not by a zoom it works out for
-itself.** `_DETAIL_ONLY` strips `way`, `refs` and `name` from exactly the three bands
-that keep the edge id, so testing `p.refs` is the same question as "did this feature
-come from an overview band". Two places in `web/index.html` asked `p.way === undefined`
-instead, which was the same test only while `way` was still an attribute of the detail
-band. `showFeature` now takes the way id as a parameter, `countMatches` keys on
-`w${f.id}` above `DETAIL_ZOOM`, and `mergeRegions` matches on `h.id`.
+## Storage
 
-**`-D 10` quantises the detail band's lower zooms, and its saving and the id change are
-disjoint.** tippecanoe's `-D` is the tile grid as a power of two, default 12 for a
-4096-unit tile, and 10 is 1024 units. Alone it takes the same band from 106,221,548
-bytes to 98,223,063, 7.53%. Both together give 77,033,089, 27.48%, against the 27.81%
-the two summed predict — near-additive, because one shrinks the attribute block and the
-other the geometry. The ground truth for the setting is that MapLibre draws a vector
-tile across 512 screen pixels, which puts detail 9 at one grid unit per pixel at native
-zoom and 10 at half a unit. 9 was measured and rejected: 10.81% on Ireland for a 375 m
-worst-case collapse at z11, taking 8.58% of that zoom's features with it. What 10 costs
-is visible in the largest z13 tile, where 25 ways of 1,984 collapse to a point and drop
-out, median length 2.88 m and maximum 5.93 m against a native-zoom screen pixel of
-5.75 m. All 25 are still drawn at z14.
+**One DuckDB file**, `work/wayfare.duckdb`. DuckDB rather than SQLite because the central
+operation is a group-by over a 5 GB comma-separated values (CSV) file, done out of core.
+Geometry is integer micro-degrees rather than well-known text: `edges` carries
+`lon_e6`/`lat_e6` INTEGER lists plus four bbox columns, and 1e-6 of a degree is 11 cm, so
+the art window test is an exact integer overlap. Migrations run on connect and rewrite in
+place, never re-running the pipeline, because a national match run costs a day or two and a
+schema change it cannot survive is one nobody applies.
 
-**Whole archive, verified end to end rather than inferred from the band.** Great Britain
-published from a copy of the server's database, against an archive built the old way
-from byte-identical inputs — 867,359 road features, 3,204 segments, 63,387 track ways —
-goes 166,165,053 bytes to 136,786,795, 17.7%. Per zoom: z5-z10 unchanged, z11 30.9%,
-z12 28.7%, z13 26.7%, z14 14.6%. z14 saves least because `-D` never touches a band's
-maximum zoom, so the whole of its saving is the id change. Nothing has been republished;
-the candidate archive is at
-`/home/samba/sambashare/wayfare-cand/out/great_britain.pmtiles` on the server. Taking it
-live needs a `publish` run and no migration behind it, because `way` was already a
-column on `edges` and already in the export.
+**DuckDB takes a single writer.** Match workers do HTTP only and the main thread writes.
 
-**Simplification reaches the maximum zoom, and a note here used to say it did not.**
-Measured on Ireland's detail band: `--simplify-only-low-zooms` builds 6.16% *bigger*,
-`--simplification-at-maximum-zoom=8` alongside `--simplification=8` is byte-identical to
-`--simplification=8` on its own, and turning simplification off entirely costs 25.89%.
-`config.SIMPLIFICATION` is the largest single geometry saving in the build, which is not
-what a knob believed to apply to five of six zooms would be.
+**A connection holds one result at a time, and a second query abandons the first
+silently.** Not an error and not a short read anything notices: a 200,000-row stream
+interrupted after its first batch ends at 20,000 and looks complete. This is why
+`Window.paths` resolves `self.weights` before it opens its stream. Making that scale lazy
+put its query inside the draw loop, where it truncated every `density` and `spectrum`
+render to its first fetch, and the renders were stable, plausible and wrong.
 
-**Feature ordering and tippecanoe's coalescing flags are exhausted, and so is gzip.**
-Every ordering and coalescing variant measured lands between +0.00% and +1.29% against
-the current build; `--reorder` costs +0.21% on Great Britain, and the `--coalesce`
-family merges nothing at all, because `publish.coalesce` has already taken everything
-mergeable out of the export. Compression is at its ceiling too: 315.2 MB of tiles come
-back as 143.5 MB, and recompressing every tile at level 9 saves 0.06%. zstd would save
-about 9.0 MB, and stock `pmtiles.js` throws on compression methods 3 and 4, so no
-browser client could read the result.
+**DuckDB cannot spill an ordered list aggregate.** `list(x ORDER BY y)` pins its per-group
+sort state in memory, and collapsing trips to stop sequences died on the London feed at
+"failed to pin block", identically at a 7.4 GB limit and at a 10.2 GB limit on a 17 GB
+machine. Raising the limit moves the wall. The fix is to project the needed columns into a
+table in one streaming scan, which does spill, then aggregate in `WAYFARE_SEQ_PARTITIONS`
+partitions keyed on `hash(trip_id)`, 16 by default. DuckDB spills to `temp_directory`, so
+that path needs room.
 
-**`--drop-densest-as-needed` chooses by spatial density, so it thins cities hardest and
-leaves a rural road carrying two buses a week alone.** On the Great Britain archive
-published 2026-08-07, tippecanoe's own `strategies` metadata records it shedding 922,505
-features at z5, 841,401 at z6, 779,546 at z7, 538,485 at z8 and 298,823 at z9, and nothing
-from z10 up. Decoding the finished archive gives z5 holding 5.1% of what z14 held, z6
-9.7%, z7 14.3%, z8 37.6%, z9 58.3% and z10 86.1%. Ireland's archive carries no
-`strategies` key at all, and neither does Northern Ireland's, so nothing was thinned at any
-zoom in either, and Ireland holds 41.5% at z5 and 75.7% at z8. Great Britain carries
-1,095,684 features at z14 against Ireland's 115,853, 9.5x the network, but at z5 carried
-55,998 against 48,043, only 1.17x. Density was the wrong criterion.
+**Never add a row-at-a-time insert loop on a table that grows with the network.** DuckDB
+inserts about 2,700 rows/s through `executemany` inside a transaction, 25 rows/s without
+one, and 1.6M rows/s from a file. `match` stages each batch to a file and reads it back:
+CSV for `pattern_edges`, newline-delimited JSON for `edges` because it carries INTEGER[]
+geometry and road names holding quotes and commas. Multi-row VALUES and unnest of parallel
+arrays are no better than `executemany`.
 
-**One national `trips` floor emptied half the map, and it shipped.** The first answer
-ranked the whole region on `trips` and kept the highest 214,000 features. `trips` is an
-absolute count, so ranking a country on one scale ranks it by how urban it is. At the
-703-trip floor that produced, measured over 0.25-degree cells on Great Britain, 310 of the
-655 cells holding any bus road lost every feature they had, 47.3% of them. The ten busiest
-cells held 45.9% of the survivors, and the top tenth of cells went from 48.7% of the map's
-features to 81.7%. On the map that drew the dense cities with black between them. The
-archive was republished uncapped as soon as it was seen, so the fault was live only
-briefly.
+**`wayfare prune` drops operator geometry, and it spares what is still drawn.**
+`db.prune_shapes` refuses while any matchable pattern is unmatched, counting matchable
+patterns only, since a tram never gets a `match_status` row and would otherwise block it
+for ever. The delete then spares every shape a live non-matchable pattern points at,
+because for a tram or a ferry `shapes` is the only geometry there is and `segments` is a
+derived copy of it. Wales measured 160 MB down to 114 MB compacted. Run it after
+`aggregate` and before `cluster`, which is the only thing that gives the space back.
 
-**The overview is not capped, and four attempts to cap it all made the map worse.**
-`config.OVERVIEW_CAP_FAR` and `config.OVERVIEW_CAP_MID` are both `None`. The quota
-machinery beneath them — a per-cell `trips` floor, a weighting exponent and a cell size
-— is switched off and kept only because z5 is still thinner than Ireland, which is the
-one place a selection might still earn its keep.
+**Departed patterns are counted and never evicted.** `patterns` keeps the row,
+`match_status` keeps the result, and nothing removes a departed pattern's `pattern_edges`
+rows, so that table grows monotonically as a database is kept current. `prune_shapes` drops
+operator geometry and nothing else. The rows are harmless to what is drawn, since every
+consumer filters on `db.current_feed()`, and they are dead weight on disk that no command
+currently reclaims.
 
-The attempts, in order, were a single national `trips` floor, which took every feature
-from 310 of Great Britain's 655 populated cells; a per-cell floor sharing the cap out in
-proportion to cell size, which emptied nothing and drew 15 features per rural cell at z6
-where Ireland drew 53; the same weighted by the square root of cell size, which restored
-the countryside and flattened the cities; and the same again on a 0.02-degree grid, which
-took coverage of 1.4 km bins from 37.8% to 88.9% and was still worse on screen than no cap.
+## Clustering
 
-**Lit pixels are what a reader sees, and every cap loses them at every zoom.** Measured
-by rasterising the tile geometry into a window and counting:
+**What it does.** `wayfare cluster` reorders `edges` on a space-filling curve and compacts
+the file. It takes no flags and reports the row count, the time and the size either side.
+It is safe to interrupt at any point, leaving the original untouched, and it needs room for
+a second copy of the database while it runs.
 
-| window              | z5   | z6   | z7   |
-| ------------------- | ---- | ---- | ---- |
-| Ireland, Dublin     | 4.7% | 4.6% | 4.5% |
-| GB uncapped, London | 3.8% | 7.0% | 9.3% |
-| GB capped, London   | 2.7% | 3.7% | 3.7% |
-| GB uncapped, Wales  | 1.1% | 1.2% | 1.3% |
-| GB capped, Wales    | 1.0% | 1.0% | 1.0% |
+**Why it prunes.** DuckDB keeps min/max zonemaps per 122,880-row group, and `match` inserts
+edges in batch order, which is spatially random, so unclustered they prune nothing. Ordering
+by a Morton code over the bbox centre makes a city window touch a handful of groups: Cardiff
+reads 100% of `edges` down to 11.7%, 22 ms to 4.4 ms, and London 100% to 26.3%, 30 ms to 16
+ms. Both verified from DuckDB's own `operator_rows_scanned` rather than inferred from wall
+time. Hilbert reaches 5.9% on Cardiff and only beats Morton on the smallest window, so it
+stays benchmark-only rather than earning the `spatial` extension. Wales, at roughly 2 row
+groups, cannot show any of this. `db.morton_sql` is the one implementation and
+[`scripts/bench_window.py`](../scripts/bench_window.py) calls it, so the benchmark and the
+command cannot drift. `db.CLUSTER_BOX` is a fixed grid over Great Britain rather than the
+data's extent, and the code is a physical row order and never an identity, so changing the
+box costs a re-run.
 
-At z8 around London the capped archive lit 5.0% against 8.2% uncapped, and the render
-showed the city hollowed into a radial skeleton. Uncapped Great Britain already exceeds
-Ireland's density at z6 and z7; the deficit is z5 alone, 3.8% against 4.7%.
+**It has to write a new file.** DuckDB never gives space back below a file's high-water
+mark: the dropped table's blocks stay allocated and neither `CHECKPOINT` nor `VACUUM`
+reclaims them, so reordering in place makes the database bigger, measured at 505 MB going to
+730 MB. `COPY FROM DATABASE` into a freshly attached file reclaims them and preserves row
+order, so the curve survives the copy. `db.cluster` reorders in place, copies to
+`<db>.compacting`, reopens and counts it, re-asserts the indexes and only then renames
+atomically. Sorted neighbours also compress better, which is the other half of the win: 528
+MB to 453 MB on the benchmark's 4.2M edges.
 
-**The counting mistake is the part worth keeping.** A cap keeps many short features
-spread over many cells, and no cap keeps fewer, longer ones. Features per zoom, populated
-cells, features per cell, and bins holding any feature all reward the first, and only the
-second reaches the screen — so four rounds shipped on numbers that rose while the map got
-worse. `wayfare coverage` counts features and inherits the same blind spot.
+**Clustering goes stale rather than off.** `cluster_edges` records the row count it sorted
+in `meta.edges_clustered`, so rows a later `match` appends land unsorted on the end where no
+zonemap can help. `wayfare status` reports `yes`, `no` or `stale (N of M edges sorted)`. It
+is a separate command rather than a step in `aggregate` for the same reason `prune` is,
+being worth doing once after a match run rather than on every re-aggregation.
 
-`--drop-densest-as-needed` remains the only thing thinning a low zoom. It chooses by
-density rather than by service level, which is a genuine fault: on the 2026-08-07 archive
-it shed 922,505 features at z5. It thins only the tiles that will not fit, 18 at z5-z7 and
-4 at z8-z9, where a cap thins the whole country to spare them.
+**`edge_services` cannot prune, and a bbox column is not worth adding.** It carries no bbox
+column and DuckDB pushes no min/max filter through the join, so the weights pass reads all
+10.25M rows under every layout. The column was measured: it prunes almost exactly as hoped,
+Cardiff 10,250,638 rows down to 614,400 and London to 2,457,600, and buys 40.9 ms to 31.1 ms
+on Cardiff, 356.1 ms to 357.6 ms on London and nothing nationally. That is four INTEGER
+columns on the largest table in the database for 10 ms on the smallest window; the scan was
+never what cost anything, and [docs/rendering.md](rendering.md) has where the time goes.
 
-**Tippecanoe applies `-x` before `-j`, so a feature filter naming an excluded attribute
-matches nothing.** Measured on London, `-x trips` with a `-j` filter on `trips` built a
-2.4 KB archive holding no tiles, and reported no error. Filtering the input file avoids the
-ordering entirely.
-
-**`--extend-zooms-if-still-dropping` treats `-z` as a ceiling it may raise.** A `far` band
-asked for z5-z7 came back covering z5-z9, which overlaps `near`, and `tile-join` would then
-merge both copies of every road into those tiles. The flag is passed to the last band only.
-
-**A longitude within about a kilometre of the prime meridian is written in scientific
-notation.** It comes out as `-1.1e-05`, and Great Britain has 63 such features, around
-Greenwich. A number pattern of `-?\d+\.?\d*` matches every other line in the export and
-skips exactly those, so the filter would have put them in the wrong cell or dropped them
-without a word. The pattern now allows an exponent.
-
-All three failures produce an archive that builds, uploads and opens without complaint.
-Counting features, per zoom in the finished archive and per cell in the filtered export, is
-what catches them, and it is the measurement the whole banding rests on.
-
-**A feature count cannot see a hole, and neither can a cell that draws anything at all.**
-Both weightings above passed the checks that were being run. The proportional one drew every
-one of Great Britain's 655 populated cells and carried 1.76x the features of the uncapped
-build at z5, and it still looked like cities in a black field, because a cell holding one
-road counts the same as a cell holding eighty. What separates them is decoding the *Mapbox
-Vector Tile* geometry back to longitude and latitude and counting drawn features per cell
-per zoom, split by how much the cell holds at z14. Under the proportional weight that
-measurement reads 15 features per rural cell against 407 per urban one; under the square
-root it reads 41 against 323.
-
-`wayfare coverage <archive>` is that measurement, and it needs the archive and nothing
-else — no database, no export — so a published file can be checked wherever it ended up.
-It reports features per cell for each quarter of the country, ranked by how much the cell
-holds at z14.
-
-The figure to read is the emptiest quarter's, in features, against a region that is not
-filtered. Great Britain draws 36 features per rural cell at z5 and 52 at z8, and Ireland
-draws 44 and 62. The proportional weight drew 15 at z6 where Ireland drew 53, with 28 rural
-cells under five features against Ireland's 6. The ratio between the busiest quarter and
-the emptiest is reported beside it and is the weaker signal of the two: Great Britain's
-cities are dense enough that its unfiltered z10 sits at 52.2x where Ireland's sits at 10.8x,
-so the two regions cannot be compared on it, and the build that put black between the
-cities read 27.1x at z6 — lower than its own z10, and no worse than what replaced it.
+Most of what is written above began as a bug, and the entries that read as arbitrary
+constants are usually the second answer to a question the first answer got wrong. The
+figures here are worth re-measuring against a run of your own before they are relied on to
+size anything.

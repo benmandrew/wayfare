@@ -3,7 +3,7 @@
 # One command, start to finish:
 #
 #   docker compose up -d valhalla        # first run builds the graph: 45-90 min for GB
-#   docker compose run --rm pipeline     # acquire -> patterns -> match -> aggregate -> publish
+#   docker compose run --rm pipeline     # acquire -> patterns -> match -> trace -> aggregate -> publish
 #   docker compose up -d web             # viewer on :8099
 #
 # `pipeline` is safe to interrupt and re-run: every stage skips work that is

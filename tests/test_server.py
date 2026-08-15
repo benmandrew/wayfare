@@ -118,7 +118,7 @@ def test_out_of_range_numbers_report_the_range(query, match):
 def test_hue_zero_survives():
     """Zero is red, and it is the one hue a falsy-default would silently discard.
 
-    `_number` used to fall back with `or default`, which turned hue=0 into 0.56.
+    The default belongs on absence of the parameter, never on its falsiness.
     """
     assert server.parse_art("area=cardiff&hue=0").opts.hue == 0.0
     assert server.parse_art("area=cardiff").opts.hue == server.DEFAULTS.hue
@@ -808,8 +808,8 @@ def test_archives_lists_only_the_tile_archives(serve_at):
 # --- The pages' own credits --------------------------------------------------
 #
 # The data credit rides in the archive, so nothing here needs to know it. The
-# basemap credit cannot: it belongs to the page, and it used to be the same string
-# typed into two files. These guard the drift, not the wording.
+# basemap credit cannot: it belongs to the page, and both pages draw the same
+# backdrop, so it lives in credits.js alone. These guard the drift, not the wording.
 
 WEB = Path(__file__).resolve().parents[1] / "web"
 PAGES = ("index.html", "art.html")
@@ -821,8 +821,8 @@ def test_both_pages_take_the_basemap_credit_from_one_place():
         text = (WEB / page).read_text()
         assert 'src="credits.js"' in text
         assert "BASEMAP_CREDIT" in text
-        # The copy each page used to carry. Both draw the same backdrop, so a
-        # second spelling of it is a spelling that will drift.
+        # The literal URL belongs in no page: a second spelling of the credit is a
+        # spelling that will drift away from BASEMAP_CREDIT.
         assert "carto.com/attributions" not in text
 
 
@@ -999,9 +999,9 @@ def test_a_kept_alive_connection_sends_without_waiting_for_nagle(serve_at):
 
 
 def test_a_range_naming_neither_end_is_a_400(serve_at):
-    """`bytes=-` matches the Range pattern -- both halves are `\\d*` -- and asks for
-    nothing. It used to reach `int("")` and raise, which on a connection the client
-    means to reuse costs more than the one aborted request it used to."""
+    """`bytes=-` matches the Range pattern -- both halves are `\\d*` -- and names no
+    range, so it has to be refused rather than parsed. A raise takes down a
+    connection the client means to reuse, which costs more than the one request."""
     base = serve_at()
     with pytest.raises(urllib.error.HTTPError) as exc:
         _get(f"{base}/wales.pmtiles", Range="bytes=-")
@@ -1030,8 +1030,8 @@ def test_an_unsatisfiable_range_frames_its_empty_body(serve_at):
 
 
 def test_a_satisfiable_suffix_range_still_works(serve_at):
-    """The branch `bytes=-` used to fall into. PMTiles reads its footer this way,
-    without knowing the file length up front."""
+    """A genuine suffix range has to keep working alongside the refusal above:
+    PMTiles reads its footer this way, without knowing the file length up front."""
     base = serve_at()
     with _get(f"{base}/wales.pmtiles", Range="bytes=-5") as response:
         assert response.status == 206

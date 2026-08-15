@@ -310,9 +310,11 @@ OSM_EXTRACTS = {
     # about one city.
     "london": "united-kingdom/england/greater-london-latest.osm.pbf",
     # Geofabrik splits Ireland at the sea and not at the border, so both halves of
-    # the island read the same 409 MB file. That is convenient rather than awkward:
-    # one extract is one graph build and therefore one GraphId space, so the
-    # Republic and Northern Ireland can share a data root and a DuckDB file.
+    # the island read the same 409 MB file. One extract is one graph build and
+    # therefore one GraphId space, so the Republic and Northern Ireland share a
+    # Valhalla graph. They still need a data root each: `meta.feed_version` holds one
+    # value, so acquiring the second region into the first's database makes it the
+    # current feed and retires every pattern of the first.
     "ireland": "ireland-and-northern-ireland-latest.osm.pbf",
     "northern_ireland": "ireland-and-northern-ireland-latest.osm.pbf",
 }
@@ -338,8 +340,8 @@ def osm_url(region: str | None = None) -> str:
 # France, Belgium, the Netherlands, Germany, Czechia and Poland, the furthest being
 # Warsaw at 20.96 E. They are correct coordinates for real services, so no validity
 # check catches them -- and a plain min/max over every live stop therefore draws a
-# window from Ireland to Poland, which is what `osmroutes.bbox` handed Overpass
-# before this existed.
+# window from Ireland to Poland, which is what `osmroutes.bbox` would hand Overpass
+# without these bounds.
 #
 # Three of the four bounds are a box. The fourth is a line through the Channel,
 # because a box cannot do it: Calais sits east of Dover by half a degree, so the
@@ -431,12 +433,12 @@ VALHALLA_DISTANCE_HEADROOM = 0.9
 # above cannot be routed at any chunk size -- hence the same derivation, giving
 # 180 km.
 #
-# This was 25 km, which was not a bound on bad data but a bound on long-distance
-# coach: triage of all 1,555 patterns it skipped nationally (63,341 trips, 1.64% of
-# every trip in the feed) found no null-island stops and no out-of-GB stops that were
-# not real international coach halts, and 1,299 of them were National Express or
-# FlixBus, median 6 stops and median longest leg 147 km. Recovery against the national
-# run, counting patterns whose stops are all in GB and whose chain fits the cap:
+# A tighter cap bounds long-distance coach rather than bad data. Triage of the 1,555
+# patterns a 25 km cap excludes nationally (63,341 trips, 1.64% of every trip in the
+# feed) found no null-island stops and no out-of-GB stops that were not real
+# international coach halts, and 1,299 of them were National Express or FlixBus,
+# median 6 stops and median longest leg 147 km. Recovery against the national run,
+# counting patterns whose stops are all in GB and whose chain fits the cap:
 #
 #     50 km   356 patterns   15,566 trips   325 routable   14,186 routable trips
 #    100 km   769            32,122         619            24,074
@@ -626,19 +628,18 @@ TRACE_JOIN_TOLERANCE_M = 1.0
 # How hard tippecanoe simplifies a line, in tile units. Lower keeps more of the road's
 # shape and costs bytes.
 #
-# It applies at every zoom including the maximum. A note here used to say the maximum
-# zoom was never simplified, and measuring it on Ireland's detail band says otherwise:
+# It applies at every zoom including the maximum, measured on Ireland's detail band:
 # `--simplify-only-low-zooms` builds 6.16% *bigger*, and `--simplification-at-maximum-
 # zoom=8` alongside `--simplification=8` is byte-identical to `--simplification=8` on
 # its own. Turning simplification off altogether costs 25.89%, which makes this knob
 # the largest single geometry saving in the build.
 #
-# 4 was tippecanoe's default. It has now been measured and it stays: building Great
-# Britain at 4, 2 and 1 gives 130.4 MB, 135.2 MB and 140.8 MB, and moves the ink in a
-# London window at z8 by 0.14 percentage points and at z12 by 0.05. There is very
-# little for simplification to remove -- the export is already short coalesced runs
-# along single ways, and `SIMPLIFY_SHARED_NODES` pins every junction -- so a lower
-# setting buys geometry nobody can see at 8% more bytes.
+# 4 is tippecanoe's default and it stays there. Building Great Britain at 4, 2 and 1
+# gives 130.4 MB, 135.2 MB and 140.8 MB, and moves the ink in a London window at z8 by
+# 0.14 percentage points and at z12 by 0.05. There is very little for simplification
+# to remove -- the export is already short coalesced runs along single ways, and
+# `SIMPLIFY_SHARED_NODES` pins every junction -- so a lower setting buys geometry
+# nobody can see at 8% more bytes.
 SIMPLIFICATION = 4
 # The grid the detail band's lower zooms are quantised to, as a power of two --
 # tippecanoe's `-D`. Its default is 12, a 4096-unit tile; this is 1024 units.
@@ -734,29 +735,28 @@ DETAIL_ZOOM = 11
 # At z8 around London the capped archive lit 5.0% against 8.2% uncapped, and the
 # render showed the city hollowed to a radial skeleton. That is what "speckly" was.
 #
-# The counting mistake underneath all four is worth keeping. A cap keeps many short
-# features spread over many cells; no cap keeps fewer, longer ones. Counting features,
-# or populated cells, or bins holding any feature, rewards the first -- and only the
-# second is visible. Four rounds were judged on measurements that could not see the
-# map. `wayfare coverage` counts the same way and has the same blind spot; the line
-# renderer in the working notes is what to reach for.
+# How a cap is judged decides whether it survives. A cap keeps many short features
+# spread over many cells; no cap keeps fewer, longer ones. Counting features, or
+# populated cells, or bins holding any feature, rewards the first -- and only the
+# second is visible, so anything proposed here is judged on a rendered line map and
+# never on a count. `wayfare coverage` counts the same way and has the same blind
+# spot; the line renderer in the working notes is what to reach for.
 #
 # tippecanoe's `--drop-densest-as-needed` chooses by density rather than by service
-# level, which is a real fault and is why this was attempted. On the 2026-08-07
-# archive it shed 922,505 features at z5. It is also, measured, better than anything
-# offered to replace it: it thins only the tiles that will not fit -- 18 at z5-z7 and
-# 4 at z8-z9 on Great Britain -- where a cap thins the whole country to spare them.
+# level, which is a real fault. It is also, measured, better than anything offered to
+# replace it: it thins only the tiles that will not fit -- 18 at z5-z7 and 4 at z8-z9
+# on Great Britain -- where a cap thins the whole country to spare them.
 FAR_ZOOM = 8
 OVERVIEW_CAP_FAR: int | None = None
-# Where the capped part of the overview ends. z10 is the only overview zoom that was
-# never under pressure -- tippecanoe kept 86.1% of the network there against 37.6% at
-# z8 -- so it is banded off and handed the export whole. Capping z8-z10 as one band
-# was tried and withdrawn for exactly this: the cap that quietens z8 takes z10 from
-# 943,040 features to 411,255, which is paying for a fixed zoom with a working one.
+# Where the capped part of the overview ends. z10 is the only overview zoom not under
+# pressure -- tippecanoe keeps 86.1% of the network there against 37.6% at z8 -- so it
+# is banded off and handed the export whole. Capping z8-z10 as one band takes z10 from
+# 943,040 features to 411,255 for a cap that quietens z8, which is paying for a fixed
+# zoom with a working one.
 MID_ZOOM = 10
 # The cap on z8-z9, or None to hand tippecanoe everything and let
 # `--drop-densest-as-needed` be the only thing standing between the network and the
-# tile size limit. See the note above for why this exists and why it once did not.
+# tile size limit. See the note above for why nothing is capped here.
 OVERVIEW_CAP_MID: int | None = None
 # How the quota is shared out: a cell's share goes as its feature count to this power.
 #

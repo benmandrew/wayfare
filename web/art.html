@@ -572,10 +572,9 @@ const MAX_FIT_PX = 2000;
 
 // How wide a preview can be drawn and still fill the stage.
 //
-// The rule used to be a fraction of the viewport capped at 1,400px, and a cap is
-// exactly what leaves empty ground: an <img> only ever shrinks to its container,
-// so on a wide screen a 1,400px render sat in the middle of a much larger panel.
-// Measuring the frame gives the size of the space the picture actually goes in.
+// An <img> only ever shrinks to its container, so a width fixed under the size of
+// the frame leaves empty ground around the picture on a wide screen. Measuring the
+// frame is what gives the size of the space the picture goes in.
 //
 // Which edge the picture meets first is the window's business, not the frame's: a
 // tall window fits by height, and asking for the frame's full width there draws

@@ -151,8 +151,8 @@ def test_a_route_stored_before_the_rule_existed_is_retired(
     A pattern normally leaves by `last_seen` falling behind, and re-running against
     the feed version already on disk stamps the same value it is holding. So the
     stored row survives the drop while `pattern_stops`, which is rebuilt outright,
-    does not -- leaving a live pattern with no stops. Measured on the server on
-    2026-08-13: 52 of them, one for every route the rule had just dropped.
+    does not -- leaving a live pattern with no stops. Retiring the stored row is the
+    only thing that clears one, since nothing else in the build will touch it again.
     """
     monkeypatch.setattr(gtfs, "_drop_routes_off_the_isles", lambda con: None)
     gtfs.build_patterns(coach_to_calais, con, memory_limit="1GB")

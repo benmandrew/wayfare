@@ -377,9 +377,9 @@ def _chain(members: list[Member]) -> list[Member]:
 
 # `n` and `trips` both survive below DETAIL_ZOOM, because both are weights the
 # viewer paints with: `n` drives the service-count ramp, `trips` the journeys-a-day
-# one. `trips` used to be stripped here alongside the info card's attributes, which
-# was right while nothing but the card read it and wrong the moment a colour mode
-# did -- the map went flat below z11 rather than reporting a missing attribute.
+# one. A colour mode paints at every zoom, so stripping `trips` here alongside the
+# info card's attributes would flatten the map below z11 rather than report a
+# missing attribute.
 #
 # It costs a key and a varint per feature in the three overview bands, against
 # `refs`, which is a whole comma-joined service list and stays excluded. The way id
@@ -645,9 +645,9 @@ def build_tiles(
                 _Band("near", config.MID_ZOOM, config.DETAIL_ZOOM - 1, {}, _DETAIL_ONLY),
                 # The one band that carries `way`, and so the one band that can spend
                 # it on the feature id instead of an attribute. `id` is excluded by
-                # hand here because it is no longer what `--use-attribute-for-id`
-                # consumes, and a property tippecanoe is not told to drop is a
-                # property it writes into every feature.
+                # hand here because `--use-attribute-for-id` consumes `way` instead,
+                # and a property tippecanoe is not told to drop is a property it
+                # writes into every feature.
                 _Band(
                     "detail",
                     config.DETAIL_ZOOM,
@@ -957,9 +957,9 @@ def _has_rows(con: duckdb.DuckDBPyConnection, table: str) -> bool:
 
     A table that is not there reads as empty rather than raising. `segments` post-dates
     Great Britain's database and `prune` reclaims tables once matching is done, so an
-    older or pruned data root is a normal thing to be handed -- and the exception it
-    used to throw came out of the credit calculation, which failed the publish over a
-    mode the region does not have.
+    older or pruned data root is a normal thing to be handed -- and `contents` reads
+    this into the credit, where raising would fail the publish over a mode the region
+    does not have.
     """
     if not db.table_exists(con, table):
         return False

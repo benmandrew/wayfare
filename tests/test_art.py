@@ -209,8 +209,8 @@ def test_window_can_be_walked_more_than_once(con):
 
 
 def test_by_weight_orders_quietest_first(con):
-    """spectrum draws in this order so busy roads finish on top. It used to sort the
-    whole window in memory; the ordering is now the database's job."""
+    """spectrum draws in this order so busy roads finish on top. The order is the
+    database's, so a render never holds the window in memory to sort it."""
     _art_edge(con, 1, -3200000, trips=900)
     _art_edge(con, 2, -3190000, trips=10)
     _art_edge(con, 3, -3180000, trips=300)
@@ -516,9 +516,9 @@ def test_polyline_equality_ignores_how_the_points_are_held():
 
 
 def test_bounds_in_sql_match_the_python_percentile_pass(con):
-    """The scale is found by SQL now instead of by pulling every weight into
-    Python. The two must pick the *same* two order statistics -- an approximation
-    would shift a render's contrast invisibly. See `_Sql.bounds_query`."""
+    """SQL finds the scale rather than pulling every weight into Python, and the two
+    must pick the *same* two order statistics -- an approximation would shift a
+    render's contrast invisibly. See `_Sql.bounds_query`."""
     from array import array
 
     for i in range(50):
@@ -901,11 +901,11 @@ WIDE_BOUNDS = art.Bounds(-3.30, 51.500, -3.10, 51.512)
 
 
 def test_banding_holds_at_a_canvas_wider_than_the_style_reference(wide_banded):
-    """The regression. `density` quotes its widths against `DENSITY_REF_PX`, so its
-    widest stroke grows with the canvas, and a collar quoted in absolute pixels stops
-    covering half of it once the canvas passes about 4,842px at `line_scale=1`. Below
-    that the collar is merely too generous, which costs a little work and hides the
-    fault -- which is why every band test until this one drew at 200px and passed.
+    """`density` quotes its widths against `DENSITY_REF_PX`, so its widest stroke
+    grows with the canvas, and a collar quoted in absolute pixels stops covering half
+    of it once the canvas passes about 4,842px at `line_scale=1`. Below that the collar
+    is merely over-generous, which costs a little work and hides the fault, so the seam
+    can only show on a canvas wider than the reference -- hence the wide fixture.
 
     Bytes rather than a pixel tolerance, for the same reason the serial comparison
     above is: a seam is a handful of pixels one part in 255 out, and any tolerance

@@ -325,7 +325,7 @@ def main(argv: list[str] | None = None) -> int:
         "The page itself always revalidates",
     )
 
-    p = sub.add_parser("all", help="acquire, patterns, match, aggregate, publish")
+    p = sub.add_parser("all", help="acquire, patterns, match, trace, aggregate, publish")
     p.add_argument("--region", default=None)
     p.add_argument("--workers", type=int, default=None)
     _archive_args(p)

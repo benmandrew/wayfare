@@ -43,7 +43,6 @@ CREATE TABLE IF NOT EXISTS routes (
 -- sequence -- so the same physical journey keeps the same id across feed
 -- versions. That is what makes an incremental rebuild possible: match_status is
 -- keyed on it, so a pattern already matched last month is not paid for again.
--- It used to be a popularity rank, which changed under every feed.
 --
 -- first_seen/last_seen are feed versions. A pattern that leaves the timetable
 -- keeps its row and its match results -- seasonal services come back, and when
@@ -381,12 +380,11 @@ def matchable(alias: str = "p", con: duckdb.DuckDBPyConnection | None = None) ->
     migration therefore leaves the column empty rather than asserting a mode nobody
     recorded, and this predicate is what makes that safe.
 
-    Pass `con` from anywhere that reads a database it has not written to, and a
-    database with no `mode` column at all gets the same answer for the same reason.
-    `connect` runs `migrate` only when it is not read-only, so a data root that has not
-    been opened for writing since the column landed still has the old schema -- Great
-    Britain's had, three days later -- and every read-only consumer of this predicate
-    failed to bind against it rather than degrading.
+    Pass `con` from anywhere that reads a database it has not written to. `connect`
+    runs `migrate` only when it is not read-only, so a read-only data root may hold no
+    `mode` column at all, and a predicate naming a column that is not there fails to
+    bind rather than degrading. With `con` in hand it degrades to TRUE, which is the
+    answer a NULL mode gets and for the same reason.
     """
     if con is not None and "mode" not in columns(con, "patterns"):
         return "TRUE"
@@ -498,9 +496,9 @@ def migrate(con: duckdb.DuckDBPyConnection) -> None:
         _migrate_pattern_ids(con)
 
     if "route_type" not in columns(con, "routes"):
-        # The mode filter's column. Nothing already stored can supply it -- the old
-        # loader never read it -- so it is added empty and the next `patterns` run
-        # fills it in from routes.txt. Until then it is NULL, which no query treats
+        # The mode filter's column. Nothing already stored can supply it -- it comes
+        # from routes.txt and nowhere else -- so it is added empty and the next
+        # `patterns` run fills it in. Until then it is NULL, which no query treats
         # as road-going, and no matched pattern is touched: a departed ferry keeps
         # its rows and its match_status exactly like any other departed pattern.
         con.execute("ALTER TABLE routes ADD COLUMN route_type VARCHAR")

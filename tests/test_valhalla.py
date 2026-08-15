@@ -396,11 +396,10 @@ def test_every_no_path_code_is_no_route(code):
     a stop chain longer than Valhalla will route. Neither answers differently on a
     second attempt, so both belong with 442 rather than with the retryable set.
 
-    442 is the regression that mattered, and the reason this matches on the code
-    rather than the prose. `_post` used to test for the substring "no route", and
-    Valhalla's 442 says "No path could be found for input" -- so NoRoute was never
-    once raised, and every permanent no-path in every database built so far was
-    filed as a transient error instead."""
+    442 is the code that means no path, and permanence is decided on the numeric
+    code and never on the message. Valhalla's "No path could be found for input" is
+    a third party's English, free to change between releases, and a mismatch there
+    would file every permanent no-path as a transient error instead."""
     c = _client(_Session(_response(400, _valhalla_body(code, "prose that may change"))))
     with pytest.raises(valhalla.NoRoute):
         c.trace_attributes([(53.0, -2.0), (53.1, -2.0)])

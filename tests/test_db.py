@@ -423,9 +423,9 @@ def test_prune_is_not_blocked_by_a_pattern_that_is_never_matched(con):
 
 
 def test_prune_keeps_the_geometry_a_non_road_pattern_is_drawn_from(con):
-    """`shapes` used to be matcher input and nothing else, so it could go whole.
-    For a tram it is the picture itself, and deleting it would blank the mode
-    silently at the next publish."""
+    """For a non-road pattern such as a tram, `shapes` is the drawn geometry itself
+    rather than matcher input, so pruning it would blank the mode silently at the
+    next publish."""
     _one_live_pattern(con)
     con.execute(
         "INSERT INTO match_status "

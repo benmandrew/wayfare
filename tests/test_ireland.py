@@ -122,8 +122,8 @@ def test_a_guid_with_no_start_date_is_still_a_version(gtfs_dir: Path):
 
 
 def test_a_publisher_name_holding_a_comma_does_not_shift_the_columns(gtfs_dir: Path):
-    """The version used to be read by splitting the line on commas, which reads a
-    quoted field as two and hands back whatever ends up under the header."""
+    """feed_info.txt is CSV, so a quoted publisher name holding a comma is one field.
+    Splitting the line on commas reads it as two and shifts every column after it."""
     _feed_info(
         gtfs_dir,
         "feed_publisher_name,feed_lang,feed_start_date,feed_version\n"

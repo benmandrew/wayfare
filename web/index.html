@@ -15,15 +15,13 @@
 <link rel="preconnect" href="https://a.basemaps.cartocdn.com" crossorigin>
 <link rel="preconnect" href="https://b.basemaps.cartocdn.com" crossorigin>
 <!-- Off the critical path, and this is the whole reason it is up here rather
-     than in boot(). The old order was: parse the page, download and run the
-     library, *then* ask what archives exist, then read their headers, then build
-     the map. Those are four serial round trips and the first two have nothing to
-     do with each other. Starting the request in <head> overlaps it with the
-     library download, so the answer is usually waiting by the time boot() asks
-     for it. Measured against a 90 ms round trip -- roughly the deployed tailnet
-     path -- that is about one round trip off every stage of boot: map
-     constructed 445 -> 349 ms, first basemap tile 625 -> 518, first bus tile
-     854 -> 719, idle 1213 -> 1095 (medians of five runs, three archives).
+     than in boot(). Nothing about the archive index depends on the library, so
+     the two have no business queueing behind one another: starting the request
+     in <head> overlaps it with the library download, and the answer is usually
+     waiting by the time boot() asks for it. Against a 90 ms round trip, roughly
+     the deployed tailnet path, that is worth about one round trip at every stage
+     of boot, from the map being constructed to the map going idle (medians of
+     five runs over three archives).
      It must not reject. A static host with no index answers 404, and that 404 is
      the signal to fall back to bus.pmtiles, so an unhandled rejection here would
      put an error in the console of every such host. -->
@@ -47,16 +45,15 @@
      exactly what pmtiles.js reads for itself, so nothing extra crosses the wire
      and the metadata read stops crossing it twice.
 
-     32 KB was measured too, on the theory that catching the first leaf directories
-     as well would be worth the bytes. It is not: over 600 ms round trips it landed
-     within 100 ms of the 16 KB head, and over a 60 KB/s pipe the extra 32 KB cost
-     more than the round trip it saved and came out behind the version with no
-     prefetch at all. The reads worth removing are the ones already paid for.
+     16 KB is the bound because the reads worth removing are the ones already
+     paid for, and bytes past the head are not. Reaching further, far enough to
+     catch the first leaf directories, buys under 100 ms over a 600 ms round trip
+     and costs more than it saves over a 60 KB/s pipe.
 
      It must not reject, and it must not be required: every failure path here ends
-     in a null head, which `HeadSource` treats as "ask the network", so a host that
-     refuses a range request or answers 404 gets exactly the behaviour it had
-     before this existed. -->
+     in a null head, which `HeadSource` treats as "ask the network", so a host
+     that refuses a range request or answers 404 reads every byte over the wire.
+     The prefetch is an optimisation and never a requirement. -->
 <script>
 window.__heads = (async () => {
   const heads = new Map();
@@ -430,13 +427,12 @@ const HOVER_COLOUR = { light: "#d64512", dark: "#ffffff" };
 // line each, but a mode sharing a colour with another mode is worse than a mode
 // nobody ever sees.
 //
-// "Outside the ramp" has to be measured against *both* ramps, and the first
-// version of this palette was not. The metro's teal and the ferry's blue each sat
-// inside one of them: in OKLab the metro was 0.043 from the dark ramp at six
-// services, which is where that ramp turns cyan, and the ferry 0.036 from the
-// light ramp, which is blue for its whole lower half. Both drew as a road
-// carrying a handful of buses. They are now 0.145 and 0.154 from the nearest ramp
-// stop in light, 0.227 and 0.293 in dark.
+// "Outside the ramp" has to hold against *both* ramps in OKLab, since a mode
+// colour sitting inside either one draws as a road carrying a handful of buses.
+// The two with the least room are the metro against the dark ramp, which turns
+// cyan at six services, and the ferry against the light ramp, which is blue for
+// its whole lower half: 0.145 and 0.154 from the nearest ramp stop in light,
+// 0.227 and 0.293 in dark.
 //
 // The ferry is crimson because nothing else was left: the light ramp is blue
 // through violet and the dark one sweeps blue, cyan, green and yellow, so between
@@ -511,13 +507,11 @@ function oklchToRgb(L, C, H) {
   ];
 }
 
-// The most chroma sRGB actually holds at this lightness and hue. Reducing
-// lightness while keeping chroma asks for colours the gamut has not got, and
-// clamping the channels then answers with a differently *hued* colour that is in
-// it -- which is the one failure this whole exercise is about, arrived at from the
-// other side. Measured before it was fixed: the darkest ferry step came back 0.068
-// from what was asked for, further than several of the mode colours are from each
-// other. So find the chroma that exists instead of clamping one that does not.
+// The most chroma sRGB holds at this lightness and hue. Reducing lightness while
+// keeping chroma asks for colours the gamut has not got, and clamping the channels
+// then answers with a differently *hued* colour that is in it -- which is the one
+// failure this whole exercise is about, arrived at from the other side. So find
+// the chroma that exists instead of clamping one that does not.
 const inGamut = (L, C, H) => oklchToRgb(L, C, H).every((v) => v >= -0.0005 && v <= 1.0005);
 
 function fitChroma(L, C, H) {
@@ -786,11 +780,11 @@ const segColourExpr = (t) =>
     rampOver(modeRamp(t, "other")),
   ]);
 
-// Track takes the middle of each mode's ramp rather than shading along it, which is
-// the same decision `modeMid` was written for and now has to be made per mode: a
-// way of track carries a service *count*, and a count of how thoroughly a line is
-// mapped is not the journeys a day every other colour on this map means. The
-// journey figure is on the feature and the card prints it; the paint stays flat.
+// Track takes the middle of each mode's ramp rather than shading along it, the
+// decision `modeMid` exists for, taken once per mode: a way of track carries a
+// service *count*, and a count of how thoroughly a line is mapped is not the
+// journeys a day every other colour on this map means. The journey figure is on
+// the feature and the card prints it; the paint stays flat.
 const trackColourExpr = (t) => [
   "match", trackMode,
   ...Object.keys(MODE_COLOUR[t]).flatMap((m) => [m, modeMid(t, m)]),
@@ -964,9 +958,9 @@ async function boot() {
   // Already in flight since <head>; this is the await, not the request. The
   // promise catches its own failure, so [] here still means "no index".
   ARCHIVES = (await window.__archives) || [];
-  // ?tiles= still names one archive and only one: its job is pointing the page at
-  // a bucket, not choosing between regions, and there is no longer anything to
-  // choose. Everything the server lists otherwise.
+  // ?tiles= names one archive and only one, because its job is pointing the page
+  // at a bucket rather than choosing between regions: the server's index is what
+  // enumerates those. Everything the server lists otherwise.
   const wanted = WANTED ? [WANTED] : ARCHIVES.length ? ARCHIVES : ["./bus.pmtiles"];
 
   // In parallel, and one failure does not sink the rest: a half-copied archive in
@@ -985,7 +979,7 @@ async function openArchive(name, i) {
   const url = new URL(name, location.href).href;
   // Already in flight since <head>, keyed by the same absolute URL built there.
   // A miss is a null head, and a null head is a source that reads the network for
-  // everything, which is what this did before the prefetch existed.
+  // everything, so the prefetch is an optimisation and never a requirement.
   const heads = await window.__heads.catch(() => new Map());
   const archive = new pmtiles.PMTiles(new HeadSource(url, heads.get(url) || null));
   protocol.add(archive); // share the instance so the header is fetched once
@@ -1183,10 +1177,9 @@ function start(missing) {
       url: "pmtiles://" + r.url,
       // No promoteId: tippecanoe writes an id into the MVT feature id field
       // itself, which is what setFeatureState addresses. Which id depends on the
-      // band. From DETAIL_ZOOM up it is the OSM way id, which took 20.28% -- 21.5
-      // MB -- off Great Britain's detail band by no longer being an attribute as
-      // well, because a sorted way id compresses where the Valhalla edge id it
-      // replaced does not. Below DETAIL_ZOOM it is still the edge id.
+      // band. From DETAIL_ZOOM up it is the OSM way id, and the way is not an
+      // attribute as well, because a sorted way id compresses where the Valhalla
+      // edge id does not. Below DETAIL_ZOOM the id is that edge id.
       //
       // So an id is not unique within a layer either, up there: a way is several
       // features by design, wherever the service set changes along it, wherever
@@ -1566,9 +1559,9 @@ function start(missing) {
   };
 
   // `way` is the feature's own id rather than one of its properties, so it is
-  // passed alongside them: the tiles stopped carrying it as an attribute, which
-  // is 20.28% of the detail band. It is only a way id from DETAIL_ZOOM up, which
-  // is the same range `detailed` covers, so it is read nowhere else.
+  // passed alongside them: carrying it as an attribute as well would repeat it in
+  // every feature of the detail band. It is only a way id from DETAIL_ZOOM up,
+  // which is the same range `detailed` covers, so it is read nowhere else.
   function showFeature(p, way) {
     current = p;
     const n = Number(p.n) || 0;
@@ -1577,9 +1570,9 @@ function start(missing) {
     // Below DETAIL_ZOOM the archive carries geometry, `n` and `trips` only: the
     // service list and road name are stripped, because nothing reads them when
     // the country is a few hundred pixels across, and the feature id is the edge
-    // id rather than the way. `refs` is the one to test for -- `trips` is now
-    // published at every zoom and the way id is no longer a property at any of
-    // them, so neither tells the two apart.
+    // id rather than the way. `refs` and the road name are the only two
+    // attributes that band drops, so a defined `refs` is what marks a feature as
+    // coming from the detail band.
     const detailed = p.refs !== undefined;
     $("meta").innerHTML = [
       `<b>${n}</b> service${n === 1 ? "" : "s"}`,
