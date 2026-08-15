@@ -287,8 +287,11 @@ def write(con: duckdb.DuckDBPyConnection, found: list[Candidate]) -> int:
       admits them. They are rebuilt from OpenStreetMap on every run rather than
       carried forward, which is what keeps a line retired in OSM from being drawn
       for ever.
-    * `traces`, so `aggregate.build_segments` draws them through the path that
-      already exists rather than a second one beside it.
+    * `traces`, which is where `aggregate.build_track_services` reads the ways each
+      relation runs over. It drew them through `build_segments` as well until the
+      per-way inversion arrived; that arm now skips them, because a relation drawn
+      once per way and again as a whole polyline is the same track painted twice
+      and a hover that lands on the wrong one of the two.
     * `trace_status`, marked ``ok``. Without it `trace._pending_sql` selects every
       one of these -- they are live, not matchable and carry no ``shape_id``, which
       is exactly its definition of pending -- and spends a national Overpass query

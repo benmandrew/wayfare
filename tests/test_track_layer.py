@@ -154,6 +154,39 @@ def test_the_export_is_ordered_so_a_rebuild_is_byte_identical(built, tmp_path):
     assert a.read_bytes() == b.read_bytes()
 
 
-def test_relation_track_is_credited_to_openstreetmap(built):
+# --- the two layers stay disjoint --------------------------------------------
+
+
+def test_a_relation_is_not_drawn_as_a_segment_as_well(built):
+    """The track layer answers for these, so `segments` must leave them alone.
+
+    An `osm:r` pattern is live, not matchable and carries no `shape_id`, which is
+    exactly what the trace arm of `build_segments` selects, so every relation came
+    out a second time as one whole polyline lying over the ways it had just been
+    collapsed into. The picture is the smaller half of it: the viewer asks the
+    segments layer first, so the hover answered with one relation's own card where
+    the track layer knows every service on the way.
+    """
     aggregate.build_segments(built)
+    assert db.scalar(built, "SELECT count(*) FROM segments") == 0
+
+
+def test_an_operator_trace_is_still_drawn_as_a_segment(built):
+    """The exclusion is of relation patterns, not of everything with a trace."""
+    _timetabled_trace(built)
+    aggregate.build_segments(built)
+    drawn = built.execute("SELECT pattern_id FROM segments").fetchall()
+    assert drawn == [(999,)]
+
+
+def test_relation_track_is_credited_to_openstreetmap(built):
+    """The credit follows the geometry into whichever layer carries it.
+
+    `segments` is empty here, which is the state a rail-only archive publishes in,
+    and the ODbL claim is owed all the same -- every way of it came out of an
+    OpenStreetMap route relation.
+    """
+    aggregate.build_segments(built)
+    aggregate.build_track_services(built)
+    assert db.scalar(built, "SELECT count(*) FROM segments") == 0
     assert publish.contents(built)["track"] is True

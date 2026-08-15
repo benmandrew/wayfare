@@ -917,13 +917,25 @@ def contents(con: duckdb.DuckDBPyConnection) -> dict[str, bool]:
 def _has_traced_segments(con: duckdb.DuckDBPyConnection) -> bool:
     """Whether anything actually drawn came from an OSM route relation.
 
-    The join is the point. `traces` is a cache keyed on pattern identity and keeps
-    its rows when a service leaves the timetable, exactly as `match_status` does, so
-    its being non-empty says what was once resolved rather than what this archive
-    holds. `segments` is rebuilt against the current feed every `aggregate`, so the
-    intersection is the honest answer -- and a credit has to describe the bytes
-    being published, not the database they came out of.
+    Two layers can carry that geometry and either one alone owes the credit, so
+    this asks both. `track_services` is the per-way inversion and is rebuilt every
+    `aggregate` against the live patterns, so its being non-empty is already a
+    statement about this archive.
+
+    The join on the other arm is the point. `traces` is a cache keyed on pattern
+    identity and keeps its rows when a service leaves the timetable, exactly as
+    `match_status` does, so its being non-empty says what was once resolved rather
+    than what this archive holds. `segments` is rebuilt against the current feed
+    every `aggregate`, so the intersection is the honest answer -- and a credit has
+    to describe the bytes being published, not the database they came out of.
+
+    Asking only the segments arm was correct exactly as long as a relation pattern
+    was drawn there too. It stopped being correct when that double draw was
+    removed, and the failure would have been an archive of nothing but relation
+    track crediting OpenStreetMap for none of it.
     """
+    if _has_rows(con, "track_services"):
+        return True
     if not (db.table_exists(con, "traces") and db.table_exists(con, "segments")):
         return False
     row = con.execute(

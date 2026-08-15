@@ -23,6 +23,13 @@ from . import db, logs
 
 log = logs.get("aggregate")
 
+# The patterns the track layer answers for, and so the ones `segments` must leave
+# alone. `osmroutes` mints a pattern per OSM route relation and `route_id` is where
+# it says so, which makes this the same predicate `build_track_services` inverts on
+# -- one claim, written twice, and they have to agree or a relation is drawn in both
+# layers or in neither.
+_DRAWN_AS_TRACK = "p.route_id LIKE 'osm:r%'"
+
 
 def build(con: duckdb.DuckDBPyConnection) -> None:
     con.execute("DELETE FROM edge_services")
@@ -87,6 +94,16 @@ def build_segments(con: duckdb.DuckDBPyConnection) -> None:
     covers the patterns with no `shape_id` at all -- which is what keeps the two arms
     disjoint, and what lets `segments` keep its primary key on `pattern_id`.
 
+    **A pattern `osmroutes` built is drawn by the track layer and must not be drawn
+    here as well.** It was, from the day that stage landed until the per-way
+    inversion followed it: an `osm:r` pattern is live, not matchable and carries no
+    `shape_id`, so the trace arm takes it, and every relation came out as one more
+    polyline underneath the very ways `build_track_services` had just collapsed it
+    into. Two coats of the same track is the visible half of that; the hover is the
+    worse half, because the viewer asks the segments layer first and gets one
+    relation's own card where the track layer would have answered for every service
+    on the way.
+
     A non-road pattern with neither gets no row and is simply not drawn. That is the
     "bad geometry is worse than missing geometry" rule applied to the one case where
     inventing would be easy: the stops are known, and a straight line between them
@@ -106,6 +123,7 @@ def build_segments(con: duckdb.DuckDBPyConnection) -> None:
             JOIN traces t ON t.pattern_id = p.pattern_id
             WHERE {db.current_feed()} AND NOT {db.matchable()}
               AND p.shape_id IS NULL
+              AND NOT {_DRAWN_AS_TRACK}
         )
         SELECT pattern_id, mode, lon_e6, lat_e6,
                list_min(lon_e6), list_min(lat_e6),
@@ -119,10 +137,12 @@ def build_segments(con: duckdb.DuckDBPyConnection) -> None:
                (SELECT count(*) FROM patterns p
                 JOIN traces t ON t.pattern_id = p.pattern_id
                 WHERE {db.current_feed()} AND NOT {db.matchable()}
-                  AND p.shape_id IS NULL),
+                  AND p.shape_id IS NULL
+                  AND NOT {_DRAWN_AS_TRACK}),
                (SELECT count(*) FROM patterns p
                 WHERE {db.current_feed()} AND NOT {db.matchable()}
                   AND p.shape_id IS NULL
+                  AND NOT {_DRAWN_AS_TRACK}
                   AND NOT EXISTS (
                       SELECT 1 FROM traces t WHERE t.pattern_id = p.pattern_id))
         """,
@@ -300,7 +320,7 @@ def build_track_services(con: duckdb.DuckDBPyConnection) -> int:
     only within one graph build.
 
     **Only patterns this pipeline built from a relation are inverted**, which is
-    what `route_id LIKE 'osm:r%'` is doing, and leaving it out would ship a
+    what `_DRAWN_AS_TRACK` is doing, and leaving it out would ship a
     confident lie. `trace` records `way_ids` as the whole candidate chain rather
     than the ways inside the slice it cut, so a Northern line short working from
     Edgware to Kennington is stored against every way of the Northern line. That is
@@ -328,7 +348,7 @@ def build_track_services(con: duckdb.DuckDBPyConnection) -> int:
             JOIN patterns p USING (pattern_id)
             CROSS JOIN unnest(t.way_ids) AS u(way_id)
             WHERE {db.current_feed()} AND NOT {db.matchable()}
-              AND p.route_id LIKE 'osm:r%'
+              AND {_DRAWN_AS_TRACK}
         )
         GROUP BY way_id, short_name, agency_id
     """)
