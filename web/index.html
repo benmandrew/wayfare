@@ -28,6 +28,58 @@
      the signal to fall back to bus.pmtiles, so an unhandled rejection here would
      put an error in the console of every such host. -->
 <script>window.__archives = fetch("archives.json").then((r) => r.json()).catch(() => []);</script>
+<!-- The same trick one level down, and the bigger half of it. Nothing about an
+     archive can be asked until the library is parsed, so the chain on a cold load
+     runs page, library, then four serial reads of the archive before a tile is
+     even requested: the first 16 KB for the header and root directory, the JSON
+     metadata for the credit, a leaf directory, and only then the tile. Profiled
+     over 200 ms latency the first tile was not requested until 9.4 s.
+
+     Two of those reads are already paid for. `getHeaderAndRoot` reads
+     `bytes=0-16383` speculatively, and every archive's header, root directory and
+     metadata end well inside it -- 4,692 bytes for Ireland, 5,193 for Great
+     Britain, 12,702 for Northern Ireland, whose root directory is the large one
+     because it has no leaves at all. pmtiles.js still asks for the metadata over
+     the wire, so those bytes cross twice.
+
+     So read the head once, here, in parallel with the library rather than behind
+     it, and hand it to `HeadSource` to answer out of memory. 16 KB, which is
+     exactly what pmtiles.js reads for itself, so nothing extra crosses the wire
+     and the metadata read stops crossing it twice.
+
+     32 KB was measured too, on the theory that catching the first leaf directories
+     as well would be worth the bytes. It is not: over 600 ms round trips it landed
+     within 100 ms of the 16 KB head, and over a 60 KB/s pipe the extra 32 KB cost
+     more than the round trip it saved and came out behind the version with no
+     prefetch at all. The reads worth removing are the ones already paid for.
+
+     It must not reject, and it must not be required: every failure path here ends
+     in a null head, which `HeadSource` treats as "ask the network", so a host that
+     refuses a range request or answers 404 gets exactly the behaviour it had
+     before this existed. -->
+<script>
+window.__heads = (async () => {
+  const heads = new Map();
+  try {
+    const named = new URLSearchParams(location.search).get("tiles");
+    const listed = named ? [named] : (await window.__archives) || [];
+    for (const name of listed.length ? listed : ["./bus.pmtiles"]) {
+      const url = new URL(name, location.href).href;
+      heads.set(
+        url,
+        fetch(url, { headers: { Range: "bytes=0-16383" } })
+          .then((r) =>
+            r.ok ? r.arrayBuffer().then((buf) => ({ buf, etag: r.headers.get("ETag") })) : null
+          )
+          .catch(() => null)
+      );
+    }
+  } catch (err) {
+    console.warn("head prefetch skipped", err);
+  }
+  return heads;
+})();
+</script>
 <link rel="stylesheet" href="vendor/maplibre-gl.css">
 <style>
 /* Visible to a screen reader, not on screen. The search input is identified only
@@ -850,6 +902,60 @@ paintLegend();
 const protocol = new pmtiles.Protocol({ metadata: true });
 maplibregl.addProtocol("pmtiles", protocol.tile);
 
+// A PMTiles source that answers out of the head prefetched in <head>, and goes to
+// the network for everything past it. `PMTiles` takes either a URL string, which
+// it wraps in the plugin's own FetchSource, or any object with `getKey` and
+// `getBytes` -- this is the second.
+//
+// The point is the reads that fall inside the head: the JSON metadata, which
+// pmtiles.js fetches separately even though `getHeaderAndRoot` has already
+// downloaded those exact bytes, and whichever leaf directories sit in the first
+// 32 KB. Each one it answers is a round trip removed from in front of the first
+// tile, which is where a slow connection spends its time rather than on bandwidth.
+//
+// `getKey` must return the URL unchanged. `protocol.add` files the archive under
+// it and `pmtiles://<url>` is what the style asks for, so a key that does not
+// match is an archive the protocol cannot find.
+class HeadSource {
+  constructor(url, head) {
+    this.url = url;
+    this.head = head; // Promise<{buf, etag} | null>
+  }
+
+  getKey() {
+    return this.url;
+  }
+
+  async getBytes(offset, length, signal, etag) {
+    const head = await this.head;
+    // Only a range wholly inside the buffer. A partial hit would have to be
+    // stitched to a second request, which is the round trip this is here to
+    // avoid, so it is left to the network entire.
+    if (head && offset + length <= head.buf.byteLength) {
+      // An archive republished between the prefetch and now is the one case this
+      // could answer with bytes from the wrong file. pmtiles.js already guards
+      // it: hand back the etag the head came with, and a mismatch against the
+      // header raises EtagMismatch and retries against the network.
+      return { data: head.buf.slice(offset, offset + length), etag: head.etag };
+    }
+    const res = await fetch(this.url, {
+      signal,
+      headers: { Range: `bytes=${offset}-${offset + length - 1}` },
+    });
+    if (!res.ok) throw new Error(`${res.status} reading ${this.url}`);
+    const buf = await res.arrayBuffer();
+    return {
+      // A server that ignores Range answers 200 with the whole archive rather
+      // than 206 with the window. Slicing keeps that working, at the cost of the
+      // download; refusing it would take out a host that merely lacks ranges.
+      data: res.status === 206 ? buf : buf.slice(offset, offset + length),
+      etag: res.headers.get("ETag") || undefined,
+      cacheControl: res.headers.get("Cache-Control") || undefined,
+      expires: res.headers.get("Expires") || undefined,
+    };
+  }
+}
+
 boot();
 
 async function boot() {
@@ -877,7 +983,11 @@ async function boot() {
 
 async function openArchive(name, i) {
   const url = new URL(name, location.href).href;
-  const archive = new pmtiles.PMTiles(url);
+  // Already in flight since <head>, keyed by the same absolute URL built there.
+  // A miss is a null head, and a null head is a source that reads the network for
+  // everything, which is what this did before the prefetch existed.
+  const heads = await window.__heads.catch(() => new Map());
+  const archive = new pmtiles.PMTiles(new HeadSource(url, heads.get(url) || null));
   protocol.add(archive); // share the instance so the header is fetched once
   try {
     return {
@@ -1060,7 +1170,10 @@ function start(missing) {
     basemap: {
       type: "raster",
       tiles: basemapTiles(theme),
-      tileSize: 256,
+      // Read once, at style time: `setTiles` can swap the URLs for a theme change
+      // but there is no setter for tile size, and a connection that changed class
+      // mid-session is not worth rebuilding the style over.
+      tileSize: basemapTileSize(),
       attribution: BASEMAP_CREDIT,
     },
   };
@@ -1602,10 +1715,32 @@ function mergeRegions(hits) {
   return { ...top, n, trips, refs: refs.join(",") };
 }
 
+// What the browser will say about the connection, where it says anything. Save-Data
+// is a header the user asked for and is honoured wherever it appears; effectiveType
+// is the browser's own estimate. Both are Chromium-only, so this is an improvement
+// where it exists and never a requirement -- Safari and Firefox take the full
+// basemap, exactly as every browser did before.
+function thriftyConnection() {
+  const c = navigator.connection;
+  if (!c) return false;
+  return Boolean(c.saveData) || ["slow-2g", "2g", "3g"].includes(c.effectiveType);
+}
+
+// Cold profiling put the basemap at 447,036 bytes over 30 requests, 40.9% of
+// everything transferred, and blocking it took a throttled load from 19.4 s to
+// 12.1 s. It competes with the archive for the same pipe while being the context
+// rather than the subject, so on a connection that says it is slow it is drawn at
+// half resolution: `tileSize: 512` against 256-pixel tiles makes MapLibre ask for
+// one zoom level lower and scale it up, which is a quarter of the tiles for a
+// blurrier backdrop. The roads on top are unaffected -- they are vector.
+const basemapTileSize = () => (thriftyConnection() ? 512 : 256);
+
 function basemapTiles(t) {
   // MapLibre has no {s} or {r} placeholder: expand the subdomains itself and
-  // pick the retina variant up front.
-  const r = devicePixelRatio > 1.4 ? "@2x" : "";
+  // pick the retina variant up front. A thrifty connection takes the plain tile
+  // whatever the screen is: a retina backdrop is the first thing to give up when
+  // the road network underneath it is still arriving.
+  const r = devicePixelRatio > 1.4 && !thriftyConnection() ? "@2x" : "";
   return ["a", "b", "c", "d"].map(
     (s) => `https://${s}.basemaps.cartocdn.com/${BASEMAP[t]}/{z}/{x}/{y}${r}.png`
   );

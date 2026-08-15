@@ -340,6 +340,49 @@ wrong in a way worth naming: a tile is in MapLibre's cache in `state: "loading"`
 moment it is *requested*, so counting tiles present reported the draft drawable nine
 seconds before its bytes existed. Read the state, or read the network.
 
+## Done — what a cold load actually spends
+
+**The load was profiled rather than guessed at** (2026-08-15). Chrome DevTools Protocol,
+cache disabled, Dublin z13, against the served Ireland archives. At 60 KB/s and 200 ms
+the page transferred 893,605 bytes over 59 requests and took 16,093 ms to finish. The
+basemap was 447,036 of those bytes over 30 requests, 40.9%, and blocking it alone took
+the load to 12,104 ms. The vector data everybody comes for was 184,709 bytes, a fifth of
+what the page fetched.
+
+**The basemap gives up resolution on a link that says it is slow.** `navigator.connection`
+reports Save-Data, which the user asked for, and `effectiveType`, which the browser
+guessed; either one drops the retina variant and sets the basemap source to `tileSize:
+512`, which makes MapLibre ask for one zoom lower and scale it up. A quarter of the tiles
+for a blurrier backdrop, with the roads on top unaffected because they are vector. On a
+normal screen that took the load to 597,466 bytes and 10,816 ms, a third off both. On a
+retina screen, where the baseline paid 1,185,780 bytes over 30 basemap tiles, it took the
+basemap to 155,839 over 9 and the whole load from 28,169 ms to 10,825 — 61.6%. A browser
+that reports nothing, which is every browser but Chromium's, is left exactly as it was:
+measured at 1,632,341 bytes against 1,627,357, and 28,169 ms against 27,707.
+
+**The archive's head is read in `<head>`, and read once.** A cold load ran page, library,
+then three serial reads of the archive before a tile was requested: `bytes=0-16383` for
+the header and root directory, the JSON metadata for the credit, and a leaf directory.
+The metadata read is bytes pmtiles.js has already downloaded — every archive's header,
+root and metadata end inside the first 16 KB, at 4,692 for Ireland, 5,193 for Great
+Britain and 12,702 for Northern Ireland, whose root is the large one because it has no
+leaves. So the page reads 16 KB up front, in parallel with the 231 KB library rather than
+behind it, and `HeadSource` answers any range inside it from memory. First tile requested
+went 9,405 ms to 5,863 on the archive that has leaves. Over 400 KB/s and 600 ms round
+trips, where latency rather than bandwidth binds, first tile drawn went 3,842 ms to 2,666
+and the whole load 5,646 to 4,637.
+
+**32 KB was measured and lost.** Catching the first leaf directories as well sounded
+worth the bytes. Over 600 ms round trips it landed within 100 ms of the 16 KB head, and
+over a 60 KB/s pipe the extra 32 KB cost more than the round trip it saved: 913,023 bytes
+and 16,141 ms, behind the 16,093 ms of doing nothing at all. The reads worth removing are
+the ones already paid for.
+
+**Brotli was considered and left alone.** The library is 231,201 bytes gzipped and sits
+on the critical path, and brotli would take perhaps 35 KB off it. That needs a new runtime
+dependency in a project whose environment is a nix flake, to save a twentieth of what the
+basemap change saves without one.
+
 ## Next — National Rail
 
 **GB heavy rail is absent from BODS.** All three `route_type=2` routes in the national

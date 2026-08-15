@@ -885,6 +885,52 @@ def test_every_legend_row_is_a_switch():
     assert "map.setFilter(id, off.length ? withoutModes(off) : null)" in text
 
 
+def test_the_archive_head_is_prefetched_under_the_key_that_reads_it():
+    """The prefetch in <head> and the lookup in `openArchive` have to agree on the
+    URL, because the map is keyed on it. They cannot share a helper -- one runs
+    before the page's own script exists -- so the expression is written twice, and
+    a divergence is silent in the worst way: every lookup misses, every archive
+    reads the network exactly as it did before, and the only evidence is a
+    prefetch nobody uses.
+
+    16 KB because that is what `getHeaderAndRoot` reads for itself. Larger was
+    measured and lost: over a 60 KB/s pipe a 32 KB head cost more than the round
+    trip it saved."""
+    text = (WEB / "index.html").read_text()
+    assert text.count("new URL(name, location.href).href") == 2
+    assert 'Range: "bytes=0-16383"' in text
+    assert "window.__heads" in text
+    assert "new pmtiles.PMTiles(new HeadSource(url, heads.get(url) || null))" in text
+
+
+def test_the_head_source_answers_only_what_it_wholly_holds():
+    """A range straddling the end of the buffer must go to the network entire. Half
+    an answer stitched to a second request is the round trip this exists to remove,
+    and a slice past the end of an ArrayBuffer is short rather than an error -- so
+    getting this wrong hands pmtiles.js a truncated directory, which it reads as a
+    corrupt archive rather than as a bug here."""
+    text = (WEB / "index.html").read_text()
+    assert "offset + length <= head.buf.byteLength" in text
+    # And a null head is "ask the network", so a host that refuses ranges or
+    # answers 404 to the prefetch behaves exactly as it did before it existed.
+    assert "const head = await this.head;" in text
+    assert "heads.get(url) || null" in text
+
+
+def test_the_basemap_gives_up_resolution_when_the_link_says_it_is_slow():
+    """Cold profiling put the basemap at 40.9% of everything transferred, and 72.7%
+    on a retina screen. Both halves of the reduction are gated on the same check --
+    the retina variant and the tile size -- because either one alone leaves the
+    other paying full price."""
+    text = (WEB / "index.html").read_text()
+    assert "function thriftyConnection()" in text
+    assert "devicePixelRatio > 1.4 && !thriftyConnection()" in text
+    assert "thriftyConnection() ? 512 : 256" in text
+    # Save-Data is the user asking; effectiveType is the browser guessing. Both.
+    assert "c.saveData" in text
+    assert "effectiveType" in text
+
+
 def _connect(base: str) -> http.client.HTTPConnection:
     """A raw connection, because urllib sends `Connection: close` on every request
     and so can never show one being reused."""
