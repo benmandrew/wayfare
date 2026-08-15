@@ -2,7 +2,11 @@
 <html lang="en" data-theme="light">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- `viewport-fit=cover` so the map reaches the edges of a notched screen. What
+     that costs is the corners: the panels and the map's own controls pay it back
+     with env(safe-area-inset-*), because a credit under a home indicator is not a
+     credit. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Wayfare — public transport routes</title>
 <!-- The basemap is on another origin, so its first tile pays a DNS lookup, a TCP
      handshake and a TLS handshake before a byte of it moves. None of that needs
@@ -116,7 +120,17 @@ window.__heads = (async () => {
 
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; }
+/* The map, the panels and the boot overlay are all absolutely positioned, so this
+   is the box every one of them measures. `dvh` rather than `%`, because a phone's
+   layout viewport is the *large* viewport -- the one with the browser's toolbars
+   hidden -- so a percentage height puts the bottom of the map, the info card and
+   the credit underneath a toolbar that is still on screen. `position: relative` is
+   what makes them resolve against this box at all; without it they measure the
+   viewport and the height above buys nothing. The plain `height` on the line
+   before stands wherever `dvh` is not understood. */
 body {
+  position: relative;
+  height: 100dvh;
   font: 13px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   color: var(--text);
   background: var(--bg);
@@ -133,7 +147,21 @@ body {
   box-shadow: var(--shadow);
 }
 .stack { position: absolute; z-index: 2; display: flex; flex-direction: column; gap: 8px; }
-.stack--tl { top: 12px; left: 12px; width: 272px; }
+/* Capped at the screen and scrolled inside that cap, at every width. The header,
+   the search, the help and a national archive's eight-row key add up to more than
+   a phone is tall and more than a laptop in landscape is tall, and what an
+   uncapped stack does with the surplus is run off the bottom edge with no way to
+   reach it. The cap clips the panels' shadows, which is the price of the scroll. */
+.stack--tl {
+  top: 12px; left: 12px; width: 272px;
+  max-height: calc(100% - 24px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+/* A flex child in a scroll container is shrunk to fit before the container will
+   scroll, which squashes the key instead of moving it. The stack scrolls; the
+   panels keep the height their content asks for. */
+.stack--tl > .panel { flex: none; }
 .stack--tr { top: 12px; right: 12px; width: 300px; max-height: calc(100% - 100px); }
 
 h1 {
@@ -161,7 +189,13 @@ h1 {
   cursor: pointer;
   white-space: nowrap;
 }
-.btn:hover { color: var(--text); border-color: var(--muted); }
+/* Guarded, because a touchscreen has no hover to leave: the browser fakes one on
+   tap and then holds it, so every button anyone has pressed stays lit. `:active`
+   is the feedback that belongs to a finger. */
+@media (hover: hover) {
+  .btn:hover { color: var(--text); border-color: var(--muted); }
+}
+.btn:active { color: var(--text); border-color: var(--muted); }
 a.btn { text-decoration: none; }
 
 /* --- search --- */
@@ -283,16 +317,58 @@ a.btn { text-decoration: none; }
    is a stacking context, so this has to be raised rather than the control. */
 .maplibregl-ctrl-bottom-left { z-index: 3; }
 
+/* A finger is not a cursor, and the two things it needs are a hit area and a font
+   the browser will not zoom to. 16px on the search field because Safari zooms the
+   page in on a focused input drawn smaller than that, and what it zooms to is the
+   panel -- leaving a map you have to pinch your way back out to. The rest is hit
+   area: these controls are 22px tall for a mouse, and the accepted floor for a
+   thumb is half again that. */
+@media (pointer: coarse) {
+  .search input { font-size: 16px; padding: 8px; }
+  .btn { padding: 7px 10px; font-size: 12.5px; }
+  .ramp-label { padding: 4px 0; font-size: 12.5px; }
+  .ramp-label input { width: 16px; height: 16px; }
+}
+
 @media (max-width: 720px) {
-  .stack--tl, .stack--tr { width: auto; left: 12px; right: 12px; }
+  /* Inset from the notch as well as from the edge: in landscape the cut-out is
+     over one of these columns. */
+  .stack--tl, .stack--tr {
+    width: auto;
+    left: calc(10px + env(safe-area-inset-left, 0px));
+    right: calc(10px + env(safe-area-inset-right, 0px));
+  }
+  /* The two panels and the map share one screen, so each is capped at a share of
+     it rather than at what its content asks for. Uncapped they took the whole of a
+     phone between them -- the header, the search and the key from the top, a
+     forty-number service list from the bottom -- and the map underneath was drawn,
+     complete, and never seen. The key starts folded at this width (see `chrome`),
+     so the usual top panel is a header and a search box. */
+  .stack--tl { top: calc(10px + env(safe-area-inset-top, 0px)); max-height: 45%; }
+  /* Set while the help is open, where the reader has asked for prose rather than
+     for the map underneath it. */
+  .stack--tl.reading { max-height: 82%; }
   /* 40px rather than 30: the collapsed credit is a 24px button on a 10px margin,
      and it has to sit clear of the card rather than under its lower edge. */
-  .stack--tr { top: auto; bottom: 40px; max-height: 44%; }
-  /* That leaves one strip along the bottom, which fits one control and not two.
-     The credit is the one that has to be in it, so the scale bar stands down on a
-     phone -- it is the only thing here nobody is obliged to show. */
-  .maplibregl-ctrl-scale { display: none; }
+  .stack--tr {
+    top: auto;
+    bottom: calc(40px + env(safe-area-inset-bottom, 0px));
+    max-height: 38%;
+  }
+  /* That leaves one strip along the bottom, which fits one control and not three.
+     The credit is the one that has to be in it -- it is a licence condition, where
+     the other two are conveniences -- so the scale bar and the zoom readout stand
+     down on a phone. Both are still on every larger screen, which is where the
+     question either of them answers gets asked. */
+  .maplibregl-ctrl-scale, .zoomlevel { display: none; }
   .maplibregl-ctrl-attrib.maplibregl-compact-show { max-width: calc(100vw - 60px); }
+  /* The home indicator is drawn over the page rather than beside it, along the
+     bottom edge these two corners share. */
+  .maplibregl-ctrl-bottom-left, .maplibregl-ctrl-bottom-right {
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  .maplibregl-ctrl-bottom-left { padding-left: env(safe-area-inset-left, 0px); }
+  .maplibregl-ctrl-bottom-right { padding-right: env(safe-area-inset-right, 0px); }
 }
 </style>
 </head>
@@ -312,6 +388,11 @@ a.btn { text-decoration: none; }
       </div>
       <a class="btn" href="art.html" title="Draw the network as a picture">Art</a>
       <button class="btn" id="theme" title="Toggle light/dark" aria-label="Toggle light or dark theme">Dark</button>
+      <!-- The key is a row of colour per mode, which on a national archive is
+           eight of them and most of a phone. So it folds, and the button is here
+           rather than on the panel itself: folded, the panel is not on screen to
+           carry it. `chrome` decides which state it opens in. -->
+      <button class="btn" id="keyBtn" title="Show or hide the key" aria-expanded="true" aria-controls="legend">Key</button>
       <button class="btn" id="helpBtn" title="What am I looking at?" aria-label="What am I looking at?" aria-expanded="false" aria-controls="help">?</button>
     </div>
     <div class="search">
@@ -327,14 +408,14 @@ a.btn { text-decoration: none; }
       <p>Trams, metros, trains and ferries have no road under them, so they are drawn from the operator's own trace and keep a colour of their own, with a bar each in the key below. Every bar is the same scale, so a quiet ferry and a busy one are the same red at different depths. Each line is one route's trace, so where two share a track they are two lines, not one busier one.</p>
       <p>National Rail is drawn from OpenStreetMap route relations, because Great Britain's rail timetable is not in the open bus feed. It is one line per stretch of track rather than one per service, and it is a single flat brown rather than a bar: no timetable is attributed to it, so nothing here knows how often a train runs. Hovering still lists which services use that stretch.</p>
       <p>Each row of the key is a switch. Clear its checkbox to take that mode off the map.</p>
-      <p>Hover a line for its service list. Filtering matches whole service numbers, so <code>4</code> will not match <code>42</code>.</p>
+      <p>Tap or hover a line for its service list. Filtering matches whole service numbers, so <code>4</code> will not match <code>42</code>.</p>
       <p>Zoomed out, the map thins the densest areas to keep tiles small, so a
          quiet-looking city is not necessarily a city without services. Zoom in for
          the complete picture.</p>
     </div>
   </div>
 
-  <div class="panel legend">
+  <div class="panel legend" id="legend">
     <div class="legend-title">Journeys a day</div>
     <!-- The road bar first, then a row for each mode actually drawn. A Great
          Britain archive holds no ferry, and a key to one would be a promise the
@@ -656,6 +737,14 @@ const $ = (id) => document.getElementById(id);
 let theme = localStorage.getItem("wayfare-theme")
   || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
 
+// Whether the thing pointing at this page is a finger. It decides what the page
+// says as well as how it is drawn: an instruction to hover, and a keyboard
+// shortcut, are both directions to a control the reader does not have.
+const COARSE = matchMedia("(pointer: coarse)").matches;
+const SEARCH_HINT = COARSE
+  ? "Filter by service number."
+  : "Press <b>/</b> to search.";
+
 /* ---------- expressions ---------- */
 
 // Trips are stored and published per week, because that is what a GTFS calendar
@@ -950,7 +1039,45 @@ class HeadSource {
   }
 }
 
+chrome();
 boot();
+
+// The page's own furniture: the two folding panels, and the copy that depends on
+// what is pointing at the page. Wired before the archives are asked for and
+// outside `start`, because none of it is about the tiles -- a page waiting on a
+// slow archive, or one that never gets a usable archive at all, should still open
+// its own help.
+function chrome() {
+  $("hint").innerHTML = SEARCH_HINT;
+  $("road").textContent = COARSE
+    ? "Tap a line to see what runs on it."
+    : "Hover a line to see what runs on it.";
+  fold("helpBtn", "help", false);
+  // The help is a page of prose, and on a phone the panel it sits in is capped at
+  // not quite half the screen -- which is reading it four lines at a time through a
+  // slot. Open, it takes most of the screen instead. What it covers is the map,
+  // which is still there when it closes. Registered after `fold`'s own handler, so
+  // `hidden` already says what the panel has just become.
+  $("helpBtn").addEventListener("click", () =>
+    $("help").closest(".stack").classList.toggle("reading", !$("help").hidden)
+  );
+  // Open where there is room for it and folded where there is not, so nobody has
+  // to find a button before they can see the map. Height as well as width: a
+  // laptop turned landscape on a short window has the same problem a phone has.
+  fold("keyBtn", "legend", !matchMedia("(max-width: 720px), (max-height: 600px)").matches);
+}
+
+// A button that shows and hides one panel and says which it is doing. The state
+// lives in the panel's own `hidden`, so there is nothing here to fall out of step
+// with what is on screen.
+function fold(btn, panel, open) {
+  const set = (on) => {
+    $(panel).hidden = !on;
+    $(btn).setAttribute("aria-expanded", String(on));
+  };
+  set(open);
+  $(btn).addEventListener("click", () => set($(panel).hidden));
+}
 
 async function boot() {
   // Ask before assuming. A server that offers an index tells us what exists; one
@@ -1327,7 +1454,7 @@ function start(missing) {
   map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-left");
   collapseCredit(map);
 
-  /* ---------- hover ---------- */
+  /* ---------- selection ---------- */
 
   // A feature is identified by its source as well as its id: the id is the OSM
   // way id from DETAIL_ZOOM up and tippecanoe's edge id below it, and neither
@@ -1341,21 +1468,30 @@ function start(missing) {
       { hover: on }
     );
 
+  // How far from the point a touch is allowed to land. A road is drawn two pixels
+  // wide and a fingertip covers forty, so a selection that has to be exact is one
+  // a phone can never make -- which is what this map was: every line on it, and no
+  // way to ask about any of them.
+  const SLOP = 12;
+
   // One query over every region's layer, rather than a handler bound to each.
   // Every hit goes to the card, because on a road two archives both hold, one
   // hit is one feed's answer and not the road's. The highlight stays on the
   // topmost of them: it says where the card came from.
   //
-  // The card deliberately keeps the last segment when the cursor leaves the road
+  // The card deliberately keeps the last segment when the pointer leaves the road
   // — the service lists run long and reading one shouldn't require holding the
   // cursor still. The highlight does not.
-  map.on("mousemove", (e) => {
+  function selectAt(point, slop) {
     // Segments are queried first because they are drawn above the roads: a tram
     // on a street should answer for the line the cursor is actually over. There
     // is nothing to merge across regions -- a segment is one pattern's own trace,
     // not a road two archives independently describe.
+    const box = slop
+      ? [[point.x - slop, point.y - slop], [point.x + slop, point.y + slop]]
+      : point;
     const at = (ids) =>
-      map.queryRenderedFeatures(e.point, { layers: liveLayers(map, ids) });
+      map.queryRenderedFeatures(box, { layers: liveLayers(map, ids) });
     const segHits = at(SEG);
     const trackHits = segHits.length ? [] : at(TRACK);
     const hits = segHits.length ? segHits : trackHits.length ? trackHits : at(BUS);
@@ -1371,6 +1507,20 @@ function start(missing) {
     if (segHits.length) showSegment(f.properties);
     else if (trackHits.length) showTrack(f.properties, f.id);
     else showFeature(mergeRegions(hits), f.id);
+  }
+
+  // A cursor is exact and asks continuously, so it asks about the point it is on:
+  // a slop box there would answer for the road beside the one under the arrow.
+  map.on("mousemove", (e) => selectAt(e.point, 0));
+  // A tap is the other half, and on a touchscreen it is the only half -- there is
+  // no cursor to move and MapLibre reports a tap as a click. It fires after a tap
+  // and not after a pan, which is the distinction the map needs and the one a
+  // faked hover cannot make. A mouse click keeps the mouse's exactness; anything
+  // that does not say it is a mouse, including a browser that reports no pointer
+  // type at all, gets the box.
+  map.on("click", (e) => {
+    const mouse = e.originalEvent && e.originalEvent.pointerType === "mouse";
+    selectAt(e.point, mouse ? 0 : SLOP);
   });
 
   /* ---------- filter ---------- */
@@ -1402,7 +1552,7 @@ function start(missing) {
     if (on) {
       countMatches();
     } else {
-      $("hint").innerHTML = "Press <b>/</b> to search.";
+      $("hint").innerHTML = SEARCH_HINT;
     }
     redrawChips();
   }
@@ -1651,11 +1801,6 @@ function start(missing) {
       .join("");
   }
 
-  $("helpBtn").addEventListener("click", () => {
-    const open = $("help").hidden;
-    $("help").hidden = !open;
-    $("helpBtn").setAttribute("aria-expanded", String(open));
-  });
 }
 
 /* ---------- helpers ---------- */

@@ -931,6 +931,92 @@ def test_the_basemap_gives_up_resolution_when_the_link_says_it_is_slow():
     assert "effectiveType" in text
 
 
+# --- The pages on a small screen ----------------------------------------------
+#
+# Four rules a phone enforces and a desktop browser never will, so nothing else
+# here would report any of them. Each one was a page that drew and could not be
+# used, rather than a page that failed.
+
+
+def test_both_pages_measure_the_viewport_that_is_actually_showing():
+    """A phone's layout viewport is the *large* viewport -- the one with the
+    browser's toolbars hidden -- so a height of `100%` is taller than the screen
+    for as long as a toolbar is on it. What that hides is the bottom of the page,
+    which on the viewer is the credit and on the studio is the status line. The
+    `%` declaration stays as the fallback for a browser that does not know the
+    unit, so both spellings have to be there and in that order."""
+    for page, unit in (("index.html", "dvh"), ("art.html", "dvh")):
+        text = (WEB / page).read_text()
+        assert f"height: 100{unit};" in text
+        assert "height: 100%" in text
+    # The studio's stacked layout scrolls, and a scroll is what slides the toolbar
+    # away -- `dvh` there would resize the stage mid-scroll, which `refit` reads as
+    # a new preview width and answers with a whole new render. `svh` is the one
+    # that does not move.
+    art_text = (WEB / "art.html").read_text()
+    assert "min-height: 100svh;" in art_text
+    assert "min-height: 52svh;" in art_text
+
+
+def test_every_safe_area_inset_carries_a_fallback():
+    """`env(safe-area-inset-left)` is undefined on a browser that does not do
+    notches, and an undefined `env()` with no fallback makes the whole declaration
+    invalid rather than zero. So `right: calc(10px + env(...))` becomes `right:
+    auto`, and an absolutely positioned panel with no right edge is one that sizes
+    itself to its content and runs off the side of the screen. Which is what it
+    did."""
+    for page in PAGES:
+        for line in (WEB / page).read_text().splitlines():
+            if "env(safe-area-inset-" not in line or line.lstrip().startswith("*"):
+                continue
+            for inset in ("top", "right", "bottom", "left"):
+                assert f"env(safe-area-inset-{inset})" not in line, line
+
+
+def test_the_viewer_answers_a_tap_and_gives_it_room_to_land():
+    """A touchscreen sends no `mousemove`, so the map's one interaction -- ask a
+    line what runs on it -- was unreachable on a phone: every road drawn, and no
+    way to select any of them. A tap arrives as a click, and it has to be met with
+    a box rather than a point, because a road is two pixels wide and a fingertip
+    covers forty. A mouse click keeps the point: a slop box under an arrow answers
+    for the road beside the one being pointed at."""
+    text = (WEB / "index.html").read_text()
+    assert 'map.on("mousemove", (e) => selectAt(e.point, 0));' in text
+    assert 'map.on("click", (e) => {' in text
+    assert 'e.originalEvent.pointerType === "mouse"' in text
+    assert "selectAt(e.point, mouse ? 0 : SLOP)" in text
+    # The box is built from the slop, and a slop of zero stays the point itself.
+    assert "const box = slop" in text
+
+
+def test_both_pages_give_a_coarse_pointer_a_field_it_will_not_zoom_into():
+    """Safari zooms the page in on a focused input drawn under 16px, and what it
+    zooms to is the panel -- leaving a map, or a column of knobs, that has to be
+    pinched back out of before anything else can be read. Both pages set their
+    fields to 16px for a finger and leave the mouse's 13px alone."""
+    for page in PAGES:
+        text = (WEB / page).read_text()
+        assert "@media (pointer: coarse) {" in text
+        block = text.split("@media (pointer: coarse) {", 1)[1].split("\n}", 1)[0]
+        assert "font-size: 16px;" in block
+
+
+def test_the_viewer_folds_its_key_away_where_there_is_no_room_for_it():
+    """The key is a row of colour per mode, which on a national archive is eight of
+    them and most of a phone. Folded by width *and* by height, because a laptop
+    turned landscape has the same problem. The toggles are wired in `chrome`, which
+    runs before the archives are asked for: a page waiting on a slow archive should
+    still open its own help, and one that never gets a usable archive at all is
+    where the help is most wanted."""
+    text = (WEB / "index.html").read_text()
+    assert "chrome();\nboot();" in text
+    assert 'fold("keyBtn", "legend"' in text
+    assert 'matchMedia("(max-width: 720px), (max-height: 600px)")' in text
+    # The panel's own `hidden` is the state, so the button cannot come to disagree
+    # with what is on screen.
+    assert '$(btn).addEventListener("click", () => set($(panel).hidden));' in text
+
+
 def _connect(base: str) -> http.client.HTTPConnection:
     """A raw connection, because urllib sends `Connection: close` on every request
     and so can never show one being reused."""

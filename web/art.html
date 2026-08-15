@@ -2,7 +2,7 @@
 <html lang="en" data-theme="light">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Wayfare studio — generative renders</title>
 <link rel="stylesheet" href="vendor/maplibre-gl.css">
 <style>
@@ -50,8 +50,10 @@ body {
 
 h1 { margin: 0; font-size: 13px; font-weight: 600; letter-spacing: .02em; }
 .sub { color: var(--muted); font-size: 11.5px; margin-top: 2px; }
-.head { padding: 10px 12px; display: flex; align-items: flex-start; gap: 8px; }
-.head > div { flex: 1; min-width: 0; }
+.head { padding: 10px 12px; display: flex; align-items: flex-start; gap: 8px; flex-wrap: wrap; }
+/* The floor on the title column is what forces the wrap on a narrow panel rather
+   than a strapline one word wide. */
+.head > div { flex: 1; min-width: 110px; }
 
 .btn {
   font: inherit;
@@ -64,7 +66,12 @@ h1 { margin: 0; font-size: 13px; font-weight: 600; letter-spacing: .02em; }
   cursor: pointer;
   white-space: nowrap;
 }
-.btn:hover { color: var(--text); border-color: var(--muted); }
+/* Guarded, as the viewer's is: a touchscreen fakes a hover on tap and then holds
+   it, which leaves every button anyone has pressed lit. */
+@media (hover: hover) {
+  .btn:hover { color: var(--text); border-color: var(--muted); }
+}
+.btn:active { color: var(--text); border-color: var(--muted); }
 a.btn { text-decoration: none; }
 .btn[aria-disabled="true"] { opacity: .45; pointer-events: none; }
 
@@ -80,7 +87,11 @@ a.btn { text-decoration: none; }
 [hidden] { display: none !important; }
 
 /* --- studio layout: controls beside a stage --- */
-.studio { display: flex; gap: 12px; height: 100%; padding: 12px; }
+/* `dvh` for the same reason the viewer uses it: a phone's percentage height is
+   measured against the viewport with the toolbars hidden, so the bottom of this
+   box -- the status line, and the button that draws the picture again -- sits
+   under a toolbar that is still on screen. The `%` before it is the fallback. */
+.studio { display: flex; gap: 12px; height: 100%; height: 100dvh; padding: 12px; }
 .controls {
   width: 296px;
   flex: none;
@@ -124,7 +135,9 @@ a.btn { text-decoration: none; }
 
 /* Styles and formats: a radio each, drawn as a stack of pickable rows. */
 .pick { position: relative; display: block; cursor: pointer; border-radius: 6px; padding: 5px 7px; }
-.pick:hover { background: var(--chip-bg); }
+@media (hover: hover) {
+  .pick:hover { background: var(--chip-bg); }
+}
 .pick input { position: absolute; opacity: 0; pointer-events: none; }
 .pick .name { font-weight: 600; }
 .blurb { color: var(--muted); font-size: 11.5px; font-weight: 400; }
@@ -235,10 +248,57 @@ input[type=color] {
   padding: 1px 5px; border-radius: 4px;
 }
 
+/* A finger is not a cursor. 16px on every field because Safari zooms the page in
+   on a focused input drawn smaller than that, and here that means zooming into a
+   column of knobs and pinching back out to see what they did. The rest is hit
+   area: a 22px button is a target a thumb misses. */
+@media (pointer: coarse) {
+  .inp, input[type=number] { font-size: 16px; }
+  .btn { padding: 7px 10px; font-size: 12.5px; }
+  .pick { padding: 8px 9px; }
+  input[type=color] { width: 52px; height: 34px; }
+  input[type=range] { height: 28px; }
+}
+
 @media (max-width: 860px) {
-  .studio { flex-direction: column; height: auto; min-height: 100%; }
+  /* `svh` and not `dvh` here, and that is the one place on this page they differ.
+     This layout scrolls, so the browser's toolbars slide away as it does, and a
+     stage measured against the *current* viewport would grow by a tenth in the
+     middle of a scroll -- which `refit` reads as a new preview width and answers
+     with a whole new render. `svh` is the viewport with the toolbars showing: the
+     smallest it gets, and the only one of the three that does not move. */
+  .studio {
+    flex-direction: column;
+    height: auto;
+    min-height: 100%;
+    min-height: 100svh;
+    padding: calc(8px + env(safe-area-inset-top, 0px)) calc(8px + env(safe-area-inset-right, 0px))
+             calc(8px + env(safe-area-inset-bottom, 0px)) calc(8px + env(safe-area-inset-left, 0px));
+  }
   .controls { width: auto; overflow: visible; }
-  .stage { min-height: 60vh; }
+  /* The picture goes first. Stacked in source order the page opens on a column of
+     knobs, which reads as a form rather than as a studio, and the thing every one
+     of those knobs changes is a scroll away.
+     Sticky, so it stays there: turning a knob and watching the render change is
+     the whole loop this page is, and it is not a loop if each turn costs a scroll
+     up and a scroll back. It sticks within the studio box, so the controls run out
+     from under it and the page ends normally. */
+  .stage {
+    order: -1;
+    position: sticky;
+    top: calc(8px + env(safe-area-inset-top, 0px));
+    z-index: 1;
+    min-height: 52vh;
+    min-height: 52svh;
+    /* Opaque, because the panels inside it are not: the gap between the picture
+       and the status line is a window onto whatever is scrolling underneath. */
+    background: var(--bg);
+  }
+  /* Download links, the reset buttons: three across is wider than a phone. */
+  .row { flex-wrap: wrap; }
+  /* The 190px cap is measured against the 272px control column, which at this
+     width is the whole screen instead. */
+  .pickmap .maplibregl-ctrl-attrib.maplibregl-compact-show { max-width: calc(100vw - 80px); }
 }
 </style>
 </head>
