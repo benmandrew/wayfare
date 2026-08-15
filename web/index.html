@@ -1248,15 +1248,11 @@ function start(missing) {
     // on a street should answer for the line the cursor is actually over. There
     // is nothing to merge across regions -- a segment is one pattern's own trace,
     // not a road two archives independently describe.
-    const segHits = map.queryRenderedFeatures(e.point, { layers: SEG });
-    const trackHits = segHits.length
-      ? []
-      : map.queryRenderedFeatures(e.point, { layers: TRACK });
-    const hits = segHits.length
-      ? segHits
-      : trackHits.length
-        ? trackHits
-        : map.queryRenderedFeatures(e.point, { layers: BUS });
+    const at = (ids) =>
+      map.queryRenderedFeatures(e.point, { layers: liveLayers(map, ids) });
+    const segHits = at(SEG);
+    const trackHits = segHits.length ? [] : at(TRACK);
+    const hits = segHits.length ? segHits : trackHits.length ? trackHits : at(BUS);
     const f = hits[0];
     map.getCanvas().style.cursor = f ? "pointer" : "";
     if (hovered && (!f || hovered.id !== f.id || hovered.src !== f.source)) {
@@ -1365,7 +1361,7 @@ function start(missing) {
     // rather than a branch that never fires. `refs` is the test, because it is
     // stripped from exactly the same bands the way id is.
     const seen = new Set(
-      map.queryRenderedFeatures({ layers: MATCH }).map((f) =>
+      map.queryRenderedFeatures({ layers: liveLayers(map, MATCH) }).map((f) =>
         f.properties.refs !== undefined ? `w${f.id}` : `${f.source}:${f.id}`
       )
     );
@@ -1615,8 +1611,17 @@ function basemapTiles(t) {
   );
 }
 
+// queryRenderedFeatures throws on a layer id the style does not hold, so every
+// caller filters first. A layer is missing whenever the style failed to add it --
+// one bad paint expression is enough -- and the handler that reads it runs on
+// every mouse move, so the one real error arrives buried under thousands of
+// identical ones naming the layer rather than the fault.
+function liveLayers(map, ids) {
+  return ids.filter((id) => map.getLayer(id));
+}
+
 function noteRenderedModes(map, ids) {
-  const live = ids.filter((id) => map.getLayer(id));
+  const live = liveLayers(map, ids);
   if (!live.length) return;
   let added = false;
   for (const f of map.queryRenderedFeatures({ layers: live })) {
@@ -1633,7 +1638,7 @@ function noteRenderedModes(map, ids) {
 // rather than ramps, and the fallback matches the paint: a feature with no `mode`
 // came out of an archive built when this layer was heavy rail alone.
 function noteRenderedTrack(map, ids) {
-  const live = ids.filter((id) => map.getLayer(id));
+  const live = liveLayers(map, ids);
   if (!live.length) return;
   let added = false;
   for (const f of map.queryRenderedFeatures({ layers: live })) {
