@@ -314,6 +314,72 @@ Rail relations are 1,569,495 vertices drawn per pattern against 443,126 per way.
 national trace run resolved 1,127 patterns, 1,040 of 1,417 metro patterns over eleven
 Underground lines. 804 tests pass, ruff and mypy are clean.
 
+## Done — a draft of the network under the network
+
+**The viewer reads each archive twice** (2026-08-15). Pop-in on a slow connection is
+the detail band arriving tile by tile over a blank map. MapLibre already refines within
+a source, holding a loaded parent tile on screen and overzooming it until the child
+lands, so what is missing is the cold view that holds no parent at all. The vendored
+MapLibre GL JS 4.7.1 has no `prefetchZoomDelta`, so it never fetches a coarser tile on
+purpose. A second vector source over the same PMTiles file, capped at `maxzoom` 9,
+covers that for the cost of one tile: it overzooms the published mid band from z9 up to
+z18 rather than requesting tiles it has been told do not exist.
+
+**The cap is `config.MID_ZOOM - 1` and the layer starts at `config.MID_ZOOM`.** Both
+are band edges `publish` owns and `web/index.html` restates, so
+`test_the_draft_layer_tracks_the_bands_publish_actually_writes` reads them back out of
+the page. Capped higher, the second source fetches the same detail tiles as the first
+and doubles the cost of the view it exists to make cheaper. Drawn lower, it re-requests
+the tiles already on screen. Both still draw a map, which is why a test holds them.
+
+**The cap survives because MapLibre writes the source spec over the TileJSON**, as
+`pick(extend(tilejson, options))`. The other order would leave the archive header's own
+maxZoom of 14 standing and turn the draft into an uncapped copy of the layer above it,
+silently. `protocol.add` shares the PMTiles instance, so the second TileJSON costs no
+request, and the attribution control deduplicates by exact string, so an archive read
+by two sources is credited once.
+
+**The draft is drawn in the same colours at the same widths.** `publish._DETAIL_ONLY`
+strips `way`, `refs` and `name` from every band below the detail one and leaves `trips`
+and `n`, which are the two attributes the colour ramp and the width ramp read. So the
+real tiles refine the geometry and leave the map looking the same. What the missing
+three cost is every query: a draft feature carries neither the id the hover addresses
+nor the `refs` the search reads, so `OVERVIEW` is kept out of `BUS`, `SEG`, `TRACK` and
+`MATCH` and `liveLayers` never sees it. It dims to 0.12 with the road network under a
+search, being the one road layer a service number cannot be applied to.
+
+**Three events, because no one of them is both edges.** `sourcedata` is the falling
+edge, firing as each tile lands. It is useless as the rising edge: 4.7.1 has no
+`sourcedataloading`, so the first report that tiles were missing would arrive at the
+moment they stopped being missing. `move` is the rising edge, reading one frame behind
+the render that requests the tiles. `idle` is the backstop for a view that needed no
+new tiles and fired neither. `map.isSourceLoaded` asks about the current viewport
+rather than the whole archive, which is the question being asked, and an early-out on
+an unchanged target keeps a per-frame handler down to a lookup per region.
+
+**Measured against the served archives, driven in headless Chrome.**
+`ireland.pmtiles` and `northern_ireland.pmtiles` were copied off the server, served
+with `wayfare serve`, and opened at `#13/53.3498/-6.2603` over a connection throttled
+through the Chrome DevTools Protocol. The overview source caches tiles at z9 and
+nothing deeper while the region source caches z13, so the cap holds against the
+header's own maxZoom of 14. The draft renders 3,219 features at that viewport against
+the detail band's 3,560, and its features carry `n` and `trips` and neither `refs` nor
+`name`, which is `_DETAIL_ONLY` doing what the paint expressions depend on. Drawn on
+its own it is Dublin's road network in the ramp's own colours at the ramp's own widths.
+
+**The draft stood in for 9.2 seconds at 60 KB/s and 14.7 seconds at 40 KB/s.** Its z9
+tile was drawable 8.6 s into the load where the region's detail tiles were not complete
+until 17.8 s, and 12.1 s against 26.8 s at the slower rate. The two regions faded
+independently, Northern Ireland's draft clearing at 12.8 s while Ireland's stayed up to
+26.8 s, which is the per-source test rather than a global one working as intended.
+
+**The draft covers the roads and not the other modes.** `segments` and `track` are
+single-pass z5–14 layers with no band structure to cap, so a tram or a railway has no
+coarse copy to stand in for it and arrives when its own tile does. Those layers are
+hundreds of features rather than millions, so they were left alone. It is a viewer
+change throughout — no republish and no re-match. 817 tests pass, ruff and mypy are
+clean.
+
 ## Next — National Rail
 
 **GB heavy rail is absent from BODS.** All three `route_type=2` routes in the national
