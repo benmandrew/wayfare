@@ -78,6 +78,45 @@ header. A `#hash` in the URL still wins, because that is someone sharing a place
 archive carries its own attribution in its own tileset metadata, and MapLibre gathers
 every loaded credit into the one control.
 
+## On a small screen
+
+The viewer's one interaction was `mousemove`, and a touchscreen sends none. Every road drew
+on a phone and none of them could be selected. A tap now runs the same lookup through
+`map.on("click")`, and it queries a 12-pixel box rather than the point under it: a road is
+drawn about two pixels wide and a fingertip covers far more. A mouse click keeps the point
+itself, because a slop box under an arrow answers for the road beside the one being pointed
+at.
+
+The panels are absolutely positioned over the map, and their content is unbounded. A
+national archive's key is a colour ramp per mode, eight rows of it, and an info card can
+hold forty service numbers; uncapped, the two of them covered a phone entirely. Each is now
+capped at a share of the screen and scrolls inside that cap, and the key folds behind a
+"Key" button. It starts folded under 720px wide or under 600px tall, since a laptop in
+landscape has the same problem. The help panel takes more of the screen while it is open,
+because a reader who opened it wants the prose rather than the map.
+
+Heights are measured in *dynamic viewport height* (`dvh`) rather than `%`. A phone's layout
+viewport is the *large viewport*, the one with the browser toolbars hidden, so a page sized
+in percentages puts its bottom edge underneath a toolbar that is still on screen. That edge
+carries the credit and the info card. The studio page uses `svh` for its stacked layout
+instead, because that layout scrolls and a scroll is what slides the toolbar away. A stage
+measured against the current viewport would grow mid-scroll, which the preview refit reads
+as a new width and answers with a whole new render.
+
+Every `env(safe-area-inset-*)` carries a `0px` fallback. An undefined `env()` with no
+fallback invalidates the whole declaration rather than reading as zero, so
+`right: calc(10px + env(...))` becomes `right: auto`, and an absolutely positioned panel
+with no right edge sizes itself to its content and runs off the side of the screen. This was
+observed, not theorised. Fields are 16px under `(pointer: coarse)`, because Safari zooms the
+page in on a focused input drawn smaller than that, and what it zooms to is the panel.
+`:hover` rules are guarded by `(hover: hover)`, since a touchscreen fakes a hover on tap and
+then holds it.
+
+The studio page stacks on narrow screens with the picture first and sticky, so turning a
+knob and seeing the render change does not cost a scroll each way. On a phone the bottom
+strip fits one map control, and the credit is the one that has to be there, being a licence
+condition; the scale bar and the zoom readout stand down at that width.
+
 ## Point at a remote archive
 
 The `?tiles=` query parameter names exactly one archive by URL, and the page loads that
