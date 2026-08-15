@@ -117,8 +117,9 @@ class Feed:
 
 
 FEEDS = {
-    # `ireland` is the Republic; `northern_ireland` is the province, and the two
-    # read the same OSM extract, so they can share a data root.
+    # `ireland` is the Republic; `northern_ireland` is the province, and the two read
+    # the same OSM extract, so they share a Valhalla graph. They still need a data
+    # root each -- see OSM_EXTRACTS for why.
     "ireland": Feed(
         url=NTA_GTFS_URL,
         filename="nta_gtfs_ireland.zip",

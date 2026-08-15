@@ -14,19 +14,97 @@ The stages run in this order, each reading what the last one wrote:
     aggregate-> invert pattern->edges into edge->services
     publish  -> GeoJSONL -> tippecanoe -> PMTiles
 
-`acquire` is covered in [docs/data.md](data.md) and `art` in
+What the feeds themselves hold is [docs/data.md](data.md), and `art` is
 [docs/rendering.md](rendering.md). `wayfare all` chains acquire, patterns, match, trace,
 aggregate and publish. It does not run `routes`, which is invoked on its own or from
 [`deploy/refresh.sh`](../deploy/refresh.sh). Every stage checkpoints, and an interrupt is
 caught and reported; re-running the same command resumes.
 
+## acquire
+
+**What it does.** Downloads a region's timetable and whatever ships beside it into `raw/`,
+then unpacks the General Transit Feed Specification (GTFS) bundle into `work/gtfs`, which
+is what `patterns` reads. It touches no database. What each feed covers, where it is thin
+and what obligations travel with it is [docs/data.md](data.md); this section is how to run
+the stage.
+
+    wayfare acquire
+    wayfare acquire --region wales
+    wayfare acquire --region ireland --force
+
+**Flags.** `--region` takes a region slug and defaults to `WAYFARE_REGION`, itself `all`:
+a Bus Open Data Service (BODS) slug, `ireland` for the Republic of Ireland bundle from the
+National Transport Authority (NTA), or `northern_ireland` for Translink's four OpenDataNI
+datasets. `--force` re-downloads, re-assembles and re-unpacks, since nothing here is
+fetched again while a good copy is on disk. `--with-osm` also archives the Geofabrik
+extract; Valhalla fetches its own copy, so this only records which extract a set of edge
+ids belongs to. `wayfare all` passes neither flag.
+
+**Cost.** The transfer, and then the unzip. Nationally the BODS bundle is 1.28 GB zipped
+and 7.84 GB unpacked, of which `stop_times.txt` is 5.09 GB; the National Public Transport
+Access Nodes (NaPTAN) register adds 102 MB and `--with-osm` a 2.16 GB extract. Budget
+about 40 GB for a national run including the Valhalla graph. Wales is 41 MB, and the
+Republic's bundle 108 MB zipped and 492 MB unpacked.
+
+**Interrupting.** Safe for the transfers. Bytes go to `<name>.part` and the file is
+renamed only once it is complete and has passed its check, so a half-file is never
+mistaken for a finished one. The partial is kept only where the host answers a Range
+request with a 206, which Geofabrik and the NTA do and BODS does not; a server that
+ignores the header sends the whole file from byte zero, so the partial is discarded rather
+than concatenated into something the right shape and the wrong size. Unpacking is the half
+that is not safe.
+
+**Three publishers, three shapes of feed.** BODS publishes one bundle per slug and
+`config.feed` builds the URL on demand, which is why only the two exceptions have an entry
+in `config.FEEDS`. `--region ireland` takes the NTA's single `GTFS_All.zip` and skips
+NaPTAN, the Great Britain stop register, which has nothing to say about anywhere else.
+`--region northern_ireland` downloads no feed at all, because none is published: the four
+OpenDataNI datasets are resolved through `package_show` at fetch time, since the resource
+id and the filename both move on every publication, and `translink.build_gtfs` assembles
+the bundle into `work/`. That assembly is redone only when a part's size or timestamp
+moves, which a `.manifest` beside it records.
+
+**BODS sends no `Content-Length`, so a truncated download looks exactly like a complete
+one.** `config.MIN_GTFS_BYTES`, 1 MiB, rejects an empty body or an error page cheaply and
+nothing else: regional bundles run from 41 MB to 1.28 GB, so no size floor separates a
+cut-short national feed from a whole Welsh one. The real test is structural. `check_gtfs`
+opens the zip and requires `stop_times.txt`, `trips.txt`, `routes.txt` and `stops.txt`,
+and a zip stores its central directory at the end, so a download cut short cannot be
+opened at all, at any feed size. A host that does declare a length has its bytes counted
+against it, skipping a `Content-Encoding` body that requests has already decoded.
+
+**Retries are for connections that dropped, never for content that is wrong.** A complete
+but unusable file raises `Invalid` and a 401 or 403 raises `Unauthorized`, and both stop
+the stage where it stands: the same bytes come back next time, and five attempts at a
+password prove nothing about it. Everything else retries `config.DOWNLOAD_RETRIES` times,
+5, waiting `DOWNLOAD_BACKOFF` of 30 seconds times the attempt number — 30, 60, 90 and 120
+seconds, or 300 in total, before it gives up.
+
+**What goes wrong.**
+
+- *A 403 that is not about credentials.* BODS blocks anything that looks like a generic
+  scraper and OpenDataNI answers the same way, so `config.USER_AGENT` is load-bearing and
+  `WAYFARE_UA` overrides it. It arrives as `Unauthorized` and is refused rather than
+  retried.
+- *A bundle missing a member.* `check_gtfs` names the missing files, the `.part` is
+  deleted and the stage stops. Re-running fetches the same bytes, so the feed itself has
+  to change.
+- *An interrupt during unpacking.* `unpack_gtfs` writes members straight into `work/gtfs`
+  with no staging, and its marker is `stop_times.txt` itself, so a run killed after that
+  member and before the ones behind it in the zip reports "already unpacked" next time and
+  hands `patterns` a truncated feed. `wayfare acquire --force` re-extracts.
+- *A second region acquired into the first's data root.* `raw/`, `work/gtfs` and the
+  database are all per data root, and `meta.feed_version` holds one value, so the second
+  region becomes the current feed and the next `publish` overwrites the first region's
+  archive. Give each region its own `WAYFARE_DATA`.
+
 ## patterns
 
-**What it does.** Reads the unpacked General Transit Feed Specification (GTFS) feed from
-`work/gtfs` and groups trips by `(route_id, direction, ordered stop sequence)`. Most trips
-are one physical journey repeated through the day, so this collapse is what makes national
-scale affordable. It writes `patterns`, `pattern_stops`, `routes`, `stops` and `shapes`,
-and rebuilds `meta.modes`.
+**What it does.** Reads the unpacked GTFS feed from `work/gtfs` and groups trips by
+`(route_id, direction, ordered stop sequence)`. Most trips are one physical journey
+repeated through the day, so this collapse is what makes national scale affordable. It
+writes `patterns`, `pattern_stops`, `routes`, `stops` and `shapes`, and rebuilds
+`meta.modes`.
 
     wayfare patterns
     wayfare patterns --modes bus,coach,tram --memory 12GB
@@ -64,16 +142,17 @@ routes, matches or gates on it.
 
 **What goes wrong.**
 
-- *No unpacked feed.* The stage names the missing `work/gtfs/stop_times.txt` and exits 1.
-  Run `wayfare acquire` first.
+- *No unpacked feed.* The stage names the directory it looked in, `work/gtfs`, rather than
+  the `stop_times.txt` inside it that it tested for, and exits 1. Run `wayfare acquire`
+  first.
 - *An empty `--modes`.* Refused rather than read as "everything", which would build a
   database with no patterns and report success.
 - *A leading zero lost from a GTFS id.* Route "07" must not become 7. `all_varchar=true`
   on every GTFS `read_csv` in [`gtfs.py`](../wayfare/gtfs.py) is the only thing stopping it.
-- *A stop outside these islands.* Bus Open Data Service (BODS) carries international
-  coach, so live stops sit between Calais and Warsaw at coordinates that are entirely
-  correct. `config.british_isles_sql` is the boundary, and the whole pattern is dropped
-  rather than the stop.
+- *A stop outside these islands.* BODS carries international coach, so live stops sit
+  between Calais and Warsaw at coordinates that are entirely correct.
+  `config.british_isles_sql` is the boundary, and the whole pattern is dropped rather than
+  the stop.
 
 **Feed churn is small.** Two Wales feeds two days apart, `20260806_023912` then
 `20260808_024504`, took 3,584 patterns to 3,541: 30 new, 73 departed. Catching up cost about
@@ -337,9 +416,9 @@ table name; the subcommand is what this section means throughout.
 deliberately not the file `trace` uses: the two stages ask for different windows, and
 sharing one body would let whichever ran first decide the other's coverage. `--refresh`
 re-queries. `--cif` attributes trips from a Network Rail Common Interface File (CIF)
-schedule and is optional, with `--stops` naming the National Public Transport Access Nodes
-(NaPTAN) CSV that turns a TIPLOC into a place and `--on` the date whose service to count.
-Without `--cif` the track draws and `trips` stays null.
+schedule and is optional, with `--stops` naming the NaPTAN CSV that turns a TIPLOC into a
+place and `--on` the date whose service to count. Without `--cif` the track draws and
+`trips` stays null.
 
 **Cost.** 54m43s nationally when profiled on the server against a cached 121.5 MB Overpass
 body, of which 99.8% was two insert loops: `write_ways` took 2,733 seconds for 68,369 ways
@@ -419,6 +498,27 @@ tells the two apart once the polyline is stored, which is why the column exists.
 pattern in both arms looks like is a hover on a National Rail way answering with one
 relation's card rather than the way's service list.
 
+**What goes wrong.** Every fault here recovers by running `wayfare aggregate` again. The
+stage is a full recomputation — three DELETEs and three `INSERT ... SELECT`s over
+`pattern_edges`, `patterns`, `shapes` and `traces`, all of them already on disk — with no
+network call, no external tool and nothing to resume, so redoing it costs the minutes it
+cost the first time. What it gets wrong is therefore what it draws rather than whether it
+finishes.
+
+- *Nothing to invert.* An `aggregate` run before `match` has written anything logs "0
+  edges carry 0 edge-service pairs" and succeeds. The counts in the log are the check; the
+  `publish` that follows is what raises.
+- *A non-road pattern with geometry from neither source.* It gets no row and is simply not
+  drawn, which the log counts rather than raises on. `wayfare trace` is what fills it, and
+  a straight line between two known stops is the thing that must not be invented.
+- *A trace written before the tracer learned to cut.* `traces.ways_cut` is FALSE, so the
+  pattern keeps its polyline in `segments` and contributes nothing per way, and a hover on
+  that track answers with one relation's card. `wayfare trace --retry ok` re-cuts it and
+  the next `wayfare aggregate` moves it into the track layer.
+- *A database matched before the mode filter existed.* `db.matchable` drops the
+  `pattern_edges` rows that should never have reached Valhalla, so those roads stop being
+  drawn on the first run of this stage and the edge count falls with them.
+
 ## publish
 
 **What it does.** Streams the network out as GeoJSONL, builds up to six tippecanoe passes
@@ -453,8 +553,7 @@ filesystem, so a killed run leaves whatever is being served untouched.
 alone and `detail` z11-z14. The fifth pass is `segments` and the sixth is `track`, each one
 band over z5-z14, and `tile-join` concatenates whatever exists. The archive holds three
 layers: the banded road layer, `segments` and `track`. Either of the last two can be
-absent, and each is skipped rather than joined in empty, because tippecanoe exits 110 on an
-empty input. A region with no matched edges gets no road bands at all.
+absent, and each is skipped rather than joined in empty.
 
 **`_DETAIL_ONLY` is `("way", "refs", "name")`, stripped from the three overview bands.**
 Those are the attributes only the info card opens, and the card does not open below
@@ -511,14 +610,30 @@ the geometry and look at it. Rasterised around London, the uncapped archive ligh
 the window at z5, 7.0% at z6 and 9.3% at z7 against the capped build's 2.7%, 3.7% and 3.7%;
 at z8 it is 8.2% against 5.0%, where the capped render hollowed the city into a skeleton.
 
-**Three silent failures guard the rest.** Tippecanoe applies `-x` before `-j`, so a filter
-naming an excluded attribute matches nothing and writes an empty band, measured on London
-as a 2.4 KB archive holding no tiles and no error. `--extend-zooms-if-still-dropping`
-treats `-z` as a ceiling it may raise, and a `far` band asked for z5-z7 came back covering
-z5-z9, which overlaps the next band and has `tile-join` merge both copies of every road;
-the flag is passed to the last band only. A longitude within about a kilometre of the prime
-meridian is written `-1.1e-05`, and Great Britain has 63 such features around Greenwich,
-which a number pattern without an exponent skips without a word.
+**What goes wrong.** Three of these are silent, and each of the three took an archive to
+the point of being served before anyone noticed.
+
+- *`tippecanoe` or `tile-join` not on `PATH`.* `build_tiles` names the missing tool and
+  where to get it. The check runs after `export_geojsonl`, so the export has already been
+  paid for and `--from-export` is what skips repeating it.
+- *An empty input.* Tippecanoe exits 110 rather than writing an empty archive, so a pass
+  with no features is skipped instead of joined in: a region with no matched edges gets no
+  road bands at all. With nothing to write at all, `build_tiles` raises rather than
+  publishing a blank archive, which loads without complaint and reads as a broken viewer.
+- *A filter naming an excluded attribute.* Tippecanoe applies `-x` before `-j`, so the
+  filter matches nothing and the band comes out empty, measured on London as a 2.4 KB
+  archive holding no tiles and no error.
+- *A band that grew past its own top zoom.* `--extend-zooms-if-still-dropping` treats `-z`
+  as a ceiling it may raise, and a `far` band asked for z5-z7 came back covering z5-z9 on
+  Great Britain, overlapping the band above it and having `tile-join` merge both copies of
+  every road. The flag is passed to the last band only.
+- *A longitude within about a kilometre of the prime meridian.* It is written `-1.1e-05`,
+  and Great Britain has 63 such features around Greenwich, which a number pattern without
+  an exponent skips without a word. `_NUM` allows the exponent, and `_features` raises on
+  a line it cannot read rather than passing over it.
+- *A default-named archive beside a region-named one.* `default_out` refuses, since
+  writing `bus.pmtiles` next to `great_britain.pmtiles` would leave the served file stale
+  while reporting success. Pass `--name-by-region` or `--out`.
 
 **Checking a built archive needs no database.**
 
@@ -533,7 +648,7 @@ the feature counts cannot make.
 **A licence condition travels with the data, not with the page.** The credit is derived
 from `config.Feed` and written into the archive's tileset metadata, so a copied archive
 keeps it. `publish.contents` reads off the database which of `road`, `operator` and `track`
-the archive holds, and the Open Database Licence (ODbL) credit to OpenStreetMap is owed
+the archive holds, and the Open Database License (ODbL) credit to OpenStreetMap is owed
 only where a route was matched onto its ways or drawn from its track. The viewer needs
 `pmtiles.Protocol({ metadata: true })` or MapLibre never sees any of it, which looks like a
 viewer crediting only its basemap rather than an error.

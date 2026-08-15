@@ -203,7 +203,7 @@ drawn twice on purpose.
 credit into the archive's own tileset metadata, derived from `config.Feed`, so a copied
 archive keeps it, and the viewer shows the credits of every archive it loads together
 in the one control. Every archive owes the timetable's publisher, and owes
-OpenStreetMap under the Open Database Licence (ODbL) only where a route was matched
+OpenStreetMap under the Open Database License (ODbL) only where a route was matched
 onto its ways or drawn as track, which `publish.contents` reads off the database.
 `pmtiles.Protocol` needs `{ metadata: true }` or MapLibre never sees any of it, which
 looks like a viewer crediting only its basemap rather than an error. Every render

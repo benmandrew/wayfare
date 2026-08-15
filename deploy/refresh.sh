@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# One monthly refresh of a deployed region, start to finish.
+# One scheduled refresh of a deployed region, start to finish. The cadence is the
+# scheduler's: the Ansible cron runs this every 7 days, and the reference timer beside
+# this script says monthly, which is a ceiling rather than a recommendation.
 #
 # The incremental path, not a rebuild: `match` selects work by the absence of a
 # `match_status` row, so a feed whose patterns are mostly unchanged costs only the
@@ -122,7 +124,7 @@ wayfare cluster
 
 # --name-by-region because every deployed data root holds one region's archive under
 # its own name, and three of them are served from one directory. Without the flag
-# `publish` writes bus.pmtiles, which is the name nothing here serves -- and it
-# refuses outright rather than writing it, so a refresh without this cannot finish
-# at all.
+# `publish` writes bus.pmtiles, which is the name nothing here serves. On a root that
+# already holds a region-named archive it refuses rather than writing that, so the
+# refresh stops instead of publishing under a name nothing reads.
 wayfare publish --name-by-region

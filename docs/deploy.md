@@ -17,8 +17,10 @@ reference for what any scheduler has to provide, and neither has ever been insta
 `valhalla` is `ghcr.io/valhalla/valhalla-scripted`, listening on 8002, with
 `force_rebuild: "False"` so an existing graph is never rebuilt under a database that
 stores its edge ids. Its healthcheck carries a 90 minute `start_period`, the window a
-first graph build gets, and every other service waits on `condition: service_healthy`, so
-nothing opens against a half-built graph.
+first graph build gets, and the three stage services wait on `condition: service_healthy`,
+so nothing opens against a half-built graph. `web` opts out with `depends_on: []`, because
+serving an archive that is already built needs no routing engine, and gating it on the
+graph would take the viewer down for the 90 minutes of a rebuild.
 
 `pipeline`, `wayfare` and `matcher` sit behind the `manual` profile and never start with
 `docker compose up`. `pipeline` runs `wayfare all`, which is `acquire`, `patterns`, `match`,
@@ -121,7 +123,7 @@ operators' relations it keeps, so a run against the wrong data root draws anothe
 rail into this one's archive. The stage names the region it thinks it is in its own log
 line.
 
-Track arrives under the Open Database Licence (ODbL), and `config.credit_parts` adds the
+Track arrives under the Open Database License (ODbL), and `config.credit_parts` adds the
 OpenStreetMap credit when an archive holds matched road *or* track. An archive with
 neither credits only the timetable's publisher.
 
@@ -252,9 +254,11 @@ to, so writing the final `.pmtiles` directly left minutes in which a client read
 ranges could span two archives, and the bands were globbed by `server.archives` and
 offered to the viewer as though an overview band were another region.
 
-Northern Ireland has no Compose project. It was driven by hand with `docker run` against
-the Ireland project's network, so `/home/ben/wayfare-ni` is host state that no committed
-file reproduces and that Ansible does not know about.
+Northern Ireland is not deployed the way `REFRESH_SERVICE` above describes. That variable
+is what the script supports; what the server actually runs is `docker run` by hand against
+the Ireland project's network, so Northern Ireland has no Compose service of its own and
+its data root is host state that no committed file reproduces and Ansible does not know
+about. Bringing it under the project is what closes the gap.
 
 Departed patterns are never evicted. `prune_shapes` drops operator geometry only, and
 nothing removes a departed pattern's `pattern_edges` rows, so that table grows

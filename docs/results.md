@@ -37,7 +37,8 @@ Run in a separate data root (`data-london`) against its own Valhalla instance on
 8003, because rebuilding the shared graph invalidates every `edge_id` in the Wales
 database.
 
-- 304 MB zip, 1.5 GB unpacked, `stop_times.txt` 1.50 GB, 17,611,239 stop times.
+- 304 MB zip, ~1.5 GB unpacked, of which `stop_times.txt` is 1.50 GB and 17,611,239 stop
+  times. The bundle is almost entirely that one file.
 - 480,412 trips collapse to 4,709 patterns, a 102x collapse against Wales's 10.3x.
   London runs the same route all day at high frequency.
 - Only 0.9% carry operator geometry (44 shapes), against Wales's 85.2% and the

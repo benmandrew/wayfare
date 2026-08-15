@@ -140,7 +140,7 @@ tippecanoe itself; the compose file's header covers single stages and pointing
 | NaPTAN stop register | Great Britain | OGL v3.0 |
 | National Transport Authority (NTA) GTFS, published as Transport for Ireland | Republic of Ireland | Creative Commons Attribution (CC BY) 4.0 |
 | Translink TransXChange timetables and MapInfo route geometry, via OpenDataNI | Northern Ireland | OGL v3.0 |
-| Geofabrik OpenStreetMap extracts | all three | Open Database Licence (ODbL) |
+| Geofabrik OpenStreetMap extracts | all three | Open Database License (ODbL) |
 
 CC BY 4.0 makes attribution a condition of use, so anything published from the NTA's feed
 has to credit the National Transport Authority. `wayfare acquire` prints the licence and

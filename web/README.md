@@ -57,10 +57,11 @@ slug `all` is a scope rather than a place.
 
 `wayfare serve` answers `GET /archives.json` with a JavaScript Object Notation (JSON) list
 of the archive filenames it can see, since the viewer is a static page and cannot list a
-directory. The header dropdown is "Go to…": choosing a region calls `fitBounds` on that
-archive's bounds rather than reloading. An archive that fails to open no longer takes the
-map down with it, and the strapline reports the count instead of a name: "3 regions, 1
-unavailable — bus services by road segment".
+directory. There is no region picker: every archive in that list is loaded onto the one
+map, and the view is framed to their combined bounds. An archive that fails to open does
+not take the map down with it, and the strapline is what reports the loss — "3 regions, 1
+unavailable — public transport services". A single region is named instead, and several
+that all opened need nothing said, so the shipped strapline stands.
 
 Three things follow from holding a set rather than one archive. `minZoom` is the deepest
 floor of the set, the maximum of the loaded headers, because at a zoom one archive cannot
@@ -123,7 +124,9 @@ The picture:
 - `height` — optional and in the same range; the window's aspect ratio sets it otherwise.
 - `scale` — 0.1 to 4.0. Ignored for SVG, which is resolution independent.
 - `hue` — 0 to 1. `line_scale` and `alpha_scale` — 0.05 to 8.
-- `caption` — up to 120 characters. `background` — `#rrggbb`.
+- `caption` — up to 120 characters. `background` — `#rrggbb`, or three 0-1 floats as
+  `r,g,b`, which is the form [`art.STYLES`](../wayfare/art.py) holds so a background
+  copied out of a style pastes straight in.
 - `credit` — a valueless flag that draws the data credit into the corner. Every render
   carries it in its file metadata regardless.
 - `coalesce` — a valueless flag that joins edges meeting end to end into one stroke.

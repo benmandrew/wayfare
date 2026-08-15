@@ -85,7 +85,8 @@ services:
       valhalla:
         condition: service_healthy
 
-  # Individual stages: acquire, patterns, match, aggregate, publish, status, art.
+  # Individual stages: acquire, patterns, match, trace, routes, aggregate, publish,
+  # status, art.
   wayfare:
     <<: *wayfare
     profiles: ["manual"]
