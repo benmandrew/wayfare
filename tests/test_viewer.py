@@ -202,6 +202,10 @@ def test_the_shared_files_are_reachable_and_typed():
                 "base.css": "text/css",
                 "util.js": "javascript",
                 "credits.js": "javascript",
+                # Generated rather than written, and the viewer's every colour and
+                # layer name is in it. A 404 here is a page that throws on the
+                # first `PALETTE` it reads and draws no map at all.
+                "palette.js": "javascript",
             }
             for name, kind in wanted.items():
                 with urllib.request.urlopen(f"{base}/{name}", timeout=30) as res:  # noqa: S310
@@ -343,15 +347,32 @@ def test_the_viewer_tells_the_two_id_spaces_apart_by_refs():
     `way` is an attribute of no band -- it is the feature id itself -- so a page that
     read one would hover in the wrong id space with nothing to show for it. Both
     halves are asserted, because either one alone leaves the discrimination able to
-    move to an attribute that is never written."""
-    assert _holds("index.html", "const detailed = p.refs !== undefined;")
+    move to an attribute that is never written.
+
+    The three readers go through one helper now, and the attribute it tests comes
+    out of `map.toml` alongside the `_DETAIL_ONLY` list `publish` strips by. What is
+    asserted here is therefore the arrangement rather than the name: that the page
+    holds exactly one definition of the test, that all three callers use it, and
+    that the name it reads is the one the pipeline strips."""
+    from wayfare import palette, publish
+
+    ink = palette.load()
+    assert ink.detail_sentinel in publish._DETAIL_ONLY
     assert _holds(
         "index.html",
-        "f.properties.refs !== undefined ? `w${f.id}` : `${f.source}:${f.id}`",
+        "const fromDetailBand = (props) => props[PALETTE.detailSentinel] !== undefined;",
+    )
+    assert _holds("index.html", "const detailed = fromDetailBand(p);")
+    assert _holds(
+        "index.html",
+        "fromDetailBand(f.properties) ? `w${f.id}` : `${f.source}:${f.id}`",
     )
     # Merging two archives over one road unions their service lists, and the same
     # sentinel says whether there is anything to union.
-    assert _holds("index.html", "if (top.refs === undefined) return top;")
+    assert _holds("index.html", "if (!fromDetailBand(top)) return top;")
+    # One definition, three callers: a second test written out inline is the copy
+    # that survives the next change to `_DETAIL_ONLY`.
+    assert _source("index.html").count("PALETTE.detailSentinel") == 1
     # The way id reaching the card comes from the feature id, never from a property.
     assert _holds("index.html", "card.feature(mergeRegions(hits), f.id)")
     for page in PAGES:

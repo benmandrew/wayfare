@@ -47,6 +47,11 @@ The `routes` stage lives in [`wayfare/osmroutes.py`](wayfare/osmroutes.py), beca
 is already the General Transit Feed Specification (GTFS) table name. Prose and the command
 line both call the stage `routes`; only the module is `osmroutes`.
 
+[`wayfare/map.toml`](wayfare/map.toml) holds every value that has to be identical on both
+sides of the Python/JavaScript boundary — the three tile layer names, every colour, and the
+handful of others listed in the rule below — and `publish`, `coverage` and both viewer pages
+resolve them through it.
+
 **Storage is one DuckDB file** (`work/wayfare.duckdb`), because the central operation
 is a group-by over a 5 GB CSV, done out of core. Geometry is integer micro-degrees,
 not WKT.
@@ -152,9 +157,29 @@ Valhalla edge id.** So `way` is an attribute of no band and neither is `id`, and
 viewer tells the two ranges apart by reading `refs`, which `_DETAIL_ONLY` strips from
 exactly the bands that carry the edge id. Put `way` back as an attribute, or strip
 `refs` from a band, and the viewer hovers in the wrong id space with no error to show
-for it. A way whose service set changes along it is several features sharing one id, so
+for it. Both halves are one entry in `map.toml` now — `bands.detail_only` is what
+`publish` strips by and `bands.sentinel` is what the viewer tests for — and loading it
+raises when the sentinel is not in the list, because a sentinel every band carries marks
+every feature as detail-band. A way whose service set changes along it is several features sharing one id, so
 a hover selects the whole way. Carrying this to a served archive is a `publish` run and
 no migration, because `way` was already a column on `edges` and already in the export.
+
+**Anything both the pipeline and a viewer must agree on is in `wayfare/map.toml`, and the
+browser cannot read it.** The three layer names, every colour, the archive name a page
+falls back to on a static host, the detail-band pair above, and the box the viewer will not
+pan outside of — which `art.ISLES` reads too. `publish` names its tippecanoe layers from
+that file and `coverage.draw` paints from it, while both pages read `web/palette.js`, which
+`scripts/palette_js.py` generates from the same file and CI checks with `--check` on every
+push. What belongs there is a value that crosses the language boundary, not configuration in
+general: `MAX_REFS_IN_TILE` stays out because the viewer reads the shortfall off `n` instead,
+and the zoom bands stay out because the viewer reads them off the PMTiles header. The generated copy exists because a
+browser has no Tom's Obvious Minimal Language (TOML) parser and the page has to work on a
+static host with no extra fetch. The *OKLab* derivation that turns a mode's seed colour into
+a six-step ramp is in `wayfare/palette.py` alone, and the page reads finished arrays and
+computes no colour. Nothing reports a mismatch — a layer the viewer names and the archive
+does not carry simply draws nothing, and a table keyed on a layer name by hand goes stale in
+silence, which is how `coverage`'s greys came to have no `track` entry and drew all track in
+the fallback grey.
 
 **Nothing holds a whole window or a whole table.** `art` streams its window and
 `publish.export_edges_geojsonl` streams by `way_id`. Anything statistical — weight
@@ -266,9 +291,14 @@ path, no version, or the byte-identical tests are a fiction.
 ## Standards
 
 - Python 3.12, ruff at line-length 92, mypy strict on `wayfare`. `ruff format` owns the
-  layout and `nixfmt` owns [`flake.nix`](flake.nix); both are enforced, so do not hand-tune
-  spacing back. `.github/workflows/check.yml` runs format, lint, types and tests in this
-  same devShell on every push and pull request.
+  layout, `nixfmt` owns [`flake.nix`](flake.nix) and `taplo` owns the TOML; all three are
+  enforced, so do not hand-tune spacing back. `.github/workflows/check.yml` runs format,
+  lint, types and tests in this same devShell on every push and pull request.
+- `taplo lint` checks [`wayfare/map.toml`](wayfare/map.toml) against
+  [`wayfare/map.schema.json`](wayfare/map.schema.json), wired up in
+  [`.taplo.toml`](.taplo.toml). The same association drives the "Even Better TOML" VS Code
+  extension, so the editor shows inline what CI fails on. What JSON Schema cannot say —
+  a relation between one value and another — is refused by `palette.load` instead.
 - The dev environment is the nix flake and nothing else. direnv enters it (`.envrc` is
   `use flake` plus `dotenv_if_exists .env`, the same file Compose reads); `nix develop`
   is the same shell without direnv. It supplies Python 3.12, uv, cairo, pkg-config,

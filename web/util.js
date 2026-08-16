@@ -118,9 +118,12 @@ function basemapTiles(t) {
 
 // West of the Blaskets to east of Lowestoft, Scilly up to Unst, with enough
 // margin that coastal places do not sit jammed against the edge. The data is
-// British Isles only, so there is nothing to find outside this. `art.ISLES` holds
-// the same box for the renderer, in the same minlon,minlat,maxlon,maxlat order.
-const ISLES = [-11.5, 49.4, 2.6, 61.3];
+// British Isles only, so there is nothing to find outside this.
+//
+// Out of `wayfare/map.toml`, which `art.ISLES` also reads. The two used to be
+// written out separately in the same minlon,minlat,maxlon,maxlat order, each
+// carrying a comment naming the other as its twin.
+const ISLES = PALETTE.roam;
 
 const MERC_MAX_LAT = 85.05112878;
 

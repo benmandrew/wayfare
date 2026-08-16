@@ -1,0 +1,41 @@
+# Taplo: the TOML formatter, linter and language server. The VS Code extension
+# "Even Better TOML" reads this file, so an editor and `taplo` on the command
+# line agree, and CI runs the same two checks the editor shows inline.
+#
+# `wayfare/map.toml` is why this exists. It is read by `publish`, by
+# `coverage.draw` and -- through the file `scripts/palette_js.py` generates from
+# it -- by both viewer pages, and a wrong shape in it is not an error any of them
+# reports: a mistyped layer name draws an empty layer, and a colour in the wrong
+# case leaves a mode's ramp ending somewhere other than the colour its key
+# promises. The schema states the shape so the editor says so while it is typed.
+
+# Only ours. `.venv` holds several thousand TOML files that are nobody's business
+# here, and a glob without this walks all of them.
+include = ["*.toml", "wayfare/**/*.toml", "deploy/**/*.toml", ".github/**/*.toml"]
+
+[formatting]
+# 92 to match ruff, so a comment reads the same width in a .toml as in a .py.
+column_width = 92
+# Four, because that is what `pyproject.toml` already uses. Picking the other
+# convention would have `taplo fmt` reindent a file nothing else in this change
+# touches, which is churn in a diff that has nothing to do with it.
+indent_string = "    "
+# Entries stay in the order they are written. The order in `[modes]` is the order
+# the legend lists them in, so sorting them here would silently reorder the key.
+reorder_keys = false
+reorder_arrays = false
+# Arrays already written across several lines stay that way, and short ones stay
+# on one line. A six-colour ramp is meant to be read across, not down.
+array_auto_expand = false
+array_auto_collapse = false
+# The comment blocks in `map.toml` carry the reasoning behind each value and are
+# most of the file. Nothing here may reflow or re-indent them.
+allowed_blank_lines = 2
+
+[[rule]]
+name = "map contract"
+include = ["wayfare/map.toml"]
+
+[rule.schema]
+path = "wayfare/map.schema.json"
+enabled = true

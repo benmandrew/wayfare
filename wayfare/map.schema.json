@@ -1,0 +1,201 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/benmandrew/wayfare/wayfare/map.schema.json",
+  "title": "wayfare map contract",
+  "description": "Every value that has to be identical on both sides of the Python/JavaScript boundary. `publish` and `coverage.draw` read this file directly; the viewer reads `web/palette.js`, generated from it by `scripts/palette_js.py`. Nothing reports a mismatch at run time, which is why the shape is checked here.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "layers",
+    "road_ramp",
+    "mode_ramp",
+    "modes",
+    "accents",
+    "track",
+    "archive",
+    "bands",
+    "roam"
+  ],
+  "definitions": {
+    "colour": {
+      "type": "string",
+      "pattern": "^#[0-9a-f]{6}$",
+      "description": "An sRGB colour as `#rrggbb`, lower case. Lower case is not a style rule: a mode's seed is the top step of its own ramp, the ramp is generated through OKLab and comes back lower case, and an upper-case seed would no longer equal the colour the legend draws for it."
+    },
+    "ramp": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/colour" },
+      "minItems": 6,
+      "maxItems": 6,
+      "description": "Six steps, quietest first. Six because the legend draws one bar for the road ramp and every mode ramp together, and the ticks under it have to line up."
+    },
+    "layer_name": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "description": "A tippecanoe source-layer name. MapLibre tolerates a layer it names and the archive does not carry, drawing nothing and saying nothing."
+    },
+    "attribute": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "description": "A feature attribute name as written into the tiles."
+    },
+    "mode_key": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "description": "A mode name. Also a key on a generated JavaScript object, so it stays a plain identifier."
+    },
+    "low": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mul", "add", "cap", "chroma"],
+      "description": "Where a mode ramp starts, relative to the mode's own colour: lightness is `min(cap, L * mul + add)` and chroma is `C * chroma`, both in OKLCh and both then fitted to sRGB. Two shapes of rule rather than one because light adds and clamps while dark multiplies.",
+      "properties": {
+        "mul": { "type": "number", "minimum": 0, "maximum": 1 },
+        "add": { "type": "number", "minimum": -1, "maximum": 1 },
+        "cap": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+        "chroma": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    }
+  },
+  "properties": {
+    "layers": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["road", "segments", "track"],
+      "description": "The three layer names inside an archive. tippecanoe writes them and MapLibre asks for them by name.",
+      "properties": {
+        "road": { "$ref": "#/definitions/layer_name" },
+        "segments": { "$ref": "#/definitions/layer_name" },
+        "track": { "$ref": "#/definitions/layer_name" }
+      }
+    },
+    "road_ramp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["light", "dark", "at", "trips_per", "needs"],
+      "properties": {
+        "light": { "$ref": "#/definitions/ramp" },
+        "dark": { "$ref": "#/definitions/ramp" },
+        "at": {
+          "type": "array",
+          "items": { "type": "number", "exclusiveMinimum": 0 },
+          "minItems": 6,
+          "maxItems": 6,
+          "uniqueItems": true,
+          "description": "Journeys a day at each of the six steps, ascending. Interpolated in log10 between them, because journeys a day span three orders of magnitude and drawn straight everything but a handful of city corridors sits in the first colour. Must be strictly ascending, which JSON Schema cannot say and `palette.load` checks."
+        },
+        "trips_per": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "`trips` on a tile feature is a count over this many days. The division to journeys a day happens where a ramp is evaluated and nowhere else."
+        },
+        "needs": {
+          "$ref": "#/definitions/attribute",
+          "description": "The attribute both ramps read. Published at every zoom: an attribute a paint property cannot find is not an error MapLibre reports, it takes the fallback and draws a whole country in the first ramp colour."
+        }
+      }
+    },
+    "mode_ramp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["light", "dark"],
+      "properties": {
+        "light": { "$ref": "#/definitions/low" },
+        "dark": { "$ref": "#/definitions/low" }
+      }
+    },
+    "modes": {
+      "type": "object",
+      "minProperties": 1,
+      "required": ["other"],
+      "description": "One entry per non-road mode, in the order the legend lists them. `other` is required: it is what a mode this palette has never heard of is drawn as, which is what an archive built by a newer pipeline looks like to an older page.",
+      "propertyNames": { "$ref": "#/definitions/mode_key" },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["label", "light", "dark"],
+        "properties": {
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "description": "What the legend calls this mode."
+          },
+          "light": { "$ref": "#/definitions/colour" },
+          "dark": { "$ref": "#/definitions/colour" }
+        }
+      }
+    },
+    "accents": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hover_light",
+        "hover_dark",
+        "unavailable_light",
+        "unavailable_dark"
+      ],
+      "properties": {
+        "hover_light": { "$ref": "#/definitions/colour" },
+        "hover_dark": { "$ref": "#/definitions/colour" },
+        "unavailable_light": { "$ref": "#/definitions/colour" },
+        "unavailable_dark": { "$ref": "#/definitions/colour" }
+      }
+    },
+    "track": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["default_mode"],
+      "properties": {
+        "default_mode": {
+          "$ref": "#/definitions/mode_key",
+          "description": "What a track feature is drawn as where the tile carries no `mode`. Must be a key of [modes], which `palette.load` checks."
+        }
+      }
+    },
+    "archive": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["default"],
+      "properties": {
+        "default": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]+\\.pmtiles$",
+          "description": "What `publish` writes when told neither a path nor to name the file for its region, and what both pages fall back to when there is no index to ask."
+        }
+      }
+    },
+    "bands": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["detail_only", "sentinel"],
+      "description": "Which band a feature came from, which is the only thing telling the two feature-id spaces apart: the detail band's id is the OpenStreetMap way id and the overview bands' is the Valhalla edge id.",
+      "properties": {
+        "detail_only": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/attribute" },
+          "minItems": 1,
+          "uniqueItems": true,
+          "description": "Attributes `publish` strips from the three overview bands."
+        },
+        "sentinel": {
+          "$ref": "#/definitions/attribute",
+          "description": "Whichever of `detail_only` the viewer tests the presence of. Must be in that list, which `palette.load` refuses to read a file without: a sentinel every band carries marks every feature as detail-band."
+        }
+      }
+    },
+    "roam": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["west", "south", "east", "north"],
+      "description": "The box a viewer will not pan outside of, and the one `art` warns a hand-written window against. Not the box that decides whether a stop is in these islands: that one is a capped line through the Channel rather than a rectangle, and lives in `config`.",
+      "properties": {
+        "west": { "type": "number", "minimum": -180, "maximum": 180 },
+        "south": { "type": "number", "minimum": -90, "maximum": 90 },
+        "east": { "type": "number", "minimum": -180, "maximum": 180 },
+        "north": { "type": "number", "minimum": -90, "maximum": 90 }
+      }
+    }
+  }
+}

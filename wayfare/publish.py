@@ -27,7 +27,7 @@ from typing import Any, NamedTuple
 
 import duckdb
 
-from . import config, db, licences, logs
+from . import config, db, licences, logs, palette
 
 log = logs.get("publish")
 
@@ -46,7 +46,11 @@ LAYER_TRACK = "track"
 
 # The archive a publish writes when it is told neither a path nor to use the region's
 # name. Region-agnostic, and deliberately still the default -- see `default_out`.
-DEFAULT_ARCHIVE = "bus.pmtiles"
+#
+# From `map.toml` because both viewer pages fall back to this name when there is no
+# index to ask, which is what a static host is. Renaming it here alone would leave
+# them looking for a file nothing writes.
+DEFAULT_ARCHIVE = palette.load().default_archive
 
 Point = tuple[int, int]  # (lon_e6, lat_e6)
 
@@ -492,7 +496,11 @@ def _chain(members: list[Member]) -> list[Member]:
 # `refs`, which is a whole comma-joined service list and stays excluded. The way id
 # and the road name go with it: the info card is the only reader of all three, and
 # the card does not open below DETAIL_ZOOM.
-_DETAIL_ONLY = ("way", "refs", "name")
+#
+# From `map.toml`, because the viewer reads the *presence* of `refs` as "this came
+# from the detail band" and so tells the two feature-id spaces apart by it. The two
+# sides used to describe each other's rule from memory, in comments.
+_DETAIL_ONLY = palette.load().detail_only
 
 # `export_geojsonl` writes with separators=(",", ":"), so this is the shape of every
 # line it produces. A line that does not match is a change to the export that this

@@ -11,7 +11,7 @@ import struct
 
 import pytest
 
-from wayfare import config, coverage
+from wayfare import config, coverage, palette
 
 
 def varint(n: int) -> bytes:
@@ -239,39 +239,45 @@ def test_the_tilt_is_what_a_hole_shows_up_in(monkeypatch, tmp_path):
     assert bands[0].tilt == 45.0
 
 
-def _grey(path):
-    """A PNG decoded back to (width, height, one byte per pixel).
+def _rgb(path):
+    """A PNG decoded back to (width, height, one (r, g, b) tuple per pixel).
 
     Every claim about a drawn map is made on these bytes, because a shade nothing is
     painted in and a road nothing is drawn along both leave the constants correct.
+    The colour type is asserted rather than assumed: an eight-bit greyscale file
+    read three channels at a time is a picture that still decodes, at a third of
+    the width, with every claim below quietly measuring the wrong pixels.
     """
     import struct as _struct
     import zlib as _zlib
 
     raw = path.read_bytes()
-    i, chunks, size = 8, [], None
+    i, chunks, size, colour_type = 8, [], None, None
     while i < len(raw):
         length = _struct.unpack_from(">I", raw, i)[0]
         tag = raw[i + 4 : i + 8]
         body = raw[i + 8 : i + 8 + length]
         if tag == b"IHDR":
             size = _struct.unpack_from(">II", body, 0)
+            colour_type = body[9]
         elif tag == b"IDAT":
             chunks.append(body)
         i += 12 + length
+    assert colour_type == 2, f"expected truecolour RGB, got colour type {colour_type}"
     width, height = size
     data = _zlib.decompress(b"".join(chunks))
-    stride = width + 1  # each row is prefixed by its filter byte
-    pixels = bytes(
-        b"".join(data[y * stride + 1 : y * stride + 1 + width] for y in range(height))
-    )
+    stride = width * 3 + 1  # each row is prefixed by its filter byte
+    pixels = []
+    for y in range(height):
+        row = data[y * stride + 1 : (y + 1) * stride]
+        pixels.extend(tuple(row[x * 3 : x * 3 + 3]) for x in range(width))
     return width, height, pixels
 
 
-def _lit(path):
-    """The pixels a PNG has anything in."""
-    width, height, pixels = _grey(path)
-    return sum(1 for p in pixels if p), (width, height)
+def _lit(path, background=(0, 0, 0)):
+    """The pixels a PNG has anything drawn in."""
+    width, height, pixels = _rgb(path)
+    return sum(1 for p in pixels if p != background), (width, height)
 
 
 def test_a_drawn_line_reaches_the_pixels_between_its_ends(tmp_path):
@@ -314,13 +320,178 @@ def _line_tile(start, end, extent=4096, name=b"bus"):
     return blob(3, layer)
 
 
+def _tagged_tile(start, end, props, extent=4096, name=b"bus"):
+    """The same one-line layer, with attributes on the feature.
+
+    Keys and values are written *after* the feature that refers to them, which the
+    wire format allows and tippecanoe does: a walker that resolves a tag as it
+    reads it sees an empty table and answers None for every attribute in the
+    archive.
+    """
+    sx, sy = start
+    ex, ey = end
+    geometry = b"".join(
+        varint(v)
+        for v in (
+            (1 << 3) | 1,
+            zigzag(sx),
+            zigzag(sy),
+            (1 << 3) | 2,
+            zigzag(ex - sx),
+            zigzag(ey - sy),
+        )
+    )
+    tags = b"".join(varint(v) for i in range(len(props)) for v in (i, i))
+    feature = blob(2, key(3, 0) + varint(1) + blob(2, tags) + blob(4, geometry))
+    keys = b"".join(blob(3, k.encode()) for k in props)
+    values = b"".join(
+        blob(4, blob(1, v.encode()) if isinstance(v, str) else key(4, 0) + varint(v))
+        for v in props.values()
+    )
+    layer = (
+        blob(1, name)
+        + feature
+        + keys
+        + values
+        + key(5, 0)
+        + varint(extent)
+        + key(15, 0)
+        + varint(2)
+    )
+    return blob(3, layer)
+
+
+def test_a_features_attributes_are_read_back_off_the_wire(tmp_path):
+    """Colouring by journeys a day needs the tags, and the tables they index into
+    can be written after the features that use them."""
+    tile = _tagged_tile(at(-20.0, 20.0), at(20.0, -20.0), {"trips": 700, "mode": "tram"})
+    layers = list(coverage._tile_layers(tile))
+    assert len(layers) == 1
+    read_trips = layers[0].attribute("trips")
+    read_mode = layers[0].attribute("mode")
+    absent = layers[0].attribute("nothing")
+    _geometry, tags = layers[0].features[0]
+    assert read_trips(tags) == 700
+    assert read_mode(tags) == "tram"
+    # A layer without the attribute is the ordinary case, not an error: `trips` is
+    # absent from every overview band of an archive built before it reached them.
+    assert absent(tags) is None
+
+
+def test_a_theme_paints_the_road_ramp_rather_than_a_grey(tmp_path):
+    """The picture is of the map, so a busy road and a quiet one differ in it.
+
+    Both are drawn, both carry a trip count three orders of magnitude apart, and
+    the colours they come out are the two ends of the road ramp the viewer reads
+    from the same file.
+    """
+    path = archive(
+        tmp_path / "a.pmtiles",
+        {
+            0: gzip.compress(
+                _tagged_tile(at(-20.0, 20.0), at(20.0, 20.0), {"trips": 7})
+                + _tagged_tile(at(-20.0, -20.0), at(20.0, -20.0), {"trips": 70_000})
+            )
+        },
+    )
+    out = tmp_path / "a.png"
+    coverage.draw(path, 0, (-40.0, -40.0, 40.0, 40.0), out, width=100, theme="dark")
+    width, height, pixels = _rgb(out)
+
+    ink = palette.load()
+    ramp = ink.road_ramp["dark"]
+    rows = [
+        {p for p in pixels[y * width : (y + 1) * width] if p != (13, 16, 20)}
+        for y in range(height)
+    ]
+    quiet = {c for row in rows[: height // 2] for c in row}
+    busy = {c for row in rows[height // 2 :] for c in row}
+    assert quiet == {palette.hex_to_rgb(ramp[0])}
+    assert busy == {palette.hex_to_rgb(ramp[-1])}
+
+
+def test_an_underlay_is_drawn_beneath_every_feature(tmp_path):
+    """A coastline is context, and must never take a pixel from a road.
+
+    The two are drawn over each other here on purpose: the road runs along the
+    same latitude as the underlay, so every pixel of one is a pixel of the other,
+    and the question is which the picture ends up carrying. Weight is what
+    decides, and the underlay's is below the quietest road's -- which is why
+    features start at two rather than at one.
+    """
+    path = archive(
+        tmp_path / "a.pmtiles",
+        {0: gzip.compress(_tagged_tile(at(-20.0, 0.0), at(20.0, 0.0), {"trips": 7}))},
+    )
+    window = (-40.0, -40.0, 40.0, 40.0)
+    # Wider than the road, so the overlap answers which wins and the overhang
+    # answers whether the underlay was drawn at all. One or the other alone
+    # passes for a `draw` that ignored the underlay entirely.
+    line = [[(-30.0, 0.0), (30.0, 0.0)]]
+
+    out = tmp_path / "both.png"
+    coverage.draw(path, 0, window, out, width=100, theme="dark", underlay=line)
+    _w, _h, both = _rgb(out)
+
+    ink = palette.load()
+    road = palette.hex_to_rgb(ink.road_ramp["dark"][0])
+    coast = coverage._COASTLINE["dark"]
+    drawn = {p for p in both if p != (13, 16, 20)}
+    # The road won every pixel the two share, and the coastline is still drawn
+    # where the road is not -- it runs the width of the window and the road does
+    # not reach the edges.
+    assert road in drawn
+    assert coast in drawn
+
+
+def test_an_underlay_needs_no_archive_to_be_drawn(tmp_path):
+    """The coastline is passed in as longitude and latitude, so it is projected
+    here rather than read out of a tile. Nothing about it comes from an archive."""
+    empty = archive(tmp_path / "empty.pmtiles", {})
+    out = tmp_path / "coast.png"
+    coverage.draw(
+        empty,
+        0,
+        (-40.0, -40.0, 40.0, 40.0),
+        out,
+        width=100,
+        theme="dark",
+        underlay=[[(-30.0, 10.0), (30.0, 10.0)]],
+    )
+    lit, _size = _lit(out, background=(13, 16, 20))
+    assert lit > 50
+
+
+def test_several_archives_composite_into_one_picture(tmp_path):
+    """These islands are three archives and the viewer draws them onto one map."""
+    west = archive(
+        tmp_path / "west.pmtiles",
+        {0: gzip.compress(_line_tile(at(-30.0, 20.0), at(-10.0, 20.0)))},
+    )
+    east = archive(
+        tmp_path / "east.pmtiles",
+        {0: gzip.compress(_line_tile(at(10.0, -20.0), at(30.0, -20.0)))},
+    )
+    window = (-40.0, -40.0, 40.0, 40.0)
+    alone, _ = _lit_after(coverage.draw, west, window, tmp_path / "one.png")
+    both, _ = _lit_after(coverage.draw, [west, east], window, tmp_path / "two.png")
+    assert both > alone
+
+
+def _lit_after(draw, archives, window, out):
+    """Draw and report the lit pixels, so two runs can be compared by ink."""
+    draw(archives, 0, window, out, width=100)
+    return _lit(out)
+
+
 def test_the_layers_are_drawn_in_different_shades(tmp_path):
     """A tram line must not be mistaken for a road that survived a filter.
 
-    Read off the picture rather than off `_SHADES`, because the constants can differ
-    while the map does not: a layer whose name never reaches the shade lookup falls
-    back to `_OTHER_SHADE`, and every road and every tram then come out the one
-    colour with nothing to show for it.
+    Read off the picture rather than off `_GREYS`, because the constants can differ
+    while the map does not: a layer whose name never reaches the grey lookup falls
+    back to `_OTHER_GREY`, and every road and every tram then come out the one
+    colour with nothing to show for it. `track` was in exactly that state -- named
+    by `publish`, absent from the lookup -- until the names came out of one file.
     """
     path = archive(
         tmp_path / "a.pmtiles",
@@ -333,9 +504,12 @@ def test_the_layers_are_drawn_in_different_shades(tmp_path):
     )
     out = tmp_path / "a.png"
     coverage.draw(path, 0, (-40.0, -40.0, 40.0, 40.0), out, width=100)
-    width, height, pixels = _grey(out)
+    width, height, pixels = _rgb(out)
 
-    rows = [set(pixels[y * width : (y + 1) * width]) - {0} for y in range(height)]
+    rows = [
+        {p for p in pixels[y * width : (y + 1) * width] if p != (0, 0, 0)}
+        for y in range(height)
+    ]
     road = {shade for row in rows[: height // 2] for shade in row}
     track = {shade for row in rows[height // 2 :] for shade in row}
     # One shade each, and the road brighter: two values that a viewer can tell apart.

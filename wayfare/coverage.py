@@ -24,12 +24,12 @@ import math
 import struct
 import zlib
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
-from . import config, logs
+from . import config, logs, palette
 
 log = logs.get("coverage")
 
@@ -47,8 +47,23 @@ _OFFSETS = "<QQQQQQQQ"
 _TILE_LAYER = 3
 _LAYER_NAME = 1
 _LAYER_FEATURE = 2
+_LAYER_KEY = 3
+_LAYER_VALUE = 4
 _LAYER_EXTENT = 5
+_FEATURE_TAGS = 2
 _FEATURE_GEOMETRY = 4
+
+# A `Value` is a one-of, so exactly one of these is present. The numeric kinds are
+# all read as a Python number and the caller is left to decide what it wanted: a
+# trip count is written as an int64 by one tippecanoe and a uint64 by another, and
+# nothing downstream cares which.
+_VALUE_STRING = 1
+_VALUE_FLOAT = 2
+_VALUE_DOUBLE = 3
+_VALUE_INT = 4
+_VALUE_UINT = 5
+_VALUE_SINT = 6
+_VALUE_BOOL = 7
 
 # Geometry command ids, which share the low three bits of a command word with its count.
 _MOVE_TO, _CLOSE = 1, 7
@@ -172,8 +187,69 @@ def _tile_zxy(tile_id: int) -> tuple[int, int, int]:
     return zoom, x, y
 
 
-def _tile_layers(tile: bytes) -> Iterator[tuple[str, int, list[bytes]]]:
-    """Each layer as its name, its extent, and one geometry blob per feature.
+def _value(buf: bytes, start: int, end: int) -> str | float | bool | None:
+    """One `Value` message, whichever of its seven kinds it holds."""
+    i = start
+    while i < end:
+        key, i = _varint(buf, i)
+        field, wire = key >> 3, key & 7
+        if field == _VALUE_STRING and wire == 2:
+            length, i = _varint(buf, i)
+            return buf[i : i + length].decode("utf-8", "replace")
+        if field == _VALUE_DOUBLE and wire == 1:
+            return float(struct.unpack_from("<d", buf, i)[0])
+        if field == _VALUE_FLOAT and wire == 5:
+            return float(struct.unpack_from("<f", buf, i)[0])
+        if field in (_VALUE_INT, _VALUE_UINT) and wire == 0:
+            return float(_varint(buf, i)[0])
+        if field == _VALUE_SINT and wire == 0:
+            return float(_unzigzag(_varint(buf, i)[0]))
+        if field == _VALUE_BOOL and wire == 0:
+            return bool(_varint(buf, i)[0])
+        i = _skip(buf, i, wire)
+    return None
+
+
+@dataclass(frozen=True)
+class TileLayer:
+    """One layer of one tile, with its features' tags left undecoded.
+
+    Tags are held as the index pairs the wire format writes rather than as a dict
+    per feature. A national archive is 6.3M features and the drawing below wants
+    one attribute out of each, so building the other five into a dict costs a walk
+    of the whole archive to throw most of it away. `attribute` resolves a name to
+    its key index once per layer, and each feature is then a scan of a short list.
+    """
+
+    name: str
+    extent: int
+    keys: list[str]
+    values: list[str | float | bool | None]
+    features: list[tuple[bytes, list[int]]]
+
+    def attribute(self, name: str) -> Callable[[list[int]], str | float | bool | None]:
+        """A reader for one attribute, or one that always answers None.
+
+        A layer that does not carry the attribute at all is the ordinary case, not
+        an error: `trips` is absent from an archive published before it was taken
+        out of `_DETAIL_ONLY`, and `mode` from a track layer written before the
+        traced modes joined it.
+        """
+        if name not in self.keys:
+            return lambda _tags: None
+        wanted = self.keys.index(name)
+
+        def read(tags: list[int]) -> str | float | bool | None:
+            for k in range(0, len(tags) - 1, 2):
+                if tags[k] == wanted:
+                    return self.values[tags[k + 1]]
+            return None
+
+        return read
+
+
+def _tile_layers(tile: bytes) -> Iterator[TileLayer]:
+    """Each layer of a tile, with its features' geometry and tags.
 
     The one walker over a tile: counting and drawing differ in what they do with a
     command stream, not in how they reach one, and two walkers over the same wire
@@ -189,9 +265,13 @@ def _tile_layers(tile: bytes) -> Iterator[tuple[str, int, list[bytes]]]:
 
         length, i = _varint(tile, i)
         layer_end, j = i + length, i
-        # The extent can appear after the features it applies to, so the layer is held
-        # until it is finished rather than yielded feature by feature.
-        name, extent, geometries = "", _DEFAULT_EXTENT, []
+        # The extent, and the key and value tables, can all appear after the
+        # features that refer to them, so the layer is held until it is finished
+        # rather than yielded feature by feature.
+        name, extent = "", _DEFAULT_EXTENT
+        keys: list[str] = []
+        values: list[str | float | bool | None] = []
+        features: list[tuple[bytes, list[int]]] = []
         while j < layer_end:
             key, j = _varint(tile, j)
             field, wire = key >> 3, key & 7
@@ -199,29 +279,45 @@ def _tile_layers(tile: bytes) -> Iterator[tuple[str, int, list[bytes]]]:
                 length, j = _varint(tile, j)
                 name = tile[j : j + length].decode("utf-8", "replace")
                 j += length
+            elif field == _LAYER_KEY and wire == 2:
+                length, j = _varint(tile, j)
+                keys.append(tile[j : j + length].decode("utf-8", "replace"))
+                j += length
+            elif field == _LAYER_VALUE and wire == 2:
+                length, j = _varint(tile, j)
+                values.append(_value(tile, j, j + length))
+                j += length
             elif field == _LAYER_EXTENT and wire == 0:
                 extent, j = _varint(tile, j)
             elif field == _LAYER_FEATURE and wire == 2:
                 length, j = _varint(tile, j)
                 feature_end, m = j + length, j
-                # Geometry is a packed repeated field, so a writer may split it across
-                # chunks that mean nothing apart: the deltas in the second continue
-                # from where the first left off.
+                # Geometry and tags are both packed repeated fields, so a writer may
+                # split either across chunks that mean nothing apart: the deltas in
+                # the second continue from where the first left off.
                 parts: list[bytes] = []
+                tags: list[int] = []
                 while m < feature_end:
                     key, m = _varint(tile, m)
-                    if (key >> 3) == _FEATURE_GEOMETRY and (key & 7) == 2:
+                    field, wire = key >> 3, key & 7
+                    if field == _FEATURE_GEOMETRY and wire == 2:
                         length, m = _varint(tile, m)
                         parts.append(tile[m : m + length])
                         m += length
+                    elif field == _FEATURE_TAGS and wire == 2:
+                        length, m = _varint(tile, m)
+                        chunk_end = m + length
+                        while m < chunk_end:
+                            tag, m = _varint(tile, m)
+                            tags.append(tag)
                     else:
-                        m = _skip(tile, m, key & 7)
+                        m = _skip(tile, m, wire)
                 if parts:
-                    geometries.append(b"".join(parts))
+                    features.append((b"".join(parts), tags))
                 j = feature_end
             else:
                 j = _skip(tile, j, wire)
-        yield name, extent, geometries
+        yield TileLayer(name, extent, keys, values, features)
         i = layer_end
 
 
@@ -243,11 +339,11 @@ def _first_point(geometry: bytes) -> tuple[int, int] | None:
 
 def _first_points(tile: bytes) -> Iterator[tuple[int, int, int]]:
     """The first point of every feature in a tile, in tile units, with the extent."""
-    for _name, extent, geometries in _tile_layers(tile):
-        for geometry in geometries:
+    for layer in _tile_layers(tile):
+        for geometry, _tags in layer.features:
             point = _first_point(geometry)
             if point is not None:
-                yield point[0], point[1], extent
+                yield point[0], point[1], layer.extent
 
 
 def _lonlat(z: int, x: int, y: int, px: int, py: int, extent: int) -> tuple[float, float]:
@@ -423,10 +519,74 @@ def report(archive: Path, zooms: list[int], cell_size: float | None = None) -> l
 # disconnected, which is what a thinned overview looks like on the screen and what no
 # count in this module can see.
 
-# Which shade each layer is drawn in. The road layer is the subject; operator geometry
-# is dimmer so a tram line is not mistaken for a road that survived a filter.
-_SHADES = {"bus": 255, "segments": 90}
-_OTHER_SHADE = 160
+# Which grey each layer is drawn in when no palette is asked for. The road layer is
+# the subject; operator geometry and relation track are dimmer, so a tram line is not
+# mistaken for a road that survived a filter.
+#
+# Keyed on `palette.load().layers` rather than on three strings written here: the
+# names are tippecanoe's, and a fourth layer added to `publish` used to arrive as
+# `_OTHER_GREY` with nothing to say it had. `track` did exactly that.
+_GREYS = {"road": 255, "segments": 90, "track": 160}
+_OTHER_GREY = 160
+
+# The pixel buffer is red, green, blue and a compositing weight. The fourth channel
+# is not drawn: it holds what the pixel was last claimed by, so a crossing decides
+# which feature keeps it, and it doubles as the "is this pixel lit at all" flag that
+# a colour of (0, 0, 0) could not answer for on its own.
+_CHANNELS = 4
+_WEIGHT = 3
+
+# What an unlit pixel is. The themes are the viewer's grounds rather than its panel
+# colours: a render is the map without the page around it.
+_BACKGROUND: dict[palette.Theme, tuple[int, int, int]] = {
+    "light": (255, 255, 255),
+    "dark": (13, 16, 20),
+}
+
+
+def _layer_greys() -> dict[str, int]:
+    """The grey per source-layer name, resolved through the shared layer names."""
+    layers = palette.load().layers
+    return {layers[role]: grey for role, grey in _GREYS.items()}
+
+
+def _layer_ranks() -> dict[str, int]:
+    """Which layer wins a pixel, in the order the viewer stacks them.
+
+    Road underneath, then relation track, then operator geometry: a tram line and
+    the road it runs beside are two features over the same ground, and the one the
+    viewer puts on top is the one this has to put on top.
+    """
+    layers = palette.load().layers
+    return {layers["road"]: 0, layers["track"]: 1, layers["segments"]: 2}
+
+
+# How much of the weight byte a layer claims. Three ranks and a fourth for a layer
+# this does not know, each with 63 levels of trip count under it, which is finer
+# than a six-step ramp can show.
+#
+# Every drawn weight is offset, because zero is what an untouched pixel holds and
+# the same channel answers "is anything here at all". Without the offset the
+# quietest road of the bottom layer weighs nothing, and a national render came out
+# 0.2% lit against the greyscale's 5.1% -- the roads were drawn and then counted as
+# background.
+_RANK_STEP = 63
+_MIN_WEIGHT = 2
+
+# Weight 1 is the underlay's, below every feature and above nothing. A coastline
+# is context and must never take a pixel from a road: the quietest road on the
+# bottom layer weighs `_MIN_WEIGHT`, which is why features start at two.
+_UNDERLAY_WEIGHT = 1
+
+# What the underlay is drawn in. Dim enough to read as ground rather than as
+# something running on it -- a coastline in a road's colour is a coastal service
+# nobody operates. Not in `map.toml`: the viewer has no coastline of its own,
+# because its basemap draws one, so this is a colour no other reader shares.
+_COASTLINE: dict[palette.Theme, tuple[int, int, int]] = {
+    "light": (198, 204, 212),
+    "dark": (38, 46, 58),
+}
+_COASTLINE_GREY = (60, 60, 60)
 
 
 def _mercator(lon: float, lat: float) -> tuple[float, float]:
@@ -467,21 +627,42 @@ def _paths(geometry: bytes) -> Iterator[list[tuple[int, int]]]:
 
 
 def _stroke(
-    pixels: bytearray, w: int, h: int, x0: int, y0: int, x1: int, y1: int, shade: int
+    pixels: bytearray,
+    w: int,
+    h: int,
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+    rgb: tuple[int, int, int],
+    weight: int,
 ) -> None:
     """Bresenham, clipped per pixel rather than per line.
 
     Per pixel because a road that leaves the window still has to be drawn up to the
     edge, and clipping the line first would need the whole Cohen-Sutherland dance for
     a picture that is thrown away after being looked at.
+
+    Where two lines cross, the heavier one keeps the pixel whole rather than the two
+    being mixed per channel. A blend of a rail colour and a road colour is a third
+    hue that names neither mode, which is the one thing the mode palette exists to
+    prevent -- so the pixel states one of them, and `weight` decides which. The
+    greyscale path passes its shade as the weight, which is the brighter-wins rule
+    this had before there was any colour in it.
     """
     dx, dy = abs(x1 - x0), -abs(y1 - y0)
     sx = 1 if x0 < x1 else -1
     sy = 1 if y0 < y1 else -1
     err = dx + dy
+    red, green, blue = rgb
     while True:
-        if 0 <= x0 < w and 0 <= y0 < h and pixels[y0 * w + x0] < shade:
-            pixels[y0 * w + x0] = shade
+        if 0 <= x0 < w and 0 <= y0 < h:
+            at = (y0 * w + x0) * _CHANNELS
+            if pixels[at + _WEIGHT] <= weight:
+                pixels[at] = red
+                pixels[at + 1] = green
+                pixels[at + 2] = blue
+                pixels[at + _WEIGHT] = weight
         if x0 == x1 and y0 == y1:
             return
         step = 2 * err
@@ -493,16 +674,36 @@ def _stroke(
             y0 += sy
 
 
-def _png(path: Path, width: int, height: int, pixels: bytearray) -> None:
-    """Eight-bit greyscale, written by hand.
+def _png(
+    path: Path,
+    width: int,
+    height: int,
+    pixels: bytearray,
+    background: tuple[int, int, int],
+) -> None:
+    """Eight-bit truecolour, written by hand.
 
     No pillow and no numpy, because `art` owns the drawing dependencies and this has
     to run anywhere an archive does -- including inside the pipeline image, which does
     not carry the art extra.
+
+    The fourth channel of the buffer is the compositing weight and is not written:
+    PNG has no room for it and nothing downstream reads it. Unlit pixels take
+    `background`, which is where a dark render gets its ground.
     """
-    raw = b"".join(
-        b"\x00" + bytes(pixels[y * width : (y + 1) * width]) for y in range(height)
-    )
+    stride = width * _CHANNELS
+    rows = []
+    for y in range(height):
+        row = bytearray(b"\x00")
+        base = y * stride
+        for x in range(width):
+            at = base + x * _CHANNELS
+            if pixels[at + _WEIGHT]:
+                row += pixels[at : at + 3]
+            else:
+                row += bytes(background)
+        rows.append(bytes(row))
+    raw = b"".join(rows)
 
     def chunk(tag: bytes, data: bytes) -> bytes:
         body = tag + data
@@ -510,72 +711,187 @@ def _png(path: Path, width: int, height: int, pixels: bytearray) -> None:
 
     with path.open("wb") as fh:
         fh.write(b"\x89PNG\r\n\x1a\n")
-        fh.write(chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0)))
+        fh.write(chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)))
         fh.write(chunk(b"IDAT", zlib.compress(raw, 9)))
         fh.write(chunk(b"IEND", b""))
 
 
+def _feature_colour(
+    layer: TileLayer, theme: palette.Theme
+) -> Callable[[list[int]], tuple[tuple[int, int, int], int]]:
+    """How one layer's features are coloured, and which wins where two cross.
+
+    The road layer is read off the road ramp by journeys a day, and the other two
+    off their own mode's ramp -- the same two rules the viewer paints by, out of the
+    same file. A feature with no `trips` takes the flat middle of its mode's ramp on
+    the non-road layers and the "no answer" grey on the road one, again as the
+    viewer does.
+
+    The weight decides a crossing, and it is the layer first and the trip count
+    only within a layer -- which is the order the viewer stacks its layers in, road
+    underneath, then track, then operator geometry on top. Ranking by trips alone
+    would put a trunk road over the tram line that crosses it, and the viewer draws
+    that the other way round.
+    """
+    ink = palette.load()
+    names = ink.layers
+    read_trips = layer.attribute(ink.ramp_needs)
+    read_mode = layer.attribute("mode")
+    road = layer.name == names["road"]
+    ranks = _layer_ranks()
+    rank = ranks.get(layer.name, len(ranks))
+
+    def colour(tags: list[int]) -> tuple[tuple[int, int, int], int]:
+        raw = read_trips(tags)
+        trips = float(raw) if isinstance(raw, int | float) else None
+        # The low bits of the weight, so a busier feature of one layer wins a
+        # pixel from a quieter one, and no feature of a lower layer wins at all.
+        within = round(ink.position(trips) * (_RANK_STEP - 1))
+        weight = _MIN_WEIGHT + rank * _RANK_STEP + within
+        if road:
+            return ink.road_rgb(theme, trips), weight
+        mode = read_mode(tags)
+        name = mode if isinstance(mode, str) else ink.track_default_mode
+        return ink.mode_rgb(theme, name, trips), weight
+
+    return colour
+
+
+def layer_attributes(archive: Path, zoom: int, sample: int = 64) -> dict[str, set[str]]:
+    """Which attributes each layer carries at one zoom, off a sample of its tiles.
+
+    What this answers is whether a render can colour by an attribute at all. A
+    paint that reads one the band does not carry is not an error anything reports:
+    the viewer falls back to a flat grey and so does `draw`, and a whole country in
+    one colour reads as a region with no buses rather than as a stale archive.
+
+    A sample because the answer is a property of the band rather than of a tile,
+    and walking 53,633 tiles of z14 to learn what the first few already said is a
+    minute spent to reach the same set.
+    """
+    found: dict[str, set[str]] = {}
+    with archive.open("rb") as fh:
+        by_zoom, tile_offset = _all_tiles(fh)
+        for entry, _tz, _tx, _ty in by_zoom.get(zoom, [])[:sample]:
+            fh.seek(tile_offset + entry.offset)
+            for layer in _tile_layers(_decompress(fh.read(entry.length))):
+                found.setdefault(layer.name, set()).update(layer.keys)
+    return found
+
+
 def draw(
-    archive: Path,
+    archives: Path | Sequence[Path],
     zoom: int,
     bbox: tuple[float, float, float, float],
     out: Path,
     width: int = 1400,
+    theme: palette.Theme | None = None,
+    underlay: Sequence[Sequence[tuple[float, float]]] | None = None,
 ) -> float:
-    """Rasterise one zoom of an archive into a window. Returns the fraction lit.
+    """Rasterise one zoom of some archives into a window. Returns the fraction lit.
 
     The fraction of pixels carrying anything is the summary statistic that answers
     what every count in this module cannot: two archives can hold the same number of
     features and light very different amounts of the screen. Comparing that figure
     between two builds of one region, or between a region and one that is not
     filtered, is what a change to the overview has to be judged on.
+
+    Several archives because a region is one archive and these islands are three,
+    and the viewer draws every archive it is offered onto one map -- a picture of
+    what it draws has to do the same or it is a picture of one region. They are
+    composited into one buffer in the order given, so a later archive wins a pixel
+    only by carrying more trips over it.
+
+    `theme` paints the viewer's own colours instead of the diagnostic greys: the
+    road ramp by journeys a day, and each non-road mode off its own ramp. Left
+    None, this is the flat greyscale that judging a low zoom wants, where a hue
+    would say something about a feature that the question is not about.
+
+    `underlay` is longitude/latitude polylines drawn under everything, for a
+    coastline. Without one the only thing saying where the land is, is where the
+    buses are, so Kerry and Cornwall read as ink rather than as places. It is
+    passed in rather than loaded here because this module reads archives and
+    nothing else -- no network, no data files -- which is what lets it run
+    wherever an archive does.
     """
+    # One archive is the ordinary diagnostic call and reads better without a list
+    # around it, so both spellings are taken rather than one being the only one.
+    archives = [archives] if isinstance(archives, Path) else list(archives)
+    if not archives:
+        raise ValueError("no archives to draw")
     west, south, east, north = bbox
     if west >= east or south >= north:
         raise ValueError(f"window {bbox} is empty; wanted west<east and south<north")
     x0, y0 = _mercator(west, north)
     x1, y1 = _mercator(east, south)
     height = max(1, round(width * (y1 - y0) / (x1 - x0)))
-    pixels = bytearray(width * height)
+    pixels = bytearray(width * height * _CHANNELS)
+    greys = _layer_greys()
 
-    with archive.open("rb") as fh:
-        by_zoom, tile_offset = _all_tiles(fh)
-        for entry, tz, tx, ty in by_zoom.get(zoom, []):
-            scale = 1 << tz
-            # A tile's own geometry can run past its edges, so the window is widened
-            # by a tile before rejecting one. Rejecting on the exact bounds clips
-            # roads that cross into the picture from outside it.
-            if (tx + 2) / scale < x0 or (tx - 1) / scale > x1:
-                continue
-            if (ty + 2) / scale < y0 or (ty - 1) / scale > y1:
-                continue
-            fh.seek(tile_offset + entry.offset)
-            tile = _decompress(fh.read(entry.length))
-            for name, extent, geometries in _tile_layers(tile):
-                shade = _SHADES.get(name, _OTHER_SHADE)
-                for geometry in geometries:
-                    for path in _paths(geometry):
-                        points = [
-                            (
-                                round(
-                                    ((tx + px / extent) / scale - x0) / (x1 - x0) * width
-                                ),
-                                round(
-                                    ((ty + py / extent) / scale - y0) / (y1 - y0) * height
-                                ),
-                            )
-                            for px, py in path
-                        ]
-                        # Deliberately not strict: this is a sliding pair over one
-                        # list, so the shorter tail is the point.
-                        for (ax, ay), (bx, by) in zip(points, points[1:], strict=False):
-                            _stroke(pixels, width, height, ax, ay, bx, by, shade)
+    # First, so every feature composites over it: the weight ordering would hold
+    # either way, but drawing ground after the things standing on it is the kind
+    # of ordering that survives until someone changes a weight.
+    if underlay:
+        ink = _COASTLINE[theme] if theme else _COASTLINE_GREY
+        for line in underlay:
+            points = [
+                (
+                    round((mx - x0) / (x1 - x0) * width),
+                    round((my - y0) / (y1 - y0) * height),
+                )
+                for mx, my in (_mercator(lon, lat) for lon, lat in line)
+            ]
+            for (ax, ay), (bx, by) in zip(points, points[1:], strict=False):
+                _stroke(pixels, width, height, ax, ay, bx, by, ink, _UNDERLAY_WEIGHT)
 
-    _png(out, width, height, pixels)
-    lit = sum(1 for p in pixels if p) / len(pixels)
+    for archive in archives:
+        with archive.open("rb") as fh:
+            by_zoom, tile_offset = _all_tiles(fh)
+            for entry, tz, tx, ty in by_zoom.get(zoom, []):
+                scale = 1 << tz
+                # A tile's own geometry can run past its edges, so the window is
+                # widened by a tile before rejecting one. Rejecting on the exact
+                # bounds clips roads that cross into the picture from outside it.
+                if (tx + 2) / scale < x0 or (tx - 1) / scale > x1:
+                    continue
+                if (ty + 2) / scale < y0 or (ty - 1) / scale > y1:
+                    continue
+                fh.seek(tile_offset + entry.offset)
+                tile = _decompress(fh.read(entry.length))
+                for layer in _tile_layers(tile):
+                    extent = layer.extent
+                    grey = greys.get(layer.name, _OTHER_GREY)
+                    colour = _feature_colour(layer, theme) if theme else None
+                    for geometry, tags in layer.features:
+                        rgb, weight = colour(tags) if colour else ((grey, grey, grey), grey)
+                        for path in _paths(geometry):
+                            points = [
+                                (
+                                    round(
+                                        ((tx + px / extent) / scale - x0)
+                                        / (x1 - x0)
+                                        * width
+                                    ),
+                                    round(
+                                        ((ty + py / extent) / scale - y0)
+                                        / (y1 - y0)
+                                        * height
+                                    ),
+                                )
+                                for px, py in path
+                            ]
+                            # Deliberately not strict: this is a sliding pair over
+                            # one list, so the shorter tail is the point.
+                            for (ax, ay), (bx, by) in zip(points, points[1:], strict=False):
+                                _stroke(pixels, width, height, ax, ay, bx, by, rgb, weight)
+
+    background = _BACKGROUND[theme] if theme else (0, 0, 0)
+    _png(out, width, height, pixels, background)
+    drawn = sum(pixels[i + _WEIGHT] != 0 for i in range(0, len(pixels), _CHANNELS))
+    lit = drawn / (width * height)
     log.info(
         "%s z%d over %s -> %s, %dx%d, %.1f%% lit",
-        archive.name,
+        ", ".join(a.name for a in archives),
         zoom,
         bbox,
         out,

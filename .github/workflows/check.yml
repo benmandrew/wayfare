@@ -88,8 +88,24 @@ jobs:
         run: nix develop --command nixfmt --check flake.nix
 
       - if: ${{ !cancelled() }}
+        name: format (toml)
+        run: nix develop --command taplo fmt --check
+
+      - if: ${{ !cancelled() }}
         name: lint
         run: nix develop --command ruff check .
+
+      # `wayfare/map.toml` against `wayfare/map.schema.json`, which is the same
+      # check the editor shows inline through "Even Better TOML" -- both read
+      # `.taplo.toml`. Nothing about a wrong shape in that file is an error at
+      # run time: a mistyped layer name draws an empty layer and says nothing,
+      # and an upper-case colour leaves a mode's ramp ending somewhere other
+      # than the colour its own key promises. The relations the schema cannot
+      # state -- an ascending scale, a sentinel inside the stripped list -- are
+      # checked by `palette.load` and covered in `tests/test_palette.py`.
+      - if: ${{ !cancelled() }}
+        name: schema (toml)
+        run: nix develop --command taplo lint
 
       # deploy/refresh.sh is the whole of the scheduled pipeline and the only
       # part of it that is shell. It runs unattended, under `set -euo pipefail`,
@@ -136,6 +152,17 @@ jobs:
         run: >-
           nix develop --command
           python scripts/coverage_badge.py --check --json coverage.json
+
+      # `web/palette.js` is generated from `wayfare/map.toml` and committed, so the
+      # viewer can read it on a static host with no TOML parser and no extra fetch.
+      # A colour edited in the TOML and not regenerated is a page painting the old
+      # one, which nothing at run time can notice. Unlike the badge and the README
+      # map this needs no data at all, so it is checked on every push.
+      - if: ${{ !cancelled() }}
+        name: palette
+        run: >-
+          nix develop --command
+          python scripts/palette_js.py --check
 
       # After the checks, so a store that failed them is never the one the next
       # run starts from, and only from main for the quota reason above. The
