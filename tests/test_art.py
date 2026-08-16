@@ -875,7 +875,7 @@ def _reopened_read_only(con, tmp_path, monkeypatch):
     still be openable as. `MIN_BAND_EDGES` is dropped to nothing because the floor is
     about start-up cost, not about correctness."""
     con.close()
-    monkeypatch.setattr(art, "MIN_BAND_EDGES", 0)
+    monkeypatch.setattr(art.band, "MIN_BAND_EDGES", 0)
     ro = db.connect(tmp_path / "test.duckdb", read_only=True)
     yield ro
     ro.close()
@@ -1198,9 +1198,9 @@ def test_worker_count_counts_cores_rather_than_threads(monkeypatch):
     serves this: `uk` `density` at 2,000px is 26.9s on four workers and 28.1s on
     eight, on four cores of eight threads."""
     monkeypatch.delenv("WAYFARE_RENDER_WORKERS", raising=False)
-    monkeypatch.setattr(art.os, "cpu_count", lambda: 8)
-    monkeypatch.setattr(art, "_cgroup_cpus", lambda: None)
-    monkeypatch.setattr(art, "_physical_cpus", lambda: 4)
+    monkeypatch.setattr(art.band.os, "cpu_count", lambda: 8)
+    monkeypatch.setattr(art.band, "_cgroup_cpus", lambda: None)
+    monkeypatch.setattr(art.band, "_physical_cpus", lambda: 4)
     assert art.default_workers() == 4
 
 
@@ -1208,18 +1208,18 @@ def test_worker_count_falls_back_to_threads_where_cores_are_unknown(monkeypatch)
     """Off Linux there is no /proc/cpuinfo to read. Over-counting costs a few percent;
     guessing low would leave half the box idle, so the logical count stands."""
     monkeypatch.delenv("WAYFARE_RENDER_WORKERS", raising=False)
-    monkeypatch.setattr(art.os, "cpu_count", lambda: 8)
-    monkeypatch.setattr(art, "_cgroup_cpus", lambda: None)
-    monkeypatch.setattr(art, "_physical_cpus", lambda: None)
+    monkeypatch.setattr(art.band.os, "cpu_count", lambda: 8)
+    monkeypatch.setattr(art.band, "_cgroup_cpus", lambda: None)
+    monkeypatch.setattr(art.band, "_physical_cpus", lambda: None)
     assert art.default_workers() == 8
 
 
 def test_a_cpu_quota_still_wins_over_the_core_count(monkeypatch):
     """The render container runs at `cpus: 4` on a bigger box. Whichever is smaller."""
     monkeypatch.delenv("WAYFARE_RENDER_WORKERS", raising=False)
-    monkeypatch.setattr(art.os, "cpu_count", lambda: 64)
-    monkeypatch.setattr(art, "_physical_cpus", lambda: 32)
-    monkeypatch.setattr(art, "_cgroup_cpus", lambda: 4)
+    monkeypatch.setattr(art.band.os, "cpu_count", lambda: 64)
+    monkeypatch.setattr(art.band, "_physical_cpus", lambda: 32)
+    monkeypatch.setattr(art.band, "_cgroup_cpus", lambda: 4)
     assert art.default_workers() == 4
 
 
@@ -1232,11 +1232,11 @@ def test_physical_cpus_reads_core_ids(tmp_path, monkeypatch):
         "processor\t: 2\nphysical id\t: 0\ncore id\t: 0\n\n"
         "processor\t: 3\nphysical id\t: 0\ncore id\t: 1\n"
     )
-    real_path = art.Path
+    real_path = art.band.Path
     monkeypatch.setattr(
-        art, "Path", lambda p: cpuinfo if p == "/proc/cpuinfo" else real_path(p)
+        art.band, "Path", lambda p: cpuinfo if p == "/proc/cpuinfo" else real_path(p)
     )
-    assert art._physical_cpus() == 2
+    assert art.band._physical_cpus() == 2
 
 
 # --- Provenance ---------------------------------------------------------------
@@ -1408,3 +1408,37 @@ def test_the_credit_shrinks_to_fit_a_small_canvas(drawable):
     ]
     assert inked, "the caption drew nothing at all"
     assert max(inked) < width - 10, "the caption ran past the right margin"
+
+
+# --- the knobs the tests turn ------------------------------------------------
+
+
+def test_the_band_floor_is_read_where_it_is_patched(monkeypatch):
+    """The banded fixtures drop this to nothing to force banding on a small window.
+
+    Splitting `art` into a package put the reader in `art.band` while the fixtures
+    still set it on the package, so the floor stayed at its real value, no render
+    banded, and every "banded matches serial" test compared the serial path with
+    itself. It is not re-exported now, so patching the wrong object raises.
+    """
+    assert not hasattr(art, "MIN_BAND_EDGES")
+    monkeypatch.setattr(art.band, "MIN_BAND_EDGES", 0)
+    assert art.band.MIN_BAND_EDGES == 0
+
+
+def test_the_worker_knobs_are_read_where_they_are_patched(monkeypatch):
+    """Same trap, and the one that hides best: a worker count patched on the package
+    leaves `default_workers` reporting the host's real cores, so a test asserting 4
+    passes on a 64-core box for the wrong reason."""
+    monkeypatch.setattr(art.band.os, "cpu_count", lambda: 64)
+    monkeypatch.setattr(art.band, "_physical_cpus", lambda: 32)
+    monkeypatch.setattr(art.band, "_cgroup_cpus", lambda: 4)
+    assert art.default_workers() == 4
+
+
+def test_the_group_cap_is_the_one_on_the_package(monkeypatch):
+    """`MAX_GROUPS` is the cap an API caller is told about, so `art.MAX_GROUPS` has
+    to be the knob. Its reader takes it off the package at call time rather than
+    binding it at import, which would make the assignment a silent no-op."""
+    monkeypatch.setattr(art, "MAX_GROUPS", 1)
+    assert art.stream._max_groups() == 1
