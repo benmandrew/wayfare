@@ -37,6 +37,12 @@
             # unattended under `set -euo pipefail`, and is vendored into Ansible
             # rather than tested by running it. CI checks it.
             pkgs.shellcheck
+            # taplo formats and schema-checks the TOML, and is the language server
+            # behind the "Even Better TOML" VS Code extension -- so an editor and
+            # CI read the one `.taplo.toml` and agree. It is here for
+            # `wayfare/map.toml`, whose shape nothing reports at run time: a
+            # mistyped layer name draws an empty layer and says nothing.
+            pkgs.taplo
           ];
 
           # buildInputs rather than nativeBuildInputs so the linker wrapper adds

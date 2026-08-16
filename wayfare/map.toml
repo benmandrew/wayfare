@@ -1,0 +1,253 @@
+# What `publish` writes, the viewer reads, and `draw` paints -- in one file,
+# because every value here has to be identical on both sides of a language
+# boundary and nothing about a mismatch is an error either side reports.
+#
+# The viewer cannot read this: a browser has no TOML parser and the page has to
+# work on a static host, so it reads `web/palette.js`, which
+# `scripts/palette_js.py` generates from this file and CI checks is current. That
+# script is also where the mode ramps are derived, so the OKLab maths below is
+# described here and implemented once, in `wayfare/palette.py`.
+#
+# Colours are the flat inputs. What gets painted is mostly derived from them --
+# see [mode_ramp] -- so editing a hex here moves six drawn colours, not one.
+#
+# The shape is `wayfare/map.schema.json`, wired up in `.taplo.toml`: an editor
+# with the "Even Better TOML" extension checks this file as it is typed, and CI
+# runs `taplo lint` for the same. The relations the schema cannot state -- an
+# ascending scale, a sentinel inside the stripped list, a track mode that is one
+# of the modes -- are refused by `palette.load` instead.
+
+
+# --- The three layers inside an archive ------------------------------------
+#
+# tippecanoe writes these names and MapLibre asks for them by name. A layer the
+# viewer names and the archive does not carry is tolerated silently, which is
+# why the two lists cannot be allowed to drift apart on their own.
+[layers]
+# The matched road network. Present in every archive.
+road = "bus"
+# The modes that were never matched, drawn from operator geometry. Absent from a
+# bus-only region.
+segments = "segments"
+# Track drawn from OSM route relations and inverted to one feature per way, so it
+# is neither a matched road nor one pattern's trace. National Rail, which BODS
+# does not carry at all, and the modes a timetable carries with no geometry to go
+# with it -- the Underground, the DLR, the trams.
+track = "track"
+
+
+# --- The road ramp ---------------------------------------------------------
+[road_ramp]
+# Light goes pale-blue -> deep violet so busy roads darken against the light
+# basemap; dark goes the other way, into warm yellow, so they glow against the
+# dark one.
+light = ["#a9c3dc", "#6f9cc6", "#4275ac", "#2e5290", "#3a3672", "#3d1d4e"]
+dark = ["#2f4d6b", "#3d7ea8", "#3fa8bd", "#5fcf9f", "#c0e86f", "#ffdf5c"]
+
+# Journeys a day at each of the six steps, interpolated linearly in log10 between
+# them. Every mode ramp shares this scale, so the ticks under the legend bar read
+# for all of them at once.
+at = [3, 10, 30, 100, 300, 1000]
+
+# `trips` on a tile feature is per week, and every ramp reads journeys a day.
+# The division happens where the ramp is evaluated and nowhere else.
+trips_per = 7
+
+# The attribute the ramp reads. Published at every zoom, including the overview
+# bands: an attribute a paint property cannot find is not an error MapLibre
+# reports, it takes the fallback out of `to-number` and draws a whole country in
+# the first ramp colour.
+needs = "trips"
+
+
+# --- Mode ramps, derived ---------------------------------------------------
+#
+# A segment has a number worth shading, and one flat colour per mode says nothing
+# about it: a single pink says "tram" and leaves a line running twice a day
+# looking like one running every four minutes. So each mode gets a ramp of its
+# own, generated from the colour it already has in the key rather than
+# hand-picked -- the hue stays exactly what the key promises, and adding a mode
+# to [modes] adds its ramp with it.
+#
+# Generated in OKLab, which is the space the palette was separated in. The mode's
+# own colour is the *top* of its ramp, so the busiest tram is the tram colour and
+# the key is telling the truth. Below that, lightness carries most of the range
+# and chroma only some of it: drain the chroma too and the four quiet modes
+# converge on the same grey, which is the one thing this ramp exists to avoid.
+#
+# Light rides up towards the paper so a quiet line is a tint of its mode; dark
+# rides down towards the map so a quiet line is a shade of it. Chroma is where the
+# two differ. Dark holds the mode's own chroma the whole way down, because a dark
+# saturated line reads fine against a dark basemap and holding it is what keeps
+# eight hues apart at the quiet end. Light tapers it, because full chroma at high
+# lightness is a neon pastel: the quiet end has to be quiet on the page as well as
+# low on the scale. Both are then fitted to the gamut, so neither asks for a
+# colour that does not exist.
+#
+# Measured over all eight modes, six steps, against each other and against the
+# road ramp. The flat palette these are generated from is itself 0.080 apart in
+# light and 0.069 in dark at its closest pair; the ramps come out 0.058 and 0.048,
+# and the crowding is in the pairs already crowded flat -- metro against cable
+# tram at the pale end, rail against cable car at the dark one. Both stay above
+# the 0.036 that was measured as "draws as a road carrying a handful of buses".
+#
+# Against the road ramp the ramps are 0.067 in light and 0.027 in dark, and the
+# dark figure is not this ramp's doing: the flat funicular green is already that
+# far from the dark road ramp and was before any of this. It is the one collision
+# in the palette that the note under [modes] did not catch.
+#
+# Each ramp spans 0.306 in light and 0.334 in dark against the road ramp's 0.513
+# and 0.538, so a mode reads as a ramp with about two thirds of the road's range.
+[mode_ramp]
+# The bottom of a ramp: lightness is `min(cap, L * mul + add)` and chroma is
+# `C * chroma`, both in OKLCh, both then fitted to sRGB. The top is the mode's own
+# colour untouched. Two shapes of lightness rule rather than one because light
+# adds and clamps while dark multiplies; `mul`/`add`/`cap` expresses both.
+light = { mul = 1.0, add = 0.30, cap = 0.94, chroma = 0.55 }
+dark = { mul = 0.55, add = 0.0, cap = 1.0, chroma = 1.0 }
+
+
+# --- One colour per non-road mode ------------------------------------------
+#
+# Deliberately outside the road ramp rather than an extension of it: a tram on its
+# own track drawn in a road colour reads as a road carrying buses. Hues are spread
+# rather than shaded, because the modes are categories and not a scale -- nothing
+# about a ferry is "more" than a tram. The four common modes come first; the
+# cable-hauled tail is rare enough in these islands to be one heritage line each,
+# but a mode sharing a colour with another mode is worse than a mode nobody ever
+# sees.
+#
+# "Outside the ramp" has to hold against *both* ramps in OKLab, since a mode
+# colour sitting inside either one draws as a road carrying a handful of buses.
+# The two with the least room are the metro against the dark ramp, which turns
+# cyan at six services, and the ferry against the light ramp, which is blue for
+# its whole lower half: 0.145 and 0.154 from the nearest ramp stop in light, 0.227
+# and 0.293 in dark.
+#
+# The ferry is crimson because nothing else was left: the light ramp is blue
+# through violet and the dark one sweeps blue, cyan, green and yellow, so between
+# them the two ramps own everything cool. Red was held back for the hover and
+# match accent, and that was the wrong shape of reservation -- the accent is one
+# orange-red at high lightness (#d64512), not the red half of the wheel, and a
+# deep crimson is 0.223 from it. In dark the accent is white, so nothing is owed.
+#
+# Order is the order the legend lists them in. Road is not here: it is the road
+# ramp above, and it is the one row the legend always draws.
+
+[modes.tram]
+label = "Tram"
+light = "#b5327a"
+dark = "#ff86c4"
+
+[modes.metro]
+label = "Metro"
+light = "#7a169b"
+dark = "#c56aeb"
+
+[modes.rail]
+label = "Rail"
+light = "#7a4b16"
+dark = "#e0a566"
+
+[modes.ferry]
+label = "Ferry"
+light = "#800732"
+dark = "#f54874"
+
+[modes.cable_tram]
+label = "Cable tram"
+light = "#6a3fb5"
+dark = "#b79cf0"
+
+[modes.funicular]
+label = "Funicular"
+light = "#0f7a3d"
+dark = "#6fd08c"
+
+[modes.aerial]
+label = "Cable car"
+light = "#8a6d00"
+dark = "#ddc067"
+
+[modes.monorail]
+label = "Monorail"
+light = "#37474f"
+dark = "#90a4ae"
+
+# What a mode with no entry above is drawn in, ramp and all. Reached by a feature
+# whose `mode` this palette has never heard of, which is what an archive built by
+# a newer pipeline looks like to an older page.
+[modes.other]
+label = "Other"
+light = "#6b6b6b"
+dark = "#b9b9b9"
+
+
+# --- The colours that are not a ramp ---------------------------------------
+[accents]
+# Hover and match accent. In dark it is white, which is why this is not the same
+# pair as `--accent` in `base.css`.
+hover_light = "#d64512"
+hover_dark = "#ffffff"
+
+# Drawn where `trips` is absent. Deliberately outside both themes' ramps and both
+# mode palettes, and neutral in each theme: "no answer here", not a low value.
+unavailable_light = "#c9ccd1"
+unavailable_dark = "#43464b"
+
+
+[track]
+# What a track feature is drawn as where the tile carries no `mode`, which is
+# every archive built before the traced modes joined this layer: those hold
+# `route=train` and nothing else, so the fallback is the fact rather than a guess.
+default_mode = "rail"
+
+
+# --- The archive a page looks for on its own -------------------------------
+[archive]
+# What `publish` writes when it is told neither a path nor to use the region's
+# name, and what both pages fall back to when there is no `/archives.json` to
+# ask -- which is what a static host is. One name in one place: it was written
+# once in `publish` and four times across the two pages, and renaming it under a
+# running deployment would have left the pages looking for a file nothing writes.
+default = "bus.pmtiles"
+
+
+# --- Which band a feature came from ----------------------------------------
+#
+# The single most fragile agreement between `publish` and the viewer, and the one
+# with the least to show for a break.
+#
+# `publish` strips these three from the three overview bands: they are what the
+# info card opens, and the card does not open below the detail zoom. `refs` is the
+# expensive one, a whole comma-joined service list per feature.
+#
+# The viewer then reads the *presence* of `sentinel` as "this feature came from
+# the detail band", which is what tells the two feature-id spaces apart -- the
+# detail band's id is the OpenStreetMap way id and the overview bands' is the
+# Valhalla edge id. Move `refs` out of `detail_only`, or move an attribute the
+# overview bands carry into it, and the viewer hovers in the wrong id space with
+# no error to show for it.
+#
+# `trips` is deliberately not here. Both ramps read it, a colour is painted at
+# every zoom, and stripping it flattens the map below the detail zoom rather than
+# reporting a missing attribute.
+[bands]
+detail_only = ["way", "refs", "name"]
+sentinel = "refs"
+
+
+# --- The box a viewer will not leave ---------------------------------------
+[roam]
+# West of the Blaskets to east of Lowestoft, Scilly up to Unst, with enough margin
+# that coastal places do not sit jammed against the edge. The data is these
+# islands only, so there is nothing to find outside it.
+#
+# Not the same box as `config.british_isles_sql`, which decides whether a *stop*
+# is in these islands and is a capped line through the Channel rather than a
+# rectangle. This one only stops a reader panning into the Atlantic, and it is
+# also what `art` warns a hand-written window against.
+west = -11.5
+south = 49.4
+east = 2.6
+north = 61.3

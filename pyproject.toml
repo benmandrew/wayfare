@@ -29,6 +29,12 @@ wayfare = "wayfare.cli:main"
 [tool.setuptools.packages.find]
 include = ["wayfare*"]
 
+# `map.toml` is read at run time, not only by the generator: `coverage.draw` takes
+# its layer names and its ramps from it. Without this it is left out of the wheel
+# and `wayfare draw` fails on an installed copy while working from a checkout.
+[tool.setuptools.package-data]
+wayfare = ["map.toml"]
+
 [tool.ruff]
 line-length = 92
 
@@ -37,9 +43,14 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.mypy]
 python_version = "3.12"
-# `scripts/` is otherwise unchecked, but the badge generator writes a file the README
-# renders and CI can gate on, which is not code to leave to a runtime error.
-files = ["wayfare", "scripts/coverage_badge.py"]
+# `scripts/` is otherwise unchecked. These three write files the README renders, two
+# of which CI gates on, which is not code to leave to a runtime error.
+files = [
+    "wayfare",
+    "scripts/coverage_badge.py",
+    "scripts/palette_js.py",
+    "scripts/readme_map.py",
+]
 strict = true
 warn_return_any = false
 

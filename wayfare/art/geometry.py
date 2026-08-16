@@ -13,7 +13,7 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from .. import logs
+from .. import logs, palette
 from .deps import _require_numpy
 
 log = logs.get("art")
@@ -100,7 +100,11 @@ PRESETS: dict[str, Bounds] = {
 
 # Everything the dataset could ever cover. Used only to warn when a hand-written
 # window falls somewhere there will never be buses.
-ISLES = Bounds(-11.5, 49.4, 2.6, 61.3)
+#
+# From `map.toml`, because the viewer holds the same box as the one it will not let
+# a reader pan outside of. The two were written out separately, in the same
+# minlon,minlat,maxlon,maxlat order, each with a comment naming the other.
+ISLES = Bounds(*palette.load().roam)
 
 
 def resolve(bounds_or_name: Bounds | str) -> Bounds:

@@ -504,7 +504,36 @@ def test_draw_passes_the_window_as_one_box(monkeypatch, root, tmp_path):
         ]
     )
     assert code == 0
-    assert got.args == (archive, 7, (-1.4, 51.0, 1.0, 52.2), out, 800)
+    # A list even for one archive, because the flag takes several, and no theme:
+    # `draw` is a diagnostic first and the greys are what judging a zoom wants.
+    assert got.args == ([archive], 7, (-1.4, 51.0, 1.0, 52.2), out, 800, None)
+
+
+def test_draw_takes_several_archives_and_a_theme(monkeypatch, root, tmp_path):
+    """These islands are three archives and the viewer draws every one it is offered
+    onto a single map, so a picture of what it draws has to take all three. The theme
+    is what makes the picture the viewer's rather than the diagnostic greyscale."""
+    got = spy(monkeypatch, coverage, "draw")
+    names = [tmp_path / f"{n}.pmtiles" for n in ("gb", "ireland", "northern_ireland")]
+    code = cli.main(
+        [
+            "draw",
+            *[str(n) for n in names],
+            str(tmp_path / "isles.png"),
+            "--zoom",
+            "9",
+            "--window",
+            "-11.0",
+            "49.8",
+            "2.2",
+            "61.0",
+            "--theme",
+            "dark",
+        ]
+    )
+    assert code == 0
+    assert got.args[0] == names
+    assert got.args[5] == "dark"
 
 
 # --- status, prune, cluster ----------------------------------------------------

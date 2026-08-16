@@ -1,0 +1,11 @@
+{
+  // Suggested on first open of the folder. The TOML one is the reason this file
+  // exists: it is the editor half of `.taplo.toml`, and without it
+  // `wayfare/map.toml` is edited with nothing checking it against
+  // `wayfare/map.schema.json` until CI does.
+  "recommendations": [
+    "tamasfe.even-better-toml",
+    "charliermarsh.ruff",
+    "ms-python.python"
+  ]
+}

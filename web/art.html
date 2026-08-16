@@ -12,6 +12,11 @@
      document before the first paint. Applied at the foot of the body, behind the
      803 KB vendored library, a reader who chose dark got a screenful of white
      while it parsed. -->
+<!-- Ahead of util.js, which reads the roaming box out of it. Generated from
+     wayfare/map.toml by scripts/palette_js.py, and shared with index.html so the
+     two pages and the pipeline cannot hold different layer names or a different
+     archive to fall back on. CI fails on a stale copy. -->
+<script src="palette.js"></script>
 <script src="util.js"></script>
 <script>bootTheme();</script>
 <style>
@@ -1417,9 +1422,9 @@ async function addNetwork(map) {
   } catch {
     archives = [];
   }
-  // `bus.pmtiles` is the convention on a static host with no index, the same
-  // fallback the viewer makes.
-  const wanted = archives.length ? archives : ["./bus.pmtiles"];
+  // The convention on a static host with no index, the same fallback the viewer
+  // makes -- out of the same file, so the two cannot pick different names.
+  const wanted = archives.length ? archives : [`./${PALETTE.defaultArchive}`];
   // `metadata: true`, and it is off by default: without it the plugin answers
   // MapLibre's TileJSON request from the PMTiles header alone and the credit
   // written into the archive's metadata block never leaves the file. This picker
@@ -1459,7 +1464,7 @@ async function addNetwork(map) {
       id,
       type: "line",
       source: id,
-      "source-layer": "bus",
+      "source-layer": PALETTE.layers.road,
       layout: { "line-cap": "round", "line-join": "round" },
       paint: {
         "line-color": PICK_LINE[theme],

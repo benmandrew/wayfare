@@ -677,6 +677,22 @@ the fallback out of `to-number` and draws a whole country in the first ramp colo
 archive published before that change is handled by the viewer's `["has", "trips"]` guard,
 which never fires against a newer build.
 
+**The layer names and the colours are one file, [`wayfare/map.toml`](../wayfare/map.toml).**
+The name tippecanoe is handed comes out of it, MapLibre asks the archive for the same name,
+and `coverage.draw` paints with the same ramp, so `bus`, `segments` and `track` are written
+in one place rather than three. Nothing either side reports when they drift, because a layer
+the viewer names and the archive does not carry is a layer that draws nothing.
+
+The viewer reads `web/palette.js` rather than the file itself, since a browser has no Tom's
+Obvious Minimal Language (TOML) parser and cannot fetch one either: the page has to work on
+a static host, and a palette landing a round trip after the page would repaint the map once
+it arrived. So `scripts/palette_js.py` generates that file from the TOML, it is committed,
+and CI runs `--check` on every push. A colour edited in the TOML and not regenerated is a
+page painting the old one, which nothing at run time can notice. The *OKLab* derivation that
+turns each of the eight non-road mode seed colours into a six-step ramp lives in
+[`wayfare/palette.py`](../wayfare/palette.py) and nowhere else, and the page holds finished
+arrays and computes no colour at all.
+
 **The detail band's feature id is the OpenStreetMap way id, and the overview bands' is the
 Valhalla edge id.** `way` is therefore an attribute of no band and neither is `id`, and the
 viewer tells the two ranges apart by reading `refs`. Put `way` back as an attribute, or
@@ -758,6 +774,33 @@ the point of being served before anyone noticed.
 the cell holds at z14, and the figure to read is the emptiest quarter's against a region
 that is not filtered. `draw` rasterises a zoom so it can be looked at, which is the check
 the feature counts cannot make.
+
+**`draw` takes several archives and composites them into one buffer**, because these
+islands are three archives and the viewer draws every one it is offered onto the one map.
+The buffer is red, green and blue plus a fourth channel carrying the compositing weight,
+and the PNG is truecolour rather than the 8-bit greyscale it used to be. `--theme light`
+or `--theme dark` paints the map's own colours out of `map.toml`, and without it the
+diagnostic greys are what they always were. Compositing ranks by layer first and trip
+count second, in the order the viewer stacks its layers — road underneath, then track,
+then segments — since ranking on trips alone put a trunk road over the tram line crossing
+it. Reading a feature's colour means reading its tags, and a layer's keys and values
+tables may be written after the features that refer to them, so the walker resolves the
+tables before it resolves any feature.
+
+Two faults came out of that work, and neither said anything. The greys were `{"bus": 255,
+"segments": 90}` with no `track` entry, so every track feature fell to the other-layer
+grey; they are keyed on the shared layer names now, and a layer `publish` writes cannot be
+missing from the table. And weight 0 meant "unlit", so the quietest road of the bottom
+layer was drawn and then counted as background, and a national render reported 0.2% lit
+against the greyscale's 5.1%. Every drawn weight is offset by one.
+
+**`scripts/readme_map.py` draws `docs/map.png`, which the README embeds.** It has no
+`--check` and CI cannot run it, since every data root is gitignored and a national build
+is a match run of a day or two, so the picture is committed and the script is run by hand
+when the archives move. It defaults to z11 because in an archive built before `trips`
+reached the overview bands z11 is the lowest band that carries it, and below that every
+road draws in the "no answer" grey. `coverage.layer_attributes` is what lets it warn about
+the band it was given rather than write that map.
 
 **A licence condition travels with the data, not with the page.** The credit is derived
 from `config.Feed` and written into the archive's tileset metadata, so a copied archive

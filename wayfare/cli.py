@@ -387,9 +387,21 @@ def _add_draw_parser(sub: _Sub) -> None:
         help="rasterise a built archive to PNG -- what a zoom looks like, not how "
         "much it holds",
     )
-    p.add_argument("archive", type=Path, help="a .pmtiles file")
+    # Several because a region is one archive and these islands are three, and the
+    # viewer draws every archive it is offered onto one map. A picture of one is a
+    # picture of one region.
+    p.add_argument("archive", type=Path, nargs="+", help="one or more .pmtiles files")
     p.add_argument("out", type=Path, help="the .png to write")
     p.add_argument("--zoom", type=int, required=True)
+    p.add_argument(
+        "--theme",
+        choices=("light", "dark"),
+        default=None,
+        help="paint the viewer's own colours -- the road ramp by journeys a day and "
+        "each mode off its own ramp -- instead of the flat greys. The greys are what "
+        "judging a low zoom wants; a hue there says something about a feature that "
+        "the question is not about",
+    )
     # Four values rather than one comma-separated string. Every window over these
     # islands opens on a negative longitude, and argparse reads `-1.4,51.0,1.0,52.2`
     # as an option because only a bare number matches its negative-number rule --
@@ -719,7 +731,14 @@ def _cmd_coverage(args: argparse.Namespace) -> int:
 
 def _cmd_draw(args: argparse.Namespace) -> int:
     west, south, east, north = args.window
-    coverage.draw(args.archive, args.zoom, (west, south, east, north), args.out, args.width)
+    coverage.draw(
+        args.archive,
+        args.zoom,
+        (west, south, east, north),
+        args.out,
+        args.width,
+        args.theme,
+    )
     return 0
 
 

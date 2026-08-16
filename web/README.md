@@ -79,6 +79,25 @@ header. A `#hash` in the URL still wins, because that is someone sharing a place
 archive carries its own attribution in its own tileset metadata, and MapLibre gathers
 every loaded credit into the one control.
 
+## Where the colours come from
+
+The page computes no colour. [`palette.js`](palette.js) is generated from
+[`wayfare/map.toml`](../wayfare/map.toml) by
+[`scripts/palette_js.py`](../scripts/palette_js.py) and committed, and every layer name,
+ramp colour, mode ramp and accent is read out of `PALETTE` as a finished array. The
+pipeline reads the same file, so the names tippecanoe writes and the names MapLibre asks
+for cannot hold different values. A browser has no Tom's Obvious Minimal Language (TOML)
+parser and cannot fetch one either: the page has to work on a static host, and a palette
+landing a round trip after the page would repaint the map once it arrived.
+
+Each of the eight non-road modes gets a six-step ramp derived in *OKLab* from the one
+colour the key already promises for that mode, and
+[`wayfare/palette.py`](../wayfare/palette.py) is the only implementation of that
+derivation. Taking the page's own copy of that maths out, along with the colour and layer
+tables it fed, removed 165 lines from [`index.html`](index.html). CI runs
+`scripts/palette_js.py --check` on every push, because a colour edited in the TOML and not
+regenerated is a page painting the old one, and nothing at run time notices.
+
 ## On a small screen
 
 The viewer's one interaction was `mousemove`, and a touchscreen sends none. Every road drew
@@ -89,10 +108,10 @@ itself, because a slop box under an arrow answers for the road beside the one be
 at.
 
 The panels are absolutely positioned over the map, and their content is unbounded. A
-national archive's key is a colour ramp per mode, eight rows of it, and an info card can
-hold forty service numbers; uncapped, the two of them covered a phone entirely. Each is now
-capped at a share of the screen and scrolls inside that cap, and the key folds behind a
-"Key" button. It starts folded under 720px wide or under 600px tall, since a laptop in
+national archive's key is a colour ramp per mode, one row for each of the eight modes in
+`map.toml`, and an info card can hold forty service numbers; uncapped, the two of them
+covered a phone entirely. Each is now capped at a share of the screen and scrolls inside
+that cap, and the key folds behind a "Key" button. It starts folded under 720px wide or under 600px tall, since a laptop in
 landscape has the same problem. The help panel takes more of the screen while it is open,
 because a reader who opened it wants the prose rather than the map.
 

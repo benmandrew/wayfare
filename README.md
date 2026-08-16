@@ -2,6 +2,8 @@
 
 ![Coverage](docs/coverage.svg)
 
+![Every service in Great Britain, the Republic of Ireland and Northern Ireland, drawn from the published archives](docs/map.png)
+
 wayfare builds a dataset of public transport routes across these islands: Great Britain
 from the Department for Transport (DfT) Bus Open Data Service (BODS), the Republic of
 Ireland from the National Transport Authority (NTA), and Northern Ireland from Translink
@@ -30,8 +32,8 @@ puts `.venv/bin` on `PATH`, so `wayfare`, `pytest -q`, `ruff check .` and `mypy`
 Outside the shell none of them are on `PATH` at all.
 
 The flake supplies Python 3.12, uv, cairo and pkg-config, felt/tippecanoe (no other fork
-writes PMTiles) and the duckdb command-line interface (CLI) for reading the database by
-hand; the Docker image builds tippecanoe 2.79.0 from source instead. Two things sit
+writes PMTiles), taplo for the TOML and the duckdb command-line interface (CLI) for
+reading the database by hand; the Docker image builds tippecanoe 2.79.0 from source instead. Two things sit
 outside the flake: a Valhalla server reachable at `WAYFARE_VALHALLA`, which defaults to
 `http://localhost:8002`, and roughly 40 GB of free disk for a national run. All pipeline
 state is one DuckDB file under `WAYFARE_DATA`.
@@ -41,6 +43,25 @@ state is one DuckDB file under `WAYFARE_DATA`.
 fetched from a service, so it renders in an offline clone and on a fork with no secrets.
 `--check` fails when the committed file has gone stale against a fresh measurement, and
 CI runs it against the report the test step already wrote.
+
+Two more files are generated the same way and for the same reason.
+`scripts/palette_js.py` writes [`web/palette.js`](web/palette.js) from
+[`wayfare/map.toml`](wayfare/map.toml), which holds every layer name and every colour
+on the map: the pipeline reads the TOML and the viewer reads what the script generates,
+so the two cannot hold different values for one thing. A browser has no TOML parser and
+the page has to work on a static host, which is why the generated copy exists at all.
+CI runs `--check` on every push, since this one needs no data.
+
+The shape of `wayfare/map.toml` is stated in `wayfare/map.schema.json` and wired up in
+`.taplo.toml`, so an editor with the *Even Better TOML* extension checks it while it is
+typed and `taplo lint` fails CI on the same thing. Nothing about a wrong shape there is an
+error at run time: a mistyped layer name draws an empty layer without a word.
+
+`scripts/readme_map.py` draws the picture above out of the published archives. It has
+no `--check` and CI cannot run it: every data root is gitignored and a national build
+is a match run of a day or two, so the PNG is committed and the script is run by hand
+when the archives move. It warns rather than writing a grey map when the band it is
+given carries no `trips`.
 
 ## Quick start
 
