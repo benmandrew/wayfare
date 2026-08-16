@@ -16,6 +16,7 @@ dependencies = [
 art = ["pycairo>=1.26", "numpy>=1.26", "pyarrow>=17"]
 dev = [
     "pytest>=8",
+    "pytest-cov>=5",
     "pytest-xdist>=3.6",
     "ruff>=0.6",
     "mypy>=1.11",
@@ -36,7 +37,9 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.mypy]
 python_version = "3.12"
-files = ["wayfare"]
+# `scripts/` is otherwise unchecked, but the badge generator writes a file the README
+# renders and CI can gate on, which is not code to leave to a runtime error.
+files = ["wayfare", "scripts/coverage_badge.py"]
 strict = true
 warn_return_any = false
 
@@ -53,3 +56,18 @@ pythonpath = ["tests"]
 # the collector happened to be running, which is how one went unnoticed. Promoting
 # warnings to errors is what keeps the attribution honest.
 filterwarnings = ["error"]
+
+# `scripts/coverage_badge.py` reads `totals.percent_covered` off the JSON report, so
+# the measurement is defined here rather than in the flags it passes: a run from the
+# command line and the run behind the badge then count the same lines.
+[tool.coverage.run]
+source = ["wayfare"]
+
+[tool.coverage.report]
+# The pipeline's optional imports sit behind `if TYPE_CHECKING` and `__main__`
+# guards, neither of which a test can reach, and counting them puts a fixed floor
+# under the number that no test can lift.
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
