@@ -1,5 +1,7 @@
 # wayfare
 
+![Coverage](docs/coverage.svg)
+
 wayfare builds a dataset of public transport routes across these islands: Great Britain
 from the Department for Transport (DfT) Bus Open Data Service (BODS), the Republic of
 Ireland from the National Transport Authority (NTA), and Northern Ireland from Translink
@@ -33,6 +35,11 @@ hand; the Docker image builds tippecanoe 2.79.0 from source instead. Two things 
 outside the flake: a Valhalla server reachable at `WAYFARE_VALHALLA`, which defaults to
 `http://localhost:8002`, and roughly 40 GB of free disk for a national run. All pipeline
 state is one DuckDB file under `WAYFARE_DATA`.
+
+`python scripts/coverage_badge.py` runs the suite under coverage and rewrites
+`docs/coverage.svg`, currently 94.2% from a 36s run. The badge is committed rather than
+fetched from a service, so it renders in an offline clone and on a fork with no secrets.
+`--check` fails when the committed file has gone stale against a fresh measurement.
 
 ## Quick start
 
