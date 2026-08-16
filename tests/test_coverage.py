@@ -410,6 +410,58 @@ def test_a_theme_paints_the_road_ramp_rather_than_a_grey(tmp_path):
     assert busy == {palette.hex_to_rgb(ramp[-1])}
 
 
+def test_an_underlay_is_drawn_beneath_every_feature(tmp_path):
+    """A coastline is context, and must never take a pixel from a road.
+
+    The two are drawn over each other here on purpose: the road runs along the
+    same latitude as the underlay, so every pixel of one is a pixel of the other,
+    and the question is which the picture ends up carrying. Weight is what
+    decides, and the underlay's is below the quietest road's -- which is why
+    features start at two rather than at one.
+    """
+    path = archive(
+        tmp_path / "a.pmtiles",
+        {0: gzip.compress(_tagged_tile(at(-20.0, 0.0), at(20.0, 0.0), {"trips": 7}))},
+    )
+    window = (-40.0, -40.0, 40.0, 40.0)
+    # Wider than the road, so the overlap answers which wins and the overhang
+    # answers whether the underlay was drawn at all. One or the other alone
+    # passes for a `draw` that ignored the underlay entirely.
+    line = [[(-30.0, 0.0), (30.0, 0.0)]]
+
+    out = tmp_path / "both.png"
+    coverage.draw(path, 0, window, out, width=100, theme="dark", underlay=line)
+    _w, _h, both = _rgb(out)
+
+    ink = palette.load()
+    road = palette.hex_to_rgb(ink.road_ramp["dark"][0])
+    coast = coverage._COASTLINE["dark"]
+    drawn = {p for p in both if p != (13, 16, 20)}
+    # The road won every pixel the two share, and the coastline is still drawn
+    # where the road is not -- it runs the width of the window and the road does
+    # not reach the edges.
+    assert road in drawn
+    assert coast in drawn
+
+
+def test_an_underlay_needs_no_archive_to_be_drawn(tmp_path):
+    """The coastline is passed in as longitude and latitude, so it is projected
+    here rather than read out of a tile. Nothing about it comes from an archive."""
+    empty = archive(tmp_path / "empty.pmtiles", {})
+    out = tmp_path / "coast.png"
+    coverage.draw(
+        empty,
+        0,
+        (-40.0, -40.0, 40.0, 40.0),
+        out,
+        width=100,
+        theme="dark",
+        underlay=[[(-30.0, 10.0), (30.0, 10.0)]],
+    )
+    lit, _size = _lit(out, background=(13, 16, 20))
+    assert lit > 50
+
+
 def test_several_archives_composite_into_one_picture(tmp_path):
     """These islands are three archives and the viewer draws them onto one map."""
     west = archive(

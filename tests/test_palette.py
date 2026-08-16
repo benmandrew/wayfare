@@ -269,6 +269,31 @@ def test_the_roam_box_is_the_one_art_warns_against():
     assert (geometry.ISLES.max_lon, geometry.ISLES.max_lat) == (east, north)
 
 
+def test_the_committed_coastline_covers_the_roam_box():
+    """`docs/coastline.json` is clipped to `map.toml`'s roam box rather than to
+    the README map's own frame, which is what lets the frame move without the
+    coastline being regenerated. A file clipped to something narrower would draw
+    a coast that stops partway for no reason the picture can show."""
+    coast = json.loads((ROOT / "docs" / "coastline.json").read_text())
+    west, south, east, north = palette.load().roam
+    assert coast, "no coastline runs"
+    xs = [x for run in coast for x, _y in run]
+    ys = [y for run in coast for _x, y in run]
+    # Every point inside the box, with the margin a kept segment's far end can
+    # reach: a segment is kept when either end is inside, so one end may sit out.
+    assert min(xs) > west - 2 and max(xs) < east + 2
+    assert min(ys) > south - 2 and max(ys) < north + 2
+    # And it holds the land in that box rather than a corner of it. Not the box's
+    # own edges: there is open Atlantic between -11.5 and Ireland's west coast, so
+    # a coastline reaching the western edge would be a coastline of something that
+    # is not there. These are the four extremes of land instead.
+    assert min(xs) < -10.0, "no Kerry"
+    assert max(xs) > 1.5, "no East Anglia"
+    assert min(ys) < 50.2, "no Cornwall"
+    assert max(ys) > 60.5, "no Shetland"
+    assert all(len(run) > 1 for run in coast), "a one-point run draws nothing"
+
+
 def test_both_pages_take_their_shared_values_from_the_generated_file():
     """`art.html` held a bare `"source-layer": "bus"` and its own copy of the
     archive fallback, neither behind a constant."""

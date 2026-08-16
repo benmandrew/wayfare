@@ -19,6 +19,7 @@ composite over each other and report a coverage the archives do not have.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -26,6 +27,13 @@ from wayfare import config, coverage, palette
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "docs" / "map.png"
+
+# Clipped from Natural Earth by `scripts/coastline.py` and committed, so a redraw
+# needs no network and works in an offline clone. Drawn under everything: without
+# it the only thing saying where the land is, is where the buses are, and a coast
+# with no service on it -- most of Sutherland, most of Kerry -- is not drawn at
+# all. Optional, because the map is still a map without it.
+COASTLINE = ROOT / "docs" / "coastline.json"
 
 # Mainland Great Britain and Ireland. Narrower than `art.ISLES`, which is the box
 # the archives actually cover: north stops at 58.8, above Dunnet Head at 58.67 and
@@ -99,7 +107,25 @@ def main() -> None:
             )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    lit = coverage.draw(archives, args.zoom, WINDOW, args.out, args.width, theme=args.theme)
+    underlay = None
+    if COASTLINE.exists():
+        underlay = json.loads(COASTLINE.read_text())
+    else:
+        print(
+            f"warning: no {COASTLINE.name}, so the map draws with nothing under it. "
+            "Run `python scripts/coastline.py` to make one.",
+            file=sys.stderr,
+        )
+
+    lit = coverage.draw(
+        archives,
+        args.zoom,
+        WINDOW,
+        args.out,
+        args.width,
+        theme=args.theme,
+        underlay=underlay,
+    )
     # `--out` can be anywhere, so the path is only shortened when it is under the
     # repository. `relative_to` raises rather than falling back on its own.
     shown = args.out.relative_to(ROOT) if args.out.is_relative_to(ROOT) else args.out

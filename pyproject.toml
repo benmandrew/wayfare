@@ -47,6 +47,7 @@ python_version = "3.12"
 # of which CI gates on, which is not code to leave to a runtime error.
 files = [
     "wayfare",
+    "scripts/coastline.py",
     "scripts/coverage_badge.py",
     "scripts/palette_js.py",
     "scripts/readme_map.py",

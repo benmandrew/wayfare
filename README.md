@@ -57,6 +57,13 @@ The shape of `wayfare/map.toml` is stated in `wayfare/map.schema.json` and wired
 typed and `taplo lint` fails CI on the same thing. Nothing about a wrong shape there is an
 error at run time: a mistyped layer name draws an empty layer without a word.
 
+`scripts/coastline.py` clips the Natural Earth 1:10m coastline to the box the viewer
+roams over and commits it as `docs/coastline.json`, 144 KB, which the map above is
+drawn on top of. The 10 MB source is downloaded once into `RAW` and reused from there,
+and the clipped file is committed, so a redraw makes no request at all. Natural Earth
+is public domain, so unlike a tile service's backdrop it puts no licence condition on
+a PNG that travels without the page it was made for.
+
 `scripts/readme_map.py` draws the picture above out of the published archives. It has
 no `--check` and CI cannot run it: every data root is gitignored and a national build
 is a match run of a day or two, so the PNG is committed and the script is run by hand

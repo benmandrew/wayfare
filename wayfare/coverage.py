@@ -565,13 +565,28 @@ def _layer_ranks() -> dict[str, int]:
 # this does not know, each with 63 levels of trip count under it, which is finer
 # than a six-step ramp can show.
 #
-# Every drawn weight is offset by one, because zero is what an untouched pixel
-# holds and the same channel answers "is anything here at all". Without the offset
-# the quietest road of the bottom layer weighs nothing, and a national render came
-# out 0.2% lit against the greyscale's 5.1% -- the roads were drawn and then
-# counted as background.
+# Every drawn weight is offset, because zero is what an untouched pixel holds and
+# the same channel answers "is anything here at all". Without the offset the
+# quietest road of the bottom layer weighs nothing, and a national render came out
+# 0.2% lit against the greyscale's 5.1% -- the roads were drawn and then counted as
+# background.
 _RANK_STEP = 63
-_MIN_WEIGHT = 1
+_MIN_WEIGHT = 2
+
+# Weight 1 is the underlay's, below every feature and above nothing. A coastline
+# is context and must never take a pixel from a road: the quietest road on the
+# bottom layer weighs `_MIN_WEIGHT`, which is why features start at two.
+_UNDERLAY_WEIGHT = 1
+
+# What the underlay is drawn in. Dim enough to read as ground rather than as
+# something running on it -- a coastline in a road's colour is a coastal service
+# nobody operates. Not in `map.toml`: the viewer has no coastline of its own,
+# because its basemap draws one, so this is a colour no other reader shares.
+_COASTLINE: dict[palette.Theme, tuple[int, int, int]] = {
+    "light": (198, 204, 212),
+    "dark": (38, 46, 58),
+}
+_COASTLINE_GREY = (60, 60, 60)
 
 
 def _mercator(lon: float, lat: float) -> tuple[float, float]:
@@ -771,6 +786,7 @@ def draw(
     out: Path,
     width: int = 1400,
     theme: palette.Theme | None = None,
+    underlay: Sequence[Sequence[tuple[float, float]]] | None = None,
 ) -> float:
     """Rasterise one zoom of some archives into a window. Returns the fraction lit.
 
@@ -790,6 +806,13 @@ def draw(
     road ramp by journeys a day, and each non-road mode off its own ramp. Left
     None, this is the flat greyscale that judging a low zoom wants, where a hue
     would say something about a feature that the question is not about.
+
+    `underlay` is longitude/latitude polylines drawn under everything, for a
+    coastline. Without one the only thing saying where the land is, is where the
+    buses are, so Kerry and Cornwall read as ink rather than as places. It is
+    passed in rather than loaded here because this module reads archives and
+    nothing else -- no network, no data files -- which is what lets it run
+    wherever an archive does.
     """
     # One archive is the ordinary diagnostic call and reads better without a list
     # around it, so both spellings are taken rather than one being the only one.
@@ -804,6 +827,22 @@ def draw(
     height = max(1, round(width * (y1 - y0) / (x1 - x0)))
     pixels = bytearray(width * height * _CHANNELS)
     greys = _layer_greys()
+
+    # First, so every feature composites over it: the weight ordering would hold
+    # either way, but drawing ground after the things standing on it is the kind
+    # of ordering that survives until someone changes a weight.
+    if underlay:
+        ink = _COASTLINE[theme] if theme else _COASTLINE_GREY
+        for line in underlay:
+            points = [
+                (
+                    round((mx - x0) / (x1 - x0) * width),
+                    round((my - y0) / (y1 - y0) * height),
+                )
+                for mx, my in (_mercator(lon, lat) for lon, lat in line)
+            ]
+            for (ax, ay), (bx, by) in zip(points, points[1:], strict=False):
+                _stroke(pixels, width, height, ax, ay, bx, by, ink, _UNDERLAY_WEIGHT)
 
     for archive in archives:
         with archive.open("rb") as fh:

@@ -814,6 +814,25 @@ reaches -10.5, so Kerry sets the western edge and the Hebrides fall inside it. T
 that leave the window are drawn up to its edge, because `draw` clips per pixel rather than
 per line.
 
+**The coastline under it is a committed file, not a basemap.** `draw` takes an `underlay`
+of longitude/latitude polylines and paints them below every feature, at a weight of 1
+against the quietest road's 2. Without one the only thing saying where the land is, is
+where the buses are, so a coast with no service on it — most of Sutherland, most of Kerry —
+is not drawn at all. `scripts/coastline.py` clips Natural Earth's 1:10m coastline to
+`map.toml`'s roam box and writes `docs/coastline.json`: 69 runs, 9,339 points, 144 KB at
+three decimal places, which is about 70 m against a pixel that is about 480 m. Clipped to
+the roam box rather than to the picture's frame, so the frame moves without the coastline
+being rebuilt. The 10 MB source is cached in `RAW` like every other download and the
+clipped file is committed, so a redraw makes no request.
+
+The alternative was the viewer's own CARTO backdrop, and the numbers were not the
+objection: the backdrop only has to match the output resolution rather than the vector
+zoom, so 1800 pixels over 13 degrees is z8 and 120 tiles rather than z11 and 6,675. What
+ruled it out is that a raster backdrop puts a licence condition on a PNG that travels
+without the page it was made for, and that baking a static asset out of a free tile service
+is not what the service is provisioned for. Natural Earth is public domain and owes
+nothing.
+
 **A licence condition travels with the data, not with the page.** The credit is derived
 from `config.Feed` and written into the archive's tileset metadata, so a copied archive
 keeps it. `publish.contents` reads off the database which of `road`, `operator` and `track`
