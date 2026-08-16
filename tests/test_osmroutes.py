@@ -221,6 +221,47 @@ def test_a_relation_that_stops_qualifying_stops_being_drawn(seeded):
     assert db.scalar(seeded, "SELECT count(*) FROM patterns") == 2
 
 
+def test_a_run_that_loses_most_of_a_region_refuses_rather_than_retiring(seeded):
+    """A truncated Overpass body, a window that missed and an operator gate that
+    tightened too far all take out most of a region at once, and a few relations is
+    also what a country with two railways looks like, so nothing downstream can tell
+    them apart. A genuine withdrawal is one line at a time and passes."""
+    for rid in (1, 2, 3, 4):
+        osmroutes.write(seeded, osmroutes.candidates([relation(relation_id=rid)]).kept)
+    seeded.execute("UPDATE patterns SET last_seen = ? WHERE route_id LIKE 'osm:r%'", [FEED])
+    assert (
+        db.scalar(seeded, "SELECT count(*) FROM patterns WHERE last_seen = ?", [FEED]) == 4
+    )
+
+    with pytest.raises(RuntimeError, match="found only 1"):
+        osmroutes.write(seeded, osmroutes.candidates([relation(relation_id=1)]).kept)
+    # Nothing written, so the archive keeps drawing what it last drew.
+    assert (
+        db.scalar(seeded, "SELECT count(*) FROM patterns WHERE last_seen = ?", [FEED]) == 4
+    )
+
+
+def test_a_deliberate_collapse_to_none_is_not_a_collapse(seeded):
+    """The floor must not stand between `Feed.route_relations = ()` and the retire it
+    exists to cause. A region that draws none on purpose comes back with nothing at
+    all, where every fault the floor catches comes back with a few."""
+    for rid in (1, 2, 3, 4):
+        osmroutes.write(seeded, osmroutes.candidates([relation(relation_id=rid)]).kept)
+    seeded.execute("UPDATE patterns SET last_seen = ? WHERE route_id LIKE 'osm:r%'", [FEED])
+
+    assert osmroutes.write(seeded, []) == 0
+    assert (
+        db.scalar(seeded, "SELECT count(*) FROM patterns WHERE last_seen = ?", [FEED]) == 0
+    )
+
+
+def test_the_first_run_of_the_stage_has_nothing_to_lose(con):
+    """A database with no relation patterns yet is let through, or the gate would
+    stop the stage ever running once."""
+    db.set_meta(con, "feed_version", FEED)
+    assert osmroutes.write(con, osmroutes.candidates([relation()]).kept) == 1
+
+
 def test_writing_without_a_feed_version_is_refused(con):
     kept = osmroutes.candidates([relation()]).kept
     with pytest.raises(RuntimeError, match="feed_version"):

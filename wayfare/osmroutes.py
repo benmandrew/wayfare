@@ -314,6 +314,53 @@ def candidates(
     )
 
 
+def _refuse_a_collapse(
+    con: duckdb.DuckDBPyConnection, found: list[Candidate], feed: str
+) -> None:
+    """Refuse to retire a region's rail because a run discovered almost none of it.
+
+    This stage rewrites everything on every invocation, and the retire that makes
+    that safe -- a line withdrawn from OpenStreetMap must stop being drawn -- is the
+    same statement that thins a region's rail to a handful of lines when a run comes
+    back nearly empty for a reason that has nothing to do with the map. A few
+    relations is what a mis-set window, a tightened operator gate and a partly
+    truncated Overpass body all look like, and it is also what a country with two
+    railways looks like, so nothing downstream can tell them apart.
+
+    The gate is the shape `deploy/refresh.sh` already uses on the publish counts: a
+    number this run produced against a number the database already holds. Below
+    `config.ROUTES_COLLAPSE_FLOOR` of what is live, the run refuses and leaves every
+    row alone, so the archive keeps drawing what it last drew. A genuine withdrawal
+    is gradual and passes.
+
+    Two runs are let through. A database with no `osm:r%` patterns yet has nothing to
+    lose, which is what makes the first run of the stage work. And a run that found
+    *nothing at all* is the region's `route_relations` selection doing its job -- the
+    Republic draws none on purpose, and a floor that refused the retire would leave
+    the copy of every line that setting exists to remove. So this catches a collapse
+    to a few and never a deliberate collapse to none.
+    """
+    if not found:
+        return
+    live = int(
+        db.scalar(
+            con,
+            "SELECT count(*) FROM patterns WHERE route_id LIKE 'osm:r%' AND last_seen = ?",
+            [feed],
+        )
+    )
+    if live == 0:
+        return
+    floor = live * config.ROUTES_COLLAPSE_FLOOR
+    if len(found) < floor:
+        raise RuntimeError(
+            f"refusing to retire {live} relation patterns: this run found only "
+            f"{len(found)}, under the {config.ROUTES_COLLAPSE_FLOOR:.0%} floor. "
+            "Nothing was written. Check the Overpass cache, the region's window and "
+            "the operator gate; `--refresh` re-queries."
+        )
+
+
 def write(con: duckdb.DuckDBPyConnection, found: list[Candidate]) -> int:
     """Insert the candidates as patterns, with their geometry and their ways.
 
@@ -340,6 +387,7 @@ def write(con: duckdb.DuckDBPyConnection, found: list[Candidate]) -> int:
     feed = db.get_meta(con, "feed_version")
     if not feed:
         raise RuntimeError("no feed_version in meta; run `wayfare patterns` first")
+    _refuse_a_collapse(con, found, feed)
 
     con.execute("BEGIN")
     try:

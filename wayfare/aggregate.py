@@ -36,6 +36,16 @@ log = logs.get("aggregate")
 # added to rows that predate it.
 _DRAWN_AS_TRACK = "COALESCE(t.ways_cut, FALSE)"
 
+# The same question asked of a pattern rather than of a `traces` row in hand, for the
+# arm of `build_segments` that joins `shapes` and never reaches `traces` at all.
+# A shape and a cut trace can now belong to one pattern -- `config.TRACE_OVER_SHAPE_MODES`
+# is what allows it -- so carrying a shape no longer decides which layer draws a
+# pattern, and only the trace does.
+_HAS_CUT_TRACE = """EXISTS (
+                SELECT 1 FROM traces t
+                WHERE t.pattern_id = p.pattern_id AND COALESCE(t.ways_cut, FALSE)
+            )"""
+
 
 def build(con: duckdb.DuckDBPyConnection) -> None:
     con.execute("DELETE FROM edge_services")
@@ -99,6 +109,17 @@ def build_segments(con: duckdb.DuckDBPyConnection) -> None:
     covers the patterns with no `shape_id` at all -- which is what keeps the two arms
     disjoint, and what lets `segments` keep its primary key on `pattern_id`.
 
+    **The shape arm is a fallback and not a claim.** `config.TRACE_OVER_SHAPE_MODES`
+    lets a mode be traced even where a shape exists, so a shaped pattern can now be
+    drawn per way instead, and this arm has to stand down for exactly the ones that
+    were. It tests the trace rather than the shape, because a mode in that set has
+    both and neither the presence nor the absence of a `shape_id` says which layer
+    won. What is left is every pattern the tracer did not resolve, drawn from the
+    operator's own recording exactly as before -- which is what makes adding a mode
+    to that set unable to take a line off the map. A relation that is unmapped, does
+    not chain, or does not carry the stop sequence costs the sharing and nothing
+    else.
+
     **A pattern the track layer draws must not be drawn here as well**, which is
     what `_DRAWN_AS_TRACK` partitions. A relation-built pattern is live, not matchable
     and carries no `shape_id`, so it satisfies this arm on every other count and that
@@ -124,6 +145,7 @@ def build_segments(con: duckdb.DuckDBPyConnection) -> None:
             FROM patterns p
             JOIN shapes s ON s.shape_id = p.shape_id
             WHERE {db.current_feed()} AND NOT {db.matchable(con)}
+              AND NOT {_HAS_CUT_TRACE}
             UNION ALL
             SELECT p.pattern_id, p.mode, t.lon_e6, t.lat_e6
             FROM patterns p
@@ -135,13 +157,23 @@ def build_segments(con: duckdb.DuckDBPyConnection) -> None:
                list_max(lon_e6), list_max(lat_e6)
         FROM geom
     """)
-    drawn, traced, missing = db.row(
+    drawn, traced, fell_back, missing = db.row(
         con,
         f"""
         SELECT (SELECT count(*) FROM segments),
                (SELECT count(*) FROM patterns p
                 JOIN traces t ON t.pattern_id = p.pattern_id
                 WHERE {db.non_road(con)} AND NOT {_DRAWN_AS_TRACK}),
+               -- Shaped patterns of a mode the tracer was allowed to fit and did
+               -- not. The number that says whether widening
+               -- `config.TRACE_OVER_SHAPE_MODES` bought anything: it is the share
+               -- of a mode still drawn as one polyline per pattern, and a mode
+               -- added to that set whose relations are unmapped shows up here in
+               -- full rather than as track that never appeared.
+               (SELECT count(*) FROM patterns p
+                WHERE {db.traceable(con)}
+                  AND p.shape_id IS NOT NULL
+                  AND NOT {_HAS_CUT_TRACE}),
                -- No `_DRAWN_AS_TRACK` on this one and none is wanted: a pattern
                -- with no trace at all is drawn by neither layer, which is what
                -- this counts.
@@ -153,10 +185,12 @@ def build_segments(con: duckdb.DuckDBPyConnection) -> None:
     )
     if drawn or missing:
         log.info(
-            "%d non-road patterns drawn (%d of them from OSM route relations), "
+            "%d non-road patterns drawn (%d of them from OSM route relations, "
+            "%d on an operator shape the tracer was offered and could not fit), "
             "%d have no geometry from either source and are not drawn",
             drawn,
             traced,
+            fell_back,
             missing,
         )
 
@@ -287,11 +321,11 @@ def _traced(con: duckdb.DuckDBPyConnection, live: str) -> dict[str, object]:
     A database with no `trace_status` table reports nothing rather than raising.
     `status` connects read-only and `connect` runs `migrate` only when it is not, so
     the table may be absent from a data root this stage has never written to -- the
-    same trap `db.non_road` carries a connection to survive.
+    same trap `db.traceable` carries a connection to survive.
     """
     if not db.table_exists(con, "trace_status"):
         return {}
-    owed = db.non_road(con)
+    owed = db.traceable(con)
     pending = db.scalar(
         con,
         f"""

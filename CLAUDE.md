@@ -27,13 +27,15 @@ the area they cover — most of them record something that was a bug first.
 
 ## Architecture
 
-Eight stages, each reading what the last wrote, each independently re-runnable:
+Nine stages, each reading what the last wrote, each independently re-runnable:
 
     acquire   -> raw downloads
     patterns  -> 1.55M trips collapse to distinct ordered stop sequences
     match     -> Valhalla; the stage that runs for a day or two
     trace     -> cuts a timetabled pattern's geometry out of an OSM route relation,
                  for the modes with no road and no shape
+    snap      -> gives an operator's own rail shape the OSM way ids it does not carry,
+                 so overlapping services share the track they run over
     routes    -> builds services from OSM route relations for the modes with no
                  timetable at all (Great Britain's National Rail)
     aggregate -> invert pattern->edges into edge->services
@@ -212,6 +214,42 @@ the two apart once the polyline is stored, and a FALSE row keeps its polyline un
 on a National Rail way answering with one relation's card rather than the way's service
 list. `mode` is in the track key, so a way carrying two networks is two features and is
 drawn twice on purpose.
+
+**A `shape_id` no longer says which of the two draws a pattern.** `config.TRACE_OVER_SHAPE_MODES`
+names the modes fitted against OpenStreetMap even where the operator published a shape, and
+it holds `rail` alone: a shape carries no way ids, way ids are the whole of what makes track
+shared, and the Republic's rail is 319 patterns running four services drawn as 319 polylines
+over each other. Tram is out and is the reason this is a set rather than a rule about shapes
+— street running and depot moves are in a tram's shape and in no route relation, so trading
+one for the other loses geometry that is correct. So `build_segments` tests for a cut trace
+rather than for a shape, which is also what makes the shape a fallback: a pattern neither
+stage resolves costs the sharing and never the line. Widen that set and the count to read is
+`aggregate`'s "on an operator shape the tracer was offered and could not fit", which is the
+share of a mode still drawn one polyline per pattern.
+
+**`trace` and `snap` answer the same question from opposite ends, and `traces` holds one row
+per pattern.** `trace` fits a pattern to a route relation by station sequence, which needs
+the relation to list its calling points in order; against the Republic's rail that resolved
+50 of 319, because OpenStreetMap models an intercity line with four stop members while the
+timetable's patterns are stopping services over branches. `snap` takes the operator's shape
+as the evidence and OpenStreetMap as the identity alone, snapping each vertex to the track
+under it. The relation fit wins where both could answer, and a snapped trace is told from a
+fitted one by its NULL `relation_id`. `snap` asks Overpass for bare `railway=*` ways and not
+for relations, because relation members cover 78.7% of the Republic's timetabled shape
+length against the track's own 100.0%, and it excludes `service=*` or a shape snaps onto a
+siding and reports a service running through a depot. Three guards keep it honest:
+`SNAP_MAX_M` is a margin and not a knob, since the covered share is 99.5% at 5 m and 100.0%
+at 25 m and 50 m; a cover under `SNAP_MIN_COVER` is refused whole rather than trimmed,
+because attributing the half of a shape that found track reports a short working over a line
+the service runs the length of; and `SNAP_HOLD_M` bounds the anti-flapping hold against the
+*nearest* way rather than against the tolerance, because held to the tolerance a way that
+has already diverged keeps the shape for another 25 m — which is what put all 319 of the
+Republic's patterns in the 20–25 m band on the first run. Its three writes are one
+transaction, since work is selected by the absence of a `snap_status` row and a status
+committed without its geometry is a pattern marked resolved that nothing will ever ask about
+again. Its Overpass window is sized off the pending shapes' vertices rather than their stops,
+since a shape runs past the stops it calls at, and is clipped by `config.Feed.bounds` like
+`trace`'s and `routes`'.
 
 **A licence condition travels with the data, not with the page.** `publish` stamps the
 credit into the archive's own tileset metadata, derived from `config.Feed`, so a copied

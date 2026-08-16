@@ -82,6 +82,17 @@ fi
 wayfare trace --retry transient || \
   echo "refresh: trace did not finish; the relations it missed stay pending" >&2
 
+# The rail the operator does publish a shape for, which carries no way id and so
+# cannot be shared between the services running over it. Same slot as `trace`, for
+# the same reasons, and its own line rather than a `&&`: the two make different
+# Overpass queries, so one being refused says nothing about the other.
+#
+# No `--retry`: nothing here is transient. A `transport_error` never reaches the
+# table, and `partial_cover` means the track is not mapped yet, which clearing every
+# week would re-ask a question OpenStreetMap has not changed its answer to.
+wayfare snap || \
+  echo "refresh: snap did not finish; that rail keeps drawing per pattern" >&2
+
 # The modes with no timetable at all: Great Britain's National Rail, which BODS
 # does not carry, and Northern Ireland's, which Translink's four datasets do not.
 # Same slot as `trace` and for the same reasons -- after the gate, and allowed to

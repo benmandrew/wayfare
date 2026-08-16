@@ -238,6 +238,110 @@ early return on an empty result meant it also retired nothing, so the setting wa
 and the 44 stayed live. Great Britain keeps `ROUTE_MODES` and is unaffected: it has no
 rail timetable, which is the case the stage exists for.
 
+## Shaped rail through `trace`, the Republic of Ireland, 2026-08-16
+
+The first run with `config.TRACE_OVER_SHAPE_MODES` holding `rail`, so heavy rail is
+fitted against an OpenStreetMap relation even though the National Transport Authority
+(NTA) publishes a shape for it. Feed `20260814_21a88e41`, on a copy of the server's
+database, so production was untouched. Great Britain is unaffected and was not run: its
+996 live rail patterns carry no `shape_id` at all, 905 of them being the `routes` stage's
+own, so nothing there changes hands.
+
+Work selected grows from 0 to 319 — every live shaped rail pattern in the Republic, which
+between them run four services and hold 392,939 vertices of mainline drawn over itself.
+
+| Step | Result |
+|---|---|
+| Overpass | one query over 51.65,-9.90 to 54.79,-5.74, 67 relations in 4s |
+| chaining | 51 of 67 chain cleanly, 15 break |
+| fit | ok 50 · no_stop_match 269, in 23.9s |
+| `segments` rail | 319 rows -> 269 |
+| `track_services` | 1,434 rows over 1,297 distinct ways |
+| vertices moved | 35,160 drawn per pattern become 10,950 drawn per way |
+
+50 of 319 is the honest yield and it is an OpenStreetMap coverage limit rather than a
+naming one. The names normalise and agree on both sides: the feed writes "Cork (Kent)"
+and the relation "Cork Kent", and `osm.normalise` folds both to `cork kent`. What the
+Republic's relations model is the intercity line with sparse stop members — `Cork - Dublin`
+carries four, Cork Kent, Mallow, Limerick Junction and Dublin Heuston — while the feed's
+patterns are stopping services over branches. The Cobh line's seven calling points are a
+subsequence of no relation fetched, so the pattern is refused. Great Britain's Underground
+resolved at 86.9% because a tube line and its timetabled service are the same list of
+stations, and heavy rail is where that stops being true.
+
+Nothing was lost to the 269 refusals. `build_segments` partitions on whether a cut trace
+exists rather than on whether a shape does, so a refused pattern keeps the operator's own
+recording and draws exactly as it did before. `aggregate` reports them as "319 on an
+operator shape the tracer was offered and could not fit" before the run and 269 after,
+and "have no geometry from either source" stayed 0 throughout.
+
+One thing the run found that is not this change's. Overpass answered the first attempt
+with a 504, which `wayfare trace` reported as `transport_error` and wrote no status row
+for, leaving all 319 patterns pending and the map unchanged — the retryable path working.
+The Republic's 44 relation-derived patterns were live at the time of this run and are the
+ones the section above retires; nothing here draws them either way.
+
+## `snap` against the Republic of Ireland, 2026-08-16
+
+The first run of the stage against real data. Feed `20260814_21a88e41`, on a copy of the
+server's database, so production was untouched. Great Britain and Northern Ireland were
+not run and have nothing here to run against: Great Britain's 996 live rail patterns carry
+no `shape_id` at all, 905 of them being `routes`' own, and Northern Ireland's database
+currently holds only bus and coach.
+
+Work selected is every live shaped rail pattern: 319, running 19 routes, holding 392,939
+vertices of mainline drawn as 319 polylines over each other.
+
+| Step | Result |
+|---|---|
+| Overpass | one query over 51.75,-9.80 to 54.69,-5.84, 4,901 ways in 5.2 MB |
+| index | 45,986 track segments |
+| snap | ok 319, in 149.3s |
+| covered | 100.0% of 41,418.0 km of shape, worst vertex 21.6 m off track |
+| `segments` | 359 rows → 40, every one of them tram |
+| `track_services` | 3,914 rows over 3,040 ways |
+| vertices | 392,939 drawn per pattern → 30,604 drawn per way |
+
+Every pattern resolved, which is the difference between snapping and fitting. The relation
+fit reached 50 of the same 319 four days earlier, and the two failures are unrelated: a
+relation lists the stations that define a line and the timetable lists the ones a service
+calls at, while the track under a shape is just there.
+
+Sharing at the way level: 2,357 ways carry one service, 492 carry two and 191 carry three,
+and the busiest way carries 62 patterns. The median is 1.19 ways per kilometre.
+
+**Two bugs, both found by running it rather than by reading it, and both in this stage.**
+
+*The three writes were not one transaction.* Killed between them, the run left 319 patterns
+marked `ok` against 271 `traces` rows, and the `ways` write is third so 2,436 way ids
+referenced geometry never stored — which `publish.export_track_geojsonl` joins away without
+a word. Work is selected by the absence of a `snap_status` row, so those 48 patterns were
+marked resolved for ever and would have stopped being drawn with nothing to show for it.
+`snap.commit` is now one transaction with a rollback. `match` survives two statements
+because a lost batch is reselected; nothing reselects here.
+
+*The anti-flapping hold was bounded against the wrong thing.* Holding the previous way until
+it left `SNAP_MAX_M` gave a way that had already diverged another 25 m of track it does not
+carry. The headline hid it — 319 of 319 `ok`, 100.0% covered — and the distribution did not:
+every one of the 319 reported its worst vertex in the 20–25 m band, over track with
+something inside 5 m of 99.5% of it. Each was a junction where the run should have changed
+way. `SNAP_HOLD_M` now bounds the hold at 3 m against the *nearest* way, and the same run
+returns:
+
+| worst vertex | held to `SNAP_MAX_M` | held to `SNAP_HOLD_M` |
+|---|---|---|
+| under 2 m | 0 | 1 |
+| 2–5 m | 0 | 75 |
+| 5–10 m | 0 | 107 |
+| 10–20 m | 0 | 104 |
+| 20–25 m | 319 | 32 |
+| ways found | 2,436 | 3,040 |
+| `track_services` rows | 3,136 | 3,914 |
+
+The 24.8% more ways are the ones the run was driving past. The 32 patterns still in the top
+band each hold at least one vertex genuinely that far from any mapped track, which is what
+the band is for.
+
 ## Determinism
 
 All three `art` styles are byte-identical run to run, which none of them were. Ties

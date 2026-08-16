@@ -41,6 +41,7 @@ from . import (
     osmroutes,
     publish,
     railtrips,
+    snap,
     trace,
 )
 
@@ -117,14 +118,21 @@ def _retry_arg(p: argparse.ArgumentParser, literal: str) -> None:
     )
 
 
-def _relations_args(p: argparse.ArgumentParser, cache: str, note: str = "") -> None:
+def _overpass_args(
+    p: argparse.ArgumentParser, cache: str, note: str = "", flag: str = "relations"
+) -> None:
     """Where an Overpass response is cached, and whether to ask again.
 
     A national window is a minutes-long metered query, so the body is cached and
     reused, and only `--refresh` overrides that.
+
+    `flag` because the three stages that ask Overpass do not ask it the same
+    question: `snap` wants bare railway ways where the other two want route
+    relations, so it needs its own flag over its own file. Sharing one would let
+    whichever stage ran first decide the other's coverage, silently.
     """
     p.add_argument(
-        "--relations",
+        f"--{flag}",
         type=Path,
         default=None,
         help=f"where the Overpass response is cached (default: {cache} in the data "
@@ -254,7 +262,7 @@ def _add_trace_parser(sub: _Sub) -> None:
         "route relations (the Underground, the DLR, London Trams)",
     )
     _limit_arg(p)
-    _relations_args(p, "raw/osm_relations.json")
+    _overpass_args(p, "raw/osm_relations.json")
     _retry_arg(
         p,
         "A literal status such as no_relation or chain_break is for after fixing "
@@ -265,13 +273,35 @@ def _add_trace_parser(sub: _Sub) -> None:
     )
 
 
+def _add_snap_parser(sub: _Sub) -> None:
+    p = sub.add_parser(
+        "snap",
+        help="give an operator's own rail shape the OSM way ids it does not carry, "
+        "so overlapping services share the track they run over",
+    )
+    _limit_arg(p)
+    _overpass_args(
+        p,
+        "raw/osm_track.json",
+        ". Its own file, not the ones `trace` and `routes` use: this stage asks for "
+        "bare railway ways rather than route relations",
+        flag="track",
+    )
+    _retry_arg(
+        p,
+        "A literal status such as partial_cover is for after re-querying Overpass "
+        "against better-mapped track. `ok` re-snaps what already worked, which is "
+        "what the snapper changing under a stored result calls for",
+    )
+
+
 def _add_routes_parser(sub: _Sub) -> None:
     p = sub.add_parser(
         "routes",
         help="build services from OSM route relations, for the modes with no "
         "timetable at all (Great Britain's National Rail)",
     )
-    _relations_args(
+    _overpass_args(
         p,
         "raw/osm_routes.json",
         ". Deliberately not the file `trace` uses: the two stages ask for different "
@@ -632,6 +662,19 @@ def _cmd_routes(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_snap(args: argparse.Namespace) -> int:
+    _require_db()
+    with _open() as con:
+        # Cleared before the run and never during, for the reason `trace` clears
+        # before its own: work is selected by the absence of a status row.
+        if args.retry:
+            snap.retry(con, _statuses(args.retry))
+        snap.run(con, cache=args.track, refresh=args.refresh, limit=args.limit)
+        for status, n, km, cover in snap.summary(con):
+            log.info("  %-16s n=%-6d shape=%-8.1fkm covered=%.1f%%", status, n, km, cover)
+    return 0
+
+
 def _cmd_aggregate(args: argparse.Namespace) -> int:
     with _open() as con:
         aggregate.build(con)
@@ -857,6 +900,10 @@ def _cmd_all(args: argparse.Namespace) -> int:
         return 1
 
     _tolerate("trace", "--retry", "transient")
+    # Its own `_tolerate` and not folded into `trace`'s, because the two ask Overpass
+    # different questions: one being refused says nothing about the other, and a
+    # shared handler would skip the stage that would have answered.
+    _tolerate("snap")
     _tolerate("routes")
 
     # `prune` sits between `aggregate`, which builds `segments` out of `patterns`
@@ -885,6 +932,7 @@ _SUBCOMMANDS = {
     "patterns": (_add_patterns_parser, _cmd_patterns),
     "match": (_add_match_parser, _cmd_match),
     "trace": (_add_trace_parser, _cmd_trace),
+    "snap": (_add_snap_parser, _cmd_snap),
     "routes": (_add_routes_parser, _cmd_routes),
     "aggregate": (_add_aggregate_parser, _cmd_aggregate),
     "publish": (_add_publish_parser, _cmd_publish),

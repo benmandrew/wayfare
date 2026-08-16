@@ -280,6 +280,26 @@ ROAD_MODES = frozenset({"bus", "coach"})
 # not ask for anything else behaves exactly as it did before modes existed.
 DEFAULT_MODES = ROAD_MODES
 
+# The modes `trace` fits even where the operator published a shape, so the result can
+# be inverted per way and drawn as shared track.
+#
+# The default rule is that the operator's own recording wins, because it is a survey
+# of where the *vehicle* goes and an OSM relation is a survey of where the *track*
+# is. Heavy rail is where those two are the same line: a train has no route choice
+# within a station throat, so the difference between the two is the platform approach
+# and a few metres of it. The gain on the other side is the whole point of the track
+# layer -- one polyline per pattern cannot answer which services run over a stretch,
+# and the Republic's rail is 319 shaped patterns and 392,939 vertices of mainline
+# drawn over itself.
+#
+# Tram is deliberately not here and is the reason this is a set rather than "has a
+# shape at all". A tram's shape includes street running and depot moves that no route
+# relation carries, so trading it for a relation's chain loses geometry that is
+# correct. Metro is out for the same reason at lower stakes: Great Britain's metro
+# shapes are 109 patterns against 1,885 unshaped ones already traced, so there is
+# almost nothing to win and a depot move to lose.
+TRACE_OVER_SHAPE_MODES = frozenset({"rail"})
+
 
 def route_types(modes: Iterable[str]) -> frozenset[int]:
     """The GTFS route_type values covered by a set of mode names.
@@ -439,6 +459,78 @@ def pad_and_clip(
             )
     return (south, west, north, east)
 
+
+# The share of a region's live relation patterns a `routes` run must rediscover
+# before it is allowed to retire the rest.
+#
+# The stage rewrites everything on every invocation, so the retire is what keeps a
+# withdrawn line from being drawn for ever -- and the same statement thins a region's
+# rail to a handful of lines when a run comes back nearly empty for a reason that has
+# nothing to do with OpenStreetMap. Nothing downstream can see the difference: a few
+# relations is what a truncated Overpass body looks like, and also what a country with
+# two railways looks like.
+#
+# 0.5 is deliberately loose. This is a floor under a catastrophe, not a churn budget:
+# real withdrawal is one line at a time, while a window that missed and an operator
+# gate tightened too far both take out most of the region at once.
+#
+# A run that finds *nothing* is exempt, and the exemption is the point rather than a
+# corner: `Feed.route_relations = ()` makes a region draw none on purpose, and the
+# retire it causes is what removes the second copy of every line. Only the partial
+# collapse is ambiguous, so only the partial collapse is refused.
+ROUTES_COLLAPSE_FLOOR = 0.5
+
+# --- Snapping an operator shape onto OSM track ------------------------------
+
+# `railway` values worth fetching as bare ways. `trace` reaches ways through a route
+# relation, which is the wrong instrument here: a relation covers only the track
+# somebody drew a route over, and against the Republic's rail the ways stored that
+# way cover 78.7% of the timetabled shape length, with Dublin-Belfast at 7.1% and
+# Limerick-Waterford at 3.3%. Asking for the track itself covers 100.0% within 25 m
+# and costs 7.2 MB in one request, so `snap` has its own query and its own cache.
+#
+# Narrower than `OSM_ROUTE_VALUES` on purpose, because this list is the snap target
+# rather than a discovery net: a shape must not land on a siding, a yard or a
+# disused alignment, and `service=*` track is excluded in the query for the same
+# reason. `preserved` and `construction` are absent because a train does not run on
+# them and a shape that snaps to one draws a confident line down track nobody uses.
+OSM_RAILWAY_VALUES = ("rail", "light_rail", "subway", "narrow_gauge", "tram")
+
+# How far a shape vertex may sit from the track it is snapped onto, in metres.
+# Measured rather than guessed: over the Republic's 3,000.6 km of rail shape, the
+# covered share is 99.5% at 5 m, 99.8% at 10 m and 100.0% at both 25 m and 50 m.
+# The answer barely moves across that range because a survey either follows the
+# track or is somewhere else entirely, so this is a wide margin on a decision with
+# no near miss in it rather than a threshold anything balances on.
+SNAP_MAX_M = 25.0
+
+# How much further than the nearest track the way a run is already on may sit before
+# the run switches to the nearer one, in metres.
+#
+# Hysteresis without this bound is worse than none. Holding the previous way until it
+# leaves `SNAP_MAX_M` entirely means a way that has already diverged keeps the shape
+# for another 25 m, and the first run measured exactly that: all 319 of the Republic's
+# rail patterns reported a worst vertex in the 20-25 m band, against an independent
+# measurement putting 99.5% of that same length within 5 m of *some* track. Every one
+# of those was a junction or a throat where the run should have changed way and did
+# not, and the metres went to the wrong way's service list.
+#
+# 3 m keeps the property the hold exists for -- parallel tracks a metre or two apart
+# do not make the choice flap from vertex to vertex -- while a genuine divergence
+# switches on the first vertex where the other way is meaningfully nearer.
+SNAP_HOLD_M = 3.0
+
+# The share of a shape's length that must find track within `SNAP_MAX_M` before the
+# snap is accepted. A partial cover is the dangerous outcome, not the useless one:
+# attributing the half that matched and silently dropping the half that did not
+# would report a short working over a line the service runs the length of. Refusing
+# the pattern leaves it drawn from its own shape, which is what it had before.
+SNAP_MIN_COVER = 0.98
+
+# Grid cell for the spatial index over the target track, in metres. Only a
+# performance knob -- the answer is the same at any size -- and 200 m keeps the
+# per-vertex candidate list to a handful at Irish track density.
+SNAP_GRID_M = 200.0
 
 # --- Publishing ------------------------------------------------------------
 
