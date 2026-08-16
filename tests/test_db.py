@@ -182,6 +182,8 @@ def test_the_predicates_cannot_be_called_without_a_connection():
         db.matchable()  # type: ignore[call-arg]
     with pytest.raises(TypeError):
         db.non_road()  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        db.traceable()  # type: ignore[call-arg]
 
 
 def test_an_old_database_migrates_and_then_builds(gtfs_dir: Path, legacy_db):
@@ -771,6 +773,45 @@ def test_non_road_selects_only_what_a_relation_has_to_draw(con):
     builders.insert_pattern(con, 5, mode="tram")
 
     assert _non_road_ids(con) == [4, 5]
+
+
+def test_traceable_is_non_road_widened_by_exactly_the_shaped_modes(con):
+    """The two predicates differ on one row and it is the shaped rail: `non_road`
+    decides what `build_segments` draws, `traceable` what the tracer is offered, and
+    a rail shape is offered because only a relation carries the way ids that make
+    track shared."""
+    db.set_meta(con, "feed_version", "F1")
+    builders.insert_pattern(con, 1, mode="rail")  # unshaped: both take it
+    builders.insert_pattern(con, 2, mode="rail")
+    builders.insert_pattern(con, 3, mode="tram")  # shaped, and tram is not widened
+    con.execute("UPDATE patterns SET shape_id = 'SH1' WHERE pattern_id IN (2, 3)")
+
+    ids = [
+        r[0]
+        for r in con.execute(
+            f"SELECT p.pattern_id FROM patterns p WHERE {db.traceable(con)} ORDER BY 1"
+        ).fetchall()
+    ]
+    assert _non_road_ids(con) == [1]
+    assert ids == [1, 2]
+
+
+def test_traceable_degrades_to_non_road_without_a_mode_column(legacy_db):
+    """No column means no pattern can be in `TRACE_OVER_SHAPE_MODES`, so there is
+    nothing to widen by and the widened predicate must still bind."""
+    path = legacy_db(
+        "CREATE TABLE patterns (pattern_id BIGINT, shape_id VARCHAR, last_seen VARCHAR)",
+        "CREATE TABLE meta (key VARCHAR, value VARCHAR)",
+        "INSERT INTO patterns VALUES (1, NULL, 'F1')",
+        "INSERT INTO meta VALUES ('feed_version', 'F1')",
+    )
+    con = duckdb.connect(str(path), read_only=True)
+    try:
+        assert db.traceable(con) == db.non_road(con)
+        sql = f"SELECT count(*) FROM patterns p WHERE {db.traceable(con)}"
+        assert db.scalar(con, sql) == 0
+    finally:
+        con.close()
 
 
 def test_non_road_binds_against_a_database_with_no_mode_column(legacy_db):

@@ -8,6 +8,14 @@ matchable -- there is no road under a tube tunnel -- and there is nothing in
 `shapes` to copy. Nationally that is 1,417 of 1,525 metro patterns and every one of
 the 71 DLR patterns.
 
+A second set of patterns reaches this stage with geometry already in hand.
+`config.TRACE_OVER_SHAPE_MODES` names the modes fitted even where the operator
+published a shape, because a shape carries no way ids and way ids are the whole of
+what makes track shared: the Republic's 319 rail patterns run four services and were
+drawn as 319 polylines over each other. The shape stays the fallback --
+`aggregate.build_segments` draws it for every pattern this stage does not resolve --
+so a mode joining that set can lose nothing it already had.
+
 The shape of the stage is `match`'s, deliberately, because the constraints are the
 same ones:
 
@@ -95,12 +103,15 @@ def _pending_sql(con: duckdb.DuckDBPyConnection) -> str:
     `trace_status` is a permanent cache, so work is selected by the absence of a row
     rather than by a status, and a recorded failure is never asked again.
 
-    Takes the connection because `db.non_road` does: a data root that predates
-    `patterns.mode` needs the predicate to degrade rather than fail to bind.
+    `db.traceable` rather than `db.non_road`, and the difference is heavy rail: a
+    shape normally ends the question, and rail is the exception because a relation is
+    the only source carrying way ids and way ids are what `aggregate` inverts into
+    shared track. Takes the connection because that predicate does: a data root that
+    predates `patterns.mode` needs it to degrade rather than fail to bind.
     """
     return f"""
         FROM patterns p
-        WHERE {db.non_road(con)}
+        WHERE {db.traceable(con)}
           AND NOT EXISTS (SELECT 1 FROM trace_status t WHERE t.pattern_id = p.pattern_id)
     """
 

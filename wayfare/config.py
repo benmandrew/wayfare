@@ -280,6 +280,26 @@ ROAD_MODES = frozenset({"bus", "coach"})
 # not ask for anything else behaves exactly as it did before modes existed.
 DEFAULT_MODES = ROAD_MODES
 
+# The modes `trace` fits even where the operator published a shape, so the result can
+# be inverted per way and drawn as shared track.
+#
+# The default rule is that the operator's own recording wins, because it is a survey
+# of where the *vehicle* goes and an OSM relation is a survey of where the *track*
+# is. Heavy rail is where those two are the same line: a train has no route choice
+# within a station throat, so the difference between the two is the platform approach
+# and a few metres of it. The gain on the other side is the whole point of the track
+# layer -- one polyline per pattern cannot answer which services run over a stretch,
+# and the Republic's rail is 319 shaped patterns and 392,939 vertices of mainline
+# drawn over itself.
+#
+# Tram is deliberately not here and is the reason this is a set rather than "has a
+# shape at all". A tram's shape includes street running and depot moves that no route
+# relation carries, so trading it for a relation's chain loses geometry that is
+# correct. Metro is out for the same reason at lower stakes: Great Britain's metro
+# shapes are 109 patterns against 1,885 unshaped ones already traced, so there is
+# almost nothing to win and a depot move to lose.
+TRACE_OVER_SHAPE_MODES = frozenset({"rail"})
+
 
 def route_types(modes: Iterable[str]) -> frozenset[int]:
     """The GTFS route_type values covered by a set of mode names.

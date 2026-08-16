@@ -312,6 +312,16 @@ way members chain end to end in the order the service runs them, so a pattern's 
 is a cut of that chain between its first and last calling points. Nothing is snapped, and
 there is no confidence score to fall back on.
 
+**Heavy rail is fitted even where the operator published a shape.** `db.traceable` is the
+predicate and `config.TRACE_OVER_SHAPE_MODES` is the list, holding `rail` alone. A shape is
+normally the better of the two recordings, being a survey of where the vehicle goes against
+a relation's survey of where the track is, and it stays the better one for a tram with
+street running and a depot. What it cannot do is carry way ids, and way ids are what
+`aggregate` inverts into shared track: the Republic's 363 rail patterns run four services,
+and 319 of them were 392,939 vertices of mainline drawn over itself. The shape is kept as
+the fallback rather than replaced, so a line whose relation is unmapped or does not chain
+draws exactly as it did before and loses only the sharing.
+
 **Overpass rather than the OpenStreetMap application programming interface (API), because
 the stage has to discover relations over an area.** Nothing in a timetable carries a
 relation id. One request per run is enough: `out body geom` inlines every member way's
@@ -500,13 +510,22 @@ carrying both a tube line and a National Rail service is two features and is dra
 `n_trips` sums to NULL rather than zero where no timetable has been attributed, because
 zero trips a week and an unknown number are different claims.
 
-**The two arms partition on `traces.ways_cut`, and a pattern in both is drawn twice.** A
-trace cut to its own pattern is inverted per way. A trace holding the whole line's chain
-keeps its polyline in `segments`, because inverting it would attribute a short working to
-track it never reaches, until `wayfare trace --retry ok` re-cuts it. Nothing recoverable
-tells the two apart once the polyline is stored, which is why the column exists. What a
-pattern in both arms looks like is a hover on a National Rail way answering with one
-relation's card rather than the way's service list.
+**The two arms partition on whether a cut trace exists, and a pattern in both is drawn
+twice.** A trace cut to its own pattern is inverted per way. A trace holding the whole
+line's chain keeps its polyline in `segments`, because inverting it would attribute a short
+working to track it never reaches, until `wayfare trace --retry ok` re-cuts it.
+`traces.ways_cut` is what tells the two apart, since nothing recoverable does once the
+polyline is stored. What a pattern in both arms looks like is a hover on a National Rail way
+answering with one relation's card rather than the way's service list.
+
+**The shape arm is a fallback and not a claim, which is why it tests the trace.** A mode in
+`config.TRACE_OVER_SHAPE_MODES` carries both a shape and a cut trace, so a `shape_id` says
+nothing about which layer draws the pattern and only the trace does. Every pattern the
+tracer did not resolve is drawn from the operator's own recording exactly as before, which
+is what makes adding a mode to that set unable to take a line off the map. The log line
+counts them: "on an operator shape the tracer was offered and could not fit" is the share
+of a mode still drawn one polyline per pattern, and a mode whose relations are unmapped
+appears there in full rather than as track that never arrived.
 
 **What goes wrong.** Every fault here recovers by running `wayfare aggregate` again. The
 stage is a full recomputation — three DELETEs and three `INSERT ... SELECT`s over

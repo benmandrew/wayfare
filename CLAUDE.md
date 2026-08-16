@@ -213,6 +213,18 @@ on a National Rail way answering with one relation's card rather than the way's 
 list. `mode` is in the track key, so a way carrying two networks is two features and is
 drawn twice on purpose.
 
+**A `shape_id` no longer says which of the two draws a pattern.** `config.TRACE_OVER_SHAPE_MODES`
+names the modes `trace` fits even where the operator published a shape, and it holds `rail`
+alone: a shape carries no way ids, way ids are the whole of what makes track shared, and
+the Republic's rail is 319 patterns running four services drawn as 319 polylines over each
+other. Tram is out and is the reason this is a set rather than a rule about shapes — street
+running and depot moves are in a tram's shape and in no route relation, so trading one for
+the other loses geometry that is correct. So `build_segments` tests for a cut trace rather
+than for a shape, which is also what makes the shape a fallback: a relation that is unmapped
+or does not chain costs the sharing and never the line. Widen that set and the count to read
+is `aggregate`'s "on an operator shape the tracer was offered and could not fit", which is
+the share of a mode still drawn one polyline per pattern.
+
 **A licence condition travels with the data, not with the page.** `publish` stamps the
 credit into the archive's own tileset metadata, derived from `config.Feed`, so a copied
 archive keeps it, and the viewer shows the credits of every archive it loads together

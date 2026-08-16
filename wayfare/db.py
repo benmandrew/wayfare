@@ -413,6 +413,10 @@ def non_road(con: duckdb.DuckDBPyConnection, alias: str = "p") -> str:
     anything reassembled from OpenStreetMap -- it is a survey of where the vehicle
     goes rather than of where the track is.
 
+    This is the predicate that decides what `build_segments` *draws*. What `trace` is
+    *offered* is :func:`traceable`, which is this with the last condition widened, and
+    the two differ by exactly the modes fitted against OpenStreetMap anyway.
+
     `con` is required for the reason :func:`matchable` requires one.
     """
     return (
@@ -434,6 +438,29 @@ HAVERSINE_SQL = """
       * pow(sin(radians({lon2} - {lon1}) / 2), 2)
     ))
 """
+
+
+def traceable(con: duckdb.DuckDBPyConnection, alias: str = "p") -> str:
+    """The live patterns `trace` is offered, which is :func:`non_road` widened.
+
+    The widening is the whole of the difference, and it is the last condition alone.
+    A `shape_id` normally settles the matter, for the reason `non_road` gives. The
+    exception is `config.TRACE_OVER_SHAPE_MODES`, where the relation's chain is worth
+    fitting even against a shape, because only the relation carries way ids and only
+    way ids can be inverted into shared track. The shape is not thrown away:
+    `build_segments` falls back to it for every pattern the tracer does not resolve,
+    so a line whose relation is unmapped draws exactly as it always did.
+
+    On a database with no `mode` column this *is* `non_road`, and not by accident:
+    without the column no pattern can be in the set, so there is nothing to widen by.
+    """
+    if "mode" not in columns(con, "patterns"):
+        return non_road(con, alias)
+    over = ", ".join(f"'{m}'" for m in sorted(config.TRACE_OVER_SHAPE_MODES))
+    return (
+        f"{current_feed(alias)} AND NOT {matchable(con, alias)} "
+        f"AND ({alias}.shape_id IS NULL OR {alias}.mode IN ({over}))"
+    )
 
 
 def connect(path: Path | None = None, read_only: bool = False) -> duckdb.DuckDBPyConnection:

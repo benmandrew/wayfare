@@ -558,13 +558,41 @@ def test_a_trace_is_drawn_per_way_rather_than_per_pattern(rail_con) -> None:
 
 
 def test_an_operator_shape_beats_a_relation(con, gtfs_dir) -> None:
-    """`trace` never selects a pattern that has a shape, so the two cannot collide --
-    and `segments` keeps its one row per pattern."""
+    """The default rule, and the one `config.TRACE_OVER_SHAPE_MODES` is the exception
+    to. A tram's shape includes street running and depot moves no relation carries, so
+    the pattern is never offered to the tracer and `segments` keeps its one row."""
     gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB", modes=frozenset({"bus", "rail"}))
-    con.execute("UPDATE patterns SET shape_id = 'SH1' WHERE mode = 'rail'")
+    con.execute("UPDATE patterns SET mode = 'tram', shape_id = 'SH1' WHERE mode = 'rail'")
     assert trace.pending_count(con) == 0
     aggregate.build(con)
     assert db.scalar(con, "SELECT count(*) FROM segments") == 1
+
+
+def test_shaped_rail_is_traced_anyway_so_its_track_can_be_shared(rail_con) -> None:
+    """A shape carries no way ids, and way ids are the whole of what makes track
+    shared: the Republic's 319 rail patterns run four services and were drawn as 319
+    polylines over each other. Rail is fitted even with a shape in hand."""
+    rail_con.execute("UPDATE patterns SET shape_id = 'SH1' WHERE mode = 'rail'")
+    assert trace.pending_count(rail_con) == 1
+    assert trace.run(rail_con, relations=osm.parse(_rail_relation())) == {"ok": 1}
+    aggregate.build(rail_con)
+    # Once, per way. The shape must not also be drawn, or the track is painted over
+    # itself and the viewer's hover lands on the polyline rather than the way.
+    assert db.scalar(rail_con, "SELECT count(*) FROM segments") == 0
+    rows = rail_con.execute("SELECT way_id FROM track_services ORDER BY way_id").fetchall()
+    assert [r[0] for r in rows] == [201, 202]
+
+
+def test_shaped_rail_the_tracer_cannot_fit_keeps_its_shape(rail_con) -> None:
+    """What makes widening `config.TRACE_OVER_SHAPE_MODES` unable to take a line off
+    the map. An unmapped relation costs the sharing and nothing else: `build_segments`
+    partitions on whether a cut trace exists, not on whether a shape does."""
+    rail_con.execute("UPDATE patterns SET shape_id = 'SH1' WHERE mode = 'rail'")
+    trace.run(rail_con, relations=[])
+    assert db.scalar(rail_con, "SELECT status FROM trace_status") == "no_relation"
+    aggregate.build(rail_con)
+    assert db.scalar(rail_con, "SELECT count(*) FROM segments") == 1
+    assert db.scalar(rail_con, "SELECT count(*) FROM track_services") == 0
 
 
 def test_a_traced_archive_owes_openstreetmap_for_its_track(rail_con) -> None:

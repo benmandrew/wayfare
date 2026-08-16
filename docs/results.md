@@ -238,6 +238,49 @@ early return on an empty result meant it also retired nothing, so the setting wa
 and the 44 stayed live. Great Britain keeps `ROUTE_MODES` and is unaffected: it has no
 rail timetable, which is the case the stage exists for.
 
+## Shaped rail through `trace`, the Republic of Ireland, 2026-08-16
+
+The first run with `config.TRACE_OVER_SHAPE_MODES` holding `rail`, so heavy rail is
+fitted against an OpenStreetMap relation even though the National Transport Authority
+(NTA) publishes a shape for it. Feed `20260814_21a88e41`, on a copy of the server's
+database, so production was untouched. Great Britain is unaffected and was not run: its
+996 live rail patterns carry no `shape_id` at all, 905 of them being the `routes` stage's
+own, so nothing there changes hands.
+
+Work selected grows from 0 to 319 — every live shaped rail pattern in the Republic, which
+between them run four services and hold 392,939 vertices of mainline drawn over itself.
+
+| Step | Result |
+|---|---|
+| Overpass | one query over 51.65,-9.90 to 54.79,-5.74, 67 relations in 4s |
+| chaining | 51 of 67 chain cleanly, 15 break |
+| fit | ok 50 · no_stop_match 269, in 23.9s |
+| `segments` rail | 319 rows -> 269 |
+| `track_services` | 1,434 rows over 1,297 distinct ways |
+| vertices moved | 35,160 drawn per pattern become 10,950 drawn per way |
+
+50 of 319 is the honest yield and it is an OpenStreetMap coverage limit rather than a
+naming one. The names normalise and agree on both sides: the feed writes "Cork (Kent)"
+and the relation "Cork Kent", and `osm.normalise` folds both to `cork kent`. What the
+Republic's relations model is the intercity line with sparse stop members — `Cork - Dublin`
+carries four, Cork Kent, Mallow, Limerick Junction and Dublin Heuston — while the feed's
+patterns are stopping services over branches. The Cobh line's seven calling points are a
+subsequence of no relation fetched, so the pattern is refused. Great Britain's Underground
+resolved at 86.9% because a tube line and its timetabled service are the same list of
+stations, and heavy rail is where that stops being true.
+
+Nothing was lost to the 269 refusals. `build_segments` partitions on whether a cut trace
+exists rather than on whether a shape does, so a refused pattern keeps the operator's own
+recording and draws exactly as it did before. `aggregate` reports them as "319 on an
+operator shape the tracer was offered and could not fit" before the run and 269 after,
+and "have no geometry from either source" stayed 0 throughout.
+
+One thing the run found that is not this change's. Overpass answered the first attempt
+with a 504, which `wayfare trace` reported as `transport_error` and wrote no status row
+for, leaving all 319 patterns pending and the map unchanged — the retryable path working.
+The Republic's 44 relation-derived patterns were live at the time of this run and are the
+ones the section above retires; nothing here draws them either way.
+
 ## Determinism
 
 All three `art` styles are byte-identical run to run, which none of them were. Ties
