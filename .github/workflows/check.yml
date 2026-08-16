@@ -140,6 +140,19 @@ jobs:
         name: lint (dockerfile)
         run: nix develop --command hadolint Dockerfile
 
+      # Relative paths in the markdown, which is all of what there is to check: no
+      # external URL in this repo is a link rather than a code span, so `--offline`
+      # costs nothing and keeps a green check from depending on a third party being
+      # up. Scoped to tracked files so it never walks `.venv` or `web/vendor`.
+      # `xargs -0` rather than an unquoted `$(git ls-files)`, which is a word split
+      # actionlint refuses through shellcheck's SC2046 -- it caught this step on the
+      # commit that added it.
+      - if: ${{ !cancelled() }}
+        name: lint (links)
+        run: >-
+          git ls-files -z '*.md' | xargs -0
+          nix develop --command lychee --offline --no-progress
+
       - if: ${{ !cancelled() }}
         name: types
         run: nix develop --command mypy

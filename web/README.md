@@ -184,7 +184,7 @@ The picture:
 - `scale` — 0.1 to 4.0. Ignored for SVG, which is resolution independent.
 - `hue` — 0 to 1. `line_scale` and `alpha_scale` — 0.05 to 8.
 - `caption` — up to 120 characters. `background` — `#rrggbb`, or three 0-1 floats as
-  `r,g,b`, which is the form [`art.STYLES`](../wayfare/art.py) holds so a background
+  `r,g,b`, which is the form [`art.STYLES`](../wayfare/art/styles.py) holds so a background
   copied out of a style pastes straight in.
 - `credit` — a valueless flag that draws the data credit into the corner. Every render
   carries it in its file metadata regardless.
@@ -243,7 +243,7 @@ one request here that costs real CPU.
 
 [`art.html`](art.html) is the page for iterating on a design, at
 http://localhost:8099/art.html. It builds its controls from `/art/meta`, so a style added in
-[`art.py`](../wayfare/art.py) appears in the interface with no change to the HTML. A cheap
+[`styles.py`](../wayfare/art/styles.py) appears in the interface with no change to the HTML. A cheap
 preview width is a separate control from the export width, requests are debounced as a
 slider moves, and a newer one supersedes whatever is in flight. The whole parameter set
 lives in the URL hash, so a design is a shareable link, and [`index.html`](index.html)

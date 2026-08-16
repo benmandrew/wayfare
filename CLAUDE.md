@@ -315,6 +315,12 @@ path, no version, or the byte-identical tests are a fiction.
   `hadolint` covers the Dockerfile, whose only other check is a 15-minute image build on a
   push to main. [`.hadolint.yaml`](.hadolint.yaml) turns off the version-pinning
   advisories and says why.
+- `lychee` checks the markdown's links, and every one of them is a relative path into
+  this repo — no external URL here is a link rather than a code span, so it runs
+  `--offline` and a green check never depends on a third party being up. What it is
+  for is prose that points into source: `wayfare/art.py` became a package and four
+  documents went on pointing at the file, because a stale relative link reports
+  nothing until somebody clicks it.
 - The dev environment is the nix flake and nothing else. direnv enters it (`.envrc` is
   `use flake` plus `dotenv_if_exists .env`, the same file Compose reads); `nix develop`
   is the same shell without direnv. It supplies Python 3.12, uv, cairo, pkg-config,

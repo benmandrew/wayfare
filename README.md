@@ -125,7 +125,7 @@ Each stage reads what the last one wrote, and each re-runs on its own.
   Non-road geometry goes into `segments`, which is how a tram or a ferry gets drawn.
 - **publish** ([`publish.py`](wayfare/publish.py)). One GeoJSON feature per line, then
   tippecanoe. Three tile layers come out: the banded road layer, `segments` and `track`.
-- **art** ([`art.py`](wayfare/art.py)). A bounding box or named preset to PNG or SVG, in one
+- **art** ([`art/`](wayfare/art/)). A bounding box or named preset to PNG or SVG, in one
   of three styles: `density`, `spectrum` or `strands`. A PNG is drawn in horizontal bands,
   one process per core (`--workers`, or `WAYFARE_RENDER_WORKERS` for a deployment).
 

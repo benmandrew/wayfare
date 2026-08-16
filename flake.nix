@@ -58,6 +58,12 @@
             # shell slip in a `RUN` is expensive to find. `.hadolint.yaml` is the
             # configuration.
             pkgs.hadolint
+            # Every link in the markdown is a relative path into this repo -- the
+            # prose links into source constantly, and no external URL is a link
+            # rather than a code span. Those paths rot on a refactor with nothing
+            # to say so: `wayfare/art.py` became a package and four documents kept
+            # pointing at the file for as long as nobody clicked.
+            pkgs.lychee
           ];
 
           # buildInputs rather than nativeBuildInputs so the linker wrapper adds
