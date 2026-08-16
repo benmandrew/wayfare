@@ -5,33 +5,16 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Wayfare studio — generative renders</title>
 <link rel="stylesheet" href="vendor/maplibre-gl.css">
+<!-- The palette and the panel chrome, shared with index.html. Linked before the
+     page's own rules, so those still win. -->
+<link rel="stylesheet" href="base.css">
+<!-- Up here, and blocking, for the one line under it: the theme has to be on the
+     document before the first paint. Applied at the foot of the body, behind the
+     803 KB vendored library, a reader who chose dark got a screenful of white
+     while it parsed. -->
+<script src="util.js"></script>
+<script>bootTheme();</script>
 <style>
-:root {
-  --bg:        #ffffff;
-  --panel:     rgba(255,255,255,.94);
-  --border:    #dcdfe4;
-  --text:      #16181d;
-  --muted:     #6b7280;
-  --chip-bg:   #eef1f5;
-  --chip-text: #2b3440;
-  --accent:    #d64512;
-  --shadow:    0 1px 2px rgba(16,24,40,.06), 0 8px 24px rgba(16,24,40,.10);
-  --radius:    8px;
-}
-[data-theme="dark"] {
-  --bg:        #0d1014;
-  --panel:     rgba(20,24,30,.92);
-  --border:    #2b323c;
-  --text:      #e8ecf1;
-  --muted:     #8b949e;
-  --chip-bg:   #232a33;
-  --chip-text: #d7dee7;
-  --accent:    #ffd15c;
-  --shadow:    0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.45);
-}
-
-* { box-sizing: border-box; }
-html, body { height: 100%; margin: 0; }
 body {
   font: 13px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   color: var(--text);
@@ -39,40 +22,9 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* --- panel chrome (as the viewer) --- */
-.panel {
-  background: var(--panel);
-  backdrop-filter: blur(8px);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow);
-}
-
-h1 { margin: 0; font-size: 13px; font-weight: 600; letter-spacing: .02em; }
-.sub { color: var(--muted); font-size: 11.5px; margin-top: 2px; }
-.head { padding: 10px 12px; display: flex; align-items: flex-start; gap: 8px; flex-wrap: wrap; }
-/* The floor on the title column is what forces the wrap on a narrow panel rather
-   than a strapline one word wide. */
-.head > div { flex: 1; min-width: 110px; }
-
-.btn {
-  font: inherit;
-  font-size: 11.5px;
-  color: var(--muted);
-  background: none;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 3px 7px;
-  cursor: pointer;
-  white-space: nowrap;
-}
-/* Guarded, as the viewer's is: a touchscreen fakes a hover on tap and then holds
-   it, which leaves every button anyone has pressed lit. */
-@media (hover: hover) {
-  .btn:hover { color: var(--text); border-color: var(--muted); }
-}
-.btn:active { color: var(--text); border-color: var(--muted); }
-a.btn { text-decoration: none; }
+/* An export the server would refuse. `pointer-events` stops the click and does
+   nothing to a keyboard, so the link leaves the tab order as well -- see
+   `exports`, which sets both. */
 .btn[aria-disabled="true"] { opacity: .45; pointer-events: none; }
 
 /* A control the current style ignores. Dimmed rather than hidden, so it is clear
@@ -80,11 +32,6 @@ a.btn { text-decoration: none; }
 .dim { opacity: .45; }
 /* Names one control inside a section, where .label names the section itself. */
 .sublabel { display: block; color: var(--muted); font-size: 11.5px; margin-bottom: 3px; }
-
-.meta { color: var(--muted); font-size: 11.5px; }
-.meta b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
-.note { color: var(--muted); font-size: 11px; margin-top: 8px; font-style: italic; }
-[hidden] { display: none !important; }
 
 /* --- studio layout: controls beside a stage --- */
 /* `dvh` for the same reason the viewer uses it: a phone's percentage height is
@@ -131,7 +78,7 @@ a.btn { text-decoration: none; }
 }
 .inp:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
 .inp::placeholder { color: var(--muted); }
-.inp.mono { font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.inp.mono { font: 12px/1.4 var(--mono); }
 
 /* Styles and formats: a radio each, drawn as a stack of pickable rows. */
 .pick { position: relative; display: block; cursor: pointer; border-radius: 6px; padding: 5px 7px; }
@@ -139,6 +86,11 @@ a.btn { text-decoration: none; }
   .pick:hover { background: var(--chip-bg); }
 }
 .pick input { position: absolute; opacity: 0; pointer-events: none; }
+/* The radio is invisible, so the row it names has to carry the ring the browser
+   would have drawn around it. Without this, tabbing through the styles or the
+   formats moves a focus nobody can see, and the arrow keys that then change the
+   selection look like the page choosing for itself. */
+.pick:focus-within { outline: 2px solid var(--accent); outline-offset: -1px; }
 .pick .name { font-weight: 600; }
 .blurb { color: var(--muted); font-size: 11.5px; font-weight: 400; }
 .pick.on { background: var(--chip-bg); box-shadow: inset 2px 0 0 var(--accent); }
@@ -151,7 +103,7 @@ a.btn { text-decoration: none; }
 .slider { display: flex; align-items: baseline; gap: 8px; }
 .slider label { flex: 1; min-width: 0; }
 .slider output {
-  font: 500 11.5px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 500 11.5px/1 var(--mono);
   color: var(--text);
   font-variant-numeric: tabular-nums;
 }
@@ -164,7 +116,6 @@ input[type=color] {
   cursor: pointer;
 }
 .row { display: flex; align-items: center; gap: 6px; }
-.row .inp { flex: 1; }
 
 /* --- the window picker --- */
 /* No fixed aspect and no drawn rectangle: the frame *is* the window, so the
@@ -236,14 +187,14 @@ input[type=color] {
 .banner.bad { border-color: var(--accent); }
 .banner.bad .what { color: var(--accent); font-weight: 600; }
 .banner pre {
-  font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 12px/1.6 var(--mono);
   background: var(--chip-bg); color: var(--chip-text);
   padding: 9px 11px; border-radius: 6px; margin: 8px 0 0; overflow-x: auto;
 }
 .empty { color: var(--muted); text-align: center; max-width: 420px; }
 .empty h2 { font-size: 15px; margin: 0 0 8px; color: var(--text); }
 .empty code {
-  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 12px/1.5 var(--mono);
   background: var(--chip-bg); color: var(--chip-text);
   padding: 1px 5px; border-radius: 4px;
 }
@@ -253,7 +204,7 @@ input[type=color] {
    column of knobs and pinching back out to see what they did. The rest is hit
    area: a 22px button is a target a thumb misses. */
 @media (pointer: coarse) {
-  .inp, input[type=number] { font-size: 16px; }
+  .inp { font-size: 16px; }
   .btn { padding: 7px 10px; font-size: 12.5px; }
   .pick { padding: 8px 9px; }
   input[type=color] { width: 52px; height: 34px; }
@@ -314,7 +265,7 @@ input[type=color] {
         <div class="sub" id="sub">Renders drawn where the data lives</div>
       </div>
       <a class="btn" href="index.html" title="Back to the map">Map</a>
-      <button class="btn" id="theme" title="Toggle light/dark">Dark</button>
+      <button class="btn" id="theme" title="Toggle light/dark" aria-label="Toggle light or dark theme">Dark</button>
     </div>
   </div>
 
@@ -333,7 +284,7 @@ input[type=color] {
             the shape that is drawn.</div>
         </div>
         <div class="row" style="margin-top:7px">
-          <button class="btn" id="pickToggle" aria-expanded="true">Hide the map</button>
+          <button class="btn" id="pickToggle" aria-expanded="true" aria-controls="pickwrap">Hide the map</button>
         </div>
       </div>
       <div class="field">
@@ -454,17 +405,22 @@ input[type=color] {
 </aside>
 
 <main class="stage">
+  <!-- An error interrupts; a warning is a render that drew and probably drew the
+       wrong window, which is worth reading at the next pause and not mid-word. -->
   <div class="panel banner bad" id="err" hidden role="alert"></div>
-  <div class="panel banner" id="warn" hidden></div>
+  <div class="panel banner" id="warn" hidden role="status"></div>
 
   <div class="panel frame" id="frame">
     <img id="shot" alt="The current render" hidden>
     <div class="empty" id="empty">Loading…</div>
   </div>
 
+  <!-- The size, the weight and the time a render took are written here after
+       every draw, and the picture they describe is not something a screen reader
+       can report. Polite, because they land in the middle of turning a knob. -->
   <div class="panel status">
-    <div class="grow meta" id="stat"></div>
-    <div class="meta" id="busy" hidden><span class="dot"></span>rendering…</div>
+    <div class="grow meta" id="stat" role="status" aria-live="polite"></div>
+    <div class="meta" id="busy" hidden aria-live="polite"><span class="dot"></span>rendering…</div>
     <button class="btn" id="again" title="Fetch it again, past the browser cache">Refresh</button>
   </div>
 </main>
@@ -481,8 +437,6 @@ input[type=color] {
 <script src="credits.js"></script>
 <script>
 "use strict";
-
-const $ = (id) => document.getElementById(id);
 
 // The knobs whose bounds the server does not publish. /art/meta carries the
 // defaults and the scale ceiling, but not these ranges, so they are named once
@@ -526,26 +480,29 @@ const MEANS = {
   },
 };
 
-const DEBOUNCE_MS = 300;
-
 let META = null;
 let S = null;            // the whole parameter set; the hash is its serialisation
 let controller = null;   // in-flight preview request
-let timer = null;
 let objectURL = null;    // currently displayed blob URL
 let lastHash = null;     // what we wrote, so our own writes are not read back
 
+// A knob comes to rest before it is drawn. 300 ms is long enough to swallow a
+// drag and short enough that a single click of a stepper feels answered.
+//
+// `render` cancels it rather than sharing a timer id, because a render asked for
+// directly -- the Refresh button, a design pasted into the address bar -- must not
+// be followed moments later by the one it superseded.
+const DEBOUNCE_MS = 300;
+const scheduleRender = debounce(() => render(), DEBOUNCE_MS);
+
 /* ---------- theme (shared with the viewer through localStorage) ---------- */
 
-let theme = localStorage.getItem("wayfare-theme")
-  || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-document.documentElement.dataset.theme = theme;
-$("theme").textContent = theme === "dark" ? "Light" : "Dark";
+// `bootTheme` has already run, in <head>, so the page is drawn in the right
+// theme rather than repainted into it. What is left is the button, which does not
+// exist until the body is parsed.
+$("theme").textContent = themeLabel();
 $("theme").addEventListener("click", () => {
-  theme = theme === "dark" ? "light" : "dark";
-  localStorage.setItem("wayfare-theme", theme);
-  document.documentElement.dataset.theme = theme;
-  $("theme").textContent = theme === "dark" ? "Light" : "Dark";
+  toggleTheme($("theme"));
   repaintPicker();
 });
 
@@ -680,6 +637,41 @@ function refit() {
   $("previewWidthOut").textContent = w + " px";
 }
 
+// Every knob a design is made of, named once, because three things read the same
+// list: `toHash` writes them into the fragment, `fromHash` reads them back out of
+// it, and `query` sends them to the renderer. Three hand-written lists is a knob
+// that can be added to two of them, and a link that then renders as a different
+// picture from the page that wrote it.
+//
+//   read  how a value comes back off a URL. `text` is taken as written; `num`
+//         only when the string is a number, so `hue=nonsense` leaves the default
+//         standing rather than painting with NaN.
+//   send  the parameter /art reads it as, or null for a knob no render takes:
+//         `format`, `width` and `scale` differ between the preview and each
+//         download, so they are set per request instead.
+//   when  whether this render carries it at all. Absent means always. What is
+//         left out matters, because every parameter sent reaches the server's
+//         cache key: a density picture carrying a grouping it ignores is a second
+//         cache entry for one image, and `group=way` over a city is then refused
+//         for a picture that would never have used it.
+//   fmt   how it is written into a request. `trim` is what keeps 0.30000000000004
+//         out of a shared URL.
+const PARAMS = [
+  { key: "style",       read: "text", send: "style" },
+  { key: "weight",      read: "text", send: "weight" },
+  { key: "group",       read: "text", send: "group", when: () => grouped() },
+  { key: "order",       read: "text", send: "order", when: () => grouped() },
+  { key: "caption",     read: "text", send: "caption", when: (s) => !!s.caption },
+  { key: "background",  read: "text", send: "background", when: (s) => !!s.background },
+  { key: "format",      read: "text", send: null },
+  { key: "hue",         read: "num",  send: "hue", fmt: trim },
+  { key: "line_scale",  read: "num",  send: "line_scale", fmt: trim },
+  { key: "alpha_scale", read: "num",  send: "alpha_scale", fmt: trim },
+  { key: "scale",       read: "num",  send: null },
+  { key: "width",       read: "num",  send: null },
+  { key: "min_trips",   read: "num",  send: "min_trips", when: (s) => !!s.min_trips },
+];
+
 function defaults() {
   const d = META.defaults;
   // A city opens in a second or so; `uk` is the slowest window there is, and
@@ -703,11 +695,16 @@ function defaults() {
     alpha_scale: d.alpha_scale,
     scale: d.scale,
     width: d.width,
-    // The stage is what has to hold it, not the export -- so it is measured, not
-    // guessed at from the viewport. `previewWidthAuto` records that nobody chose
-    // it, which is what lets a resized window re-fit and keeps the number out of
-    // a shared link.
-    previewWidth: fitWidth(),
+    // Measured by the `refit` that follows every call of this, and not here: the
+    // stage is what has to hold the picture, `fitWidth` reads the stage's box out
+    // of the layout, and `toHash` asks for the defaults on its way to writing the
+    // URL -- so a measurement here is a forced layout behind every keystroke and
+    // every slider tick. Zero is a width nothing is ever drawn at, because
+    // `refit` replaces it first, and it leaves the 5% guard there seeing a change
+    // however small the stage is.
+    previewWidth: 0,
+    // Records that nobody chose the width, which is what lets a resized window
+    // re-fit and keeps the number out of a shared link.
     previewWidthAuto: true,
     caption: "",
     credit: false,
@@ -722,10 +719,8 @@ function toHash(s) {
   const d = defaults();
   const p = new URLSearchParams();
   if (s.area) p.set("area", s.area); else p.set("bbox", s.bbox);
-  for (const k of ["style", "hue", "line_scale", "alpha_scale", "scale",
-                   "width", "caption", "background", "format",
-                   "weight", "group", "order", "min_trips"]) {
-    if (String(s[k]) !== String(d[k])) p.set(k, String(s[k]));
+  for (const { key } of PARAMS) {
+    if (String(s[key]) !== String(d[key])) p.set(key, String(s[key]));
   }
   // An automatic preview width is the sender's stage, not a decision, and putting
   // it in the link would reopen the page at whatever size their screen happened to
@@ -752,12 +747,10 @@ function fromHash(base) {
     // back to a window instead of trusting the hash.
     if (META.presets[name]) { s.area = name; s.bbox = fmtBbox(META.presets[name]); }
   }
-  for (const k of ["style", "caption", "background", "format",
-                   "weight", "group", "order"]) {
-    if (p.has(k)) s[k] = p.get(k);
-  }
-  for (const k of ["hue", "line_scale", "alpha_scale", "scale", "width", "min_trips"]) {
-    if (p.has(k) && Number.isFinite(Number(p.get(k)))) s[k] = Number(p.get(k));
+  for (const { key, read } of PARAMS) {
+    if (!p.has(key)) continue;
+    if (read === "text") s[key] = p.get(key);
+    else if (Number.isFinite(Number(p.get(key)))) s[key] = Number(p.get(key));
   }
   // A width in the link is one somebody typed, so it wins over the fitted one and
   // stops the stage re-fitting it -- the counterpart of the rule in toHash.
@@ -797,11 +790,35 @@ function writeHash() {
 addEventListener("hashchange", () => {
   if (!META || location.hash.replace(/^#/, "") === lastHash) return;
   S = fromHash(defaults());
+  refit(); // the defaults carry no preview width; the stage is what decides it
   apply();
   render();
 });
 
 /* ---------- controls ---------- */
+
+// One control, one key of the state: read the widget, write the key, push the
+// whole state back into every widget, and draw. Eight of the fourteen controls
+// are exactly this, and the `apply()` is the part worth having in one place -- a
+// control that skips it changes the picture and leaves the panel beside it
+// describing the design it replaced.
+//
+// `read` says what the widget means. Two of the ids are containers rather than
+// controls, because a stack of radios is one choice, so it is handed the event as
+// well: the control that changed is whichever radio inside it did.
+const bind = (id, key, read) =>
+  $(id).addEventListener("change", (e) => {
+    S[key] = read($(id), e);
+    apply();
+    changed();
+  });
+
+const value = (el) => el.value;
+const checked = (el) => el.checked;
+const picked = (el, e) => e.target.value;
+// Sorted, so two orders of one choice are one URL and one cached render, which
+// is what the endpoint does with a filter as well.
+const chosen = (el) => [...el.selectedOptions].map((o) => o.value).sort();
 
 function build() {
   $("styles").innerHTML = META.styles.map((st) => `
@@ -811,11 +828,7 @@ function build() {
       <div class="blurb">${escapeHtml(st.blurb)}${
         st.needs_groups ? " · draws one ribbon per group" : ""}</div>
     </label>`).join("");
-  $("styles").addEventListener("change", (e) => {
-    S.style = e.target.value;
-    apply();
-    changed();
-  });
+  bind("styles", "style", picked);
 
   const names = Object.keys(META.presets).sort();
   $("preset").innerHTML =
@@ -846,11 +859,7 @@ function build() {
     $(id).innerHTML = vocabulary(name)
       .map((v) => `<option value="${escapeHtml(v)}">${escapeHtml(label(v))}</option>`)
       .join("");
-    $(id).addEventListener("change", () => {
-      S[id] = $(id).value;
-      apply();
-      changed();
-    });
+    bind(id, id, value);
   }
 
   // The filter menus hold what this database actually holds. A server that could not
@@ -860,11 +869,7 @@ function build() {
   fillOptions($("operator"), d.operators || []);
   fillOptions($("class"), d.road_classes || []);
   for (const [id, key] of [["operator", "operator"], ["class", "roadClass"]]) {
-    $(id).addEventListener("change", () => {
-      S[key] = [...$(id).selectedOptions].map((o) => o.value).sort();
-      apply();
-      changed();
-    });
+    bind(id, key, chosen);
   }
   $("filterReset").addEventListener("click", () => {
     S.operator = [];
@@ -916,11 +921,7 @@ function build() {
       <span class="name">${name.toUpperCase()}</span>
     </label>`;
   }).join("");
-  $("formats").addEventListener("change", (e) => {
-    S.format = e.target.value;
-    apply();
-    changed();
-  });
+  bind("formats", "format", picked);
 
   $("background").addEventListener("input", () => {
     S.background = $("background").value;
@@ -937,11 +938,7 @@ function build() {
     changed();
   });
 
-  $("credit").addEventListener("change", () => {
-    S.credit = $("credit").checked;
-    apply();
-    changed();
-  });
+  bind("credit", "credit", checked);
 
   for (const id of ["width", "previewWidth"]) {
     $(id).max = META.limits.max_width;
@@ -973,15 +970,14 @@ function build() {
 // automatic width follows it -- debounced, because a drag of the window edge is
 // dozens of resize events and each one would be a render.
 function watchStage() {
-  let pending = null;
+  const refitStage = debounce(() => {
+    const before = S.previewWidth;
+    refit();
+    if (S.previewWidth !== before) render();
+  }, 250);
   addEventListener("resize", () => {
     if (!S || !S.previewWidthAuto) return;
-    clearTimeout(pending);
-    pending = setTimeout(() => {
-      const before = S.previewWidth;
-      refit();
-      if (S.previewWidth !== before) render();
-    }, 250);
+    refitStage();
   });
 }
 
@@ -1031,11 +1027,10 @@ function applyQuery() {
   // Grouping is meaningless to a style that paints every road at once. Dimmed and
   // disabled rather than dropped from the request silently: the knob is real, and
   // which style would use it is the useful thing to say.
-  const grouped = !!styleSpec().needs_groups;
-  $("grouping").classList.toggle("dim", !grouped);
-  $("group").disabled = $("order").disabled = !grouped;
+  $("grouping").classList.toggle("dim", !grouped());
+  $("group").disabled = $("order").disabled = !grouped();
   const ribbons = META.styles.filter((st) => st.needs_groups).map((st) => st.name);
-  $("groupNote").textContent = grouped
+  $("groupNote").textContent = grouped()
     ? [MEANS.group[S.group], MEANS.order[S.order]].filter(Boolean).join(" ")
     : `${S.style} paints every road at once, so grouping does not reach it. `
       + `${ribbons.join(" and ") || "No style here"} draws ribbons.`;
@@ -1056,11 +1051,11 @@ function changed() {
   writeHash();
   exports();
   $("busy").hidden = false;
-  clearTimeout(timer);
-  timer = setTimeout(() => render(), DEBOUNCE_MS);
+  scheduleRender();
 }
 
 const styleSpec = () => META.styles.find((st) => st.name === S.style) || META.styles[0];
+const grouped = () => !!styleSpec().needs_groups;
 
 /* ---------- requests ---------- */
 
@@ -1069,28 +1064,24 @@ const styleSpec = () => META.styles.find((st) => st.name === S.style) || META.st
 function query({ width, scale, format, download, sample }) {
   const p = new URLSearchParams();
   if (S.area) p.set("area", S.area); else p.set("bbox", S.bbox);
-  p.set("style", S.style);
+  // The three the caller decides: the preview and each download differ in size
+  // and in format and in nothing else.
   p.set("format", format);
   p.set("width", String(Math.round(width)));
   if (format === "png" && scale !== 1) p.set("scale", trim(scale));
-  p.set("weight", S.weight);
-  // Sent only to a style that groups. They reach the server's cache key whether or
-  // not the render reads them, so a density picture must not carry a grouping it
-  // ignores -- and `group=way` over a city would then be refused for nothing.
-  if (styleSpec().needs_groups) {
-    p.set("group", S.group);
-    p.set("order", S.order);
+  for (const { key, send, when, fmt } of PARAMS) {
+    if (!send || (when && !when(S))) continue;
+    p.set(send, (fmt || String)(S[key]));
   }
+  // The filters are comma-joined, which is how the endpoint's own `_many` reads
+  // them, and shorter than a repeated parameter.
   if (S.operator.length) p.set("operator", S.operator.join(","));
   if (S.roadClass.length) p.set("class", S.roadClass.join(","));
-  if (S.min_trips) p.set("min_trips", String(S.min_trips));
-  p.set("hue", trim(S.hue));
-  p.set("line_scale", trim(S.line_scale));
-  p.set("alpha_scale", trim(S.alpha_scale));
   if (sample && sample > 1) p.set("sample", String(sample));
-  if (S.caption) p.set("caption", S.caption);
+  // Written as the flag the endpoint reads rather than through the table, so a
+  // request never carries `credit=false` -- which `_flag` would reject and a
+  // truthiness test would read as true.
   if (S.credit) p.set("credit", "1");
-  if (S.background) p.set("background", S.background);
   let q = p.toString();
   if (download) q += "&download"; // a valueless flag, which URLSearchParams cannot write
   return "/art?" + q;
@@ -1103,7 +1094,7 @@ function query({ width, scale, format, download, sample }) {
 // then again at full detail. Moving another control supersedes both, so a drag
 // never waits on a picture already out of date.
 async function render(force) {
-  clearTimeout(timer);
+  scheduleRender.cancel();
   if (!META || !META.enabled) return;
 
   // Supersede rather than queue: the server allows four waiting renders and a
@@ -1220,6 +1211,16 @@ function serverMs(res) {
 
 /* ---------- exports ---------- */
 
+// A download the server would answer with a 400. `pointer-events: none` takes
+// the click and nothing else, so the link leaves the tab order with it: focused,
+// it still answered Enter, and what that fetches is the error page the greying
+// out was there to prevent.
+const refuse = (el, over) => {
+  el.setAttribute("aria-disabled", String(over));
+  if (over) el.tabIndex = -1;
+  else el.removeAttribute("tabindex");
+};
+
 // The server rejects anything over its pixel budget, and a rejected download is
 // a wasted wait, so the same arithmetic runs here first.
 function exports() {
@@ -1248,8 +1249,8 @@ function exports() {
   // before the format decides what a pixel is.
   const svgPx = S.width * h;
   const limit = META.limits.max_pixels;
-  $("dlPng").setAttribute("aria-disabled", String(px > limit));
-  $("dlSvg").setAttribute("aria-disabled", String(svgPx > limit));
+  refuse($("dlPng"), px > limit);
+  refuse($("dlSvg"), svgPx > limit);
   const over = Math.min(px, svgPx) > limit ? "both" : px > limit ? "png" : "";
   $("exportSize").innerHTML = over
     ? `<span style="color:var(--accent)">
@@ -1264,14 +1265,8 @@ function exports() {
 
 /* ---------- geometry ---------- */
 
-const MERC_MAX_LAT = 85.05112878;
-
-function mercY(lat) {
-  const phi = clamp(lat, -MERC_MAX_LAT, MERC_MAX_LAT) * Math.PI / 180;
-  return Math.log(Math.tan(Math.PI / 4 + phi / 2));
-}
-
 // art.Projection.canvas_height, so the megapixel estimate matches the server's.
+// `mercY` is util.js's, the same one the roaming box is built from.
 function canvasHeight(b, width) {
   const dx = (b[2] - b[0]) * Math.PI / 180;
   const dy = mercY(b[3]) - mercY(b[1]);
@@ -1301,8 +1296,6 @@ function bounds() {
 // back into the state that caused it, or a typed window would fight the fit that
 // displays it.
 
-const ISLES = [-11.5, 49.4, 2.6, 61.3];   // art.ISLES, and the viewer's own copy
-const BASEMAP = { light: "light_all", dark: "dark_all" };
 const PICK_LINE = { light: "#3f6d9e", dark: "#79c6c9" };
 
 let pickMap = null;
@@ -1374,11 +1367,7 @@ function initPicker() {
     addNetwork(pickMap);
   });
 
-  let sizing = null;
-  addEventListener("resize", () => {
-    clearTimeout(sizing);
-    sizing = setTimeout(() => quietly(() => pickMap.resize()), 100);
-  });
+  addEventListener("resize", debounce(() => quietly(() => pickMap.resize()), 100));
 
   $("pickToggle").addEventListener("click", () => showPicker(!!$("pickwrap").hidden));
   showPicker(localStorage.getItem("wayfare-pickmap") !== "closed");
@@ -1482,34 +1471,8 @@ async function addNetwork(map) {
   });
 }
 
-// MapLibre has no {s} or {r} placeholder: expand the subdomains and pick the
-// retina variant up front. The viewer holds the same six lines; they are two
-// self-contained pages by design, and this is the whole of what they share.
-function basemapTiles(t) {
-  const r = devicePixelRatio > 1.4 ? "@2x" : "";
-  return ["a", "b", "c", "d"].map(
-    (s) => `https://${s}.basemaps.cartocdn.com/${BASEMAP[t]}/{z}/{x}/{y}${r}.png`
-  );
-}
-
-// maxBounds constrains the whole viewport, not the centre, so MapLibre zooms in
-// until the visible area fits inside the box -- and on a landscape frame it is
-// the box's width that binds, leaving a slice of the country at full zoom out.
-// Widen the box, and only the box, until it is at least as wide as the frame.
-// The viewer does this too, and for the same reason.
-function roamingBounds(el) {
-  const merc = (lat) => 0.5 - mercY(lat) / (2 * Math.PI);
-  const [w, s, e, n] = ISLES;
-  const tall = merc(s) - merc(n);            // north is the smaller y
-  const wide = (e - w) / 360;
-  const aspect = Math.max(el.clientWidth, 1) / Math.max(el.clientHeight, 1);
-  const grow = (Math.max(0, aspect * tall - wide) * 360) / 2;
-  return [[w - grow, s], [e + grow, n]];
-}
-
 /* ---------- helpers ---------- */
 
-const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
 const tripsLabel = () => (S.min_trips ? S.min_trips + " a week" : "no floor");
 const filtersActive = () =>
   !!(S.operator.length || S.roadClass.length || S.min_trips);
@@ -1531,7 +1494,6 @@ function setSelected(el, chosen) {
 
 const trim = (v) => String(Number(Number(v).toFixed(4)));
 const fmtBbox = (b) => b.map((n) => trim(n)).join(",");
-const label = (n) => n.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 
 function bytes(n) {
   if (n < 1024) return n + " B";
@@ -1543,12 +1505,6 @@ function flash(el, text) {
   const was = el.textContent;
   el.textContent = text;
   setTimeout(() => { el.textContent = was; }, 1200);
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
-  );
 }
 </script>
 </body>

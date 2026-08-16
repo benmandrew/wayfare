@@ -9,8 +9,9 @@ map tiles) as local files out of `web/vendor/`, where unmodified `dist` builds o
 GL JS 4.7.1 and pmtiles 4.4.1 are committed, both under the 3-Clause BSD licence.
 [`web/vendor/README.md`](vendor/README.md) records the versions and how to update them. The
 one thing still fetched from a third party is the raster basemap, from
-`basemaps.cartocdn.com`; point `BASEMAP` at a local tile source if panning the map should
-not be visible to anyone else.
+`basemaps.cartocdn.com`; point `BASEMAP` in [`web/util.js`](util.js) at a local tile source
+if panning the map should not be visible to anyone else. Both pages read it from there, so
+the map and the studio move together.
 
 ## Serve locally
 

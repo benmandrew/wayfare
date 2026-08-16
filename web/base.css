@@ -1,0 +1,88 @@
+/* The chrome both pages wear: the palette, and the handful of elements that are
+   the same thing on the map and in the studio -- a panel, a heading, a button.
+   Two self-contained pages by design, but the copies of these had already drifted
+   in their comments and were one edit from drifting in a colour.
+
+   Linked before each page's own <style>, so a page rule of equal specificity
+   still wins. Nothing here may be written to depend on that order: the
+   overrides are the pages', and this file is what they override. */
+
+:root {
+  --bg:        #ffffff;
+  --panel:     rgba(255,255,255,.94);
+  --border:    #dcdfe4;
+  --text:      #16181d;
+  --muted:     #6b7280;
+  --chip-bg:   #eef1f5;
+  --chip-text: #2b3440;
+  --accent:    #d64512;
+  --shadow:    0 1px 2px rgba(16,24,40,.06), 0 8px 24px rgba(16,24,40,.10);
+  --radius:    8px;
+  /* Every number on either page is set in this stack -- a service number, a byte
+     count, a bounding box, a render's dimensions -- because a proportional digit
+     in a column of them is a column that will not line up. It was written out
+     seven times across the two pages before it was a token. */
+  --mono:      ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+[data-theme="dark"] {
+  --bg:        #0d1014;
+  --panel:     rgba(20,24,30,.92);
+  --border:    #2b323c;
+  --text:      #e8ecf1;
+  --muted:     #8b949e;
+  --chip-bg:   #232a33;
+  --chip-text: #d7dee7;
+  --accent:    #ffd15c;
+  --shadow:    0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.45);
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+
+/* --- panel chrome --- */
+.panel {
+  background: var(--panel);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+h1 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: .02em;
+}
+.sub { color: var(--muted); font-size: 11.5px; margin-top: 2px; }
+/* The floor on the title column is what forces the wrap on a narrow panel:
+   without it flexbox spends the whole row on the controls and squeezes the
+   strapline down to one word per line. 110px is under what is free with the
+   three buttons alone, so the ordinary case is still the one-row header. */
+.head { padding: 10px 12px; display: flex; align-items: flex-start; gap: 8px; flex-wrap: wrap; }
+.head > div { flex: 1; min-width: 110px; }
+
+.btn {
+  font: inherit;
+  font-size: 11.5px;
+  color: var(--muted);
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 7px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+/* Guarded, because a touchscreen has no hover to leave: the browser fakes one on
+   tap and then holds it, so every button anyone has pressed stays lit. `:active`
+   is the feedback that belongs to a finger. */
+@media (hover: hover) {
+  .btn:hover { color: var(--text); border-color: var(--muted); }
+}
+.btn:active { color: var(--text); border-color: var(--muted); }
+a.btn { text-decoration: none; }
+
+.meta { color: var(--muted); font-size: 11.5px; }
+.meta b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.note { color: var(--muted); font-size: 11px; margin-top: 8px; font-style: italic; }
+[hidden] { display: none !important; }

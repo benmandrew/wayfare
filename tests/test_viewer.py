@@ -16,23 +16,50 @@ of whitespace removed -- or against a regex that spells out where whitespace may
 vary. Where a space is part of a string literal the page emits, it is matched
 exactly, because there the space is the meaning.
 
-Nothing here imports `wayfare.server`; the pages are static files it happens to
-serve. `tests/test_server.py` covers the serving.
+A page is more than its own file. Both pages link `base.css` for the palette and
+the panel chrome, and `util.js` beside `credits.js` for what the map and the studio
+both do, so an assertion about the cascade reads `_cascade` -- the shared sheet
+followed by the page, which is the order the browser applies them in -- and one
+about a shared helper reads the file that holds it. What each page must *not* say
+is still read off the page alone.
+
+One test here starts `wayfare.server` over the real `web/` directory, because a
+file the pages link and the server does not reach is a page that loads without its
+palette, and nothing in the source of either page can show that. Everything else
+about the serving is `tests/test_server.py`.
 """
 
 from __future__ import annotations
 
 import functools
 import re
+import socketserver
+import threading
+import urllib.request
 from pathlib import Path
+
+from wayfare import server
 
 WEB = Path(__file__).resolve().parents[1] / "web"
 PAGES = ("index.html", "art.html")
+# Linked by both pages, in this order, ahead of the page's own rules and script.
+SHARED = ("base.css", "util.js", "credits.js")
 
 
 @functools.cache
 def _source(page: str) -> str:
     return (WEB / page).read_text()
+
+
+@functools.cache
+def _cascade(page: str) -> str:
+    """The shared stylesheet and then the page, as the browser stacks them.
+
+    Offsets into this are cascade order, which is what a fallback-before-override
+    assertion is about. A rule that moved into `base.css` still has to come before
+    the page rule that overrides it, and here it does.
+    """
+    return (WEB / "base.css").read_text() + _source(page)
 
 
 def _tight(text: str) -> str:
@@ -72,8 +99,10 @@ def _declared(page: str, prop: str, value: str) -> int:
 
     An offset rather than a boolean, because two declarations of one property are
     a fallback and an override, and which comes first is the whole point of them.
+    Read out of the whole cascade, so a declaration in `base.css` is found where it
+    actually applies rather than reported missing.
     """
-    found = re.search(rf"{re.escape(prop)}\s*:\s*{re.escape(value)}\s*;", _source(page))
+    found = re.search(rf"{re.escape(prop)}\s*:\s*{re.escape(value)}\s*;", _cascade(page))
     return found.start() if found else -1
 
 
@@ -124,6 +153,84 @@ def test_both_pages_ask_the_pmtiles_plugin_for_the_archive_metadata():
         assert made, f"{page} builds no pmtiles.Protocol"
         for args in made:
             assert re.search(r"metadata\s*:\s*true", args), f"{page}: {args}"
+
+
+# --- What the two pages share -------------------------------------------------
+#
+# They are still two self-contained pages, and the shared files are the parts that
+# had already been copied between them. A copy is not wrong until it drifts, and
+# every one of these had: the studio's basemap lost the slow-link check, its
+# roaming box gained a guard the viewer's never got, and the same box was written
+# nested on one page and flat on the other.
+
+
+def test_the_pages_take_what_they_share_from_one_place():
+    """Neither page may hold its own copy of anything in `util.js`, because a copy
+    is what the drift above was made of. `escapeHtml` is the one that matters most
+    and reads least: it is what stands between a service number out of a feed and
+    the innerHTML of the card, and two of them is one that can be fixed alone."""
+    shared = (WEB / "util.js").read_text()
+    for name in ("escapeHtml", "roamingBounds", "basemapTiles", "debounce", "bootTheme"):
+        assert re.search(rf"(function|const)\s+{name}\b", shared), name
+        for page in PAGES:
+            assert not re.search(rf"(function|const)\s+{name}\b", _source(page)), (
+                page,
+                name,
+            )
+    # And the linking that makes the sharing real, in both pages.
+    for page in PAGES:
+        for name in SHARED:
+            assert name in _source(page), (page, name)
+
+
+def test_the_shared_files_are_reachable_and_typed():
+    """A stylesheet the server does not answer for is a page drawn with no palette,
+    and a script it answers as `text/plain` is a page that runs none of it --
+    neither of which the source of a page can show. So they are fetched.
+
+    `wayfare.server` over the real `web/` directory rather than a fixture, since
+    what is in question is whether these particular files are reachable through the
+    server the deployment runs, at a type a browser will act on."""
+    handler = functools.partial(server.Handler, directory=str(WEB))
+    with socketserver.TCPServer(("127.0.0.1", 0), handler) as httpd:
+        httpd.daemon_threads = True
+        thread = threading.Thread(target=httpd.serve_forever, args=(0.01,), daemon=True)
+        thread.start()
+        try:
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            wanted = {
+                "base.css": "text/css",
+                "util.js": "javascript",
+                "credits.js": "javascript",
+            }
+            for name, kind in wanted.items():
+                with urllib.request.urlopen(f"{base}/{name}", timeout=30) as res:  # noqa: S310
+                    assert res.status == 200, name
+                    assert kind in res.headers["Content-Type"], (name, res.headers)
+                    assert res.read() == (WEB / name).read_bytes(), name
+        finally:
+            httpd.shutdown()
+            thread.join(timeout=5)
+
+
+def test_the_theme_is_on_the_document_before_anything_is_painted():
+    """Both pages hardcoded `data-theme="light"` and applied the stored theme from
+    the script at the foot of the body -- behind an 803 KB vendored library -- so a
+    reader who had chosen dark got a full screen of white until it parsed.
+
+    The read belongs in <head>, where it runs before the first paint. What this
+    pins is the ordering: the call is in the head, and the vendored library is not
+    what it waits on."""
+    for page in PAGES:
+        text = _source(page)
+        head = text[: text.index("</head>")]
+        assert re.search(r"<script>\s*bootTheme\(\);?\s*</script>", head), page
+        # The library the theme used to queue behind is loaded past the head.
+        assert "vendor/maplibre-gl.js" not in head, page
+    # One definition, and it is the same one both pages call.
+    assert re.search(r"function\s+bootTheme\b", (WEB / "util.js").read_text()), (
+        "util.js defines no bootTheme"
+    )
 
 
 # --- The viewer's own style ---------------------------------------------------
@@ -190,10 +297,10 @@ def test_a_shadow_takes_every_filter_the_line_above_it_takes():
     They stay out of the hover query on purpose: a shadow is offset from its line,
     so a cursor over one is a cursor beside the thing it would report."""
     tight = _tight(_source("index.html"))
-    for line, shadow in (("SEG", "SEG_SHADOW"), ("TRACK", "TRACK_SHADOW")):
+    for line, shadow in (("seg", "segShadow"), ("track", "trackShadow")):
         assert _holds("index.html", f"for (const id of [...{line}, ...{shadow}])")
         assert _holds("index.html", f"for (const id of {shadow})")
-    assert _holds("index.html", "for (const id of [...SEG_SHADOW, ...TRACK_SHADOW])")
+    assert _holds("index.html", "for (const id of [...segShadow, ...trackShadow])")
     # Above every road and under the line each belongs to.
     order = [
         tight.index(_tight(f"layers.push({name}(r))"))
@@ -207,7 +314,7 @@ def test_a_shadow_takes_every_filter_the_line_above_it_takes():
     ]
     assert order == sorted(order)
     # The cursor asks the lines, never the shadows.
-    assert _holds("index.html", "at(SEG)") and not _holds("index.html", "at(SEG_SHADOW)")
+    assert _holds("index.html", "at(seg)") and not _holds("index.html", "at(segShadow)")
 
 
 def test_every_legend_row_is_a_switch():
@@ -246,7 +353,7 @@ def test_the_viewer_tells_the_two_id_spaces_apart_by_refs():
     # sentinel says whether there is anything to union.
     assert _holds("index.html", "if (top.refs === undefined) return top;")
     # The way id reaching the card comes from the feature id, never from a property.
-    assert _holds("index.html", "showFeature(mergeRegions(hits), f.id)")
+    assert _holds("index.html", "card.feature(mergeRegions(hits), f.id)")
     for page in PAGES:
         text = _source(page)
         assert not re.search(r'\[\s*"get"\s*,\s*"way"\s*\]', text), page
@@ -296,14 +403,24 @@ def test_the_basemap_gives_up_resolution_when_the_link_says_it_is_slow():
     """Cold profiling put the basemap at 40.9% of everything transferred, and 72.7%
     on a retina screen. Both halves of the reduction are gated on the same check --
     the retina variant and the tile size -- because either one alone leaves the
-    other paying full price."""
-    text = _source("index.html")
+    other paying full price.
+
+    Read out of `util.js`, which is where the check lives now, and neither page may
+    hold a basemap of its own: the studio's copy was the same six lines without the
+    check in them, so a slow link was honoured on the map and ignored on the page
+    beside it, with nothing to see either way."""
+    text = (WEB / "util.js").read_text()
     assert re.search(r"function\s+thriftyConnection\s*\(\s*\)", text)
-    assert _holds("index.html", "devicePixelRatio > 1.4 && !thriftyConnection()")
-    assert _holds("index.html", "thriftyConnection() ? 512 : 256")
+    assert "devicePixelRatio > 1.4 && !thriftyConnection()" in text
+    assert "thriftyConnection() ? 512 : 256" in text
     # Save-Data is the user asking; effectiveType is the browser guessing. Both.
     assert "c.saveData" in text
     assert "effectiveType" in text
+    # A tile URL in a page is a second basemap; the preconnect in the viewer's head
+    # names the host and asks for nothing, so it is the template that is checked.
+    for page in PAGES:
+        assert 'src="util.js"' in _source(page), page
+        assert "{z}/{x}/{y}" not in _source(page), page
 
 
 # --- The pages on a small screen ----------------------------------------------
