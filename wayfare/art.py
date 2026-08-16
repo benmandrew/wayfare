@@ -26,7 +26,7 @@ from array import array
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, BinaryIO
+from typing import TYPE_CHECKING, Any, BinaryIO, Protocol
 from xml.sax.saxutils import escape
 
 from . import config, db, logs
@@ -41,11 +41,7 @@ RGB = tuple[float, float, float]
 # Maps a normalised traffic weight in [0, 1] to a line width, alpha or saturation.
 Ramp = Callable[[float], float]
 
-# All drawing is done in logical units and the surface is scaled up for print, so
-# a "1px" line means the same physical thickness at any `scale`.
-BASE_DPI = 96.0
-
-# The canvas width `density`'s stroke widths are quoted against. `scale` above
+# The canvas width `density`'s stroke widths are quoted against. `RenderOpts.scale`
 # handles print resolution; this handles the other axis, how much map a pixel
 # covers. Chosen as 2,000 because that is `RenderOpts.width_px`'s own default.
 DENSITY_REF_PX = 2000.0
@@ -80,13 +76,16 @@ class Bounds:
             and max(lats) >= self.min_lat
         )
 
-    def as_e6(self) -> tuple[int, int, int, int]:
+    def as_wsen_e6(self) -> tuple[int, int, int, int]:
         """This window in micro-degrees, west/south/east/north.
 
         Geometry comes out of the database as the integers it is stored as, so the
         drawing path tests it against these rather than dividing every vertex by a
         million first. Scaling the window up once is four operations; scaling the
         vertices down is one per point, on the hottest loop there is.
+
+        Named for its order, because :meth:`as_predicate_params` is the same four
+        numbers in a different one and the two are not interchangeable.
         """
         return (
             round(self.min_lon * 1e6),
@@ -94,6 +93,22 @@ class Bounds:
             round(self.max_lon * 1e6),
             round(self.max_lat * 1e6),
         )
+
+    def as_predicate_params(self) -> list[int]:
+        """The same four numbers, in the order `_Sql.where` binds them.
+
+        The window predicate is an overlap test rather than a containment one, so
+        each stored bound is compared against the *opposite* edge of the window:
+        `min_lon_e6 <= max_lon AND max_lon_e6 >= min_lon`, and the same for latitude.
+        That crossing is why the parameter order is not west/south/east/north, and
+        why it is written down once here rather than restated at each call site.
+        """
+        return [
+            round(self.max_lon * 1e6),
+            round(self.min_lon * 1e6),
+            round(self.max_lat * 1e6),
+            round(self.min_lat * 1e6),
+        ]
 
 
 # Framing hints, not administrative boundaries -- they exist to point the camera,
@@ -283,11 +298,11 @@ class Projection:
         The lists come back in the order given, one per edge, so a caller can zip
         them straight back against the rows it fetched.
 
-        Nothing on the rendering path calls this any more -- :meth:`flat` does the
-        work and :class:`Path` keeps the per-edge view without materialising it.
-        This stays because it is the form the projection is *tested* in, against a
-        scalar `__call__` per vertex, and because :class:`Held` has per-edge lists
-        already and no flat buffer to hand.
+        The drawing path does not come through here -- :meth:`flat` projects a whole
+        fetch and :class:`Polyline` keeps the per-edge view without materialising it.
+        What this form is for is checking that one: it is where the vectorised
+        projection is tested against a scalar `__call__` per vertex, which needs the
+        per-edge structure the fast path deliberately does not build.
         """
         lens = [len(v) for v in lon_e6]
         if not sum(lens):
@@ -306,31 +321,13 @@ class Projection:
 def simplify(pts: list[tuple[float, float]], tol: float) -> list[tuple[float, float]]:
     """Drop vertices that land within `tol` pixels of the last one kept.
 
-    A Valhalla directed edge averages 4.14 coordinates over tens of metres, so at a
-    preview width most of an edge is smaller than a pixel and collapses to its two
-    endpoints. That matters because cairo's cost is tessellating joins and caps once
-    per vertex -- not per pixel, and not per stroke.
-    Over a million edges this drops 64% of the vertices and 30% of the draw time,
-    for a difference in 0.05% of the output bytes.
-
-    The comparison is against the last *kept* vertex rather than the previous one,
-    so a gently curving road accumulates its small steps and survives; comparing
-    against the previous vertex would straighten it out entirely. Endpoints are
-    always kept, so edges still meet where they met.
-
-    Not every style may use this -- see `draw_spectrum`, which takes colour from the
-    angle between points and so cannot afford to lose any.
+    The list-of-tuples form of :meth:`Polyline.simplified`, and a delegate to it so
+    that the rule has one implementation. Nothing on the drawing path comes through
+    here -- geometry reaches a style as a :class:`Polyline` -- but the rule is easier
+    to read and to test over plain points, and a second copy of it would be free to
+    drift.
     """
-    if tol <= 0.0 or len(pts) <= 2:
-        return pts
-    out = [pts[0]]
-    kx, ky = pts[0]
-    for x, y in pts[1:-1]:
-        if abs(x - kx) >= tol or abs(y - ky) >= tol:
-            out.append((x, y))
-            kx, ky = x, y
-    out.append(pts[-1])
-    return out
+    return Polyline.of(pts).simplified(tol).points()
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -392,11 +389,24 @@ class Polyline:
             x0, y0 = x1, y1
 
     def simplified(self, tol: float) -> Polyline:
-        """This path with sub-`tol` vertices dropped -- see :func:`simplify`.
+        """This path with sub-`tol` vertices dropped.
 
-        Same rule and same result as that function, kept separate rather than shared
-        because the two work on different things: one filters a list of tuples it
-        was given, this one filters indices into a buffer it does not own.
+        A Valhalla directed edge averages 4.14 coordinates over tens of metres, so at
+        a preview width most of an edge is smaller than a pixel and collapses to its
+        two endpoints. That matters because cairo's cost is tessellating joins and
+        caps once per vertex -- not per pixel, and not per stroke. Over a million
+        edges this drops 64% of the vertices and 30% of the draw time, for a
+        difference in 0.05% of the output bytes.
+
+        The comparison is against the last *kept* vertex rather than the previous
+        one, so a gently curving road accumulates its small steps and survives;
+        comparing against the previous vertex would straighten it out entirely.
+        Endpoints are always kept, so edges still meet where they met. What narrows
+        is `idx`, so a simplified path costs a list of indices rather than a second
+        list of tuples.
+
+        Not every style may use this -- see `draw_spectrum`, which takes colour from
+        the angle between points and so cannot afford to lose any.
         """
         idx = self.idx
         if tol <= 0.0 or len(idx) <= 2:
@@ -430,7 +440,6 @@ class Edge:
     road_class: str | None
     length_m: float
     coords: list[tuple[float, float]]  # (lon, lat)
-    n_services: int
     # Whatever `QuerySpec.weight` asked for -- trips per week by default, but possibly
     # a service count or traffic per metre. Named for its role rather than its usual
     # contents, because a field called n_trips holding a count of operators is a lie.
@@ -589,22 +598,26 @@ class QuerySpec:
 DEFAULT_SPEC = QuerySpec()
 
 
+# The two tables a render reads, named rather than spelled out at each of the half
+# dozen sites that scan them. Substituting either for a materialised or extracted
+# window was tried and is not worth having: a density render is 75% cairo and the
+# whole database scan is a quarter of the rest, and a Parquet extract of the window
+# measured *slower* on a filtered spec. See docs/rendering.md.
+EDGES = "edges"
+SERVICES = "edge_services"
+
+
 @dataclass(frozen=True, slots=True)
 class Source:
-    """Where the two tables are read from.
+    """The relations a render is handed rather than deriving for itself.
 
-    Normally the database. The point of naming them is that a materialised or
-    extracted window can be substituted underneath a render without touching the
-    query builder, and the bbox predicate is applied either way, so correctness never
-    depends on the substitute being exactly right -- only speed.
-
-    What a substitution can win is bounded, and narrowly. A density render is 75%
-    cairo, and the whole database scan is a quarter of the rest, so anything plugged
-    in here can only ever address that quarter.
+    Both exist for banding, and both are the same argument: a band draws a fraction
+    of the window, so anything it works out from its own rows is worked out from a
+    fraction of the country. The parent computes each once over the whole picture and
+    every band is given it. Every name here is an identifier this code chose and
+    registered; nothing a request supplies ever reaches one.
     """
 
-    edges: str = "edges"
-    services: str = "edge_services"
     # A relation holding (grp, n_edges, trips) already computed, in place of the
     # `gstat` a grouped query would derive from this window. Only banding sets it,
     # and it is the whole reason a band draws the same picture as the serial render
@@ -657,10 +670,9 @@ class _Sql:
 
         `edges` stores each geometry's bounding box as four micro-degree integers, so
         the window test is an exact integer overlap in SQL and nothing has to look
-        inside the geometry. That is worth stating because it used not to be: when
-        geom was WKT text there was no numeric column to compare against, and the
-        filter matched the *first* vertex only, over-selected a collar of edges
-        padded by the longest edge in the table, and re-tested each one in Python.
+        inside the geometry. Without those columns the predicate can only reach the
+        first vertex, which over-selects by the length of the longest edge in the
+        table and leaves every row to be re-tested in Python.
 
         There is no spatial index, so a window over `uk` reads the whole table. Four
         integer comparisons a row is a cheap way to pay that, and an edge-plane
@@ -675,7 +687,7 @@ class _Sql:
         where, params = self.where(sampled=sampled)
         sql = f"""
     SELECT edge_id, way_id, road_name, road_class, length_m, lon_e6, lat_e6
-    FROM {self.source.edges}
+    FROM {EDGES}
     WHERE {where}
 """
         return sql, params
@@ -723,9 +735,9 @@ class _Sql:
             clauses.append(f"short_name IN ({_holes(self.spec.service)})")
             params += list(self.spec.service)
         if not clauses:
-            return f"{self.source.services} s", params
+            return f"{SERVICES} s", params
         where = " AND ".join(clauses)
-        return f"(SELECT * FROM {self.source.services} WHERE {where}) s", params
+        return f"(SELECT * FROM {SERVICES} WHERE {where}) s", params
 
     def _having(self) -> str:
         """A floor on traffic, deliberately on trips and not on the chosen weight.
@@ -742,13 +754,38 @@ class _Sql:
         # An inner join drops edges no surviving service uses; see QuerySpec.selective.
         return "JOIN" if self.spec.selective else "LEFT JOIN"
 
+    def _win_svc(
+        self, *, sampled: bool, name: str = "svc", extra_cols: str = ""
+    ) -> tuple[str, list[Any]]:
+        """`WITH win AS (...), svc AS (...)`: the window, and a weight per edge in it.
+
+        Every query in this class opens with this pair, so it is written once. The
+        alternative was six copies of it, each with its own hand-ordered parameter
+        list -- and bound parameters follow *textual* order, so a copy that grew a
+        hole in a different place binds the window's numbers to the filter's holes
+        and either raises or, worse, filters on a longitude.
+
+        `extra_cols` is appended to the aggregate's select list, for the one caller
+        that needs more than the weight out of it. `name` renames the second CTE,
+        because the grouped queries call it `edge_w` and join it a second time.
+        """
+        win, win_p = self.window(sampled=sampled)
+        svc, svc_p = self.services()
+        sql = f"""
+WITH win AS ({win}
+), {name} AS (
+    SELECT s.edge_id, {self.weight} AS weight{extra_cols}
+    FROM {svc} JOIN win USING (edge_id)
+    GROUP BY s.edge_id
+    {self._having()}
+)"""
+        return sql, win_p + svc_p
+
     # -- whole queries -----------------------------------------------------
     def edges_query(self, *, with_groups: bool, by_weight: bool) -> tuple[str, list[Any]]:
         # Sampled: this is the geometry that gets drawn. Each surviving edge still
         # carries its own true weight, because a weight is computed from that edge's
         # own service rows -- only how many edges there are changes.
-        win, win_p = self.window(sampled=True)
-        svc, svc_p = self.services()
         groups = f", list(DISTINCT {self.group}) AS groups" if with_groups else ""
         groups_col = ", svc.groups" if with_groups else ""
         # edge_id breaks the tie, so equally busy roads draw in a fixed order rather
@@ -774,23 +811,15 @@ class _Sql:
             if by_weight
             else "ORDER BY win.edge_id"
         )
-        sql = f"""
-WITH win AS ({win}
-), svc AS (
-    SELECT s.edge_id,
-           count(DISTINCT s.short_name) AS n_services,
-           {self.weight} AS weight
-           {groups}
-    FROM {svc} JOIN win USING (edge_id)
-    GROUP BY s.edge_id
-    {self._having()}
-)
-SELECT win.edge_id, win.road_class, win.length_m, win.lon_e6, win.lat_e6,
-       coalesce(svc.n_services, 0), coalesce(svc.weight, 0){groups_col}
+        base, params = self._win_svc(sampled=True, extra_cols=groups)
+        sql = f"""{base}
+SELECT win.edge_id, win.road_class, win.length_m,
+       win.lon_e6 AS lon_e6, win.lat_e6 AS lat_e6,
+       coalesce(svc.weight, 0) AS weight{groups_col}
 FROM win {self._join()} svc USING (edge_id)
 {order}
 """
-        return sql, win_p + svc_p
+        return sql, params
 
     def weights_query(self) -> tuple[str, list[Any]]:
         """Just the weight per edge, for the percentile pass.
@@ -798,19 +827,11 @@ FROM win {self._join()} svc USING (edge_id)
         Eight bytes an edge against the hundreds its geometry costs, which is what
         lets the bounds be known before a single coordinate is read.
         """
-        win, win_p = self.window()
-        svc, svc_p = self.services()
-        sql = f"""
-WITH win AS ({win}
-), svc AS (
-    SELECT s.edge_id, {self.weight} AS weight
-    FROM {svc} JOIN win USING (edge_id)
-    GROUP BY s.edge_id
-    {self._having()}
-)
+        base, params = self._win_svc(sampled=False)
+        sql = f"""{base}
 SELECT coalesce(svc.weight, 0) FROM win {self._join()} svc USING (edge_id)
 """
-        return sql, win_p + svc_p
+        return sql, params
 
     def bounds_query(self, lo_q: float, hi_q: float) -> tuple[str, list[Any]]:
         """The two order statistics :class:`Weights` needs, without shipping the rest.
@@ -832,16 +853,8 @@ SELECT coalesce(svc.weight, 0) FROM win {self._join()} svc USING (edge_id)
         Ties need no thought: two rows with equal weight can take either rank, and
         the value read off at a given rank is the same either way.
         """
-        win, win_p = self.window()
-        svc, svc_p = self.services()
-        sql = f"""
-WITH win AS ({win}
-), svc AS (
-    SELECT s.edge_id, {self.weight} AS weight
-    FROM {svc} JOIN win USING (edge_id)
-    GROUP BY s.edge_id
-    {self._having()}
-), w AS (
+        base, params = self._win_svc(sampled=False)
+        sql = f"""{base}, w AS (
     SELECT coalesce(svc.weight, 0) AS weight
     FROM win {self._join()} svc USING (edge_id)
 ), ranked AS (
@@ -855,7 +868,7 @@ SELECT max(weight) FILTER (WHERE rn = least(n - 1, floor(? * n)::BIGINT)),
 FROM ranked
 """
         # Textual order again -- the two CTEs first, then the quantiles in the SELECT.
-        return sql, win_p + svc_p + [lo_q, hi_q]
+        return sql, params + [lo_q, hi_q]
 
     def _grouped_base(self) -> tuple[str, list[Any]]:
         """The shared part of the two grouped queries.
@@ -871,7 +884,7 @@ FROM ranked
         `pair` joins `edge_w` rather than only `win`, and that join is load-bearing.
         `edge_w` is where `min_trips` is applied, so without it a below-floor edge
         still drew as long as one of its groups survived -- `Window.edges()` and
-        `Window.groups()` would then disagree about which network they were drawing,
+        `Window.group_paths()` would then disagree about which network they draw,
         from an identical spec, and only the grouped styles would be wrong. It also
         skewed ribbon widths, because `gstat` summed the surviving edges and then the
         whole unfiltered set got stroked. Unfiltered the join is a no-op: `edge_w`
@@ -880,7 +893,7 @@ FROM ranked
         The stats CTE is `gstat`, not `grp`: `grp` is the group *column*, and a CTE
         sharing the name makes `JOIN ... USING (grp)` read as a self-reference.
         """
-        win, win_p = self.window()
+        base, params = self._win_svc(sampled=False, name="edge_w")
         svc, svc_p = self.services()
         # Substituted, not derived, when the caller has already computed it over a
         # wider window than this one -- see `Source.groups`. The identifier comes
@@ -892,24 +905,17 @@ FROM ranked
     FROM pair p JOIN edge_w w USING (edge_id)
     GROUP BY p.grp"""
         )
-        sql = f"""
-WITH win AS ({win}
-), edge_w AS (
-    SELECT s.edge_id, {self.weight} AS weight
-    FROM {svc} JOIN win USING (edge_id)
-    GROUP BY s.edge_id
-    {self._having()}
-), pair AS (
+        sql = f"""{base}, pair AS (
     SELECT DISTINCT {self.group} AS grp, s.edge_id
     FROM {svc} JOIN win USING (edge_id) JOIN edge_w USING (edge_id)
 ), gstat AS (
     {gstat}
 )
 """
-        # The window CTE is declared once; the services fragment appears twice, in
-        # edge_w and again in pair. Bound parameters follow textual order, so this
-        # list has to match that exactly -- one win, then two svc.
-        return sql, win_p + svc_p + svc_p
+        # The services fragment appears twice, in edge_w and again in pair, and bound
+        # parameters follow textual order -- so its own parameters follow the shared
+        # opening's a second time.
+        return sql, params + svc_p
 
     def group_query(self) -> tuple[str, list[Any]]:
         order = _order_sql(self.spec.order, grouped=False)
@@ -977,16 +983,8 @@ WITH win AS ({win}
         `o.eid <> e.edge_id` drops a self-loop, which is the one edge that is its own
         unique predecessor and successor.
         """
-        win, win_p = self.window(sampled=True)
-        svc, svc_p = self.services()
-        sql = f"""
-WITH win AS ({win}
-), svc AS (
-    SELECT s.edge_id, {self.weight} AS weight
-    FROM {svc} JOIN win USING (edge_id)
-    GROUP BY s.edge_id
-    {self._having()}
-), e AS (
+        base, params = self._win_svc(sampled=True)
+        sql = f"""{base}, e AS (
     SELECT win.edge_id AS edge_id,
            coalesce(svc.weight, 0) AS weight,
            win.lon_e6[1] AS sx, win.lat_e6[1] AS sy,
@@ -1007,7 +1005,7 @@ JOIN ind i ON i.ex = e.ex AND i.ey = e.ey AND i.weight = e.weight
 LEFT JOIN outd o ON o.sx = e.ex AND o.sy = e.ey AND o.weight = e.weight
 ORDER BY e.edge_id
 """
-        return sql, win_p + svc_p
+        return sql, params
 
     def chained_query(self, *, by_weight: bool) -> tuple[str, list[Any]]:
         """The drawn geometry, ordered so one chain's edges arrive together.
@@ -1017,17 +1015,9 @@ ORDER BY e.edge_id
         streaming property survives. `chain_id` and `seq` between them are unique, so
         the order is fully defined without a further tiebreak.
         """
-        win, win_p = self.window(sampled=True)
-        svc, svc_p = self.services()
+        base, params = self._win_svc(sampled=True)
         order = "w.weight, c.chain_id, c.seq" if by_weight else "c.chain_id, c.seq"
-        sql = f"""
-WITH win AS ({win}
-), svc AS (
-    SELECT s.edge_id, {self.weight} AS weight
-    FROM {svc} JOIN win USING (edge_id)
-    GROUP BY s.edge_id
-    {self._having()}
-), w AS (
+        sql = f"""{base}, w AS (
     SELECT win.edge_id AS edge_id, win.lon_e6, win.lat_e6,
            coalesce(svc.weight, 0) AS weight
     FROM win {self._join()} svc USING (edge_id)
@@ -1036,17 +1026,7 @@ SELECT c.chain_id, w.lon_e6, w.lat_e6, w.weight
 FROM w JOIN {self.source.chains or CHAIN_VIEW} c USING (edge_id)
 ORDER BY {order}
 """
-        return sql, win_p + svc_p
-
-    def cardinality_query(self) -> tuple[str, list[Any]]:
-        """How many groups this spec would produce, before anything is drawn."""
-        win, win_p = self.window()
-        svc, svc_p = self.services()
-        return (
-            f"WITH win AS ({win})\n"
-            f"SELECT count(DISTINCT {self.group}) FROM {svc} JOIN win USING (edge_id)",
-            win_p + svc_p,
-        )
+        return sql, params
 
 
 def _order_sql(order: str, *, grouped: bool) -> str:
@@ -1069,6 +1049,27 @@ def _order_sql(order: str, *, grouped: bool) -> str:
     qualified = key if col == "grp" else f"{'gstat.' if grouped else ''}{col}"
     tiebreak = f"{key}, p.edge_id" if grouped else key
     return f"{qualified} {direction}, {tiebreak}"
+
+
+def _held_order(
+    order: str, by_group: dict[str, list[Edge]], trips: dict[str, float]
+) -> list[str]:
+    """The same ordering as :func:`_order_sql`, over lists rather than over SQL.
+
+    `Held` draws from a list and cannot ask the database for an order, but the order
+    is what decides which ribbon ends up underneath -- so a spec that asks for
+    `narrowest` has to get it here too. The group key breaks the tie, ascending,
+    exactly as it does in SQL.
+    """
+    col, direction = ORDERS[order]
+    if col == "grp":
+        return sorted(by_group, reverse=direction == "DESC")
+    sign = -1.0 if direction == "DESC" else 1.0
+
+    def of(name: str) -> float:
+        return float(len(by_group[name])) if col == "n_edges" else trips[name]
+
+    return sorted(by_group, key=lambda n: (sign * of(n), n))
 
 
 def _holes(values: Sequence[Any]) -> str:
@@ -1116,9 +1117,9 @@ def _in_window(
     """Per-edge mask: does this edge's own geometry overlap the window?
 
     `edges` stores a bounding box per edge and the SQL has already filtered on it,
-    so this repeats that test against the vertices themselves. It is kept because
-    it is what the row path did, and dropping it would silently change which edges
-    draw wherever a stored box and its geometry disagree.
+    so this repeats that test against the vertices themselves. The box is the cheap
+    over-approximation and the vertices are the answer: an edge whose box clips the
+    window but whose geometry does not is selected by the query and must not draw.
 
     Vectorised with `reduceat`, which needs every start index to be in bounds even
     for a group it will not be asked about -- an empty list at the end of a batch
@@ -1137,6 +1138,45 @@ def _in_window(
         & (np.minimum.reduceat(lat, starts) <= n)
         & (np.maximum.reduceat(lat, starts) >= s)
     )
+
+
+class Frame(Protocol):
+    """The whole of what a style may ask a window for.
+
+    A style is handed one of these and nothing else. Naming the four members is what
+    keeps the line between paint and query where it belongs: a style that wanted the
+    query spec would have to come through here, where adding a member is a decision
+    rather than an attribute access.
+
+    Two things implement it and they share no code. :class:`Window` streams from the
+    database; :class:`Held` walks a list a caller already has. Inheriting the second
+    from the first is what this replaces -- `Held` never ran the base class's
+    constructor, so every method it did not override raised AttributeError on a field
+    that was never set.
+    """
+
+    @property
+    def weights(self) -> Weights:
+        """The scale that turns an edge's weight into a number in [0, 1]."""
+
+    @property
+    def alpha_compensation(self) -> float:
+        """What an additive style must scale its alpha by for the edges left out."""
+
+    def paths(
+        self,
+        proj: Projection,
+        *,
+        tol: float = 0.0,
+        by_weight: bool = False,
+        coalesce: bool = False,
+    ) -> Iterator[tuple[float, Polyline]]:
+        """(weight, geometry in canvas pixels), one drawn shape at a time."""
+
+    def group_paths(
+        self, proj: Projection, *, tol: float = 0.0
+    ) -> Iterator[tuple[str, float, Polyline]]:
+        """The same, grouped: a group's shapes arrive together and never return."""
 
 
 class Window:
@@ -1165,29 +1205,30 @@ class Window:
         self.con = con
         self.with_groups = with_groups
         self.spec = spec
-        self.sql = _Sql(
-            spec,
-            source,
-            [
-                round(bounds.max_lon * 1e6),
-                round(bounds.min_lon * 1e6),
-                round(bounds.max_lat * 1e6),
-                round(bounds.min_lat * 1e6),
-            ],
-        )
+        self.sql = _Sql(spec, source, bounds.as_predicate_params())
         self._weights: Weights | None = None
+
+    @property
+    def alpha_compensation(self) -> float:
+        """How much light a style owes the edges this window is not handing over.
+
+        A sampled window hands over one edge in `spec.sample`, so a style compositing
+        additively has to put the light of the edges that were dropped onto the ones
+        that remain. The factor is the window's to state rather than the style's to
+        work out: a style may not read the spec, and what it needs is a number to
+        multiply an alpha by rather than what the spec asked for.
+        """
+        return float(max(1, self.spec.sample))
 
     @property
     def weights(self) -> Weights:
         """The window's weight scale, computed on first use and then held.
 
         Lazy because one of the three styles never asks. `strands` takes its widths
-        and alphas from the *group* statistics inside `_group_rows`, so for that
-        style the scale here is a whole extra pass over the window whose result is
-        thrown away -- 94ms over London, and about three seconds over `uk` at 4.2M
-        edges. It was eager because two styles out of three want it before they draw
-        anything, which is a reason to compute it once, not a reason to compute it
-        unasked.
+        and alphas from the *group* statistics inside `group_paths`, so for that
+        style the scale here would be a whole extra pass over the window whose result
+        is thrown away -- 94ms over London, and about three seconds over `uk` at 4.2M
+        edges. Held once computed, because the other two read it per edge.
         """
         if self._weights is None:
             query, params = self.sql.bounds_query(_LO_Q, _HI_Q)
@@ -1239,8 +1280,8 @@ class Window:
         if not n:
             return None
         np = _require_numpy()
-        ids = table.column(0).to_numpy(zero_copy_only=False)
-        nxt = table.column(1).to_numpy(zero_copy_only=False)
+        ids = table.column("edge_id").to_numpy(zero_copy_only=False)
+        nxt = table.column("next_id").to_numpy(zero_copy_only=False)
         # ids arrive sorted, so searchsorted is the edge id -> row index map and no
         # dict is built. Every next_id is an id, so every lookup lands.
         succ = np.full(n, -1, dtype=np.int64)
@@ -1327,14 +1368,14 @@ class Window:
         query, params = self.sql.edges_query(with_groups=False, by_weight=by_weight)
         cur = self.con.execute(query, params)
         # The window test stays in micro-degrees, against the same integers the
-        # database holds -- see `Bounds.as_e6`.
-        box = self.bounds.as_e6()
+        # database holds -- see `Bounds.as_wsen_e6`.
+        box = self.bounds.as_wsen_e6()
         for batch in _batches(cur):
-            lon, offsets, lengths = _lists(batch.column(3))
-            lat, _, _ = _lists(batch.column(4))
+            lon, offsets, lengths = _lists(batch.column("lon_e6"))
+            lat, _, _ = _lists(batch.column("lat_e6"))
             keep = _in_window(lon, lat, offsets, lengths, box)
             xs, ys = proj.flat(lon, lat)
-            weights = batch.column(6).to_pylist()
+            weights = batch.column("weight").to_pylist()
             offs = offsets.tolist()
             for i in keep.nonzero()[0].tolist():
                 line = Polyline(xs, ys, range(offs[i], offs[i + 1]))
@@ -1367,18 +1408,18 @@ class Window:
         try:
             query, params = self.sql.chained_query(by_weight=by_weight)
             cur = self.con.execute(query, params)
-            box = self.bounds.as_e6()
+            box = self.bounds.as_wsen_e6()
             ax: list[float] = []
             ay: list[float] = []
             live = -1  # chain id of the run being accumulated, -1 for none
             weight = 0.0
             for batch in _batches(cur):
-                lon, offsets, lengths = _lists(batch.column(1))
-                lat, _, _ = _lists(batch.column(2))
+                lon, offsets, lengths = _lists(batch.column("lon_e6"))
+                lat, _, _ = _lists(batch.column("lat_e6"))
                 keep = _in_window(lon, lat, offsets, lengths, box).tolist()
                 xs, ys = proj.flat(lon, lat)
-                chains = batch.column(0).to_pylist()
-                weights = batch.column(3).to_pylist()
+                chains = batch.column("chain_id").to_pylist()
+                weights = batch.column("weight").to_pylist()
                 offs = offsets.tolist()
                 for i in range(len(keep)):
                     # An edge the window test drops leaves a hole, and the edges
@@ -1446,88 +1487,56 @@ class Window:
         weights = Weights.over(array("d", (t for _, _, t in rows)))
         return {g: weights.of(t) for g, _, t in rows}
 
-    def groups(self) -> Iterator[tuple[str, float, list[tuple[float, float]]]]:
-        """(group, its weight, one edge's coordinates), grouped.
-
-        Consecutive tuples sharing a group belong to the same ribbon, widest first by
-        default. The caller strokes a group's geometry as one path and moves on.
-        """
-        for name, weight, _, coords in self._group_rows(None, 0.0):
-            yield name, weight, coords
-
     def group_paths(
         self, proj: Projection, *, tol: float = 0.0
     ) -> Iterator[tuple[str, float, Polyline]]:
-        """:meth:`groups`, already projected and simplified. Same grouping."""
-        for name, weight, pts, _ in self._group_rows(proj, tol):
-            yield name, weight, pts
+        """(group, its weight, one edge's geometry in canvas pixels), grouped.
 
-    def _group_rows(
-        self, proj: Projection | None, tol: float
-    ) -> Iterator[tuple[str, float, Polyline, list[tuple[float, float]]]]:
-        """The shared body of `groups` and `group_paths`.
-
-        One generator so the ordering, the weighting and the window test cannot drift
-        apart between the projected and unprojected views of the same data.
-
-        The group listing is materialised because it is small -- hundreds of services
-        for a city, thousands nationally. That assumption is the spec's to break:
-        `group=way` over a city is one group per OSM way, so the count is checked
-        against MAX_GROUPS here rather than discovered as a render that never ends.
+        Consecutive tuples sharing a group belong to the same ribbon, widest first by
+        default. The caller strokes a group's geometry as one path and moves on, so
+        nothing but one group's shapes is ever live.
         """
         weight_of = self.group_weights()
         if not weight_of:
             return
 
         query, params = self.sql.grouped_query()
-        box = self.bounds.as_e6()
+        box = self.bounds.as_wsen_e6()
         cur = self.con.execute(query, params)
-        empty = Polyline((), (), ())
         for batch in _batches(cur):
-            lon, offsets, lengths = _lists(batch.column(1))
-            lat, _, _ = _lists(batch.column(2))
+            lon, offsets, lengths = _lists(batch.column("lon_e6"))
+            lat, _, _ = _lists(batch.column("lat_e6"))
             keep = _in_window(lon, lat, offsets, lengths, box)
-            names = batch.column(0).to_pylist()
+            names = batch.column("grp").to_pylist()
             offs = offsets.tolist()
-            xs, ys = proj.flat(lon, lat) if proj is not None else ((), ())
-            lons = lon.tolist() if proj is None else ()
-            lats = lat.tolist() if proj is None else ()
+            xs, ys = proj.flat(lon, lat)
             for i in keep.nonzero()[0].tolist():
-                a, b = offs[i], offs[i + 1]
-                # `groups()` wants degrees and no projection; `group_paths()` wants
-                # the projection and no degrees. Neither ever wants both, so only
-                # the half that was asked for is built.
-                line = (
-                    Polyline(xs, ys, range(a, b)).simplified(tol)
-                    if proj is not None
-                    else empty
-                )
-                coords = (
-                    []
-                    if proj is not None
-                    else [(lons[j] / 1e6, lats[j] / 1e6) for j in range(a, b)]
-                )
-                yield names[i], weight_of[names[i]], line, coords
+                line = Polyline(xs, ys, range(offs[i], offs[i + 1])).simplified(tol)
+                yield names[i], weight_of[names[i]], line
 
 
-class Held(Window):
-    """A window backed by edges already in memory.
+class Held:
+    """A :class:`Frame` backed by edges already in memory.
 
     `render(edges=...)` exists so a caller can re-render a window it already has,
     which is worth keeping for anyone tuning options against one area. It is the
     only path that still holds everything, and it is the caller's choice to.
 
-    It cannot honour a spec: the edges it was handed were already weighted, grouped
-    and filtered by whatever produced them. `spec` is recorded so a caller can see
-    which one that was, and ignored otherwise.
+    It cannot honour the whole of a spec: the edges it was handed were already
+    weighted, grouped and filtered by whatever produced them. What it can honour is
+    the draw order, which is a property of the list rather than of the query, so
+    `spec.order` is read and the rest is recorded for a caller to inspect.
     """
 
     def __init__(self, edges: Sequence[Edge], *, spec: QuerySpec = DEFAULT_SPEC) -> None:
         self._edges = list(edges)
         self.spec = spec
-        # The base class computes this lazily off the database; there is no database
-        # here, so it is filled in up front and the property finds it already set.
-        self._weights: Weights | None = Weights.over([e.weight for e in self._edges])
+        # There is no query to take a scale from, so it is taken from the edges.
+        self.weights = Weights.over([e.weight for e in self._edges])
+
+    @property
+    def alpha_compensation(self) -> float:
+        return float(max(1, self.spec.sample))
 
     def edges(self, *, by_weight: bool = False) -> Iterator[Edge]:
         if by_weight:
@@ -1559,11 +1568,6 @@ class Held(Window):
     def group_paths(
         self, proj: Projection, *, tol: float = 0.0
     ) -> Iterator[tuple[str, float, Polyline]]:
-        for name, weight, coords in self.groups():
-            pts = [proj(x, y) for x, y in coords]
-            yield name, weight, Polyline.of(pts).simplified(tol)
-
-    def groups(self) -> Iterator[tuple[str, float, list[tuple[float, float]]]]:
         by_group: dict[str, list[Edge]] = {}
         for e in self._edges:
             for name in e.groups:
@@ -1572,9 +1576,10 @@ class Held(Window):
             return
         trips = {n: sum(e.weight for e in es) for n, es in by_group.items()}
         weights = Weights.over(list(trips.values()))
-        for name in sorted(by_group, key=lambda n: (-len(by_group[n]), n)):
+        for name in _held_order(self.spec.order, by_group, trips):
             for e in by_group[name]:
-                yield name, weights.of(trips[name]), e.coords
+                pts = [proj(x, y) for x, y in e.coords]
+                yield name, weights.of(trips[name]), Polyline.of(pts).simplified(tol)
 
 
 def _to_edge(row: tuple[Any, ...], *, with_groups: bool) -> Edge | None:
@@ -1586,9 +1591,8 @@ def _to_edge(row: tuple[Any, ...], *, with_groups: bool) -> Edge | None:
         road_class=row[1],
         length_m=float(row[2] or 0.0),
         coords=[(x / 1e6, y / 1e6) for x, y in zip(lon_e6, lat_e6, strict=True)],
-        n_services=int(row[5]),
-        weight=float(row[6]),
-        groups=tuple(sorted(row[7])) if with_groups and row[7] else (),
+        weight=float(row[5]),
+        groups=tuple(sorted(row[6])) if with_groups and row[6] else (),
     )
 
 
@@ -1676,23 +1680,6 @@ class Weights:
         return min(1.0, max(0.0, (v - self.lo) / (self.hi - self.lo)))
 
 
-def _normalise(
-    values: Sequence[float], lo_q: float = _LO_Q, hi_q: float = _HI_Q
-) -> list[float]:
-    """The original list-at-a-time scale, kept as the reference :class:`Weights` is
-    tested against.
-
-    Nothing draws through it any more -- the styles weight each edge as it streams
-    past -- but the two must agree exactly, or the same window would come out
-    differently depending on which path rendered it. Pinning that here is what makes
-    the change from one to the other checkable.
-    """
-    if not values:
-        return []
-    w = Weights.over(values, lo_q, hi_q)
-    return [w.of(v) for v in values]
-
-
 def _stable_unit(text: str) -> float:
     """A deterministic float in [0, 1) from a string.
 
@@ -1740,20 +1727,18 @@ class RenderOpts:
     coalesce: bool = False
 
 
-StyleFn = Callable[["cairo.Context[cairo.Surface]", "Window", Projection, RenderOpts], None]
+StyleFn = Callable[["cairo.Context[cairo.Surface]", Frame, Projection, RenderOpts], None]
 
 
 @dataclass(frozen=True, slots=True)
 class Style:
     draw: StyleFn
-    background: RGB = (0.02, 0.02, 0.035)
-    needs_groups: bool = False
-    blurb: str = ""
-    # The widest stroke this style lays down at `line_scale=1`. Only banding reads
-    # it, and only to work out how far outside a band an edge can still be and paint
-    # into it -- a band whose collar is narrower than half a line width grows a seam.
-    # Declared rather than measured because it is a property of the ramps in `draw`,
-    # and a style that widens its lines has to say so here.
+    # The widest stroke this style lays down at `line_scale=1`. Required rather than
+    # defaulted: only banding reads it, and only to work out how far outside a band
+    # an edge can still be and paint into it -- so a style that inherited someone
+    # else's number would either grow a seam or query a collar it never draws in,
+    # and both are invisible until a picture is looked at closely. It is a property
+    # of the ramps in `draw`, so declaring it is part of writing a style.
     #
     # There are two regimes, and `ref_px` is which one this style is in. Left None,
     # `max_line_px` is absolute pixels: the style strokes the same width whatever the
@@ -1761,7 +1746,10 @@ class Style:
     # with `width_px` -- which is what `density` does, so that the map and the lines
     # shrink together. A canvas-scaling style that inherited the absolute reading
     # would get a collar too wide below `ref_px` and, worse, too narrow above it.
-    max_line_px: float = 20.0
+    max_line_px: float
+    background: RGB = (0.02, 0.02, 0.035)
+    needs_groups: bool = False
+    blurb: str = ""
     ref_px: float | None = None
     # Whether this style reads `RenderOpts.coalesce`. Declared rather than inferred so
     # a request for it against a style that ignores it says so instead of quietly
@@ -1811,7 +1799,7 @@ def density_halo_width(t: float) -> float:
 
 def draw_density(
     ctx: cairo.Context[cairo.Surface],
-    window: Window,
+    window: Frame,
     proj: Projection,
     opts: RenderOpts,
 ) -> None:
@@ -1870,7 +1858,7 @@ def draw_density(
     # thing a preview is for, since line weight is one of the knobs being judged. So
     # the preview stays a little dark, says so on the page, and is followed by the
     # real render.
-    alpha_scale = opts.alpha_scale * max(1, window.spec.sample)
+    alpha_scale = opts.alpha_scale * window.alpha_compensation
 
     # Bound once: this is a property that may run a query on first touch, and it
     # is read once per edge.
@@ -1888,7 +1876,7 @@ def draw_density(
 
 def draw_spectrum(
     ctx: cairo.Context[cairo.Surface],
-    window: Window,
+    window: Frame,
     proj: Projection,
     opts: RenderOpts,
 ) -> None:
@@ -1941,7 +1929,7 @@ def draw_spectrum(
 
 def draw_strands(
     ctx: cairo.Context[cairo.Surface],
-    window: Window,
+    window: Frame,
     proj: Projection,
     opts: RenderOpts,
 ) -> None:
@@ -2148,6 +2136,11 @@ CREDIT_REF_PX = 220.0
 # text too small to read is only a small one.
 CREDIT_MIN_PX = 6.5
 
+# The same two for the user's own caption, which is a title rather than a footnote
+# and so is drawn larger.
+CAPTION_REF_PX = 130.0
+CAPTION_MIN_PX = 10.0
+
 
 def _captions(
     ctx: cairo.Context[cairo.Surface], proj: Projection, opts: RenderOpts
@@ -2164,7 +2157,7 @@ def _captions(
     projection for a canvas size and nothing else -- no weight scale, no window, no
     band collar -- so a credited render draws the same map as an uncredited one.
     """
-    size = max(10.0, proj.width / 130)
+    size = max(CAPTION_MIN_PX, proj.width / CAPTION_REF_PX)
     x = size * 2.2
     y = proj.height - size * 2.2
     if opts.credit:
@@ -2321,8 +2314,16 @@ def _stamped(data: bytes, fmt: str, fields: dict[str, str]) -> bytes:
 FORMATS = (".png", ".svg")
 
 
-def _fmt(path: Path | str) -> str:
-    suffix = (Path(path).suffix if isinstance(path, Path) else path).lower()
+def _fmt(path_or_suffix: Path | str) -> str:
+    """The output format, from a path to write or from a bare suffix.
+
+    Both, because the two entry points hold different things: `render` has a filename
+    and `render_bytes` has `.png` or `.svg` on its own. A bare suffix has no suffix of
+    its own -- `Path(".png").suffix` is empty, since a leading dot names a hidden file
+    -- so an empty one means the text was already the answer.
+    """
+    text = str(path_or_suffix)
+    suffix = (Path(text).suffix or text).lower()
     if suffix not in FORMATS:
         raise ValueError(f"unsupported output format {suffix!r}; use .png or .svg")
     return suffix
@@ -2354,6 +2355,34 @@ def _surface(
         ),
         scale,
     )
+
+
+def _canvas(
+    surface: Any, draw_scale: float, sty: Style, opts: RenderOpts, dev_origin: int = 0
+) -> Any:
+    """A context on `surface`, scaled for print and filled with the ground colour.
+
+    `dev_origin` is the device row the surface's first row stands for, which is how a
+    band draws its slice of a taller picture in the whole picture's coordinates; zero
+    for a whole canvas. The shift is in device space and the print scale is applied
+    after it, so `y_device = y_user * scale - origin` and a style still draws in the
+    logical units it was written in.
+
+    Typed loosely because a style takes a `Context[Surface]` and cairo's stubs make
+    that invariant in the surface type.
+    """
+    import cairo
+
+    ctx: Any = cairo.Context(surface)
+    ctx.translate(0, -dev_origin)
+    ctx.scale(draw_scale, draw_scale)
+    ctx.set_antialias(cairo.Antialias.BEST)
+    ctx.set_line_cap(cairo.LineCap.ROUND)
+    ctx.set_line_join(cairo.LineJoin.ROUND)
+    r, g, b = opts.background or sty.background
+    ctx.set_source_rgb(r, g, b)
+    ctx.paint()
+    return ctx
 
 
 def _default_path(bounds_or_name: Bounds | str, style: str) -> Path:
@@ -2510,7 +2539,7 @@ def band_cuts(
     where, params = sql.where(sampled=True)
     row = con.execute(
         "SELECT count(*), quantile_cont((min_lat_e6 + max_lat_e6) / 2.0, ?) "
-        f"FROM {sql.source.edges} WHERE {where}",
+        f"FROM {EDGES} WHERE {where}",
         [[i / n for i in range(1, n)], *params],
     ).fetchone()
     n_edges = int(row[0]) if row else 0
@@ -2626,32 +2655,17 @@ def _draw_band(job: _BandJob) -> tuple[int, int, int, bytes]:
     # split, and the clip that remains is exactly the serial path's.
     #
     # `max_stroke_px` takes the canvas width because a style may quote its widths
-    # against a reference canvas rather than in absolute pixels. A fixed collar was
-    # right for every style until `density` started scaling with `width_px`, at which
-    # point it was twice what a 2,000px render needed and less than a 6,000px one did
-    # -- and only the second of those is a seam, which is why it went unnoticed.
+    # against a reference canvas rather than in absolute pixels; a collar read as
+    # absolute pixels under a style that scales with `width_px` is too narrow above
+    # that style's reference canvas, which is a seam, and merely wasteful below it.
     pad = _band_pad(sty, job.opts, job.width)
     dev_pad = math.ceil(pad * s)
-    origin = job.dev_y0 - dev_pad
     surface = cairo.ImageSurface(
         cairo.FORMAT_ARGB32,
         max(1, round(job.width * s)),
         (job.dev_y1 - job.dev_y0) + 2 * dev_pad,
     )
-    # Typed loosely for the same reason `_render` is: a style takes a
-    # Context[Surface] and cairo's stubs make that invariant in the surface type.
-    ctx: Any = cairo.Context(surface)
-    # Device-space shift first, then the print scale, so `y_device = y_user * s -
-    # origin` and a style still draws in the logical units it was written in.
-    ctx.translate(0, -origin)
-    ctx.scale(s, s)
-    ctx.set_antialias(cairo.Antialias.BEST)
-    ctx.set_line_cap(cairo.LineCap.ROUND)
-    ctx.set_line_join(cairo.LineJoin.ROUND)
-
-    r, g, b = job.opts.background or sty.background
-    ctx.set_source_rgb(r, g, b)
-    ctx.paint()
+    ctx = _canvas(surface, s, sty, job.opts, dev_origin=job.dev_y0 - dev_pad)
 
     ctx.save()
     # Clip to the window and nothing else -- the same rectangle `_render` uses, so an
@@ -2704,13 +2718,11 @@ def _draw_banded(
     surface: Any,
     bounds: Bounds,
     proj: Projection,
-    sty: Style,
     style: str,
     opts: RenderOpts,
     draw_scale: float,
     con: duckdb.DuckDBPyConnection,
     query: QuerySpec,
-    source: Source,
     workers: int,
 ) -> bool:
     """Fill `surface` from `workers` processes, one band each; False if it declined.
@@ -2732,7 +2744,8 @@ def _draw_banded(
     db_path = band_source(con)
     if db_path is None:
         return False
-    window = Window(bounds, con, with_groups=sty.needs_groups, spec=query, source=source)
+    sty = STYLES[style]
+    window = Window(bounds, con, with_groups=sty.needs_groups, spec=query)
     n_edges, cuts = band_cuts(
         con, window.sql, bounds, proj, surface.get_height() / draw_scale, workers
     )
@@ -2754,7 +2767,7 @@ def _draw_banded(
             style=style,
             opts=opts,
             query=query,
-            source=source,
+            source=DEFAULT_SOURCE,
             # Resolved here, on the parent's connection, precisely once.
             weights=window.weights,
             group_stats=window.group_stats() if sty.needs_groups else None,
@@ -2792,7 +2805,6 @@ def _render(
     *,
     opts: RenderOpts | None = None,
     query: QuerySpec = DEFAULT_SPEC,
-    source: Source = DEFAULT_SOURCE,
     con: duckdb.DuckDBPyConnection | None = None,
     edges: Sequence[Edge] | None = None,
     workers: int = 1,
@@ -2829,22 +2841,8 @@ def _render(
         # not have -- but silence would look like it had been honoured.
         log.warning("%s ignores coalesce; see the coalescing section", style)
 
-    cairo = _require_cairo()
-
-    # Streamed from the database unless the caller handed over edges it already
-    # holds; either way the styles see the same interface.
-    own_con = con is None and edges is None
-    if edges is not None:
-        window: Window = Held(edges, spec=query)
-    else:
-        con = con or db.connect(read_only=True)
-        window = Window(
-            bounds, con, with_groups=sty.needs_groups, spec=query, source=source
-        )
-
-    width = opts.width_px
-    height = opts.height_px or Projection.canvas_height(bounds, width)
-    proj = Projection.fit(bounds, width, height)
+    _require_cairo()
+    proj = Projection.fit(bounds, opts.width_px, _canvas_height(bounds, opts))
 
     # cairo draws into a buffer rather than into the sink, because both formats are
     # post-processed before they land: neither PNG nor SVG metadata is something
@@ -2852,49 +2850,108 @@ def _render(
     # once. It costs one copy of the *encoded* image, against a raster that is
     # already resident and several times larger.
     buf = io.BytesIO()
-    surface, draw_scale = _surface(fmt, buf, width, height, opts.scale)
+    surface, draw_scale = _surface(fmt, buf, proj.width, proj.height, opts.scale)
     # Styles draw in logical units and the context is scaled up for print, so a
     # tolerance of half a logical pixel is half a *device* pixel only at 1x. Divide
     # it here, where `draw_scale` is known -- and where SVG's fixed 1.0 keeps a
     # vector output at full detail whatever `scale` was asked for.
     opts = replace(opts, simplify_px=opts.simplify_px / draw_scale)
-    ctx = cairo.Context(surface)
-    ctx.scale(draw_scale, draw_scale)
-    ctx.set_antialias(cairo.Antialias.BEST)
-    ctx.set_line_cap(cairo.LineCap.ROUND)
-    ctx.set_line_join(cairo.LineJoin.ROUND)
-
-    r, g, b = opts.background or sty.background
-    ctx.set_source_rgb(r, g, b)
-    ctx.paint()
-
-    # Banding needs a file to reopen per process and a raster to paste into, so it is
-    # off for an SVG, for edges the caller already holds, and for a database that is
-    # not the configured one. Each of those falls back rather than failing: `workers`
-    # asks for speed, and a request for speed that cannot be honoured is not an error.
-    banded = workers > 1 and fmt == ".png" and edges is None and con is not None
+    ctx = _canvas(surface, draw_scale, sty, opts)
 
     t0 = time.monotonic()
-    if banded:
-        assert con is not None
-        try:
-            banded = _draw_banded(
-                surface,
-                bounds,
-                proj,
-                sty,
-                style,
-                opts,
-                draw_scale,
-                con,
-                query,
-                source,
-                workers,
+    _paint(
+        surface,
+        ctx,
+        bounds,
+        proj,
+        style,
+        opts,
+        draw_scale,
+        fmt,
+        con=con,
+        edges=edges,
+        query=query,
+        workers=workers,
+    )
+    # Last, and in this process whether or not the map was drawn in others: text
+    # composites with OVER, and the additive and screening styles would take it as
+    # light to accumulate.
+    _captions(ctx, proj, opts)
+
+    _emit(surface, buf, fmt, sink, _provenance(bounds, bounds_or_name, style))
+    log.info(
+        "%s %dx%d %s in %.1fs -> %s",
+        style,
+        proj.width,
+        proj.height,
+        f"@{opts.scale:g}x" if opts.scale != 1.0 else "",
+        time.monotonic() - t0,
+        label,
+    )
+
+
+def _canvas_height(bounds: Bounds, opts: RenderOpts) -> int:
+    """The canvas height: the caller's, or the one that fits the window exactly."""
+    return opts.height_px or Projection.canvas_height(bounds, opts.width_px)
+
+
+def _open_window(
+    bounds: Bounds,
+    sty: Style,
+    query: QuerySpec,
+    con: duckdb.DuckDBPyConnection | None,
+    edges: Sequence[Edge] | None,
+) -> Frame:
+    """What the style will draw from: the database, or edges the caller holds."""
+    if edges is not None:
+        return Held(edges, spec=query)
+    assert con is not None  # _paint opens one before it asks for a window
+    return Window(bounds, con, with_groups=sty.needs_groups, spec=query)
+
+
+def _paint(
+    surface: Any,
+    ctx: Any,
+    bounds: Bounds,
+    proj: Projection,
+    style: str,
+    opts: RenderOpts,
+    draw_scale: float,
+    fmt: str,
+    *,
+    con: duckdb.DuckDBPyConnection | None,
+    edges: Sequence[Edge] | None,
+    query: QuerySpec,
+    workers: int,
+) -> None:
+    """Draw the map onto `surface`, in bands or serially, and own the connection.
+
+    Whatever this opens, it closes -- which is the render server's whole rule: DuckDB
+    gives a writer an exclusive lock, so a handle left alive by a finished render
+    stops the next pipeline stage from starting. A connection the caller supplied is
+    the caller's to close.
+
+    Banding needs a file to reopen per process and a raster to paste into, so it is
+    off for an SVG, for edges the caller already holds, and for a database a worker
+    cannot open. Each of those falls back to drawing serially rather than failing:
+    `workers` asks for speed, and speed that cannot be had is not an error.
+    """
+    sty = STYLES[style]
+    own_con = con is None and edges is None
+    if own_con:
+        con = db.connect(read_only=True)
+    try:
+        if (
+            workers > 1
+            and fmt == ".png"
+            and edges is None
+            and con is not None
+            and _draw_banded(
+                surface, bounds, proj, style, opts, draw_scale, con, query, workers
             )
-        finally:
-            if own_con and banded:
-                con.close()
-    if not banded:
+        ):
+            return
+        window = _open_window(bounds, sty, query, con, edges)
         ctx.save()
         # Clip to the window rather than the frame: the query returns a collar of
         # edges just outside the bounds, and without this they bleed into the
@@ -2904,31 +2961,26 @@ def _render(
         try:
             sty.draw(ctx, window, proj, opts)
         finally:
-            if own_con and con is not None:
-                con.close()
-        ctx.restore()
+            ctx.restore()
+    finally:
+        if own_con and con is not None:
+            con.close()
 
-    _captions(ctx, proj, opts)
 
+def _emit(
+    surface: Any, buf: io.BytesIO, fmt: str, sink: Sink, fields: dict[str, str]
+) -> None:
+    """Finish the surface, stamp the provenance in, and hand the bytes to the sink."""
     if fmt == ".png":
         surface.write_to_png(buf)
     # Flushes the SVG writer as well, so the buffer holds a complete document by the
     # time this returns.
     surface.finish()
-    data = _stamped(buf.getvalue(), fmt, _provenance(bounds, bounds_or_name, style))
+    data = _stamped(buf.getvalue(), fmt, fields)
     if isinstance(sink, Path):
         sink.write_bytes(data)
     else:
         sink.write(data)
-    log.info(
-        "%s %dx%d %s in %.1fs -> %s",
-        style,
-        width,
-        height,
-        f"@{opts.scale:g}x" if opts.scale != 1.0 else "",
-        time.monotonic() - t0,
-        label,
-    )
 
 
 def render(
@@ -2938,7 +2990,6 @@ def render(
     *,
     opts: RenderOpts | None = None,
     query: QuerySpec = DEFAULT_SPEC,
-    source: Source = DEFAULT_SOURCE,
     con: duckdb.DuckDBPyConnection | None = None,
     edges: Sequence[Edge] | None = None,
     workers: int | None = None,
@@ -2963,7 +3014,6 @@ def render(
         str(path),
         opts=opts,
         query=query,
-        source=source,
         con=con,
         edges=edges,
         workers=default_workers(workers),
@@ -2978,7 +3028,6 @@ def render_bytes(
     fmt: str = ".png",
     opts: RenderOpts | None = None,
     query: QuerySpec = DEFAULT_SPEC,
-    source: Source = DEFAULT_SOURCE,
     con: duckdb.DuckDBPyConnection | None = None,
     edges: Sequence[Edge] | None = None,
     workers: int | None = None,
@@ -2999,7 +3048,6 @@ def render_bytes(
         "memory",
         opts=opts,
         query=query,
-        source=source,
         con=con,
         edges=edges,
         workers=default_workers(workers),

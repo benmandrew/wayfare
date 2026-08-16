@@ -16,12 +16,9 @@ import pytest
 from wayfare import art, db
 
 BOUNDS = art.Bounds(*builders.WINDOW)
-BBOX = [
-    round(BOUNDS.max_lon * 1e6),
-    round(BOUNDS.min_lon * 1e6),
-    round(BOUNDS.max_lat * 1e6),
-    round(BOUNDS.min_lat * 1e6),
-]
+BBOX = BOUNDS.as_predicate_params()
+# The grouped path only exists projected, so every test that walks it needs one.
+PROJ = art.Projection.fit(BOUNDS, 800, 600)
 
 # No filter, each filter on its own, then all of them at once. The last case is the
 # one that catches a fragment whose parameters were appended in the wrong order.
@@ -91,10 +88,18 @@ def _every_query(sql):
         sql.edges_query(with_groups=True, by_weight=True),
         sql.edges_query(with_groups=False, by_weight=False),
         sql.weights_query(),
+        sql.bounds_query(0.02, 0.98),
         sql.group_query(),
         sql.grouped_query(),
-        sql.cardinality_query(),
+        sql.chain_query(),
+        sql.chained_query(by_weight=True),
     )
+
+
+def _group_names(con, **kwargs):
+    """The group of every drawn shape, in the order the ribbons are laid down."""
+    window = art.Window(BOUNDS, con, with_groups=True, spec=art.QuerySpec(**kwargs))
+    return [name for name, _weight, _line in window.group_paths(PROJ)]
 
 
 # --- The vocabulary ---------------------------------------------------------
@@ -184,7 +189,8 @@ def test_every_weight_and_group_combination_executes(net, weight, group):
                 sql.edges_query(with_groups=True, by_weight=True),
                 sql.edges_query(with_groups=False, by_weight=False),
                 sql.weights_query(),
-                sql.cardinality_query(),
+                sql.bounds_query(0.02, 0.98),
+                sql.chain_query(),
             ]
         for query, params in queries:
             net.execute(query, params).fetchall()
@@ -277,12 +283,12 @@ def test_a_filter_removes_the_same_edges_from_both_query_shapes(net, kwargs):
     spec = art.QuerySpec(**kwargs)
     # The grouped query returns geometry without an edge id, so the first vertex
     # stands in for identity -- every edge here starts at a different longitude.
-    flat = {round(e.coords[0][0] * 1e6) for e in art.Window(BOUNDS, net, spec=spec).edges()}
+    flat = {PROJ(*e.coords[0]) for e in art.Window(BOUNDS, net, spec=spec).edges()}
     grouped = {
-        round(coords[0][0] * 1e6)
-        for _name, _weight, coords in art.Window(
+        line.points()[0]
+        for _name, _weight, line in art.Window(
             BOUNDS, net, with_groups=True, spec=spec
-        ).groups()
+        ).group_paths(PROJ)
     }
     assert flat and grouped  # a vacuous pass would prove nothing
     assert grouped <= flat
@@ -328,19 +334,14 @@ def test_every_weight_arrives_as_a_float(net, weight):
 def test_a_non_string_group_key_comes_back_as_a_string(net):
     """way_id is a BIGINT. `strands` hashes the group name to pick a hue, so a
     non-string here is a TypeError deep inside drawing rather than a query error."""
-    window = art.Window(BOUNDS, net, with_groups=True, spec=art.QuerySpec(group="way"))
-    names = {name for name, _weight, _coords in window.groups()}
+    names = set(_group_names(net, group="way"))
     assert names == {"1", "99"}
     assert all(isinstance(n, str) for n in names)
 
 
 def test_a_null_group_key_becomes_unknown(net):
     """road_name is frequently null nationally, and a null hue is a crash."""
-    window = art.Window(
-        BOUNDS, net, with_groups=True, spec=art.QuerySpec(group="road_name")
-    )
-    names = {name for name, _weight, _coords in window.groups()}
-    assert names == {"R", "unknown"}
+    assert set(_group_names(net, group="road_name")) == {"R", "unknown"}
     for e in art.Window(
         BOUNDS, net, with_groups=True, spec=art.QuerySpec(group="road_name")
     ).edges():
@@ -354,15 +355,13 @@ def test_too_many_groups_is_refused_before_anything_is_drawn(net, monkeypatch):
     """`group=way` over a city is one group per OSM way, which is one composited
     stroke per edge. Better a message than a render that never ends."""
     monkeypatch.setattr(art, "MAX_GROUPS", 1)
-    window = art.Window(BOUNDS, net, with_groups=True, spec=art.QuerySpec(group="way"))
     with pytest.raises(ValueError, match="group='way' gives 2 groups"):
-        list(window.groups())
+        _group_names(net, group="way")
 
 
 def test_a_window_inside_the_cap_is_fine(net, monkeypatch):
     monkeypatch.setattr(art, "MAX_GROUPS", 2)
-    window = art.Window(BOUNDS, net, with_groups=True, spec=art.QuerySpec(group="way"))
-    assert {name for name, _w, _c in window.groups()} == {"1", "99"}
+    assert set(_group_names(net, group="way")) == {"1", "99"}
 
 
 # --- Determinism ------------------------------------------------------------
@@ -388,13 +387,10 @@ def test_every_order_draws_a_pinned_sequence(net, order):
     commutative -- but an SVG records stroke order, and two runs of `strands` once
     differed in 180,365 of 293,842 bytes. The edge_id tiebreak in _order_sql is what
     fixes it, so pin the full sequence rather than just the group order."""
-    window = art.Window(BOUNDS, net, with_groups=True, spec=art.QuerySpec(order=order))
-    assert [name for name, _w, _c in window.groups()] == ORDERED_NAMES[order]
+    assert _group_names(net, order=order) == ORDERED_NAMES[order]
 
 
 def test_the_default_order_is_widest_first(net):
     """The default ordering puts trunk routes underneath, and equally broad services
     fall back to their name so the scan order cannot decide the picture."""
-    window = art.Window(BOUNDS, net, with_groups=True)
-    names = [name for name, _w, _c in window.groups()]
-    assert names == ORDERED_NAMES["widest"]
+    assert _group_names(net) == ORDERED_NAMES["widest"]

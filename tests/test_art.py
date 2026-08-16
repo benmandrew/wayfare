@@ -6,6 +6,7 @@ import re
 import struct
 import zlib
 from dataclasses import replace
+from pathlib import Path
 from xml.etree import ElementTree
 
 import builders
@@ -121,6 +122,68 @@ def test_unknown_style_lists_the_known_ones(tmp_path):
         art.render("cardiff", style="nonesuch", out_path=tmp_path / "x.png", edges=[])
 
 
+class _Bare:
+    """Exactly :class:`art.Frame` and nothing else -- no spec, no connection.
+
+    Anything a style reaches for beyond the four members raises AttributeError here,
+    which is the point: the protocol is the whole of what paint may ask of data.
+    """
+
+    weights = art.Weights.over([1.0, 100.0, 900.0])
+    alpha_compensation = 2.0
+
+    def paths(self, proj, *, tol=0.0, by_weight=False, coalesce=False):
+        yield 100.0, art.Polyline.of([(10.0, 10.0), (60.0, 70.0), (90.0, 20.0)])
+
+    def group_paths(self, proj, *, tol=0.0):
+        yield "42", 0.5, art.Polyline.of([(10.0, 10.0), (60.0, 70.0)])
+
+
+@pytest.mark.parametrize("style", sorted(art.STYLES))
+def test_a_style_draws_from_the_frame_and_nothing_else(style):
+    """A render is a style and a query spec, and they know nothing about each other.
+    The one crossing is `Style.needs_groups`, which names the *shape* of the data a
+    style consumes. A style reading `window.spec` -- for the sample rate, say -- puts
+    a query concern inside the paint, and it raises here rather than compiling."""
+    import cairo
+
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 100, 100)
+    ctx = cairo.Context(surface)
+    proj = art.Projection.fit(BOUNDS, 100, 100)
+    art.STYLES[style].draw(ctx, _Bare(), proj, art.RenderOpts(width_px=100))
+
+
+def test_the_window_says_how_much_light_a_sampled_render_owes(con):
+    """`density` composites additively, so a preview drawing one edge in eight has to
+    put the light of the missing seven onto the survivors. Which edges there are is
+    the spec's business; the number to multiply an alpha by is the window's, so the
+    style asks for that rather than reading the sample rate itself."""
+    builders.insert_edge(con, 1, lon_e6=-3200000, span_e6=1000)
+    builders.insert_services(con, 1, n_trips=100)
+    assert art.Window(BOUNDS, con).alpha_compensation == 1.0
+    spec = art.QuerySpec(sample=8)
+    assert art.Window(BOUNDS, con, spec=spec).alpha_compensation == 8.0
+    assert art.Held(art.load_edges(BOUNDS, con=con)).alpha_compensation == 1.0
+
+
+def test_a_style_must_declare_its_widest_stroke():
+    """Banding sizes a band's collar off `max_line_px`. A style that inherited a
+    default would get a collar for a picture it does not draw, and too narrow a collar
+    is a seam nothing raises about -- so the declaration is required at construction."""
+    with pytest.raises(TypeError):
+        art.Style(draw=lambda *a: None)
+
+
+def test_a_format_comes_from_a_path_or_from_a_bare_suffix():
+    """`render` holds a filename and `render_bytes` holds `.png` on its own. A bare
+    suffix has no suffix of its own, which is what the fallback is for."""
+    assert art._fmt(Path("/tmp/a.PNG")) == ".png"
+    assert art._fmt("/tmp/a.png") == ".png"
+    assert art._fmt(".svg") == ".svg"
+    with pytest.raises(ValueError, match="unsupported"):
+        art._fmt("/tmp/a.tiff")
+
+
 def test_unknown_output_format_fails_before_querying(tmp_path):
     """Rejecting the suffix must not cost a full window query first."""
     with pytest.raises(ValueError):
@@ -224,7 +287,8 @@ def test_strands_arrive_grouped_by_service_widest_first(con):
     builders.insert_services(con, 3, ("42",), n_trips=100)
     w = art.Window(BOUNDS, con, with_groups=True)
 
-    names = [name for name, _weight, _coords in w.groups()]
+    proj = art.Projection.fit(BOUNDS, 800, 600)
+    names = [name for name, _weight, _line in w.group_paths(proj)]
     assert names == ["42", "42", "42", "9A"]  # widest service first, then grouped
     # Once a name is left behind it never comes back, which is what lets the caller
     # stroke and forget.
@@ -330,12 +394,13 @@ def test_sampling_leaves_group_widths_alone(con):
 
     full = art.Window(BOUNDS, con, with_groups=True)
     thin = art.Window(BOUNDS, con, with_groups=True, spec=art.QuerySpec(sample=8))
+    proj = art.Projection.fit(BOUNDS, 800, 600)
 
-    widths = {(n, round(w, 9)) for n, w, _ in full.groups()}
-    thin_widths = {(n, round(w, 9)) for n, w, _ in thin.groups()}
+    widths = {(n, round(w, 9)) for n, w, _ in full.group_paths(proj)}
+    thin_widths = {(n, round(w, 9)) for n, w, _ in thin.group_paths(proj)}
     assert thin_widths == widths
     # ...while the geometry it hands back really is thinner.
-    assert 0 < len(list(thin.groups())) < len(list(full.groups()))
+    assert 0 < len(list(thin.group_paths(proj))) < len(list(full.group_paths(proj)))
 
 
 def test_paths_agree_with_projecting_the_edge_stream(con):
@@ -377,13 +442,37 @@ def test_held_window_matches_the_streaming_one(con):
 
     streamed = art.Window(BOUNDS, con, with_groups=True)
     held = art.Held(art.load_edges(BOUNDS, with_groups=True, con=con))
+    proj = art.Projection.fit(BOUNDS, 800, 600)
 
     assert held.weights == streamed.weights
     assert [e.edge_id for e in held.edges(by_weight=True)] == [
         e.edge_id for e in streamed.edges(by_weight=True)
     ]
-    assert [(n, round(w, 9)) for n, w, _ in held.groups()] == [
-        (n, round(w, 9)) for n, w, _ in streamed.groups()
+    assert [(n, round(w, 9)) for n, w, _ in held.group_paths(proj)] == [
+        (n, round(w, 9)) for n, w, _ in streamed.group_paths(proj)
+    ]
+
+
+@pytest.mark.parametrize("order", sorted(art.ORDERS))
+def test_held_lays_its_ribbons_down_in_the_order_the_spec_asked_for(con, order):
+    """`Held` cannot honour a filter -- its edges were chosen by whatever produced
+    them -- but the draw order is a property of the list rather than of the query, and
+    it decides which ribbon ends up underneath. Hard-coded to `widest` it silently
+    ignored `order=`, so `render(edges=...)` drew a different picture from the
+    streaming path for four of the five orders."""
+    builders.insert_edge(con, 1, lon_e6=-3200000, span_e6=1000)
+    builders.insert_services(con, 1, (("42", "OP1"), ("9A", "OP2")), n_trips=100)
+    builders.insert_edge(con, 2, lon_e6=-3190000, span_e6=1000)
+    builders.insert_services(con, 2, (("42", "FIRST"),), n_trips=50)
+    builders.insert_edge(con, 3, lon_e6=-3180000, span_e6=1000)
+    builders.insert_services(con, 3, (("7", "OP1"),), n_trips=30)
+
+    spec = art.QuerySpec(order=order)
+    proj = art.Projection.fit(BOUNDS, 800, 600)
+    held = art.Held(art.load_edges(BOUNDS, with_groups=True, con=con), spec=spec)
+    streamed = art.Window(BOUNDS, con, with_groups=True, spec=spec)
+    assert [n for n, _w, _p in held.group_paths(proj)] == [
+        n for n, _w, _p in streamed.group_paths(proj)
     ]
 
 
@@ -451,33 +540,6 @@ def test_two_specs_do_not_draw_the_same_picture(drawable):
         BOUNDS, "strands", query=art.QuerySpec(operator=("FIRST",)), **kwargs
     )
     assert plain != filtered
-
-
-# --- Cached windows -----------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "query",
-    [
-        art.DEFAULT_SPEC,
-        art.QuerySpec(weight="density", group="way"),
-        art.QuerySpec(min_trips=100),
-    ],
-    ids=lambda q: q.key,
-)
-@pytest.mark.parametrize("style", sorted(art.STYLES))
-def test_substituting_the_source_never_changes_the_picture(drawable, style, query):
-    """`Source` names where the two tables are read from, so that a materialised or
-    extracted window can be swapped in underneath a render. Whatever is swapped in,
-    the picture has to be the same one -- a source that changed the output would make
-    every design iterated against it a picture of something other than the database.
-    """
-    kwargs = {"fmt": ".svg", "opts": RENDER_OPTS, "con": drawable, "query": query}
-    direct = art.render_bytes(BOUNDS, style, **kwargs)
-    wrapped = art.Source(
-        edges="(SELECT * FROM edges)", services="(SELECT * FROM edge_services)"
-    )
-    assert art.render_bytes(BOUNDS, style, source=wrapped, **kwargs) == direct
 
 
 # --- The flat geometry path -------------------------------------------------

@@ -587,8 +587,22 @@ def test_meta_survives_no_database_at_all(no_db):
 
 
 HELD = [
-    art.Edge(1, "secondary", 100.0, [(-3.20, 51.480), (-3.19, 51.485)], 1, 100, ("42",)),
-    art.Edge(2, "secondary", 100.0, [(-3.19, 51.485), (-3.18, 51.490)], 1, 900, ("9A",)),
+    art.Edge(
+        edge_id=1,
+        road_class="secondary",
+        length_m=100.0,
+        coords=[(-3.20, 51.480), (-3.19, 51.485)],
+        weight=100,
+        groups=("42",),
+    ),
+    art.Edge(
+        edge_id=2,
+        road_class="secondary",
+        length_m=100.0,
+        coords=[(-3.19, 51.485), (-3.18, 51.490)],
+        weight=900,
+        groups=("9A",),
+    ),
 ]
 
 
