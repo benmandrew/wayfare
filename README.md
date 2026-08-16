@@ -2,7 +2,10 @@
 
 ![Coverage](docs/coverage.svg)
 
-![Every service across mainland Great Britain and Ireland, drawn from the three published archives: road in blue through yellow by journeys a day, rail in orange, ferry in crimson](docs/map.png)
+<p align="center">
+  <img src="docs/map.png" width="50%"
+       alt="Every service across mainland Great Britain and Ireland, drawn from the three published archives: road in blue through yellow by journeys a day, rail in orange, ferry in crimson">
+</p>
 
 wayfare builds a dataset of public transport routes across these islands: Great Britain
 from the Department for Transport (DfT) Bus Open Data Service (BODS), the Republic of
