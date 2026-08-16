@@ -797,10 +797,22 @@ against the greyscale's 5.1%. Every drawn weight is offset by one.
 **`scripts/readme_map.py` draws `docs/map.png`, which the README embeds.** It has no
 `--check` and CI cannot run it, since every data root is gitignored and a national build
 is a match run of a day or two, so the picture is committed and the script is run by hand
-when the archives move. It defaults to z11 because in an archive built before `trips`
-reached the overview bands z11 is the lowest band that carries it, and below that every
-road draws in the "no answer" grey. `coverage.layer_attributes` is what lets it warn about
-the band it was given rather than write that map.
+when the archives move. It defaults to z11 for its geometry rather than its attributes: a
+current archive carries `trips` at every zoom, so the ramp draws at any of them, and z11 is
+the finest band whose whole-country pass is seconds. The check under it is not dead, since
+an archive built before `trips` reached the overview bands has it in the detail band alone
+and comes out every road in the "no answer" grey below z11.
+`coverage.layer_attributes` is what lets it warn about the band it was given rather than
+write that map.
+
+Its window is mainland Great Britain and Ireland, north to 58.8 — above Dunnet Head at
+58.67 and below Orkney at 58.7. What the crop buys is the sea rather than the islands:
+Shetland sits 2.2 degrees north of the Scottish mainland with two ferry lines and nothing
+else in between, so reaching it spent a fifth of the height on water. The Outer Hebrides
+stay and cannot be dropped without dropping Ireland, since they reach -7.7 and Dunmore Head
+reaches -10.5, so Kerry sets the western edge and the Hebrides fall inside it. The ferries
+that leave the window are drawn up to its edge, because `draw` clips per pixel rather than
+per line.
 
 **A licence condition travels with the data, not with the page.** The credit is derived
 from `config.Feed` and written into the archive's tileset metadata, so a copied archive

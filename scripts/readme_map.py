@@ -27,21 +27,34 @@ from wayfare import config, coverage, palette
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "docs" / "map.png"
 
-# The islands, with room for the Hebrides and Shetland in the north-west and the
-# Channel ports in the south-east. Wider than `art.ISLES` on purpose: this is a
-# picture of what the archives hold, and a ferry to Lerwick is one of the things
-# they hold.
-WINDOW = (-11.0, 49.8, 2.2, 61.0)
+# Mainland Great Britain and Ireland. Narrower than `art.ISLES`, which is the box
+# the archives actually cover: north stops at 58.8, above Dunnet Head at 58.67 and
+# below Orkney at 58.7, so the picture keeps every mile of mainland road and drops
+# the two archipelagos.
+#
+# What that buys is not the islands themselves but the sea around them. Shetland
+# sits 2.2 degrees north of the Scottish mainland with nothing but two ferry lines
+# in between, so a window reaching it spent a fifth of its height drawing water.
+#
+# The Outer Hebrides stay, and cannot be dropped without dropping Ireland: they
+# reach -7.7 and Dunmore Head reaches -10.5, so the western edge is set by Kerry
+# and the Hebrides are inside it either way.
+WINDOW = (-11.0, 49.8, 2.0, 58.8)
 
 # One archive per region, in the order they are drawn. Great Britain first because
 # it is the largest and the other two sit clear of it.
 REGIONS = ("great_britain", "ireland", "northern_ireland")
 
-# z11 is the lowest band that carries `trips` in an archive built before that
-# attribute reached the overview bands, and the ramp is what the picture is for.
-# Below it the roads come out flat grey, which is what the viewer draws for the
-# same archive and is honest, but it is not a map anyone wants at the top of a
-# README. `--zoom` is there for an archive that carries `trips` further down.
+# The detail band, chosen for its geometry rather than for its attributes. A
+# current archive carries `trips` at every zoom, so the ramp is drawn at any of
+# them; z11 is simply the finest band whose whole-country pass is seconds rather
+# than minutes.
+#
+# The check below is not therefore dead. An archive built before `trips` reached
+# the overview bands has it in the detail band alone, and drawing such an archive
+# at z10 comes out every road in the "no answer" grey -- which is exactly what the
+# viewer draws for it and is honest, and is not a map anyone wants at the top of a
+# README. So the zoom is a flag and the mismatch is reported rather than written.
 DEFAULT_ZOOM = 11
 
 
