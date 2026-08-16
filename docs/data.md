@@ -350,15 +350,18 @@ into it.
 
 `road` and `track` are independent and either alone sets the ODbL credit; together they
 only widen its noun, which the `licences.openstreetmap(what=...)` factory takes as an
-argument. The bare `OPENSTREETMAP` constant is only the default, "Road geometry". An
-archive with no matched edges and no track credits nobody but the publisher.
+argument; its default is "Road geometry". An archive with no matched edges and no track
+credits nobody but the publisher.
 
 Everything else about a licence lives in [`wayfare/licences.py`](../wayfare/licences.py):
 the names, the `URLS` table from each name to its URI, the frozen `Credit` dataclass of
 `what`, `who`, `licence` and `who_url`, and the three renderers `html`, `lines` and `text`.
 A licence with no entry in `URLS` raises a `KeyError` at publish time rather than dropping
-the URI and publishing anyway. The dependency runs one way and has to: `config` imports
-`licences`, never the reverse. Adding a source to `config.FEEDS` credits it everywhere.
+the URI and publishing anyway. The renderers take a tuple of credits and know nothing about
+where it came from, so the dependency runs one way and has to: [`wayfare/feeds.py`](../wayfare/feeds.py)
+imports `licences`, never the reverse. Adding a source to `FEEDS` credits it everywhere; the
+feed definitions live in `feeds` and `config` re-exports every name, so `config.FEEDS` and
+`config.credit_parts` still read as they always did.
 
 ### Where the credit travels
 
@@ -377,8 +380,8 @@ header alone, and the attribution never leaves the file, which looks like a view
 crediting only its basemap rather than like an error.
 
 A render is the case tileset metadata cannot reach, since a PNG is passed around on its own.
-Every render stamps `config.credit_text()` into its own file, and
-`config.credit_lines(region, links=False)` is the same credit shortened for a caption drawn
+Every render stamps `licences.text(config.credit_parts())` into its own file, and
+`licences.lines(config.credit_parts(region), links=False)` is the same credit shortened for a caption drawn
 on the canvas; [`docs/rendering.md`](rendering.md) covers how. The studio page states the
 credit at the download control, served from `/art/meta`, because the download is the moment
 the obligation attaches to somebody.

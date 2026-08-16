@@ -10,17 +10,15 @@ from __future__ import annotations
 
 import itertools
 
+import builders
 import pytest
 
 from wayfare import art, db
 
-BOUNDS = art.Bounds(-3.30, 51.40, -3.10, 51.60)
-BBOX = [
-    round(BOUNDS.max_lon * 1e6),
-    round(BOUNDS.min_lon * 1e6),
-    round(BOUNDS.max_lat * 1e6),
-    round(BOUNDS.min_lat * 1e6),
-]
+BOUNDS = art.Bounds(*builders.WINDOW)
+BBOX = BOUNDS.as_predicate_params()
+# The grouped path only exists projected, so every test that walks it needs one.
+PROJ = art.Projection.fit(BOUNDS, 800, 600)
 
 # No filter, each filter on its own, then all of them at once. The last case is the
 # one that catches a fragment whose parameters were appended in the wrong order.
@@ -39,32 +37,6 @@ FILTERS: list[dict[str, object]] = [
 ]
 
 
-def _edge(
-    con,
-    edge_id,
-    lon,
-    trips,
-    services=(("42", "OP1"),),
-    *,
-    road_class="secondary",
-    road_name="R",
-    way_id=1,
-    length_m=100.0,
-):
-    """One short east-west edge inside BOUNDS, plus a row per (service, operator)."""
-    span = [lon, lon + 1000]
-    con.execute(
-        "INSERT INTO edges VALUES (?, ?, ?, ?, ?, [?, ?], "
-        "[51480000, 51480000], ?, 51480000, ?, 51480000)",
-        [edge_id, way_id, road_name, road_class, length_m, *span, *span],
-    )
-    for short_name, agency_id in services:
-        con.execute(
-            "INSERT INTO edge_services VALUES (?, ?, ?, 1, ?)",
-            [edge_id, short_name, agency_id, trips],
-        )
-
-
 @pytest.fixture(scope="module")
 def net(tmp_path_factory):
     """A four-edge network with every awkward case the spec has to survive.
@@ -78,19 +50,20 @@ def net(tmp_path_factory):
     more than all the queries put together.
     """
     con = db.connect(tmp_path_factory.mktemp("spec") / "spec.duckdb")
-    _edge(con, 1, -3200000, 100, (("42", "OP1"), ("9A", "OP2")))
-    _edge(con, 2, -3190000, 50, (("42", "FIRST"),))
-    _edge(con, 3, -3180000, 0, ())
-    _edge(
+    for edge_id, lon in enumerate((-3200000, -3190000, -3180000), start=1):
+        builders.insert_edge(con, edge_id, lon_e6=lon, span_e6=1000)
+    builders.insert_edge(
         con,
         4,
-        -3170000,
-        30,
-        (("7", "OP1"),),
+        lon_e6=-3170000,
+        span_e6=1000,
         road_class="primary",
         road_name=None,
         way_id=99,
     )
+    builders.insert_services(con, 1, (("42", "OP1"), ("9A", "OP2")), n_trips=100)
+    builders.insert_services(con, 2, (("42", "FIRST"),), n_trips=50)
+    builders.insert_services(con, 4, (("7", "OP1"),), n_trips=30)
     yield con
     con.close()
 
@@ -107,6 +80,26 @@ def _edges_where(con, predicate):
     """The edge ids a raw `edge_services` predicate picks out, as the reference set."""
     sql = f"SELECT DISTINCT edge_id FROM edge_services WHERE {predicate}"
     return {r[0] for r in con.execute(sql).fetchall()}
+
+
+def _every_query(sql):
+    """Every query the spec can produce, as (text, parameters) pairs."""
+    return (
+        sql.edges_query(with_groups=True, by_weight=True),
+        sql.edges_query(with_groups=False, by_weight=False),
+        sql.weights_query(),
+        sql.bounds_query(0.02, 0.98),
+        sql.group_query(),
+        sql.grouped_query(),
+        sql.chain_query(),
+        sql.chained_query(by_weight=True),
+    )
+
+
+def _group_names(con, **kwargs):
+    """The group of every drawn shape, in the order the ribbons are laid down."""
+    window = art.Window(BOUNDS, con, with_groups=True, spec=art.QuerySpec(**kwargs))
+    return [name for name, _weight, _line in window.group_paths(PROJ)]
 
 
 # --- The vocabulary ---------------------------------------------------------
@@ -196,30 +189,26 @@ def test_every_weight_and_group_combination_executes(net, weight, group):
                 sql.edges_query(with_groups=True, by_weight=True),
                 sql.edges_query(with_groups=False, by_weight=False),
                 sql.weights_query(),
-                sql.cardinality_query(),
+                sql.bounds_query(0.02, 0.98),
+                sql.chain_query(),
             ]
         for query, params in queries:
             net.execute(query, params).fetchall()
 
 
 @pytest.mark.parametrize("filters", FILTERS, ids=lambda f: "+".join(f) or "none")
-def test_bound_parameters_match_the_holes(filters):
+@pytest.mark.parametrize("order", sorted(art.ORDERS))
+@pytest.mark.parametrize("group", sorted(art.GROUPS))
+@pytest.mark.parametrize("weight", sorted(art.WEIGHTS))
+def test_bound_parameters_match_the_holes(weight, group, order, filters):
     """A `?` with no parameter behind it, or the other way round, is a bind error at
     render time. The services fragment appears twice in the grouped queries, so its
     parameters have to be repeated in textual order -- which is exactly the mistake
     that got through once already."""
-    for weight, group, order in itertools.product(art.WEIGHTS, art.GROUPS, art.ORDERS):
-        spec = art.QuerySpec(weight=weight, group=group, order=order, **filters)
-        sql = art._Sql(spec, art.DEFAULT_SOURCE, BBOX)
-        for query, params in (
-            sql.edges_query(with_groups=True, by_weight=True),
-            sql.edges_query(with_groups=False, by_weight=False),
-            sql.weights_query(),
-            sql.group_query(),
-            sql.grouped_query(),
-            sql.cardinality_query(),
-        ):
-            assert query.count("?") == len(params), (weight, group, order, filters)
+    spec = art.QuerySpec(weight=weight, group=group, order=order, **filters)
+    sql = art._Sql(spec, art.DEFAULT_SOURCE, BBOX)
+    for query, params in _every_query(sql):
+        assert query.count("?") == len(params)
 
 
 # --- Filters ----------------------------------------------------------------
@@ -253,6 +242,24 @@ def test_min_trips_is_a_floor_on_weekly_trips(net):
     assert _ids(net, min_trips=1000) == []
 
 
+HOSTILE = "read_csv('/etc/passwd')"
+
+
+@pytest.mark.parametrize("field", ["operator", "service", "road_class"])
+def test_a_filter_value_is_bound_rather_than_written_into_the_sql(net, field):
+    """A filter value arrives from a query string on a server, and DuckDB's
+    `read_only` stops a write without stopping `read_csv` from reading any file the
+    process can. Binding the value is the whole of what keeps `/art` from being a
+    file-read primitive, so pin it in the generated text and again at execution."""
+    sql = art._Sql(art.QuerySpec(**{field: (HOSTILE,)}), art.DEFAULT_SOURCE, BBOX)
+    for query, params in _every_query(sql):
+        assert HOSTILE not in query
+        assert HOSTILE in params
+    # And a value that reaches the database as data selects nothing, rather than
+    # being evaluated as the call it is spelled to look like.
+    assert _ids(net, **{field: (HOSTILE,)}) == []
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -276,12 +283,12 @@ def test_a_filter_removes_the_same_edges_from_both_query_shapes(net, kwargs):
     spec = art.QuerySpec(**kwargs)
     # The grouped query returns geometry without an edge id, so the first vertex
     # stands in for identity -- every edge here starts at a different longitude.
-    flat = {round(e.coords[0][0] * 1e6) for e in art.Window(BOUNDS, net, spec=spec).edges()}
+    flat = {PROJ(*e.coords[0]) for e in art.Window(BOUNDS, net, spec=spec).edges()}
     grouped = {
-        round(coords[0][0] * 1e6)
-        for _name, _weight, coords in art.Window(
+        line.points()[0]
+        for _name, _weight, line in art.Window(
             BOUNDS, net, with_groups=True, spec=spec
-        ).groups()
+        ).group_paths(PROJ)
     }
     assert flat and grouped  # a vacuous pass would prove nothing
     assert grouped <= flat
@@ -327,19 +334,14 @@ def test_every_weight_arrives_as_a_float(net, weight):
 def test_a_non_string_group_key_comes_back_as_a_string(net):
     """way_id is a BIGINT. `strands` hashes the group name to pick a hue, so a
     non-string here is a TypeError deep inside drawing rather than a query error."""
-    window = art.Window(BOUNDS, net, with_groups=True, spec=art.QuerySpec(group="way"))
-    names = {name for name, _weight, _coords in window.groups()}
+    names = set(_group_names(net, group="way"))
     assert names == {"1", "99"}
     assert all(isinstance(n, str) for n in names)
 
 
 def test_a_null_group_key_becomes_unknown(net):
     """road_name is frequently null nationally, and a null hue is a crash."""
-    window = art.Window(
-        BOUNDS, net, with_groups=True, spec=art.QuerySpec(group="road_name")
-    )
-    names = {name for name, _weight, _coords in window.groups()}
-    assert names == {"R", "unknown"}
+    assert set(_group_names(net, group="road_name")) == {"R", "unknown"}
     for e in art.Window(
         BOUNDS, net, with_groups=True, spec=art.QuerySpec(group="road_name")
     ).edges():
@@ -353,33 +355,42 @@ def test_too_many_groups_is_refused_before_anything_is_drawn(net, monkeypatch):
     """`group=way` over a city is one group per OSM way, which is one composited
     stroke per edge. Better a message than a render that never ends."""
     monkeypatch.setattr(art, "MAX_GROUPS", 1)
-    window = art.Window(BOUNDS, net, with_groups=True, spec=art.QuerySpec(group="way"))
     with pytest.raises(ValueError, match="group='way' gives 2 groups"):
-        list(window.groups())
+        _group_names(net, group="way")
 
 
 def test_a_window_inside_the_cap_is_fine(net, monkeypatch):
     monkeypatch.setattr(art, "MAX_GROUPS", 2)
-    window = art.Window(BOUNDS, net, with_groups=True, spec=art.QuerySpec(group="way"))
-    assert {name for name, _w, _c in window.groups()} == {"1", "99"}
+    assert set(_group_names(net, group="way")) == {"1", "99"}
 
 
 # --- Determinism ------------------------------------------------------------
 
 
+# The sequence each order draws over `net`. Service 42 spans edges 1 and 2 and
+# carries 150 trips, 9A one edge and 100, 7 one edge and 30 -- so `narrowest` and
+# `name` both need the group key to break a tie, and pinning the sequence is what
+# says the tiebreak is there. Two runs agreeing would not: an undefined order over
+# four rows is a stable one.
+ORDERED_NAMES = {
+    "widest": ["42", "42", "7", "9A"],
+    "narrowest": ["7", "9A", "42", "42"],
+    "busiest": ["42", "42", "9A", "7"],
+    "quietest": ["7", "9A", "42", "42"],
+    "name": ["42", "42", "7", "9A"],
+}
+
+
 @pytest.mark.parametrize("order", sorted(art.ORDERS))
-def test_every_order_is_deterministic(net, order):
+def test_every_order_draws_a_pinned_sequence(net, order):
     """The order *inside* a ribbon matters. A PNG hides it -- SCREEN compositing is
     commutative -- but an SVG records stroke order, and two runs of `strands` once
     differed in 180,365 of 293,842 bytes. The edge_id tiebreak in _order_sql is what
     fixes it, so pin the full sequence rather than just the group order."""
-    window = art.Window(BOUNDS, net, with_groups=True, spec=art.QuerySpec(order=order))
-    assert list(window.groups()) == list(window.groups())
+    assert _group_names(net, order=order) == ORDERED_NAMES[order]
 
 
-def test_widest_first_with_a_name_tiebreak(net):
+def test_the_default_order_is_widest_first(net):
     """The default ordering puts trunk routes underneath, and equally broad services
     fall back to their name so the scan order cannot decide the picture."""
-    window = art.Window(BOUNDS, net, with_groups=True)
-    names = [name for name, _w, _c in window.groups()]
-    assert names == ["42", "42", "7", "9A"]
+    assert _group_names(net) == ORDERED_NAMES["widest"]

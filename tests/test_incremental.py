@@ -11,9 +11,9 @@ from pathlib import Path
 
 import duckdb
 import pytest
-from conftest import FakeClient
+from builders import FakeClient
 
-from wayfare import aggregate, config, db, gtfs, match
+from wayfare import aggregate, config, db, gtfs, maintenance, match
 
 FEED_1 = "20260806_022608"
 FEED_2 = "20260903_014412"
@@ -202,7 +202,7 @@ def test_departed_patterns_keep_their_edges_but_leave_the_map(gtfs_dir: Path, co
     assert con.execute("SELECT count(*) FROM match_status").fetchone()[0] == 3
     assert con.execute("SELECT count(*) FROM pattern_edges").fetchone()[0] == 6
 
-    cov = aggregate.coverage(con)
+    cov = aggregate.funnel(con)
     assert cov["feed_version"] == FEED_2
     assert cov["patterns_total"] == 1
     assert cov["patterns_departed"] == 2
@@ -218,7 +218,7 @@ def test_an_unmatchable_mode_never_counts_as_pending(gtfs_dir: Path, con):
     match.run(con, client_=FakeClient())
     assert match.pending_count(con) == 0
 
-    cov = aggregate.coverage(con)
+    cov = aggregate.funnel(con)
     assert cov["patterns_pending"] == 0
     assert cov["patterns_pct"] == 100.0
     # ...and the ferry is still visible, so losing one is not silent either.
@@ -233,7 +233,10 @@ def test_departed_patterns_do_not_block_pruning(gtfs_dir: Path, con):
     _drop_the_short_working(gtfs_dir)
     _build(gtfs_dir, con)
     match.run(con, client_=FakeClient())
-    db.prune_shapes(con)  # would raise if departed patterns counted as pending
+    # Would raise if departed patterns counted as pending, and the count says the
+    # geometry actually went rather than the refusal merely not firing.
+    assert maintenance.prune_shapes(con) == 1
+    assert db.scalar(con, "SELECT count(*) FROM shapes") == 0
 
 
 def test_gaining_operator_geometry_is_reported_and_opt_in(gtfs_dir: Path, con):
@@ -312,41 +315,37 @@ def test_an_unreported_graph_does_not_block_the_run(gtfs_dir: Path, con):
 # -- migrating a database built before any of this --------------------------
 
 
-def _legacy_db(path: Path) -> None:
-    """A database as it was written before pattern ids became hashes."""
-    con = duckdb.connect(str(path))
-    con.execute(db.SCHEMA)
-    con.execute("ALTER TABLE patterns DROP COLUMN first_seen")
-    con.execute("ALTER TABLE patterns DROP COLUMN last_seen")
-    # `mode` postdates the ids becoming hashes, so a database this old has no such
-    # column either, and the migration has to add both.
-    con.execute("ALTER TABLE patterns DROP COLUMN mode")
-    con.execute("""
-        INSERT INTO patterns VALUES
-          (1, 'R1', 'OP1', '42', 0, 'SH1', 4, 10, 1000.0),
-          (2, 'R1', 'OP1', '42', 0, NULL,  2,  5,  330.0)
-    """)
-    con.execute("""
-        INSERT INTO pattern_stops VALUES
-          (1, 0, 'S1'), (1, 1, 'S2'), (1, 2, 'S3'), (1, 3, 'S4'),
-          (2, 0, 'S1'), (2, 1, 'S2')
-    """)
-    con.execute("""
-        INSERT INTO match_status VALUES
-          (1, 'ok', 'shape', 0.9, 1000.0, 1.0, 2, NULL, NULL),
-          (2, 'ok', 'stops', 0.0,  330.0, 1.0, 1, NULL, NULL)
-    """)
-    con.execute("INSERT INTO pattern_edges VALUES (1, 0, 1001), (1, 1, 1002), (2, 0, 1001)")
-    con.execute("INSERT INTO meta VALUES ('feed_version', ?)", [FEED_1])
-    con.close()
+# A database as it was written before pattern ids became hashes. `mode` postdates
+# the ids becoming hashes, so a database this old has no such column either, and the
+# migration has to add all three.
+_LEGACY = (
+    db.SCHEMA,
+    "ALTER TABLE patterns DROP COLUMN first_seen",
+    "ALTER TABLE patterns DROP COLUMN last_seen",
+    "ALTER TABLE patterns DROP COLUMN mode",
+    """
+    INSERT INTO patterns VALUES
+      (1, 'R1', 'OP1', '42', 0, 'SH1', 4, 10, 1000.0),
+      (2, 'R1', 'OP1', '42', 0, NULL,  2,  5,  330.0)
+    """,
+    """
+    INSERT INTO pattern_stops VALUES
+      (1, 0, 'S1'), (1, 1, 'S2'), (1, 2, 'S3'), (1, 3, 'S4'),
+      (2, 0, 'S1'), (2, 1, 'S2')
+    """,
+    """
+    INSERT INTO match_status VALUES
+      (1, 'ok', 'shape', 0.9, 1000.0, 1.0, 2, NULL, NULL),
+      (2, 'ok', 'stops', 0.0,  330.0, 1.0, 1, NULL, NULL)
+    """,
+    "INSERT INTO pattern_edges VALUES (1, 0, 1001), (1, 1, 1002), (2, 0, 1001)",
+    f"INSERT INTO meta VALUES ('feed_version', '{FEED_1}')",
+)
 
 
-def test_migration_renumbers_without_losing_match_work(tmp_path: Path):
+def test_migration_renumbers_without_losing_match_work(legacy_db):
     """A national match run costs a day or two. The rewrite has to carry it."""
-    path = tmp_path / "legacy.duckdb"
-    _legacy_db(path)
-
-    con = db.connect(path)
+    con = db.connect(legacy_db(*_LEGACY, name="legacy"))
     rows = con.execute(
         "SELECT pattern_id, n_stops, first_seen, last_seen FROM patterns ORDER BY n_stops"
     ).fetchall()
@@ -373,9 +372,8 @@ def test_migration_renumbers_without_losing_match_work(tmp_path: Path):
     con.close()
 
 
-def test_migration_is_not_repeated(tmp_path: Path):
-    path = tmp_path / "legacy.duckdb"
-    _legacy_db(path)
+def test_migration_is_not_repeated(legacy_db):
+    path = legacy_db(*_LEGACY, name="legacy")
     con = db.connect(path)
     first = con.execute("SELECT pattern_id FROM patterns ORDER BY n_stops").fetchall()
     con.close()

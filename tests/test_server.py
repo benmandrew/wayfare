@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import gzip
@@ -17,25 +18,13 @@ import urllib.request
 from collections import OrderedDict
 from pathlib import Path
 
+import builders
 import pytest
 
-from wayfare import art, config, db, server
+from wayfare import art, config, db, licences, server
 
-# A window that holds the edges the fixtures insert, and the preset that covers it.
-WINDOW = "-3.30,51.40,-3.10,51.60"
+# The preset that covers `builders.WINDOW_Q`, at a width small enough to draw fast.
 BASE = "area=cardiff&width=200"
-
-
-def _edge(con, edge_id, lon, trips, services=("42",)):
-    con.execute(
-        "INSERT INTO edges VALUES (?, 1, 'R', 'secondary', 100.0, [?, ?], "
-        "[51480000, 51480000], ?, 51480000, ?, 51480000)",
-        [edge_id, lon, lon + 1000, lon, lon + 1000],
-    )
-    for s in services:
-        con.execute(
-            "INSERT INTO edge_services VALUES (?, ?, 'OP1', 1, ?)", [edge_id, s, trips]
-        )
 
 
 @pytest.fixture
@@ -48,7 +37,10 @@ def art_db(tmp_path: Path, monkeypatch) -> Path:
     path = tmp_path / "work" / "wayfare.duckdb"
     con = db.connect(path)
     for i, lon in enumerate([-3200000, -3190000, -3180000]):
-        _edge(con, i + 1, lon, trips=100 * (i + 1), services=("42", "9A")[: i % 2 + 1])
+        builders.insert_edge(con, i + 1, lon_e6=lon, span_e6=1000)
+        builders.insert_services(
+            con, i + 1, ("42", "9A")[: i % 2 + 1], n_trips=100 * (i + 1)
+        )
     db.set_meta(con, "feed_version", "20260806_022608")
     con.close()
     monkeypatch.setattr(config, "DB_PATH", path)
@@ -67,7 +59,7 @@ def no_db(tmp_path: Path, monkeypatch) -> Path:
 
 def test_a_preset_and_a_raw_window_both_resolve():
     assert server.parse_art("area=cardiff").area == "cardiff"
-    assert server.parse_art(f"bbox={WINDOW}").area == WINDOW
+    assert server.parse_art(f"bbox={builders.WINDOW_Q}").area == builders.WINDOW_Q
 
 
 def test_no_area_names_the_presets():
@@ -228,7 +220,7 @@ def test_a_lat_lon_window_warns_rather_than_failing():
     request = server.parse_art("bbox=51.4,-3.3,51.6,-3.1")
     assert request.warning is not None
     assert "lon first" in request.warning
-    assert server.parse_art(f"bbox={WINDOW}").warning is None
+    assert server.parse_art(f"bbox={builders.WINDOW_Q}").warning is None
 
 
 def test_a_bare_request_asks_for_the_original_query():
@@ -332,7 +324,7 @@ def test_the_warning_is_not_part_of_the_key():
 
 def test_filename_names_the_preset_but_not_a_raw_window():
     assert server.parse_art("area=cardiff&format=svg").filename() == "cardiff-density.svg"
-    assert server.parse_art(f"bbox={WINDOW}").filename() == "window-density.png"
+    assert server.parse_art(f"bbox={builders.WINDOW_Q}").filename() == "window-density.png"
 
 
 # --- The renderer -----------------------------------------------------------
@@ -376,18 +368,18 @@ def test_too_many_groups_is_the_callers_fault_not_a_server_error(art_db, monkeyp
 
 def test_the_second_identical_request_is_not_redrawn(art_db, monkeypatch):
     renderer = server.Renderer()
-    draws = _count_draws(monkeypatch)
+    draws = _Draws(monkeypatch)
     first = renderer.render(server.parse_art(BASE))
     second = renderer.render(server.parse_art(BASE))
     assert second is first
-    assert draws == [1]
+    assert draws.calls == 1
 
 
 def test_a_rewritten_database_is_not_served_from_the_cache(art_db, monkeypatch):
     """Every stage rewrites the file in place, so the cache key and the ETag carry the
     file's size and mtime. A stale render is worse than a slow one."""
     renderer = server.Renderer()
-    draws = _count_draws(monkeypatch)
+    draws = _Draws(monkeypatch)
     before = renderer.stamp()
     etag_before = renderer.etag(server.parse_art(BASE))
     renderer.render(server.parse_art(BASE))
@@ -397,7 +389,7 @@ def test_a_rewritten_database_is_not_served_from_the_cache(art_db, monkeypatch):
     assert renderer.stamp() != before
     assert renderer.etag(server.parse_art(BASE)) != etag_before
     renderer.render(server.parse_art(BASE))
-    assert draws == [2]
+    assert draws.calls == 2
 
 
 def test_a_missing_database_stamps_as_absent(no_db):
@@ -410,27 +402,50 @@ def test_a_missing_database_says_where_it_looked(no_db):
     assert str(no_db) in _message(server.Renderer(), server.parse_art(BASE))
 
 
-def test_the_cache_evicts_to_stay_under_its_cap():
+def test_the_cache_evicts_to_stay_under_its_cap(art_db, monkeypatch):
+    """Four 40-byte renders into a 100-byte cache. Read back through `render`, so
+    what is asserted is the thing the cache is for -- the oldest request pays for a
+    redraw and the newest does not -- rather than which keys a dictionary holds."""
     renderer = server.Renderer(cache_bytes=100)
-    for i in range(4):
-        renderer._store(f"k{i}", (b"x" * 40, f"e{i}"))
-    assert renderer._held <= 100
-    assert renderer._cache.get("k0") is None  # oldest went first
-    assert renderer._cache.get("k3") is not None
+    draws = _Draws(monkeypatch, size=40)
+    asks = [server.parse_art(f"{BASE}&min_trips={i}") for i in range(4)]
+    for request in asks:
+        renderer.render(request)
+    assert draws.calls == 4
+
+    renderer.render(asks[3])
+    assert draws.calls == 4  # the newest is still held
+    renderer.render(asks[0])
+    assert draws.calls == 5  # the oldest went first, and has to be drawn again
 
 
-def test_an_entry_larger_than_the_cache_is_not_stored():
+def test_an_entry_larger_than_the_cache_is_not_stored(art_db, monkeypatch):
     """Keeping it would evict everything else to hold one render nobody asked for
     twice."""
     renderer = server.Renderer(cache_bytes=100)
-    renderer._store("small", (b"x" * 10, "e"))
-    renderer._store("huge", (b"x" * 200, "e"))
-    assert list(renderer._cache) == ["small"]
+    draws = _Draws(monkeypatch, size=10)
+    small = server.parse_art(BASE)
+    huge = server.parse_art(f"{BASE}&min_trips=1")
+    renderer.render(small)
+    draws.size = 200
+    renderer.render(huge)
+    assert draws.calls == 2
+
+    renderer.render(huge)
+    assert draws.calls == 3  # never stored, so it is drawn every time it is asked for
+    draws.size = 10
+    renderer.render(small)
+    assert draws.calls == 3  # and it evicted nothing on its way past
 
 
 def test_a_full_queue_is_turned_away_rather_than_made_to_wait(monkeypatch):
     """A studio page re-rendering on every slider move would otherwise build a
-    backlog of renders nobody is looking at any more."""
+    backlog of renders nobody is looking at any more.
+
+    The refusal is asserted through `render`, but the setup is not public and cannot
+    be: holding the slot from outside is the only way to make two requests queue
+    behind one, and `_waiting` is the only thing that says they have both got there.
+    Anything else either races the threads or waits `RENDER_WAIT_S` out."""
     monkeypatch.setattr(server, "QUEUE_LIMIT", 2)
     # Long enough that the waiters cannot time out mid-test, but the slot is released
     # immediately afterwards, so nothing waits it out.
@@ -455,18 +470,27 @@ def test_a_full_queue_is_turned_away_rather_than_made_to_wait(monkeypatch):
         assert not t.is_alive()
 
 
-def _count_draws(monkeypatch) -> list[int]:
-    """[calls to art.render_bytes], so a cache hit is visible as a call that
-    did not happen."""
-    calls = [0]
-    real = art.render_bytes
+class _Draws:
+    """Counts calls to `art.render_bytes`, so a cache hit is visible as a render
+    that did not happen.
 
-    def counted(*a, **kw):
-        calls[0] += 1
-        return real(*a, **kw)
+    `size` answers with that many bytes instead of drawing. What the cache does
+    turns on how large a render is and how long ago it was asked for, and a real
+    200-pixel PNG lets a test choose neither. It is settable mid-test, because a
+    cache that holds one entry and refuses another is two sizes in one run.
+    """
 
-    monkeypatch.setattr(art, "render_bytes", counted)
-    return calls
+    def __init__(self, monkeypatch, size: int | None = None) -> None:
+        self.size = size
+        self.calls = 0
+        self._real = art.render_bytes
+        monkeypatch.setattr(art, "render_bytes", self)
+
+    def __call__(self, *args, **kwargs) -> bytes:
+        self.calls += 1
+        if self.size is None:
+            return self._real(*args, **kwargs)
+        return b"x" * self.size
 
 
 def _message(renderer: server.Renderer, request: server.ArtRequest) -> str:
@@ -509,7 +533,7 @@ def test_meta_serves_the_credit_the_renders_carry(art_db):
     """The studio states it at the download, which is where the obligation lands.
     Served rather than written into the page: it follows the region this server's
     database holds, not the markup."""
-    assert server.art_meta(True)["credit"] == config.credit_html()
+    assert server.art_meta(True)["credit"] == licences.html(config.credit_parts())
 
 
 def test_meta_publishes_the_query_vocabularies_in_a_stable_order(art_db):
@@ -532,6 +556,53 @@ def test_meta_reports_the_operators_and_road_classes_the_database_holds(art_db):
     database = server.art_meta(True)["database"]
     assert database["operators"] == ["OP1"]
     assert database["road_classes"] == ["secondary"]
+
+
+def test_the_facets_are_read_once_per_database_rewrite(art_db, monkeypatch):
+    """The operator list is a DISTINCT over `edge_services` -- 10.25M rows with
+    nothing to prune -- and /art/meta is a page load. A hit opens nothing at all,
+    which is the point: the connection is the cheap half and the write lock it
+    competes for is not. Invalidated on the same size and mtime the render cache
+    uses, so a rebuilt database is never described by the previous one's dropdowns."""
+    opens = _Opens(monkeypatch)
+    first = server.art_meta(True)["database"]
+    assert first["operators"] == ["OP1"]
+    assert opens.calls == 1
+
+    assert server.art_meta(True)["database"] == first
+    assert opens.calls == 1
+
+    st = art_db.stat()
+    os.utime(art_db, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    assert server.art_meta(True)["database"] == first
+    assert opens.calls == 2
+
+
+def test_the_dimension_cap_covers_the_height_and_keeps_the_name_the_page_reads(art_db):
+    """One cap over both axes: a tall window at a legal width is as much work as a
+    wide one. The studio page asks for `max_width`, so the name it knows has to keep
+    working alongside the one that says what the cap is."""
+    limits = server.art_meta(True)["limits"]
+    assert limits["max_dimension"] == limits["max_width"] == server.MAX_DIMENSION
+    with pytest.raises(server.BadRequest, match="height=99999 is out of range"):
+        server.parse_art("area=cardiff&height=99999")
+    assert server.parse_art("area=cardiff&width=200&height=300").opts.height_px == 300
+    assert server.parse_art("area=cardiff&width=200").opts.height_px is None
+
+
+class _Opens:
+    """Counts read-only opens of the database, so a memo hit is visible as a
+    connection that was never made -- and therefore as a lock never competed for."""
+
+    def __init__(self, monkeypatch) -> None:
+        self.calls = 0
+        real = db.connect
+
+        def counted(*a, **kw):
+            self.calls += 1
+            return real(*a, **kw)
+
+        monkeypatch.setattr(server.db, "connect", counted)
 
 
 def test_the_facet_lists_are_bounded(art_db, monkeypatch):
@@ -563,8 +634,22 @@ def test_meta_survives_no_database_at_all(no_db):
 
 
 HELD = [
-    art.Edge(1, "secondary", 100.0, [(-3.20, 51.480), (-3.19, 51.485)], 1, 100, ("42",)),
-    art.Edge(2, "secondary", 100.0, [(-3.19, 51.485), (-3.18, 51.490)], 1, 900, ("9A",)),
+    art.Edge(
+        edge_id=1,
+        road_class="secondary",
+        length_m=100.0,
+        coords=[(-3.20, 51.480), (-3.19, 51.485)],
+        weight=100,
+        groups=("42",),
+    ),
+    art.Edge(
+        edge_id=2,
+        road_class="secondary",
+        length_m=100.0,
+        coords=[(-3.19, 51.485), (-3.18, 51.490)],
+        weight=900,
+        groups=("9A",),
+    ),
 ]
 
 
@@ -585,80 +670,6 @@ def test_render_bytes_writes_nothing_to_disk(fmt, magic, tmp_path, monkeypatch):
 def test_render_bytes_rejects_a_format_before_touching_the_database(no_db):
     with pytest.raises(ValueError, match="unsupported output format"):
         art.render_bytes("cardiff", "density", fmt=".tiff")
-
-
-# --- Compression ------------------------------------------------------------
-
-
-@pytest.fixture
-def gzip_cache(monkeypatch) -> OrderedDict:
-    """An empty cache per test, since it is process-wide and outlives a server."""
-    cache: OrderedDict[tuple[str, int, int], bytes] = OrderedDict()
-    monkeypatch.setattr(server, "_gzip_cache", cache)
-    return cache
-
-
-def _count_compressions(monkeypatch) -> list[int]:
-    """[calls to gzip.compress], so a cache hit is visible as work not done."""
-    calls = [0]
-    real = gzip.compress
-
-    def counted(*a, **kw):
-        calls[0] += 1
-        return real(*a, **kw)
-
-    monkeypatch.setattr(server.gzip, "compress", counted)
-    return calls
-
-
-def test_a_file_is_compressed_once_and_again_when_it_changes(
-    tmp_path, monkeypatch, gzip_cache
-):
-    """784 KB of vendored maplibre cost 15.8 ms of CPU to gzip and 0.04 ms to read,
-    and the page asks for the same handful of files every load -- so recompressing
-    per request was nearly all of the cost of serving them. Keyed on the mtime and
-    size the ETag already uses, so an edited file recompresses rather than being
-    served stale under a validator that has moved."""
-    path = tmp_path / "app.js"
-    path.write_text("var x = 1;\n" * 500)
-    calls = _count_compressions(monkeypatch)
-
-    first = server._gzipped(str(path))
-    assert first is not None
-    assert gzip.decompress(first) == path.read_bytes()
-    assert server._gzipped(str(path)) == first
-    assert calls == [1]
-
-    st = path.stat()
-    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
-    again = server._gzipped(str(path))
-    assert calls == [2]
-    # Byte-identical, because the content did not change and `mtime=0` keeps gzip
-    # from stamping the clock into its header. Without it two compressions of one
-    # file differ, under an ETag that says they do not.
-    assert again == first
-
-    path.write_text("var x = 2;\n" * 500)
-    changed = server._gzipped(str(path))
-    assert calls == [3]
-    assert changed != first
-
-
-def test_the_compression_cache_is_bounded(tmp_path, monkeypatch, gzip_cache):
-    """COMPRESS_MAX caps an entry at 1 MiB, so a count is enough to bound the
-    total. The web directory holds six compressible files; the cap is for a
-    directory nobody has served yet."""
-    monkeypatch.setattr(server, "GZIP_CACHE_ENTRIES", 2)
-    for i in range(3):
-        path = tmp_path / f"f{i}.js"
-        path.write_text(f"var x{i};")
-        server._gzipped(str(path))
-    assert len(gzip_cache) == 2
-    assert not any(key[0].endswith("f0.js") for key in gzip_cache)  # oldest went first
-
-
-def test_an_unreadable_file_compresses_to_nothing_rather_than_raising(tmp_path):
-    assert server._gzipped(str(tmp_path / "absent.js")) is None
 
 
 def test_an_aborted_body_closes_the_connection():
@@ -722,6 +733,108 @@ def serve_at(tmp_path: Path, monkeypatch):
 def _get(url: str, **headers: str):
     request = urllib.request.Request(url, headers=headers)
     return urllib.request.urlopen(request, timeout=30)  # noqa: S310 - a local test server
+
+
+# --- Compression ------------------------------------------------------------
+#
+# Read over HTTP rather than off `_gzipped`, because a compressed body is only ever
+# something a request asked for: the cache's whole job is that the second request
+# for one file does no work, and a served response is where that shows.
+
+
+@pytest.fixture
+def gzip_cache(monkeypatch) -> OrderedDict:
+    """An empty cache per test, since it is process-wide and outlives a server."""
+    cache: OrderedDict[tuple[str, int, int], bytes] = OrderedDict()
+    monkeypatch.setattr(server, "_gzip_cache", cache)
+    return cache
+
+
+def _count_compressions(monkeypatch) -> list[int]:
+    """[calls to gzip.compress], so a cache hit is visible as work not done."""
+    calls = [0]
+    real = gzip.compress
+
+    def counted(*a, **kw):
+        calls[0] += 1
+        return real(*a, **kw)
+
+    monkeypatch.setattr(server.gzip, "compress", counted)
+    return calls
+
+
+def _compressed(url: str) -> bytes:
+    """The gzipped body a compressible file is served as."""
+    with _get(url, **{"Accept-Encoding": "gzip"}) as response:
+        assert response.headers["Content-Encoding"] == "gzip"
+        return response.read()
+
+
+def test_a_file_is_compressed_once_and_again_when_it_changes(
+    tmp_path, monkeypatch, serve_at, gzip_cache
+):
+    """784 KB of vendored maplibre cost 15.8 ms of CPU to gzip and 0.04 ms to read,
+    and the page asks for the same handful of files every load -- so recompressing
+    per request was nearly all of the cost of serving them. Keyed on the mtime and
+    size the ETag already uses, so an edited file recompresses rather than being
+    served stale under a validator that has moved."""
+    base = serve_at()
+    path = tmp_path / "web" / "app.js"
+    path.write_text("var x = 1;\n" * 500)
+    calls = _count_compressions(monkeypatch)
+
+    first = _compressed(f"{base}/app.js")
+    assert gzip.decompress(first) == path.read_bytes()
+    assert _compressed(f"{base}/app.js") == first
+    assert calls == [1]
+
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    again = _compressed(f"{base}/app.js")
+    assert calls == [2]
+    # Byte-identical, because the content did not change and `mtime=0` keeps gzip
+    # from stamping the clock into its header. Without it two compressions of one
+    # file differ, under an ETag that says they do not.
+    assert again == first
+
+    path.write_text("var x = 2;\n" * 500)
+    changed = _compressed(f"{base}/app.js")
+    assert calls == [3]
+    assert changed != first
+
+
+def test_the_compression_cache_is_bounded(tmp_path, monkeypatch, serve_at, gzip_cache):
+    """COMPRESS_MAX caps an entry at 1 MiB, so a count is enough to bound the
+    total. The web directory holds six compressible files; the cap is for a
+    directory nobody has served yet.
+
+    Shown as the eviction it is: the file that has gone longest unasked-for is
+    compressed a second time when it comes back, and the newest is not."""
+    monkeypatch.setattr(server, "GZIP_CACHE_ENTRIES", 2)
+    base = serve_at()
+    for i in range(3):
+        (tmp_path / "web" / f"f{i}.js").write_text(f"var x{i};")
+    calls = _count_compressions(monkeypatch)
+
+    for i in range(3):
+        _compressed(f"{base}/f{i}.js")
+    assert calls == [3]
+
+    _compressed(f"{base}/f2.js")
+    assert calls == [3]  # still held
+    _compressed(f"{base}/f0.js")
+    assert calls == [4]  # oldest went first
+
+
+def test_an_unreadable_file_compresses_to_nothing_rather_than_raising(serve_at):
+    """A file the server cannot read has to fall back to the uncompressed path and
+    answer from there -- a 404 for one that is not there, rather than a traceback in
+    the handler and a connection dropped mid-response."""
+    base = serve_at()
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(f"{base}/absent.js", **{"Accept-Encoding": "gzip"})
+    with contextlib.closing(exc.value):
+        assert exc.value.code == 404
 
 
 def test_art_over_http_answers_with_a_png_an_etag_and_a_timing(art_db, serve_at):
@@ -805,284 +918,6 @@ def test_archives_lists_only_the_tile_archives(serve_at):
         assert json.loads(response.read()) == ["wales.pmtiles"]
 
 
-# --- The pages' own credits --------------------------------------------------
-#
-# The data credit rides in the archive, so nothing here needs to know it. The
-# basemap credit cannot: it belongs to the page, and both pages draw the same
-# backdrop, so it lives in credits.js alone. These guard the drift, not the wording.
-
-WEB = Path(__file__).resolve().parents[1] / "web"
-PAGES = ("index.html", "art.html")
-
-
-def test_both_pages_take_the_basemap_credit_from_one_place():
-    assert "carto.com/attributions" in (WEB / "credits.js").read_text()
-    for page in PAGES:
-        text = (WEB / page).read_text()
-        assert 'src="credits.js"' in text
-        assert "BASEMAP_CREDIT" in text
-        # The literal URL belongs in no page: a second spelling of the credit is a
-        # spelling that will drift away from BASEMAP_CREDIT.
-        assert "carto.com/attributions" not in text
-
-
-def test_both_pages_fold_the_credit_away_on_load():
-    """`compact: true` buys the (i) button and not the closed state -- MapLibre
-    opens the panel itself as soon as a source reports a credit. Every map has to
-    start it closed, so a third one added later is the thing this catches."""
-    assert "function collapseCredit" in (WEB / "credits.js").read_text()
-    for page in PAGES:
-        assert "collapseCredit(" in (WEB / page).read_text()
-
-
-def test_neither_page_hardcodes_the_data_credit():
-    """Which is the whole design: `wayfare publish` puts it in the archive, and a
-    page that also stated it would be wrong for whichever region is not showing."""
-    for page in (*PAGES, "credits.js"):
-        assert "Open Government Licence" not in (WEB / page).read_text()
-
-
-# --- The viewer's own style ---------------------------------------------------
-#
-# Two rules the browser enforces and nothing else does. There is no JavaScript
-# test harness here, so these read the source: narrow, and each one guards a
-# failure that showed up as a page rather than as a stack trace.
-
-
-def _const(page: str, name: str) -> str:
-    """One `const <name> = [...]` from a page, whitespace collapsed."""
-    text = (WEB / page).read_text()
-    start = text.index(f"const {name} = ")
-    return " ".join(text[start : text.index("\n];", start)].split())
-
-
-def test_every_width_keeps_zoom_at_the_top_of_its_interpolate():
-    """A `["zoom"]` expression is legal only as the input to the outermost
-    interpolate, and MapLibre rejects the whole style for one paint property that
-    breaks the rule -- basemap, roads, every region. `trackWidth` wrapped its zoom
-    interpolate in a `["+"]` to add the hover bump, so the viewer drew a blank page
-    with one line in the console for every archive, from the day the track layer
-    landed. The bump belongs on each stop.
-
-    All three widths now come out of one model, so the rule is checked where it is
-    kept -- `widthOf` -- and each width is checked to go through it. The zoom term
-    is arithmetic done in JavaScript, which is what keeps `["zoom"]` out of the
-    stops: a model that reached for `["^", gain, ["-", ["zoom"], 6]]` instead would
-    read perfectly well and blank the page."""
-    text = (WEB / "index.html").read_text()
-    assert _const("index.html", "widthOf").startswith(
-        'const widthOf = (f, bump) => [ "interpolate", ["linear"], ["zoom"],'
-    )
-    for name in ("width", "segWidth", "trackWidth"):
-        assert f"const {name} = (bump) => widthOf(WIDTH." in text
-    # One `["zoom"]` in the whole model, and it is that interpolate's input.
-    assert _const("index.html", "widthOf").count('["zoom"]') == 1
-
-
-def test_a_segment_with_no_timetable_keeps_its_mode():
-    """`trips` is absent on every segment `routes` builds, because a relation is the
-    service there and Britain publishes no rail timetable to count against it: the
-    tile over Crewe holds 50 rail segments carrying `mode` and `ref` and nothing
-    else. Drawn through `guarded` -- the road network's rule, where a missing weight
-    means "no answer here" -- that painted the whole national railway in the neutral
-    grey, next to the Republic's rail in full colour.
-
-    So a segment falls back to the middle of its own mode's ramp, flat, which is what
-    the track band does with the same absence. Grey goes back to meaning the one
-    thing it should: a mode this palette does not know.
-
-    The width falls the same way. `to-number`'s default was `quiet`, the bottom of
-    the range, so those lines were drawn at the width of a service running twice a
-    day as well as in the colour of one nobody could identify."""
-    text = (WEB / "index.html").read_text()
-    body = _const("index.html", "segColourExpr")
-    assert "shadedOrMid" in body and "guarded" not in body
-    assert 'const shadedOrMid = (t, m) => [ "case", ["has", RAMP.needs],' in _const(
-        "index.html", "shadedOrMid"
-    )
-    # The road network keeps the grey: a road has no mode colour to fall back to.
-    assert "const colourExpr = (t) => guarded(t, rampOver(RAMP_COLOURS[t]));" in text
-    assert '["to-number", ["get", f.weight], midOf(f)]' in text
-
-
-def test_a_shadow_takes_every_filter_the_line_above_it_takes():
-    """The shadows under the non-road modes are drawn and nothing else -- no hover
-    query, no legend count -- but they carry the same features, so every filter and
-    every dimming that reaches a line has to reach its shadow. A shadow the mode
-    switch misses is the outline of a mode the legend says is off, and a shadow the
-    search misses is the outline of a service the search said no to, drawn at full
-    strength under a line dimmed to a tenth.
-
-    They stay out of the hover query on purpose: a shadow is offset from its line,
-    so a cursor over one is a cursor beside the thing it would report."""
-    text = (WEB / "index.html").read_text()
-    for line, shadow in (("SEG", "SEG_SHADOW"), ("TRACK", "TRACK_SHADOW")):
-        assert f"for (const id of [...{line}, ...{shadow}])" in text
-        assert f"for (const id of {shadow})" in text
-    assert "for (const id of [...SEG_SHADOW, ...TRACK_SHADOW])" in text
-    # Above every road and under the line each belongs to.
-    order = [
-        text.index(f"layers.push({name}(r))")
-        for name in (
-            "busLayer",
-            "trackShadowLayer",
-            "trackLayer",
-            "segShadowLayer",
-            "segLayer",
-        )
-    ]
-    assert order == sorted(order)
-    # The cursor asks the lines, never the shadows.
-    assert "at(SEG)" in text and "at(SEG_SHADOW)" not in text
-
-
-def test_every_legend_row_is_a_switch():
-    """The key is also the control: a checkbox per row, on unless it has been
-    cleared. `hiddenRows` holds that off the DOM because `paintLegend` rewrites the
-    rows on a theme change and on the first sighting of a mode -- a box drawn from
-    the markup alone comes back ticked over a mode that is still off the map."""
-    text = (WEB / "index.html").read_text()
-    assert 'type="checkbox" data-row=' in text
-    assert "const off = hiddenRows.has(key);" in text
-    assert '${off ? "" : " checked"}' in text
-    # The road network and the relation track are a layer each; the modes share one
-    # layer per region, so a mode goes off by filter and not by visibility.
-    assert "withoutModes" in text
-    assert "map.setFilter(id, off.length ? withoutModes(off) : null)" in text
-
-
-def test_the_archive_head_is_prefetched_under_the_key_that_reads_it():
-    """The prefetch in <head> and the lookup in `openArchive` have to agree on the
-    URL, because the map is keyed on it. They cannot share a helper -- one runs
-    before the page's own script exists -- so the expression is written twice, and
-    a divergence is silent in the worst way: every lookup misses, every archive
-    reads the network exactly as it did before, and the only evidence is a
-    prefetch nobody uses.
-
-    16 KB because that is what `getHeaderAndRoot` reads for itself. Larger was
-    measured and lost: over a 60 KB/s pipe a 32 KB head cost more than the round
-    trip it saved."""
-    text = (WEB / "index.html").read_text()
-    assert text.count("new URL(name, location.href).href") == 2
-    assert 'Range: "bytes=0-16383"' in text
-    assert "window.__heads" in text
-    assert "new pmtiles.PMTiles(new HeadSource(url, heads.get(url) || null))" in text
-
-
-def test_the_head_source_answers_only_what_it_wholly_holds():
-    """A range straddling the end of the buffer must go to the network entire. Half
-    an answer stitched to a second request is the round trip this exists to remove,
-    and a slice past the end of an ArrayBuffer is short rather than an error -- so
-    getting this wrong hands pmtiles.js a truncated directory, which it reads as a
-    corrupt archive rather than as a bug here."""
-    text = (WEB / "index.html").read_text()
-    assert "offset + length <= head.buf.byteLength" in text
-    # And a null head is "ask the network", so a host that refuses ranges or
-    # answers 404 to the prefetch behaves exactly as it did before it existed.
-    assert "const head = await this.head;" in text
-    assert "heads.get(url) || null" in text
-
-
-def test_the_basemap_gives_up_resolution_when_the_link_says_it_is_slow():
-    """Cold profiling put the basemap at 40.9% of everything transferred, and 72.7%
-    on a retina screen. Both halves of the reduction are gated on the same check --
-    the retina variant and the tile size -- because either one alone leaves the
-    other paying full price."""
-    text = (WEB / "index.html").read_text()
-    assert "function thriftyConnection()" in text
-    assert "devicePixelRatio > 1.4 && !thriftyConnection()" in text
-    assert "thriftyConnection() ? 512 : 256" in text
-    # Save-Data is the user asking; effectiveType is the browser guessing. Both.
-    assert "c.saveData" in text
-    assert "effectiveType" in text
-
-
-# --- The pages on a small screen ----------------------------------------------
-#
-# Four rules a phone enforces and a desktop browser never will, so nothing else
-# here would report any of them. Each one was a page that drew and could not be
-# used, rather than a page that failed.
-
-
-def test_both_pages_measure_the_viewport_that_is_actually_showing():
-    """A phone's layout viewport is the *large* viewport -- the one with the
-    browser's toolbars hidden -- so a height of `100%` is taller than the screen
-    for as long as a toolbar is on it. What that hides is the bottom of the page,
-    which on the viewer is the credit and on the studio is the status line. The
-    `%` declaration stays as the fallback for a browser that does not know the
-    unit, so both spellings have to be there and in that order."""
-    for page, unit in (("index.html", "dvh"), ("art.html", "dvh")):
-        text = (WEB / page).read_text()
-        assert f"height: 100{unit};" in text
-        assert "height: 100%" in text
-    # The studio's stacked layout scrolls, and a scroll is what slides the toolbar
-    # away -- `dvh` there would resize the stage mid-scroll, which `refit` reads as
-    # a new preview width and answers with a whole new render. `svh` is the one
-    # that does not move.
-    art_text = (WEB / "art.html").read_text()
-    assert "min-height: 100svh;" in art_text
-    assert "min-height: 52svh;" in art_text
-
-
-def test_every_safe_area_inset_carries_a_fallback():
-    """`env(safe-area-inset-left)` is undefined on a browser that does not do
-    notches, and an undefined `env()` with no fallback makes the whole declaration
-    invalid rather than zero. So `right: calc(10px + env(...))` becomes `right:
-    auto`, and an absolutely positioned panel with no right edge is one that sizes
-    itself to its content and runs off the side of the screen. Which is what it
-    did."""
-    for page in PAGES:
-        for line in (WEB / page).read_text().splitlines():
-            if "env(safe-area-inset-" not in line or line.lstrip().startswith("*"):
-                continue
-            for inset in ("top", "right", "bottom", "left"):
-                assert f"env(safe-area-inset-{inset})" not in line, line
-
-
-def test_the_viewer_answers_a_tap_and_gives_it_room_to_land():
-    """A touchscreen sends no `mousemove`, so the map's one interaction -- ask a
-    line what runs on it -- was unreachable on a phone: every road drawn, and no
-    way to select any of them. A tap arrives as a click, and it has to be met with
-    a box rather than a point, because a road is two pixels wide and a fingertip
-    covers forty. A mouse click keeps the point: a slop box under an arrow answers
-    for the road beside the one being pointed at."""
-    text = (WEB / "index.html").read_text()
-    assert 'map.on("mousemove", (e) => selectAt(e.point, 0));' in text
-    assert 'map.on("click", (e) => {' in text
-    assert 'e.originalEvent.pointerType === "mouse"' in text
-    assert "selectAt(e.point, mouse ? 0 : SLOP)" in text
-    # The box is built from the slop, and a slop of zero stays the point itself.
-    assert "const box = slop" in text
-
-
-def test_both_pages_give_a_coarse_pointer_a_field_it_will_not_zoom_into():
-    """Safari zooms the page in on a focused input drawn under 16px, and what it
-    zooms to is the panel -- leaving a map, or a column of knobs, that has to be
-    pinched back out of before anything else can be read. Both pages set their
-    fields to 16px for a finger and leave the mouse's 13px alone."""
-    for page in PAGES:
-        text = (WEB / page).read_text()
-        assert "@media (pointer: coarse) {" in text
-        block = text.split("@media (pointer: coarse) {", 1)[1].split("\n}", 1)[0]
-        assert "font-size: 16px;" in block
-
-
-def test_the_viewer_folds_its_key_away_where_there_is_no_room_for_it():
-    """The key is a row of colour per mode, which on a national archive is eight of
-    them and most of a phone. Folded by width *and* by height, because a laptop
-    turned landscape has the same problem. The toggles are wired in `chrome`, which
-    runs before the archives are asked for: a page waiting on a slow archive should
-    still open its own help, and one that never gets a usable archive at all is
-    where the help is most wanted."""
-    text = (WEB / "index.html").read_text()
-    assert "chrome();\nboot();" in text
-    assert 'fold("keyBtn", "legend"' in text
-    assert 'matchMedia("(max-width: 720px), (max-height: 600px)")' in text
-    # The panel's own `hidden` is the state, so the button cannot come to disagree
-    # with what is on screen.
-    assert '$(btn).addEventListener("click", () => set($(panel).hidden));' in text
-
-
 def _connect(base: str) -> http.client.HTTPConnection:
     """A raw connection, because urllib sends `Connection: close` on every request
     and so can never show one being reused."""
@@ -1157,8 +992,15 @@ def test_a_range_naming_neither_end_is_a_400(serve_at):
     base = serve_at()
     with pytest.raises(urllib.error.HTTPError) as exc:
         _get(f"{base}/wales.pmtiles", Range="bytes=-")
-    assert exc.value.code == 400
-    assert "malformed Range" in exc.value.reason
+    # Closed rather than left to the collector. urllib hands the response back
+    # inside the exception, and this is the one error test that never reads the
+    # body -- reading to EOF is what closes the socket everywhere else. An
+    # exception outlives the test that raised it, so the ResourceWarning surfaced
+    # under `-W error` as an unraisable charged to whichever test happened to be
+    # running when the collector reached it.
+    with contextlib.closing(exc.value):
+        assert exc.value.code == 400
+        assert "malformed Range" in exc.value.reason
 
 
 def test_an_unsatisfiable_range_frames_its_empty_body(serve_at):
@@ -1177,6 +1019,31 @@ def test_an_unsatisfiable_range_frames_its_empty_body(serve_at):
         # rather than being read as the tail of this one.
         conn.request("GET", "/archives.json")
         assert json.loads(conn.getresponse().read()) == ["wales.pmtiles"]
+    finally:
+        conn.close()
+
+
+def test_every_response_carries_one_set_of_cors_headers(serve_at):
+    """The viewer reads an archive cross-origin, and a header sent twice is as broken
+    as one never sent -- a browser refuses a duplicated
+    Access-Control-Allow-Origin. `end_headers` is the one hook every response passes
+    through, so it is the only place they may be added: a response adding its own
+    could only be de-duplicated by reading back the buffer the stdlib is still
+    building, and that guard matched the 416's `Content-Range` too, which left the
+    one response in the set without them."""
+    conn = _connect(serve_at())
+    try:
+        for headers, status in (
+            ({}, 200),
+            ({"Range": "bytes=0-3"}, 206),
+            ({"Range": "bytes=99999-"}, 416),
+        ):
+            conn.request("GET", "/wales.pmtiles", headers=headers)
+            response = conn.getresponse()
+            assert response.status == status
+            assert response.headers.get_all("Access-Control-Allow-Origin") == ["*"]
+            assert len(response.headers.get_all("Access-Control-Expose-Headers")) == 1
+            response.read()
     finally:
         conn.close()
 

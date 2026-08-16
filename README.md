@@ -122,12 +122,14 @@ naming by region is what lets several sit side by side.
 
 ```console
 $ docker compose up -d valhalla     # first start builds the graph
-$ docker compose run --rm pipeline  # acquire, patterns, match, trace, aggregate, publish
+$ docker compose run --rm pipeline  # every stage, acquire through publish
 $ docker compose up -d web          # viewer and renderer on :8099
 ```
 
 `pipeline` runs `wayfare all`, which is safe to interrupt and re-run, since every stage
-skips work already done. `routes` is not part of `all` and runs on its own. Compose pulls
+skips work already done. It runs the same stages in the same order as
+[`deploy/refresh.sh`](deploy/refresh.sh), `routes` among them, and differs only in leaving
+`acquire` unforced. Compose pulls
 the published `benmandrew/wayfare:latest` rather than building, so a server never compiles
 tippecanoe itself; the compose file's header covers single stages and pointing
 `WAYFARE_IMAGE` at a local build.

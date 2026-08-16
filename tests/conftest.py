@@ -1,64 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
+import duckdb
 import pytest
 
-from wayfare import db, valhalla
-
-
-class FakeClient:
-    """Stands in for Valhalla. Returns two edges for anything it is asked to match,
-    which is enough to exercise checkpointing, resumption and aggregation."""
-
-    def __init__(
-        self,
-        road_m: float = 1000.0,
-        fail: Exception | None = None,
-        graph: str | None = "valhalla-test/1",
-    ):
-        self.base = "http://fake-valhalla/"
-        self.road_m = road_m
-        self.fail = fail
-        self.graph = graph
-        self.calls: list[str] = []
-
-    def healthy(self) -> bool:
-        return True
-
-    def graph_id(self) -> str | None:
-        return self.graph
-
-    def _match(self, source: str) -> valhalla.Match:
-        self.calls.append(source)
-        if self.fail:
-            raise self.fail
-        edges = [
-            valhalla.Edge(
-                1001,
-                44556677,
-                self.road_m / 2,
-                "Oxford Road",
-                "secondary",
-                [(53.48, -2.245), (53.48, -2.240)],
-            ),
-            valhalla.Edge(
-                1002,
-                44556678,
-                self.road_m / 2,
-                "Oxford Road",
-                "secondary",
-                [(53.48, -2.240), (53.48, -2.235)],
-            ),
-        ]
-        return valhalla.Match(edges, confidence=0.9, road_m=self.road_m, source=source)
-
-    def match_shape(self, shape):
-        return self._match("shape")
-
-    def match_stops(self, stops):
-        return self._match("stops")
-
+from wayfare import db
 
 # A four-stop line running east along a single street, with two trips sharing one
 # pattern and a third trip that turns short. Enough to exercise the collapse from
@@ -145,3 +94,62 @@ def con(tmp_path: Path):
     c = db.connect(tmp_path / "test.duckdb")
     yield c
     c.close()
+
+
+@pytest.fixture(autouse=True)
+def staging(monkeypatch, tmp_path: Path) -> None:
+    """`db.insert_via_file` stages under WORK, which a test must not be writing to.
+
+    Autouse rather than opt-in: a test reaching the real working directory is a
+    fault wherever it happens, and the staging path is not visible from the call.
+    """
+    monkeypatch.setattr(db.config, "WORK", tmp_path / "work")
+
+
+@pytest.fixture
+def legacy_db(tmp_path: Path) -> Callable[..., Path]:
+    """Build a database at an older schema, then hand back its path for `db.connect`
+    to migrate. A national match run costs a day or two, so every migration is
+    checked against the layout it has to rewrite rather than against a fresh one."""
+
+    def build(
+        *ddl: str, rows: dict[str, list[tuple]] | None = None, name: str = "old"
+    ) -> Path:
+        path = tmp_path / f"{name}.duckdb"
+        old = duckdb.connect(str(path))
+        try:
+            for statement in ddl:
+                old.execute(statement)
+            for table, values in (rows or {}).items():
+                if not values:
+                    continue
+                marks = ", ".join("?" * len(values[0]))
+                old.executemany(f"INSERT INTO {table} VALUES ({marks})", values)
+        finally:
+            old.close()
+        return path
+
+    return build
+
+
+@pytest.fixture
+def tippecanoe_calls(monkeypatch) -> list[list[str]]:
+    """Stub tippecanoe and tile-join, collecting the argv of every invocation.
+
+    Each writes an empty file at its `-o`, because `build_tiles` checks the output
+    exists before joining. Thirteen copies of this lived inline in test_publish.
+    """
+    import subprocess
+
+    from wayfare import publish
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_: Any) -> subprocess.CompletedProcess:
+        calls.append(cmd)
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
+    monkeypatch.setattr(publish.subprocess, "run", fake_run)
+    return calls

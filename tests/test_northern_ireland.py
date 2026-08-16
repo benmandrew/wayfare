@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import zipfile
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 import pytest
+from builders import FakeResponse
 
 from wayfare import acquire, config, db, gtfs, licences, mapinfo, translink
 
@@ -208,14 +210,15 @@ def _mif_mid(tmp_path: Path, mif: str, mid: str) -> tuple[Path, Path]:
 # --- The MIF/MID reader ------------------------------------------------------
 
 
-def test_the_header_names_the_columns_and_the_delimiter(tmp_path: Path):
+def test_the_header_names_the_columns_and_the_delimiter():
     lines = iter(STOPPING_MIF.splitlines())
     head = mapinfo.header(lines)
     assert head.columns[:4] == ("SubNetwork", "StopID", "StopAreaID", "StoppingPointID")
     assert head.delimiter == ","
     assert head.encoding == "cp1252"
-    # The iterator is left on the first object, not on the header's last line.
-    assert next(lines).strip() in ("", "POINT -5.9300 54.5900")
+    # `Data` is the last line the header consumes, so what is left is the object
+    # section: the blank line that follows it and then the first object.
+    assert [ln.strip() for ln in lines][:2] == ["", "POINT -5.9300 54.5900"]
 
 
 def test_attributes_join_to_geometry_by_position_alone(tmp_path: Path):
@@ -260,6 +263,43 @@ def test_more_attribute_rows_than_objects_is_an_error(tmp_path: Path):
 def test_fewer_attribute_rows_than_objects_is_an_error(tmp_path: Path):
     mif, mid = _mif_mid(tmp_path, STOPPING_MIF, '"nir", 1, 0, "11", "700000000001"\n')
     with pytest.raises(mapinfo.Malformed, match="ran out of rows"):
+        list(mapinfo.read(mif, mid))
+
+
+def test_a_polyline_the_file_ends_in_the_middle_of_is_an_error(tmp_path: Path):
+    """A truncated download is the ordinary way this file arrives broken, and a
+    generator that runs its iterator dry reports the generator rather than the pair:
+    PEP 479 turns the StopIteration into `RuntimeError`, out of the one module whose
+    whole thesis is that a misalignment must name itself."""
+    mif, mid = _mif_mid(
+        tmp_path, LINKS_MIF.split("PLINE 4")[0] + "PLINE 4\n-5.9300 54.5900\n", LINKS_MID
+    )
+    with pytest.raises(mapinfo.Malformed, match="coordinate pairs"):
+        list(mapinfo.read(mif, mid))
+
+
+def test_a_multiple_polyline_missing_its_section_count_is_an_error(tmp_path: Path):
+    mif, mid = _mif_mid(
+        tmp_path,
+        LINKS_MIF.replace(
+            "PLINE 2\n-5.9200 54.5910\n-5.9100 54.5920\n", "PLINE MULTIPLE 2\n"
+        ),
+        LINKS_MID,
+    )
+    with pytest.raises(mapinfo.Malformed, match="section"):
+        list(mapinfo.read(mif, mid))
+
+
+def test_an_attribute_row_of_the_wrong_width_is_an_error(tmp_path: Path):
+    """Position is the only join, so a row that does not hold the columns the header
+    declared means the delimiter or the column count is being misread. Mapping the
+    values that do line up leaves the ATCO code off a road that still draws."""
+    mif, mid = _mif_mid(
+        tmp_path,
+        STOPPING_MIF,
+        STOPPING_MID.replace('"nir", 2, 0, "22", "700000000002"', '"nir", 2, 0, "22"'),
+    )
+    with pytest.raises(mapinfo.Malformed, match="columns"):
         list(mapinfo.read(mif, mid))
 
 
@@ -352,6 +392,86 @@ def test_a_shape_id_is_a_function_of_the_stop_sequence(ni_gtfs: Path):
     assert translink._shape_id(("A", "B")) != translink._shape_id(("B", "A"))
 
 
+# --- The week and the clock --------------------------------------------------
+#
+# `patterns` weights a journey by days per week, so a day pattern read as the wrong
+# week is a service level that is wrong everywhere it is drawn and raises nothing.
+# The times are the other half: a run time that reads as zero collapses a journey
+# onto one minute, which still loads.
+
+
+def _profile(inner: str) -> ET.Element:
+    return ET.fromstring(
+        f'<OperatingProfile xmlns="http://www.transxchange.org.uk/">{inner}</OperatingProfile>'
+    )
+
+
+def _regular(inner: str) -> ET.Element:
+    return _profile(f"<RegularDayType><DaysOfWeek>{inner}</DaysOfWeek></RegularDayType>")
+
+
+def test_a_journey_with_no_operating_profile_runs_the_working_week():
+    """The same default `gtfs.py` applies to a trip with no calendar row."""
+    assert translink._days(None) == (1, 1, 1, 1, 1, 0, 0)
+
+
+def test_a_day_range_names_every_day_it_spans():
+    assert translink._days(_regular("<MondayToThursday/>")) == (1, 1, 1, 1, 0, 0, 0)
+    assert translink._days(_regular("<SaturdayToSunday/>")) == (0, 0, 0, 0, 0, 1, 1)
+
+
+def test_weekend_is_the_two_days_and_not_a_range():
+    assert translink._days(_regular("<Weekend/>")) == (0, 0, 0, 0, 0, 1, 1)
+
+
+def test_named_days_accumulate():
+    assert translink._days(_regular("<Monday/><Sunday/>")) == (1, 0, 0, 0, 0, 0, 1)
+
+
+def test_an_unrecognised_day_pattern_is_warned_rather_than_guessed_at(caplog):
+    with caplog.at_level("WARNING"):
+        days = translink._days(_regular("<EveryOtherThursday/>"))
+    assert days == (1, 1, 1, 1, 1, 0, 0)
+    assert "unrecognised day pattern" in caplog.text
+
+
+def test_a_profile_that_names_no_ordinary_day_runs_on_none():
+    """HolidaysOnly and its kin. Weighting it as a working week would put a bank
+    holiday extra on the map every day of the year."""
+    holidays = _profile("<RegularDayType><HolidaysOnly/></RegularDayType>")
+    assert translink._days(holidays) == (0,) * 7
+
+
+def test_a_run_time_is_read_in_every_unit_it_may_carry():
+    assert translink._seconds("PT2M30S") == 150
+    assert translink._seconds("PT90S") == 90
+    assert translink._seconds("P1DT2H3M4S") == 93_784
+    assert translink._seconds("") == 0
+
+
+def test_an_unreadable_run_time_is_warned_and_treated_as_zero(caplog):
+    with caplog.at_level("WARNING"):
+        assert translink._seconds("half an hour") == 0
+    assert "unreadable run time" in caplog.text
+
+
+def test_a_journey_leaving_after_midnight_is_timetabled_past_24_hours():
+    """A DepartureDayShift journey is filed under the previous day, so its times
+    have to run past midnight -- which is how GTFS spells the same thing, and what
+    keeps a night bus from sorting ahead of the evening it belongs to."""
+    plain = ET.fromstring(
+        '<VehicleJourney xmlns="http://www.transxchange.org.uk/">'
+        "<DepartureTime>00:20:00</DepartureTime></VehicleJourney>"
+    )
+    shifted = ET.fromstring(
+        '<VehicleJourney xmlns="http://www.transxchange.org.uk/">'
+        "<DepartureTime>00:20:00</DepartureTime>"
+        "<DepartureDayShift>1</DepartureDayShift></VehicleJourney>"
+    )
+    assert translink._departure(plain) == 1200
+    assert translink._departure(shifted) == 1200 + 86_400
+
+
 def test_direction_is_transxchanges_own_and_totally_mapped():
     assert translink._direction("outbound") == "0"
     assert translink._direction("inbound") == "1"
@@ -433,22 +553,16 @@ def test_patterns_build_from_the_assembled_feed(ni_gtfs: Path, con):
 
 
 class FakeCkan:
-    """CKAN's package_show, with the shape the real one has: several formats in
-    one dataset and several ZIPs of different vintages."""
+    """A session serving CKAN's package_show, with the shape the real one has:
+    several formats in one dataset and several ZIPs of different vintages."""
 
-    def __init__(self, body):
+    def __init__(self, body: dict):
         self.body = body
-        self.seen = []
+        self.seen: list[tuple[str, dict | None]] = []
 
-    def get(self, url, params=None, headers=None, timeout=None):
+    def get(self, url, params=None, headers=None, timeout=None) -> FakeResponse:
         self.seen.append((url, params))
-        return self
-
-    def raise_for_status(self):
-        return None
-
-    def json(self):
-        return self.body
+        return FakeResponse(self.body)
 
 
 PACKAGE = {
@@ -495,7 +609,7 @@ def test_a_refused_package_show_is_an_error():
         translink.resource("x", session=FakeCkan({"success": False}))
 
 
-def test_the_province_is_four_datasets_and_no_naptan(monkeypatch):
+def test_the_province_is_four_datasets_and_no_naptan():
     feed = config.feed("northern_ireland")
     assert feed.url == ""
     assert [p.kind for p in feed.parts] == [

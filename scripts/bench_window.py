@@ -42,7 +42,7 @@ from typing import Any
 
 import duckdb
 
-from wayfare import art, db
+from wayfare import art, db, maintenance
 
 # --- Synthetic geography ----------------------------------------------------
 
@@ -363,8 +363,8 @@ def order_sql(layout: str) -> str:
         return salted("batch")
     if layout == "morton":
         # The package's own, so what this measures and what `wayfare cluster` does
-        # cannot drift apart. `db.CLUSTER_BOX` is this file's `GB` by construction.
-        return db.morton_sql(_CX, _CY)
+        # cannot drift apart. `maintenance.CLUSTER_BOX` is this file's `GB` by construction.
+        return maintenance.morton_sql(_CX, _CY)
     if layout == "hilbert":
         return f"ST_Hilbert({_CX}, {_CY}, {_BOX})"
     raise ValueError(layout)
@@ -395,7 +395,7 @@ def build_layout(
         ORDER BY {key}
     """)
     if indices:
-        db.index(con)
+        db.create_indices(con)
     con.execute("CHECKPOINT")
     con.close()
 
@@ -417,12 +417,7 @@ _TOUCH = (
 
 def bbox(b: art.Bounds) -> list[int]:
     """The four bounds in the order the window predicate binds them, as Window does."""
-    return [
-        round(b.max_lon * 1e6),
-        round(b.min_lon * 1e6),
-        round(b.max_lat * 1e6),
-        round(b.min_lat * 1e6),
-    ]
+    return b.as_predicate_params()
 
 
 def queries(bounds: art.Bounds) -> dict[str, tuple[str, list[Any], str | None]]:

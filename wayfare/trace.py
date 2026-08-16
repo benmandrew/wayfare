@@ -41,21 +41,7 @@ from . import config, db, logs, osm, osmroutes
 
 log = logs.get("trace")
 
-TRANSPORT_ERROR = "transport_error"
-
-# The one status it is safe to clear unattended, and the alias that names it. Same
-# vocabulary as `match --retry transient`, because it means the same thing: nothing
-# was ever learned about these patterns.
-_RETRY_ALIASES = {"transient": (TRANSPORT_ERROR,)}
-
-# How much wider than the patterns' own extent to ask Overpass for, in degrees. A
-# relation is only returned if it intersects the window, and a line whose stops sit
-# just inside the box still runs out of it -- the Central line reaches Epping, well
-# past anything a London window would be drawn around. 0.2 degrees is about 22 km.
-_BBOX_PAD_DEG = 0.2
-
-# Results are committed this often, for the reason `config.CHECKPOINT_EVERY` exists.
-_CHECKPOINT_EVERY = 500
+TRANSPORT_ERROR = db.TRANSPORT_ERROR
 
 
 @dataclass
@@ -87,22 +73,6 @@ class Outcome:
 
 
 @dataclass
-class Candidate:
-    """One relation, prepared once and tested against many patterns."""
-
-    relation: osm.Relation
-    latlon: list[tuple[float, float]]
-    metres: list[tuple[float, float]]
-    cum: list[float]
-    way_ids: list[int]
-    # Which way each point of the chain came from, parallel to `latlon`. `way_ids`
-    # is the whole line and this is where each way sits along it, which is what
-    # turns a cut expressed in metres back into the ways underneath it.
-    way_at: list[int]
-    names: list[str]  # normalised stop names, in relation order
-
-
-@dataclass
 class Prepared:
     """The fetched relations, chained: the usable ones and what the rest served.
 
@@ -112,37 +82,36 @@ class Prepared:
     nothing were mapped.
     """
 
-    candidates: list[Candidate]
+    candidates: list[osm.Measured]
     broken_names: set[str] = field(default_factory=set)
 
 
 # -- work selection ---------------------------------------------------------
 
 
-def _pending_sql() -> str:
-    """The patterns this stage owes an answer for.
+def _pending_sql(con: duckdb.DuckDBPyConnection) -> str:
+    """The patterns this stage owes an answer for: the non-road ones with no outcome.
 
-    Three conditions and each is load-bearing. Live, because a departed pattern is
-    work spent on a journey nobody runs. Not matchable, because a bus belongs to
-    Valhalla and a road relation is not what this draws. And no ``shape_id``,
-    because where the operator recorded the course themselves that recording is
-    better than anything reassembled from OSM -- it is a survey of where the vehicle
-    goes rather than of where the track is.
+    `trace_status` is a permanent cache, so work is selected by the absence of a row
+    rather than by a status, and a recorded failure is never asked again.
+
+    Takes the connection because `db.non_road` does: a data root that predates
+    `patterns.mode` needs the predicate to degrade rather than fail to bind.
     """
     return f"""
         FROM patterns p
-        WHERE {db.current_feed()}
-          AND NOT {db.matchable()}
-          AND p.shape_id IS NULL
+        WHERE {db.non_road(con)}
           AND NOT EXISTS (SELECT 1 FROM trace_status t WHERE t.pattern_id = p.pattern_id)
     """
 
 
 def pending_count(con: duckdb.DuckDBPyConnection) -> int:
-    return int(db.scalar(con, f"SELECT count(*) {_pending_sql()}"))
+    return int(db.scalar(con, f"SELECT count(*) {_pending_sql(con)}"))
 
 
-def bbox(con: duckdb.DuckDBPyConnection) -> tuple[float, float, float, float] | None:
+def bbox(
+    con: duckdb.DuckDBPyConnection, region: str | None = None
+) -> tuple[float, float, float, float] | None:
     """The window to ask Overpass for: every pending pattern's stops, padded.
 
     Computed from the work rather than from the region, because the region is a feed
@@ -154,6 +123,11 @@ def bbox(con: duckdb.DuckDBPyConnection) -> tuple[float, float, float, float] | 
     never met a continental stop -- it spans the pending non-road patterns, which are
     urban rail -- but nothing about the construction stops it, and the mode selection
     is the only thing standing in the way.
+
+    Then padded and clipped to `config.Feed.bounds` by `config.pad_and_clip`, which
+    `osmroutes.bbox` also runs: Northern Ireland's rail reaches Dublin Connolly, so a
+    box round its pending patterns covers most of the island and returns the
+    Republic's own lines, which this region's archive would then draw over them.
     """
     row = db.row(
         con,
@@ -161,18 +135,17 @@ def bbox(con: duckdb.DuckDBPyConnection) -> tuple[float, float, float, float] | 
         SELECT min(s.lat), min(s.lon), max(s.lat), max(s.lon)
         FROM pattern_stops ps
         JOIN stops s USING (stop_id)
-        WHERE ps.pattern_id IN (SELECT p.pattern_id {_pending_sql()})
+        WHERE ps.pattern_id IN (SELECT p.pattern_id {_pending_sql(con)})
           AND {config.british_isles_sql("s.lat", "s.lon")}
         """,
     )
     if row is None or row[0] is None:
         return None
-    south, west, north, east = (float(v) for v in row)
-    return (
-        south - _BBOX_PAD_DEG,
-        west - _BBOX_PAD_DEG,
-        north + _BBOX_PAD_DEG,
-        east + _BBOX_PAD_DEG,
+    return config.pad_and_clip(
+        (float(row[0]), float(row[1]), float(row[2]), float(row[3])),
+        pad=config.TRACE_BBOX_PAD_DEG,
+        region=region,
+        what="pending stops",
     )
 
 
@@ -185,7 +158,7 @@ def load_pending(con: duckdb.DuckDBPyConnection, limit: int | None = None) -> li
     rows = con.execute(
         f"""
         SELECT p.pattern_id, p.mode, p.short_name
-        {_pending_sql()}
+        {_pending_sql(con)}
         ORDER BY p.n_trips DESC, p.pattern_id
         {"LIMIT ?" if limit else ""}
         """,
@@ -221,26 +194,10 @@ def load_pending(con: duckdb.DuckDBPyConnection, limit: int | None = None) -> li
 def retry(con: duckdb.DuckDBPyConnection, statuses: list[str]) -> int:
     """Forget outcomes with these statuses so the next run redoes them.
 
-    Call this before tracing starts, never during. Work is selected by the absence
-    of a status row, exactly as in `match`, so a row deleted while its pattern is
-    being worked on is handed out twice.
+    `traces` goes with the status row: the geometry only exists because of it, and a
+    pattern handed back with its old cut still stored would be drawn twice.
     """
-    wanted: list[str] = []
-    for s in statuses:
-        wanted.extend(_RETRY_ALIASES.get(s, (s,)))
-    ids = [
-        r[0]
-        for r in con.execute(
-            "SELECT pattern_id FROM trace_status WHERE status IN (SELECT unnest(?))",
-            [wanted],
-        ).fetchall()
-    ]
-    if not ids:
-        return 0
-    con.execute("DELETE FROM traces WHERE pattern_id IN (SELECT unnest(?))", [ids])
-    con.execute("DELETE FROM trace_status WHERE pattern_id IN (SELECT unnest(?))", [ids])
-    log.info("cleared %d outcomes with status in %s", len(ids), wanted)
-    return len(ids)
+    return db.retry_statuses(con, "trace_status", ("traces",), statuses)
 
 
 # -- preparing the relations -------------------------------------------------
@@ -254,41 +211,28 @@ def prepare(relations: list[osm.Relation]) -> Prepared:
     for per *line*, and each pattern then costs a subsequence search and a handful of
     projections.
     """
-    out: list[Candidate] = []
+    out: list[osm.Measured] = []
     broken_names: set[str] = set()
     broken = 0
     for rel in relations:
-        ch = osm.chain(rel)
-        names = [osm.normalise(s.name) for s in rel.stops]
-        if ch.breaks or len(ch.points) < 2 or len(rel.stops) < 2:
-            broken += ch.breaks > 0
+        m = osm.prepare(rel)
+        if not m.chains or len(rel.stops) < 2:
+            broken += m.breaks > 0
             # Which stations the unusable relations serve, so that a pattern with no
             # candidate left can say *why* -- "the line is mapped and its chain is
             # broken" and "nothing here is mapped at all" are different problems with
             # different fixes, and collapsing both to `no_relation` hides the first.
-            if ch.breaks:
-                broken_names.update(n for n in names if n)
+            if m.breaks:
+                broken_names.update(n for n in m.names if n)
             continue
-        ref_lat = ch.points[0][0]
-        metres = osm.to_metres(ch.points, ref_lat)
-        out.append(
-            Candidate(
-                relation=rel,
-                latlon=ch.points,
-                metres=metres,
-                cum=osm.cumulative(metres),
-                way_ids=ch.way_ids,
-                way_at=ch.way_at,
-                names=names,
-            )
-        )
+        out.append(m)
     log.info(
         "%d of %d relations chain cleanly (%d broke)", len(out), len(relations), broken
     )
     return Prepared(candidates=out, broken_names=broken_names)
 
 
-def index_by_name(candidates: list[Candidate]) -> dict[str, list[int]]:
+def index_by_name(candidates: list[osm.Measured]) -> dict[str, list[int]]:
     """Normalised stop name to the candidates carrying it.
 
     A pattern is tested only against relations that call at its first stop, which
@@ -305,30 +249,39 @@ def index_by_name(candidates: list[Candidate]) -> dict[str, list[int]]:
 # -- resolving one pattern ---------------------------------------------------
 
 
-# How specific a near-miss is, most informative first. A pattern is tested against
-# several relations and fails each for its own reason; the one worth writing down is
-# the one that got furthest, because that is the one naming the actual obstacle.
+# Every way a pattern can fail to fit a relation: the reason, the status it is
+# recorded as, and what that status means in words. Ordered by how specific the
+# near-miss is, most informative first -- a pattern is tested against several
+# relations and fails each for its own reason, and the one worth writing down is the
+# one that got furthest, because that is the one naming the actual obstacle.
 # `no_relation` is last: it says only that nothing was tried.
-_REASON_RANK = ("not_monotonic", "off_track", "no_sequence", "chain_break", "no_relation")
+#
+# Two reasons share one status. Getting a station's name to line up and then finding
+# it 3 km from the track is a name collision between lines; getting the sequence
+# wrong is a different line entirely. Both are `no_stop_match` in the table, and the
+# distinction survives in `detail`.
+_REASONS: tuple[tuple[str, str, str], ...] = (
+    (
+        "not_monotonic",
+        "not_monotonic",
+        "its stops run out of order along the relation's chain",
+    ),
+    (
+        "off_track",
+        "no_stop_match",
+        "a matched station sits too far from the relation's track",
+    ),
+    (
+        "no_sequence",
+        "no_stop_match",
+        "a relation shares a terminus but not the stop sequence",
+    ),
+    ("chain_break", "chain_break", "the relation serving it does not chain into one path"),
+    ("no_relation", "no_relation", "no relation calls at either of its ends"),
+)
 
-# Two of those are diagnoses of the same recorded status. Getting a station's name to
-# line up and then finding it 3 km from the track is a name collision between lines;
-# getting the sequence wrong is a different line entirely. Both are `no_stop_match` in
-# the table, and the distinction survives in `detail`.
-_STATUS_OF_REASON = {
-    "not_monotonic": "not_monotonic",
-    "off_track": "no_stop_match",
-    "no_sequence": "no_stop_match",
-    "chain_break": "chain_break",
-    "no_relation": "no_relation",
-}
-
-_DETAIL_OF_REASON = {
-    "not_monotonic": "its stops run out of order along the relation's chain",
-    "off_track": "a matched station sits too far from the relation's track",
-    "no_sequence": "a relation shares a terminus but not the stop sequence",
-    "chain_break": "the relation serving it does not chain into one path",
-    "no_relation": "no relation calls at either of its ends",
+_BY_REASON = {
+    reason: (rank, status, detail) for rank, (reason, status, detail) in enumerate(_REASONS)
 }
 
 
@@ -366,13 +319,12 @@ def resolve(p: Pattern, prepared: Prepared, index: dict[str, list[int]]) -> Outc
     # before any pattern reached it.
     if ends & prepared.broken_names:
         reasons.add("chain_break")
-    reason = next((r for r in _REASON_RANK if r in reasons), "no_relation")
-    return Outcome(
-        p.pattern_id, _STATUS_OF_REASON[reason], detail=_DETAIL_OF_REASON[reason]
-    )
+    reason = next((r for r, _, _ in _REASONS if r in reasons), "no_relation")
+    _, status, detail = _BY_REASON[reason]
+    return Outcome(p.pattern_id, status, detail=detail)
 
 
-def _fit(p: Pattern, c: Candidate) -> Outcome | str:
+def _fit(p: Pattern, c: osm.Measured) -> Outcome | str:
     """This pattern against one relation, or the reason it is not that line.
 
     A pattern is a contiguous run of its line's calling points -- a short working of
@@ -394,7 +346,7 @@ def _fit(p: Pattern, c: Candidate) -> Outcome | str:
             out = _cut(p, c, matched, reverse)
             if not isinstance(out, str):
                 return out
-            if _REASON_RANK.index(out) < _REASON_RANK.index(worst):
+            if _BY_REASON[out][0] < _BY_REASON[worst][0]:
                 worst = out
     return worst
 
@@ -418,7 +370,9 @@ def _occurrences(haystack: list[str], needle: list[frozenset[str]]) -> list[int]
     ]
 
 
-def _cut(p: Pattern, c: Candidate, matched: list[osm.Stop], reverse: bool) -> Outcome | str:
+def _cut(
+    p: Pattern, c: osm.Measured, matched: list[osm.Stop], reverse: bool
+) -> Outcome | str:
     """Project the matched stops onto the chain and slice between the ends.
 
     The relation's *own* stop nodes are what get projected, not the timetable's
@@ -427,11 +381,9 @@ def _cut(p: Pattern, c: Candidate, matched: list[osm.Stop], reverse: bool) -> Ou
     side -- and projecting the further of the two risks landing on a parallel line.
     The feed's coordinate is used to check the name join instead.
     """
-    ref_lat = c.latlon[0][0]
-    node_m = osm.to_metres([(s.lat, s.lon) for s in matched], ref_lat)
     along: list[float] = []
-    for pt in node_m:
-        d, off = osm.project(c.metres, c.cum, pt)
+    for s in matched:
+        d, off = c.place(s.lat, s.lon)
         # A stop node well off its own relation's track means the name matched
         # something on another line that happens to share the name.
         if off > config.TRACE_STOP_MAX_M:
@@ -453,20 +405,19 @@ def _cut(p: Pattern, c: Candidate, matched: list[osm.Stop], reverse: bool) -> Ou
 
     worst = 0.0
     for stop, point in zip(matched, p.points, strict=False):
-        gap = _haversine_m((stop.lat, stop.lon), point)
+        gap = osm.haversine_m((stop.lat, stop.lon), point)
         worst = max(worst, gap)
     if worst > config.TRACE_STOP_MAX_M:
         return "off_track"
 
-    geom = osm.slice_between(c.latlon, c.cum, along[0], along[-1])
+    geom = osm.slice_between(c.points, c.cum, along[0], along[-1])
     if len(geom) < 2:
         return "off_track"
-    # The ways under the cut, not the ways of the line. Recording the whole chain
-    # documented what was drawn and no more, and it was enough while nothing read
-    # the column -- but inverted into `track_services` it says a Northern line
-    # short working from Edgware to Kennington runs over every way of the Northern
-    # line, which is a confident lie about half of it. `slice_between` answers the
-    # same question in geometry; this is the same cut, in identity.
+    # The ways under the cut, not the ways of the line. `aggregate` inverts this list
+    # per way, so the whole chain would say a Northern line short working from Edgware
+    # to Kennington runs over every way of the Northern line, which is a confident lie
+    # about half of it. `slice_between` answers the same question in geometry; this is
+    # the same cut, in identity.
     ways = osm.ways_between(c.way_at, c.cum, along[0], along[-1])
     return Outcome(
         pattern_id=p.pattern_id,
@@ -481,15 +432,6 @@ def _cut(p: Pattern, c: Candidate, matched: list[osm.Stop], reverse: bool) -> Ou
         way_ids=ways,
         geom=geom,
     )
-
-
-def _haversine_m(a: tuple[float, float], b: tuple[float, float]) -> float:
-    from math import asin, cos, radians, sin, sqrt
-
-    lat1, lon1 = radians(a[0]), radians(a[1])
-    lat2, lon2 = radians(b[0]), radians(b[1])
-    h = sin((lat2 - lat1) / 2) ** 2 + cos(lat1) * cos(lat2) * sin((lon2 - lon1) / 2) ** 2
-    return 2 * 6_371_000.0 * asin(sqrt(h))
 
 
 # -- the run ----------------------------------------------------------------
@@ -539,7 +481,7 @@ def run(
         got = resolve(p, prepared, index)
         counts[got.status] = counts.get(got.status, 0) + 1
         batch.append(got)
-        if len(batch) >= _CHECKPOINT_EVERY:
+        if len(batch) >= config.TRACE_CHECKPOINT_EVERY:
             write_outcomes(con, batch, by_id)
             batch = []
             log.info("%d/%d traced", n, len(patterns))

@@ -12,9 +12,11 @@ from __future__ import annotations
 import json
 
 import pytest
-from test_osmroutes import FEED, relation
+from builders import relation
 
 from wayfare import aggregate, db, osmroutes, publish
+
+FEED = "20260812_test"
 
 
 @pytest.fixture
@@ -22,12 +24,14 @@ def built(con):
     """A database holding one two-way rail relation, drawn and aggregated."""
     db.set_meta(con, "feed_version", FEED)
     rels = [relation(relation_id=1, tags={"ref": "XC", "operator": "CrossCountry"})]
-    osmroutes.write(con, osmroutes.candidates(rels)[0])
+    osmroutes.write(con, osmroutes.candidates(rels).kept)
     osmroutes.write_ways(con, rels)
     return con
 
 
-def _timetabled_trace(con, pattern_id: int = 999, *, ways_cut: bool = False) -> None:
+def _timetabled_trace(
+    con, pattern_id: int = 999, *, ways_cut: bool = False, short_name: str = "Northern"
+) -> None:
     """A pattern from the timetable whose geometry `trace` resolved.
 
     `ways_cut` is what says whether its `way_ids` are the ways under its own
@@ -35,8 +39,8 @@ def _timetabled_trace(con, pattern_id: int = 999, *, ways_cut: bool = False) -> 
     """
     con.execute(
         "INSERT INTO patterns (pattern_id, route_id, short_name, mode, n_trips, "
-        "first_seen, last_seen) VALUES (?, '43', 'Northern', 'metro', 12, ?, ?)",
-        [pattern_id, FEED, FEED],
+        "first_seen, last_seen) VALUES (?, '43', ?, 'metro', 12, ?, ?)",
+        [pattern_id, short_name, FEED, FEED],
     )
     con.execute(
         "INSERT INTO traces (pattern_id, relation_id, way_ids, ways_cut, lon_e6, lat_e6) "
@@ -69,7 +73,7 @@ def test_two_relations_over_one_way_collapse_to_one_way(built):
         relation(relation_id=1, tags={"ref": "XC", "operator": "CrossCountry"}),
         relation(relation_id=2, name="Other", tags={"ref": "TP"}),
     ]
-    osmroutes.write(built, osmroutes.candidates(both)[0])
+    osmroutes.write(built, osmroutes.candidates(both).kept)
     aggregate.build_track_services(built)
     assert db.scalar(built, "SELECT count(DISTINCT way_id) FROM track_services") == 2
     assert db.scalar(built, "SELECT count(*) FROM track_services") == 4
@@ -178,14 +182,14 @@ def test_refs_is_a_string_rather_than_an_array(built, tmp_path):
     It stores the array's JSON *text* instead, so a two-service way reached the
     viewer as the literal `["Northern line","Jubilee line"]` and the split on commas
     came back holding `["Northern line` and `Jubilee line"]`. Every name mangled and
-    the service search matching nothing, with no error anywhere. `export_geojsonl`
+    the service search matching nothing, with no error anywhere. `export_edges_geojsonl`
     has always joined; this is the same contract, checked rather than assumed.
     """
     both = [
         relation(relation_id=1, tags={"ref": "XC", "operator": "CrossCountry"}),
         relation(relation_id=2, name="Other", tags={"ref": "TP"}),
     ]
-    osmroutes.write(built, osmroutes.candidates(both)[0])
+    osmroutes.write(built, osmroutes.candidates(both).kept)
     aggregate.build_track_services(built)
     path = publish.export_track_geojsonl(built, tmp_path / "track.geojsonl")
     assert path is not None
@@ -235,6 +239,34 @@ def test_a_cut_trace_leaves_the_segments_layer(built):
     _timetabled_trace(built, ways_cut=True)
     aggregate.build_segments(built)
     assert db.scalar(built, "SELECT count(*) FROM segments") == 0
+
+
+def test_no_pattern_reaches_both_layers_when_both_arms_are_populated(built):
+    """The partition itself, rather than either arm of it.
+
+    Each arm is checked above with only its own kind of trace in the database, and
+    a rule that admits a pattern to both tables passes both of those tests. What it
+    produces is a way drawn twice -- once per way and again as a whole polyline over
+    it -- with the hover answering from whichever layer the viewer asks first.
+    """
+    _timetabled_trace(built, 998, ways_cut=True, short_name="Victoria")
+    _timetabled_trace(built, 999, ways_cut=False, short_name="Northern")
+    aggregate.build_segments(built)
+    aggregate.build_track_services(built)
+
+    as_segment = {r[0] for r in built.execute("SELECT pattern_id FROM segments").fetchall()}
+    # `track_services` is inverted per way and keeps no pattern id, so the patterns
+    # behind it are the ones whose service name reached it.
+    as_track = {
+        r[0]
+        for r in built.execute(
+            "SELECT DISTINCT p.pattern_id FROM track_services t "
+            "JOIN patterns p ON p.short_name = t.short_name"
+        ).fetchall()
+    }
+    everything = {r[0] for r in built.execute("SELECT pattern_id FROM patterns").fetchall()}
+    assert as_segment & as_track == set()
+    assert as_segment | as_track == everything
 
 
 def test_relation_track_is_credited_to_openstreetmap(built):

@@ -9,13 +9,14 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 
 FORMAT = "%(asctime)s %(levelname)-7s %(name)-14s %(message)s"
 DATEFMT = "%Y-%m-%dT%H:%M:%SZ"
 
 
 def setup(level: str | None = None) -> None:
-    logging.Formatter.converter = __import__("time").gmtime
+    logging.Formatter.converter = time.gmtime
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(logging.Formatter(FORMAT, DATEFMT))
     root = logging.getLogger()

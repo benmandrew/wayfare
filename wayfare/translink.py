@@ -47,7 +47,7 @@ import shutil
 import tempfile
 import zipfile
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -302,6 +302,133 @@ def _days(profile: ET.Element | None) -> tuple[int, ...]:
     return tuple(week)
 
 
+def _clock(hhmmss: str) -> int:
+    parts = (hhmmss or "0:0:0").split(":")
+    h, m, s = (int(p or 0) for p in (parts + ["0", "0", "0"])[:3])
+    return (h * 60 + m) * 60 + s
+
+
+def _departure(el: ET.Element) -> int:
+    """A journey's first time, in seconds from midnight of the day it is filed under.
+
+    ``DepartureDayShift`` is a journey that leaves after midnight and is timetabled
+    against the previous day, so its times run past 24 hours -- which is how GTFS
+    writes the same thing, and is what keeps the night buses in the right order.
+    """
+    depart = _clock(_text(el, "DepartureTime"))
+    return depart + 86_400 if _text(el, "DepartureDayShift") else depart
+
+
+# The tags that arrive in bulk, and so the ones worth freeing as they end. An
+# `Operator` is a handful of elements in the whole file and clearing it buys
+# nothing.
+_CLEARED = ("StopPoint", "JourneyPatternSection", "Service", "VehicleJourney")
+
+_Section = tuple[tuple[str, ...], tuple[int, ...]]
+_Service = tuple[Route, tuple[int, ...], str, str]
+
+
+@dataclass
+class _Reading:
+    """What one forward pass over a TransXChange file has seen so far.
+
+    Each handler is one tag's effect on this state and reads nothing else. That is
+    what keeps the pass to a single loop: the element order the format guarantees
+    means a journey arrives after the stops, sections and services it refers back
+    to, so every handler finds what the earlier ones left here.
+    """
+
+    stops: dict[str, Stop] = field(default_factory=dict)
+    operators: dict[str, str] = field(default_factory=dict)
+    sections: dict[str, _Section] = field(default_factory=dict)
+    # journey pattern id -> (service code, direction, section ref)
+    patterns: dict[str, tuple[str, str, str]] = field(default_factory=dict)
+    services: dict[str, _Service] = field(default_factory=dict)
+    routes: dict[str, Route] = field(default_factory=dict)
+    trips: list[Trip] = field(default_factory=list)
+
+    def stop_point(self, el: ET.Element) -> None:
+        atco = _text(el, "AtcoCode")
+        lat = _text(el, "Place/Location/Latitude")
+        lon = _text(el, "Place/Location/Longitude")
+        # Not `if lat and lon`: Translink has shipped stops at exactly 0,0, which
+        # is in the Gulf of Guinea and passes every non-null test.
+        if atco and float(lat or 0) and float(lon or 0):
+            self.stops[atco] = Stop(
+                atco, _text(el, "Descriptor/CommonName"), float(lat), float(lon)
+            )
+
+    def operator(self, el: ET.Element) -> None:
+        self.operators[el.get("id") or ""] = _text(el, "OperatorCode")
+
+    def section(self, el: ET.Element) -> None:
+        links = el.findall(TXC + "JourneyPatternTimingLink")
+        seq = [_text(link, "From/StopPointRef") for link in links]
+        runs = [_seconds(_text(link, "RunTime")) for link in links]
+        if seq:
+            seq.append(_text(links[-1], "To/StopPointRef"))
+        self.sections[el.get("id") or ""] = (tuple(seq), tuple(runs))
+
+    def service(self, el: ET.Element) -> None:
+        code = _text(el, "ServiceCode")
+        agency = self.operators.get(_text(el, "RegisteredOperatorRef"), "")
+        line = _text(el, "Lines/Line/LineName")
+        mode = _text(el, "Mode") or "bus"
+        if mode not in MODES:
+            log.warning("unrecognised mode %r on service %s", mode, code)
+        route = Route(
+            f"{agency}-{line}",
+            agency,
+            line,
+            _text(el, "Description"),
+            MODES.get(mode, "3"),
+        )
+        # Two branches of one line register separately, so the same route_id
+        # arrives twice. Keep the first by service code so the long name does
+        # not depend on file order.
+        self.routes.setdefault(route.route_id, route)
+        self.services[code] = (
+            route,
+            _days(el.find(TXC + "OperatingProfile")),
+            _text(el, "OperatingPeriod/StartDate").replace("-", ""),
+            _text(el, "OperatingPeriod/EndDate").replace("-", ""),
+        )
+        for jp in el.iter(TXC + "JourneyPattern"):
+            self.patterns[jp.get("id") or ""] = (
+                code,
+                _text(jp, "Direction"),
+                _text(jp, "JourneyPatternSectionRefs"),
+            )
+
+    def journey(self, el: ET.Element) -> None:
+        pattern = self.patterns.get(_text(el, "JourneyPatternRef"))
+        if pattern is None:
+            return
+        code, direction, section_ref = pattern
+        found = self.services.get(code)
+        section = self.sections.get(section_ref)
+        if found is None or section is None or len(section[0]) < 2:
+            return
+        stop_seq, run_times = section
+        route, week, start, end = found
+        own = el.find(TXC + "OperatingProfile")
+        times = [_departure(el)]
+        for run in run_times:
+            times.append(times[-1] + run)
+        self.trips.append(
+            Trip(
+                _text(el, "VehicleJourneyCode"),
+                route.route_id,
+                _days(own) if own is not None else week,
+                start,
+                end,
+                direction,
+                stop_seq,
+                tuple(times),
+            )
+        )
+
+
 def read_timetable(
     path: Path,
 ) -> tuple[dict[str, Stop], dict[str, Route], list[Trip]]:
@@ -313,108 +440,22 @@ def read_timetable(
     stops, then journey pattern sections, then services, then the journeys that
     refer back to all three.
     """
-    stops: dict[str, Stop] = {}
-    operators: dict[str, str] = {}
-    sections: dict[str, tuple[tuple[str, ...], tuple[int, ...]]] = {}
-    patterns: dict[str, tuple[str, str, str]] = {}  # jp -> (service, direction, section)
-    services: dict[str, tuple[Route, tuple[int, ...], str, str]] = {}
-    routes: dict[str, Route] = {}
-    trips: list[Trip] = []
-
+    seen = _Reading()
+    handlers = {
+        "StopPoint": seen.stop_point,
+        "Operator": seen.operator,
+        "JourneyPatternSection": seen.section,
+        "Service": seen.service,
+        "VehicleJourney": seen.journey,
+    }
     for _, el in ET.iterparse(str(path), events=("end",)):
         tag = el.tag.split("}")[-1]
-        if tag == "StopPoint":
-            atco = _text(el, "AtcoCode")
-            lat = _text(el, "Place/Location/Latitude")
-            lon = _text(el, "Place/Location/Longitude")
-            # Not `if lat and lon`: Translink has shipped stops at exactly 0,0,
-            # which is in the Gulf of Guinea and passes every non-null test.
-            if atco and float(lat or 0) and float(lon or 0):
-                stops[atco] = Stop(
-                    atco, _text(el, "Descriptor/CommonName"), float(lat), float(lon)
-                )
-        elif tag == "Operator":
-            operators[el.get("id") or ""] = _text(el, "OperatorCode")
-        elif tag == "JourneyPatternSection":
-            seq: list[str] = []
-            runs: list[int] = []
-            for link in el.findall(TXC + "JourneyPatternTimingLink"):
-                seq.append(_text(link, "From/StopPointRef"))
-                runs.append(_seconds(_text(link, "RunTime")))
-            if seq:
-                seq.append(
-                    _text(
-                        el.findall(TXC + "JourneyPatternTimingLink")[-1], "To/StopPointRef"
-                    )
-                )
-            sections[el.get("id") or ""] = (tuple(seq), tuple(runs))
-        elif tag == "Service":
-            code = _text(el, "ServiceCode")
-            agency = operators.get(_text(el, "RegisteredOperatorRef"), "")
-            line = _text(el, "Lines/Line/LineName")
-            mode = _text(el, "Mode") or "bus"
-            if mode not in MODES:
-                log.warning("unrecognised mode %r on service %s", mode, code)
-            route = Route(
-                f"{agency}-{line}",
-                agency,
-                line,
-                _text(el, "Description"),
-                MODES.get(mode, "3"),
-            )
-            # Two branches of one line register separately, so the same route_id
-            # arrives twice. Keep the first by service code so the long name does
-            # not depend on file order.
-            routes.setdefault(route.route_id, route)
-            week = _days(el.find(TXC + "OperatingProfile"))
-            start = _text(el, "OperatingPeriod/StartDate").replace("-", "")
-            end = _text(el, "OperatingPeriod/EndDate").replace("-", "")
-            services[code] = (route, week, start, end)
-            for jp in el.iter(TXC + "JourneyPattern"):
-                patterns[jp.get("id") or ""] = (
-                    code,
-                    _text(jp, "Direction"),
-                    _text(jp, "JourneyPatternSectionRefs"),
-                )
-        elif tag == "VehicleJourney":
-            pattern = patterns.get(_text(el, "JourneyPatternRef"))
-            if pattern is None:
-                continue
-            code, direction, section_ref = pattern
-            found = services.get(code)
-            section = sections.get(section_ref)
-            if found is None or section is None or len(section[0]) < 2:
-                continue
-            stop_seq, run_times = section
-            route, week, start, end = found
-            own = el.find(TXC + "OperatingProfile")
-            depart = _clock(_text(el, "DepartureTime"))
-            if _text(el, "DepartureDayShift"):
-                depart += 86_400
-            times = [depart]
-            for run in run_times:
-                times.append(times[-1] + run)
-            trips.append(
-                Trip(
-                    _text(el, "VehicleJourneyCode"),
-                    route.route_id,
-                    _days(own) if own is not None else week,
-                    start,
-                    end,
-                    direction,
-                    stop_seq,
-                    tuple(times),
-                )
-            )
-        if tag in ("StopPoint", "JourneyPatternSection", "Service", "VehicleJourney"):
+        handle = handlers.get(tag)
+        if handle is not None:
+            handle(el)
+        if tag in _CLEARED:
             el.clear()
-    return stops, routes, trips
-
-
-def _clock(hhmmss: str) -> int:
-    parts = (hhmmss or "0:0:0").split(":")
-    h, m, s = (int(p or 0) for p in (parts + ["0", "0", "0"])[:3])
-    return (h * 60 + m) * 60 + s
+    return seen.stops, seen.routes, seen.trips
 
 
 def _hhmmss(seconds: int) -> str:
@@ -460,6 +501,182 @@ def _write(dest: Path, name: str, header: str, rows: Iterator[list[str]]) -> Non
         w.writerows(rows)
 
 
+def _read_timetables(
+    timetables: list[Path], work: Path
+) -> tuple[dict[str, Stop], dict[str, Route], list[Trip], str]:
+    """Every TransXChange file of every bundle, merged, with the newest build stamp."""
+    stops: dict[str, Stop] = {}
+    routes: dict[str, Route] = {}
+    trips: list[Trip] = []
+    version = ""
+    for path in _timetable_members(timetables, work):
+        file_stops, file_routes, file_trips = read_timetable(path)
+        stops.update(file_stops)
+        routes.update(file_routes)
+        trips.extend(file_trips)
+        version = max(version, _created(path))
+        log.info(
+            "%s: %d stops, %d routes, %d journeys",
+            path.name,
+            len(file_stops),
+            len(file_routes),
+            len(file_trips),
+        )
+    return stops, routes, trips, version
+
+
+def _shapes_for(
+    trips: list[Trip], hops: dict[tuple[str, str], tuple[tuple[float, float], ...]]
+) -> dict[str, tuple[tuple[float, float], ...]]:
+    """One shape per distinct stop sequence, empty where a hop is unpublished.
+
+    The empty entry is kept rather than left out, so a sequence whose geometry is
+    incomplete is stitched once and not once per journey that runs it.
+    """
+    shapes: dict[str, tuple[tuple[float, float], ...]] = {}
+    shaped = 0
+    for trip in trips:
+        sid = _shape_id(trip.stops)
+        if sid not in shapes:
+            line = _stitch(trip.stops, hops)
+            shapes[sid] = line or ()
+        if shapes[sid]:
+            shaped += 1
+    log.info(
+        "%d of %d journeys carry road geometry (%.1f%%)",
+        shaped,
+        len(trips),
+        100.0 * shaped / max(len(trips), 1),
+    )
+    return shapes
+
+
+def _write_tables(
+    stage: Path,
+    stops: dict[str, Stop],
+    routes: dict[str, Route],
+    trips: list[Trip],
+    shapes: dict[str, tuple[tuple[float, float], ...]],
+    version: str,
+) -> None:
+    """The seven GTFS files, every one of them in a defined order.
+
+    Order is the whole reason this is one function: nothing here reads a clock or a
+    file system, so two builds of one publication write the same bytes.
+    """
+    _write(
+        stage,
+        "agency.txt",
+        "agency_id,agency_name,agency_url,agency_timezone",
+        (
+            [a, a, "https://www.translink.co.uk/", "Europe/London"]
+            for a in sorted({r.agency for r in routes.values()})
+        ),
+    )
+    _write(
+        stage,
+        "stops.txt",
+        "stop_id,stop_name,stop_lat,stop_lon",
+        (
+            [s.atco, s.name, f"{s.lat:.6f}", f"{s.lon:.6f}"]
+            for s in sorted(stops.values(), key=lambda s: s.atco)
+        ),
+    )
+    _write(
+        stage,
+        "routes.txt",
+        "route_id,agency_id,route_short_name,route_long_name,route_type",
+        (
+            [r.route_id, r.agency, r.short_name, r.long_name, r.route_type]
+            for r in sorted(routes.values(), key=lambda r: r.route_id)
+        ),
+    )
+    calendars = sorted({(t.days, t.start, t.end) for t in trips})
+    _write(
+        stage,
+        "calendar.txt",
+        "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
+        "start_date,end_date",
+        ([_service_id(d, a, b), *(str(x) for x in d), a, b] for d, a, b in calendars),
+    )
+    _write(
+        stage,
+        "trips.txt",
+        "route_id,service_id,trip_id,direction_id,shape_id",
+        (
+            [
+                t.route_id,
+                _service_id(t.days, t.start, t.end),
+                t.trip_id,
+                _direction(t.direction),
+                _shape_id(t.stops) if shapes[_shape_id(t.stops)] else "",
+            ]
+            for t in trips
+        ),
+    )
+    _write(
+        stage,
+        "stop_times.txt",
+        "trip_id,arrival_time,departure_time,stop_id,stop_sequence",
+        (
+            [t.trip_id, _hhmmss(sec), _hhmmss(sec), stop, str(i + 1)]
+            for t in trips
+            for i, (stop, sec) in enumerate(zip(t.stops, t.times, strict=False))
+        ),
+    )
+    _write(
+        stage,
+        "shapes.txt",
+        "shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence",
+        (
+            [sid, f"{lat:.6f}", f"{lon:.6f}", str(i + 1)]
+            for sid, line in sorted(shapes.items())
+            for i, (lon, lat) in enumerate(line)
+        ),
+    )
+    # The version is the timetable's creation stamp and deliberately not the
+    # geometry's. It keys `first_seen`/`last_seen`, so it has to move when the
+    # timetable does and stay still when it does not; a geometry refresh
+    # changes no pattern and would report churn that never happened.
+    starts = [t.start for t in trips if t.start]
+    ends = [t.end for t in trips if t.end]
+    _write(
+        stage,
+        "feed_info.txt",
+        "feed_publisher_name,feed_publisher_url,feed_lang,feed_start_date,"
+        "feed_end_date,feed_version",
+        iter(
+            [
+                [
+                    "Translink",
+                    "https://www.opendatani.gov.uk/",
+                    "en",
+                    min(starts, default=""),
+                    max(ends, default=""),
+                    version,
+                ]
+            ]
+        ),
+    )
+
+
+def _zip_bundle(stage: Path, out: Path) -> None:
+    """Pack the staged tables, through a `.part` so a kill leaves no usable half."""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    part = out.with_suffix(out.suffix + ".part")
+    with zipfile.ZipFile(part, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in sorted(stage.iterdir()):
+            # A fixed timestamp rather than the staged file's own. Every row is
+            # written in a defined order, so two builds of one publication differ
+            # only in when they ran -- and this is the one feed in the project
+            # whose bytes are ours to make comparable.
+            info = zipfile.ZipInfo(f.name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o644 << 16
+            zf.writestr(info, f.read_bytes())
+    part.replace(out)
+
+
 def build_gtfs(timetables: list[Path], geometry: list[Path], out: Path) -> Path:
     """Assemble the four Translink downloads into one GTFS bundle."""
     with tempfile.TemporaryDirectory(prefix="translink-") as tmp:
@@ -472,148 +689,10 @@ def build_gtfs(timetables: list[Path], geometry: list[Path], out: Path) -> Path:
         hops = _hop_geometry(link_mifs, _atco_by_point(stop_mifs))
         log.info("%d stop-to-stop road links from %d bundles", len(hops), len(geometry))
 
-        stops: dict[str, Stop] = {}
-        routes: dict[str, Route] = {}
-        trips: list[Trip] = []
-        version = ""
-        for path in _timetable_members(timetables, work):
-            file_stops, file_routes, file_trips = read_timetable(path)
-            stops.update(file_stops)
-            routes.update(file_routes)
-            trips.extend(file_trips)
-            version = max(version, _created(path))
-            log.info(
-                "%s: %d stops, %d routes, %d journeys",
-                path.name,
-                len(file_stops),
-                len(file_routes),
-                len(file_trips),
-            )
-
-        shapes: dict[str, tuple[tuple[float, float], ...]] = {}
-        shaped = 0
-        for trip in trips:
-            sid = _shape_id(trip.stops)
-            if sid not in shapes:
-                line = _stitch(trip.stops, hops)
-                shapes[sid] = line or ()
-            if shapes[sid]:
-                shaped += 1
-        log.info(
-            "%d of %d journeys carry road geometry (%.1f%%)",
-            shaped,
-            len(trips),
-            100.0 * shaped / max(len(trips), 1),
-        )
-
-        _write(
-            stage,
-            "agency.txt",
-            "agency_id,agency_name,agency_url,agency_timezone",
-            (
-                [a, a, "https://www.translink.co.uk/", "Europe/London"]
-                for a in sorted({r.agency for r in routes.values()})
-            ),
-        )
-        _write(
-            stage,
-            "stops.txt",
-            "stop_id,stop_name,stop_lat,stop_lon",
-            (
-                [s.atco, s.name, f"{s.lat:.6f}", f"{s.lon:.6f}"]
-                for s in sorted(stops.values(), key=lambda s: s.atco)
-            ),
-        )
-        _write(
-            stage,
-            "routes.txt",
-            "route_id,agency_id,route_short_name,route_long_name,route_type",
-            (
-                [r.route_id, r.agency, r.short_name, r.long_name, r.route_type]
-                for r in sorted(routes.values(), key=lambda r: r.route_id)
-            ),
-        )
-        calendars = sorted({(t.days, t.start, t.end) for t in trips})
-        _write(
-            stage,
-            "calendar.txt",
-            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,"
-            "start_date,end_date",
-            ([_service_id(d, a, b), *(str(x) for x in d), a, b] for d, a, b in calendars),
-        )
-        _write(
-            stage,
-            "trips.txt",
-            "route_id,service_id,trip_id,direction_id,shape_id",
-            (
-                [
-                    t.route_id,
-                    _service_id(t.days, t.start, t.end),
-                    t.trip_id,
-                    _direction(t.direction),
-                    _shape_id(t.stops) if shapes[_shape_id(t.stops)] else "",
-                ]
-                for t in trips
-            ),
-        )
-        _write(
-            stage,
-            "stop_times.txt",
-            "trip_id,arrival_time,departure_time,stop_id,stop_sequence",
-            (
-                [t.trip_id, _hhmmss(sec), _hhmmss(sec), stop, str(i + 1)]
-                for t in trips
-                for i, (stop, sec) in enumerate(zip(t.stops, t.times, strict=False))
-            ),
-        )
-        _write(
-            stage,
-            "shapes.txt",
-            "shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence",
-            (
-                [sid, f"{lat:.6f}", f"{lon:.6f}", str(i + 1)]
-                for sid, line in sorted(shapes.items())
-                for i, (lon, lat) in enumerate(line)
-            ),
-        )
-        # The version is the timetable's creation stamp and deliberately not the
-        # geometry's. It keys `first_seen`/`last_seen`, so it has to move when the
-        # timetable does and stay still when it does not; a geometry refresh
-        # changes no pattern and would report churn that never happened.
-        starts = [t.start for t in trips if t.start]
-        ends = [t.end for t in trips if t.end]
-        _write(
-            stage,
-            "feed_info.txt",
-            "feed_publisher_name,feed_publisher_url,feed_lang,feed_start_date,"
-            "feed_end_date,feed_version",
-            iter(
-                [
-                    [
-                        "Translink",
-                        "https://www.opendatani.gov.uk/",
-                        "en",
-                        min(starts, default=""),
-                        max(ends, default=""),
-                        version,
-                    ]
-                ]
-            ),
-        )
-
-        out.parent.mkdir(parents=True, exist_ok=True)
-        part = out.with_suffix(out.suffix + ".part")
-        with zipfile.ZipFile(part, "w", zipfile.ZIP_DEFLATED) as zf:
-            for f in sorted(stage.iterdir()):
-                # A fixed timestamp rather than the staged file's own. Every row
-                # written above is in a defined order, so two builds of one
-                # publication differ only in when they ran -- and this is the one
-                # feed in the project whose bytes are ours to make comparable.
-                info = zipfile.ZipInfo(f.name, date_time=(1980, 1, 1, 0, 0, 0))
-                info.compress_type = zipfile.ZIP_DEFLATED
-                info.external_attr = 0o644 << 16
-                zf.writestr(info, f.read_bytes())
-        part.replace(out)
+        stops, routes, trips, version = _read_timetables(timetables, work)
+        shapes = _shapes_for(trips, hops)
+        _write_tables(stage, stops, routes, trips, shapes, version)
+        _zip_bundle(stage, out)
     log.info(
         "built %s (%.1f MB), feed version %s", out.name, out.stat().st_size / 1e6, version
     )

@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 
 import pytest
+from builders import insert_pattern
 
 from wayfare import db, gtfs
 
@@ -69,13 +70,31 @@ def test_a_shape_is_one_row_holding_its_points_in_order(gtfs_dir: Path, con):
 
 def test_ids_stay_strings(gtfs_dir: Path, con):
     """A route named "07" must not become 7, or the join to patterns silently
-    loses every service whose number has a leading zero."""
+    loses every service whose number has a leading zero.
+
+    Every id read out of the feed, not just the one the public sees: a stop id is
+    what `pattern_stops` joins on and what the identity hash is built from, so a
+    numeric-looking one that loses its zeros takes the stop chain with it."""
     (gtfs_dir / "routes.txt").write_text(
         "route_id,agency_id,route_short_name,route_long_name,route_type\n"
         "R1,OP1,07,Alpha to Delta,3\n"
     )
+    stops = (gtfs_dir / "stops.txt").read_text()
+    (gtfs_dir / "stops.txt").write_text(stops + "007,Echo,53.4800,-2.2250\n")
+    times = (gtfs_dir / "stop_times.txt").read_text()
+    (gtfs_dir / "stop_times.txt").write_text(times + "T3,11:10:00,11:10:00,007,3\n")
+
     gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB")
+
     assert con.execute("SELECT DISTINCT short_name FROM patterns").fetchone()[0] == "07"
+    assert con.execute("SELECT stop_id FROM stops WHERE name = 'Echo'").fetchone() == (
+        "007",
+    )
+    pid = con.execute("SELECT pattern_id FROM patterns WHERE n_stops = 3").fetchone()[0]
+    ordered = con.execute(
+        "SELECT stop_id FROM pattern_stops WHERE pattern_id = ? ORDER BY seq", [pid]
+    ).fetchall()
+    assert [s[0] for s in ordered] == ["S1", "S2", "007"]
 
 
 def test_rebuild_is_idempotent(gtfs_dir: Path, con):
@@ -83,6 +102,23 @@ def test_rebuild_is_idempotent(gtfs_dir: Path, con):
     gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB")
     assert con.execute("SELECT count(*) FROM patterns").fetchone()[0] == 2
     assert con.execute("SELECT count(*) FROM pattern_stops").fetchone()[0] == 6
+
+
+def test_a_withdrawn_osm_pattern_is_reported_as_departed(gtfs_dir: Path, con, caplog):
+    """`osmroutes` retires a relation by setting `last_seen` to NULL, and SQL
+    answers NULL rather than true to `last_seen <> 'F1'`. The churn line is how a
+    monthly run sees a line leave, so a whole mode leaving silently reads as a feed
+    that did not change."""
+    modes = frozenset({"bus", "rail"})
+    gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB", modes=modes)
+    feed = db.get_meta(con, "feed_version")
+    insert_pattern(con, 4242, mode="rail", feed=feed, last_seen=None)
+
+    with caplog.at_level(logging.INFO, logger="wayfare.gtfs"):
+        gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB", modes=modes)
+
+    churn = [r.getMessage() for r in caplog.records if "departed" in r.getMessage()]
+    assert churn and churn[-1].endswith("1 departed")
 
 
 # --- Modes -------------------------------------------------------------------

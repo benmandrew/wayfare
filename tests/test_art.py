@@ -6,11 +6,16 @@ import re
 import struct
 import zlib
 from dataclasses import replace
+from pathlib import Path
 from xml.etree import ElementTree
 
+import builders
 import pytest
 
-from wayfare import art, config, db
+from wayfare import art, config, db, licences
+
+# One window over Cardiff, shared by every test here that needs somewhere to draw.
+BOUNDS = art.Bounds(*builders.WINDOW)
 
 
 def test_presets_are_well_formed():
@@ -117,6 +122,68 @@ def test_unknown_style_lists_the_known_ones(tmp_path):
         art.render("cardiff", style="nonesuch", out_path=tmp_path / "x.png", edges=[])
 
 
+class _Bare:
+    """Exactly :class:`art.Frame` and nothing else -- no spec, no connection.
+
+    Anything a style reaches for beyond the four members raises AttributeError here,
+    which is the point: the protocol is the whole of what paint may ask of data.
+    """
+
+    weights = art.Weights.over([1.0, 100.0, 900.0])
+    alpha_compensation = 2.0
+
+    def paths(self, proj, *, tol=0.0, by_weight=False, coalesce=False):
+        yield 100.0, art.Polyline.of([(10.0, 10.0), (60.0, 70.0), (90.0, 20.0)])
+
+    def group_paths(self, proj, *, tol=0.0):
+        yield "42", 0.5, art.Polyline.of([(10.0, 10.0), (60.0, 70.0)])
+
+
+@pytest.mark.parametrize("style", sorted(art.STYLES))
+def test_a_style_draws_from_the_frame_and_nothing_else(style):
+    """A render is a style and a query spec, and they know nothing about each other.
+    The one crossing is `Style.needs_groups`, which names the *shape* of the data a
+    style consumes. A style reading `window.spec` -- for the sample rate, say -- puts
+    a query concern inside the paint, and it raises here rather than compiling."""
+    import cairo
+
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 100, 100)
+    ctx = cairo.Context(surface)
+    proj = art.Projection.fit(BOUNDS, 100, 100)
+    art.STYLES[style].draw(ctx, _Bare(), proj, art.RenderOpts(width_px=100))
+
+
+def test_the_window_says_how_much_light_a_sampled_render_owes(con):
+    """`density` composites additively, so a preview drawing one edge in eight has to
+    put the light of the missing seven onto the survivors. Which edges there are is
+    the spec's business; the number to multiply an alpha by is the window's, so the
+    style asks for that rather than reading the sample rate itself."""
+    builders.insert_edge(con, 1, lon_e6=-3200000, span_e6=1000)
+    builders.insert_services(con, 1, n_trips=100)
+    assert art.Window(BOUNDS, con).alpha_compensation == 1.0
+    spec = art.QuerySpec(sample=8)
+    assert art.Window(BOUNDS, con, spec=spec).alpha_compensation == 8.0
+    assert art.Held(art.load_edges(BOUNDS, con=con)).alpha_compensation == 1.0
+
+
+def test_a_style_must_declare_its_widest_stroke():
+    """Banding sizes a band's collar off `max_line_px`. A style that inherited a
+    default would get a collar for a picture it does not draw, and too narrow a collar
+    is a seam nothing raises about -- so the declaration is required at construction."""
+    with pytest.raises(TypeError):
+        art.Style(draw=lambda *a: None)
+
+
+def test_a_format_comes_from_a_path_or_from_a_bare_suffix():
+    """`render` holds a filename and `render_bytes` holds `.png` on its own. A bare
+    suffix has no suffix of its own, which is what the fallback is for."""
+    assert art._fmt(Path("/tmp/a.PNG")) == ".png"
+    assert art._fmt("/tmp/a.png") == ".png"
+    assert art._fmt(".svg") == ".svg"
+    with pytest.raises(ValueError, match="unsupported"):
+        art._fmt("/tmp/a.tiff")
+
+
 def test_unknown_output_format_fails_before_querying(tmp_path):
     """Rejecting the suffix must not cost a full window query first."""
     with pytest.raises(ValueError):
@@ -172,19 +239,6 @@ def test_unknown_name_mentions_the_window_form():
 # --- Streaming ---------------------------------------------------------------
 
 
-def _art_edge(con, edge_id, lon, trips, services=("42",), agency="OP1"):
-    con.execute(
-        "INSERT INTO edges VALUES (?, 1, 'R', 'secondary', 100.0, [?, ?], "
-        "[51480000, 51480000], ?, 51480000, ?, 51480000)",
-        [edge_id, lon, lon + 1000, lon, lon + 1000],
-    )
-    for s in services:
-        con.execute(
-            "INSERT INTO edge_services VALUES (?, ?, ?, 1, ?)",
-            [edge_id, s, agency, trips],
-        )
-
-
 def test_an_empty_window_has_a_usable_scale():
     w = art.Weights.over([])
     assert w.of(10) == 0.5
@@ -192,45 +246,52 @@ def test_an_empty_window_has_a_usable_scale():
 
 def test_window_streams_the_same_edges_the_list_form_returns(con):
     for i, lon in enumerate([-3200000, -3190000, -3180000]):
-        _art_edge(con, i + 1, lon, trips=100 * (i + 1))
-    bounds = art.Bounds(-3.30, 51.40, -3.10, 51.60)
+        builders.insert_edge(con, i + 1, lon_e6=lon, span_e6=1000)
+        builders.insert_services(con, i + 1, n_trips=100 * (i + 1))
 
-    streamed = list(art.Window(bounds, con).edges())
-    listed = art.load_edges(bounds, con=con)
+    streamed = list(art.Window(BOUNDS, con).edges())
+    listed = art.load_edges(BOUNDS, con=con)
     assert [e.edge_id for e in streamed] == [e.edge_id for e in listed]
     assert len(streamed) == 3
 
 
 def test_window_can_be_walked_more_than_once(con):
     """density makes two additive passes, so the stream has to reopen."""
-    _art_edge(con, 1, -3200000, trips=100)
-    w = art.Window(art.Bounds(-3.30, 51.40, -3.10, 51.60), con)
+    builders.insert_edge(con, 1, lon_e6=-3200000, span_e6=1000)
+    builders.insert_services(con, 1, n_trips=100)
+    w = art.Window(BOUNDS, con)
     assert [e.edge_id for e in w.edges()] == [e.edge_id for e in w.edges()] == [1]
 
 
 def test_by_weight_orders_quietest_first(con):
     """spectrum draws in this order so busy roads finish on top. The order is the
     database's, so a render never holds the window in memory to sort it."""
-    _art_edge(con, 1, -3200000, trips=900)
-    _art_edge(con, 2, -3190000, trips=10)
-    _art_edge(con, 3, -3180000, trips=300)
-    w = art.Window(art.Bounds(-3.30, 51.40, -3.10, 51.60), con)
+    builders.insert_edge(con, 1, lon_e6=-3200000, span_e6=1000)
+    builders.insert_services(con, 1, n_trips=900)
+    builders.insert_edge(con, 2, lon_e6=-3190000, span_e6=1000)
+    builders.insert_services(con, 2, n_trips=10)
+    builders.insert_edge(con, 3, lon_e6=-3180000, span_e6=1000)
+    builders.insert_services(con, 3, n_trips=300)
+    w = art.Window(BOUNDS, con)
     assert [e.edge_id for e in w.edges(by_weight=True)] == [2, 3, 1]
 
 
 def test_strands_arrive_grouped_by_service_widest_first(con):
     """A ribbon is stroked as one path, so a service's edges must arrive together
     and never be revisited once the next service starts."""
-    _art_edge(con, 1, -3200000, trips=100, services=("42", "9A"))
-    _art_edge(con, 2, -3190000, trips=100, services=("42",))
-    _art_edge(con, 3, -3180000, trips=100, services=("42",))
-    w = art.Window(art.Bounds(-3.30, 51.40, -3.10, 51.60), con, with_groups=True)
+    builders.insert_edge(con, 1, lon_e6=-3200000, span_e6=1000)
+    builders.insert_services(con, 1, ("42", "9A"), n_trips=100)
+    builders.insert_edge(con, 2, lon_e6=-3190000, span_e6=1000)
+    builders.insert_services(con, 2, ("42",), n_trips=100)
+    builders.insert_edge(con, 3, lon_e6=-3180000, span_e6=1000)
+    builders.insert_services(con, 3, ("42",), n_trips=100)
+    w = art.Window(BOUNDS, con, with_groups=True)
 
-    names = [name for name, _weight, _coords in w.groups()]
+    proj = art.Projection.fit(BOUNDS, 800, 600)
+    names = [name for name, _weight, _line in w.group_paths(proj)]
     assert names == ["42", "42", "42", "9A"]  # widest service first, then grouped
     # Once a name is left behind it never comes back, which is what lets the caller
     # stroke and forget.
-    assert len(set(names)) == len({n for n in names})
     seen, order = set(), []
     for n in names:
         if n not in seen:
@@ -246,7 +307,7 @@ def test_batch_projection_matches_the_scalar_one(con):
     """The batched path is vectorised for speed, not for a different answer. If the
     two ever disagree the same window draws differently depending on whether it came
     from the database or from a list."""
-    proj = art.Projection.fit(art.Bounds(-3.3, 51.4, -3.1, 51.6), 800, 600)
+    proj = art.Projection.fit(BOUNDS, 800, 600)
     lons = [[-3200000, -3190000, -3180000], [-3150000, -3140000]]
     lats = [[51480000, 51490000, 51500000], [51450000, 51460000]]
 
@@ -279,11 +340,11 @@ def test_sampling_thins_the_window_but_not_the_weight_scale(con):
     """A preview must draw fewer edges without changing what a trip count looks
     like, or its colours and line widths would not be the ones being tuned."""
     for i in range(64):
-        _art_edge(con, i + 1, -3200000 + i * 1000, trips=10 * (i + 1))
-    bounds = art.Bounds(-3.30, 51.40, -3.10, 51.60)
+        builders.insert_edge(con, i + 1, lon_e6=-3200000 + i * 1000, span_e6=1000)
+        builders.insert_services(con, i + 1, n_trips=10 * (i + 1))
 
-    full = art.Window(bounds, con)
-    thin = art.Window(bounds, con, spec=art.QuerySpec(sample=8))
+    full = art.Window(BOUNDS, con)
+    thin = art.Window(BOUNDS, con, spec=art.QuerySpec(sample=8))
 
     ids = [e.edge_id for e in thin.edges()]
     assert 0 < len(ids) < 64
@@ -315,11 +376,11 @@ def test_sampling_picks_the_same_edges_every_time(con):
     """A preview that redrew a different eighth on every keystroke would flicker,
     and two runs of the same render would not be comparable."""
     for i in range(64):
-        _art_edge(con, i + 1, -3200000 + i * 1000, trips=100)
-    bounds = art.Bounds(-3.30, 51.40, -3.10, 51.60)
+        builders.insert_edge(con, i + 1, lon_e6=-3200000 + i * 1000, span_e6=1000)
+        builders.insert_services(con, i + 1, n_trips=100)
     spec = art.QuerySpec(sample=8)
-    first = [e.edge_id for e in art.Window(bounds, con, spec=spec).edges()]
-    second = [e.edge_id for e in art.Window(bounds, con, spec=spec).edges()]
+    first = [e.edge_id for e in art.Window(BOUNDS, con, spec=spec).edges()]
+    second = [e.edge_id for e in art.Window(BOUNDS, con, spec=spec).edges()]
     assert first == second
 
 
@@ -328,27 +389,28 @@ def test_sampling_leaves_group_widths_alone(con):
     the whole window. Sampling that too would make a preview weight its ribbons
     differently from the render it stands in for."""
     for i in range(64):
-        _art_edge(con, i + 1, -3200000 + i * 1000, trips=100, services=("42",))
-    bounds = art.Bounds(-3.30, 51.40, -3.10, 51.60)
+        builders.insert_edge(con, i + 1, lon_e6=-3200000 + i * 1000, span_e6=1000)
+        builders.insert_services(con, i + 1, ("42",), n_trips=100)
 
-    full = art.Window(bounds, con, with_groups=True)
-    thin = art.Window(bounds, con, with_groups=True, spec=art.QuerySpec(sample=8))
+    full = art.Window(BOUNDS, con, with_groups=True)
+    thin = art.Window(BOUNDS, con, with_groups=True, spec=art.QuerySpec(sample=8))
+    proj = art.Projection.fit(BOUNDS, 800, 600)
 
-    widths = {(n, round(w, 9)) for n, w, _ in full.groups()}
-    thin_widths = {(n, round(w, 9)) for n, w, _ in thin.groups()}
+    widths = {(n, round(w, 9)) for n, w, _ in full.group_paths(proj)}
+    thin_widths = {(n, round(w, 9)) for n, w, _ in thin.group_paths(proj)}
     assert thin_widths == widths
     # ...while the geometry it hands back really is thinner.
-    assert 0 < len(list(thin.groups())) < len(list(full.groups()))
+    assert 0 < len(list(thin.group_paths(proj))) < len(list(full.group_paths(proj)))
 
 
 def test_paths_agree_with_projecting_the_edge_stream(con):
     """`paths` exists to skip building degrees at all, so it has its own decode. It
     must still land on the pixels the unprojected stream would have."""
     for i in range(3):
-        _art_edge(con, i + 1, -3200000 + i * 5000, trips=100 * (i + 1))
-    bounds = art.Bounds(-3.30, 51.40, -3.10, 51.60)
-    proj = art.Projection.fit(bounds, 800, 600)
-    w = art.Window(bounds, con)
+        builders.insert_edge(con, i + 1, lon_e6=-3200000 + i * 5000, span_e6=1000)
+        builders.insert_services(con, i + 1, n_trips=100 * (i + 1))
+    proj = art.Projection.fit(BOUNDS, 800, 600)
+    w = art.Window(BOUNDS, con)
 
     viaPaths = [(weight, line.points()) for weight, line in w.paths(proj)]
     viaEdges = [(e.weight, [proj(lon, lat) for lon, lat in e.coords]) for e in w.edges()]
@@ -356,13 +418,14 @@ def test_paths_agree_with_projecting_the_edge_stream(con):
 
 
 def test_held_paths_match_the_streaming_ones(con):
-    _art_edge(con, 1, -3200000, trips=900, services=("42",))
-    _art_edge(con, 2, -3190000, trips=10, services=("42",))
-    bounds = art.Bounds(-3.30, 51.40, -3.10, 51.60)
-    proj = art.Projection.fit(bounds, 800, 600)
+    builders.insert_edge(con, 1, lon_e6=-3200000, span_e6=1000)
+    builders.insert_services(con, 1, ("42",), n_trips=900)
+    builders.insert_edge(con, 2, lon_e6=-3190000, span_e6=1000)
+    builders.insert_services(con, 2, ("42",), n_trips=10)
+    proj = art.Projection.fit(BOUNDS, 800, 600)
 
-    streamed = art.Window(bounds, con, with_groups=True)
-    held = art.Held(art.load_edges(bounds, with_groups=True, con=con))
+    streamed = art.Window(BOUNDS, con, with_groups=True)
+    held = art.Held(art.load_edges(BOUNDS, with_groups=True, con=con))
     assert list(held.paths(proj)) == list(streamed.paths(proj))
     assert [(n, round(w, 9), p) for n, w, p in held.group_paths(proj)] == [
         (n, round(w, 9), p) for n, w, p in streamed.group_paths(proj)
@@ -372,45 +435,72 @@ def test_held_paths_match_the_streaming_ones(con):
 def test_held_window_matches_the_streaming_one(con):
     """`render(edges=...)` re-renders a window a caller already has; it must draw
     the same picture as the streaming path."""
-    _art_edge(con, 1, -3200000, trips=900, services=("42", "9A"))
-    _art_edge(con, 2, -3190000, trips=10, services=("42",))
-    bounds = art.Bounds(-3.30, 51.40, -3.10, 51.60)
+    builders.insert_edge(con, 1, lon_e6=-3200000, span_e6=1000)
+    builders.insert_services(con, 1, ("42", "9A"), n_trips=900)
+    builders.insert_edge(con, 2, lon_e6=-3190000, span_e6=1000)
+    builders.insert_services(con, 2, ("42",), n_trips=10)
 
-    streamed = art.Window(bounds, con, with_groups=True)
-    held = art.Held(art.load_edges(bounds, with_groups=True, con=con))
+    streamed = art.Window(BOUNDS, con, with_groups=True)
+    held = art.Held(art.load_edges(BOUNDS, with_groups=True, con=con))
+    proj = art.Projection.fit(BOUNDS, 800, 600)
 
     assert held.weights == streamed.weights
     assert [e.edge_id for e in held.edges(by_weight=True)] == [
         e.edge_id for e in streamed.edges(by_weight=True)
     ]
-    assert [(n, round(w, 9)) for n, w, _ in held.groups()] == [
-        (n, round(w, 9)) for n, w, _ in streamed.groups()
+    assert [(n, round(w, 9)) for n, w, _ in held.group_paths(proj)] == [
+        (n, round(w, 9)) for n, w, _ in streamed.group_paths(proj)
+    ]
+
+
+@pytest.mark.parametrize("order", sorted(art.ORDERS))
+def test_held_lays_its_ribbons_down_in_the_order_the_spec_asked_for(con, order):
+    """`Held` cannot honour a filter -- its edges were chosen by whatever produced
+    them -- but the draw order is a property of the list rather than of the query, and
+    it decides which ribbon ends up underneath. Hard-coded to `widest` it silently
+    ignored `order=`, so `render(edges=...)` drew a different picture from the
+    streaming path for four of the five orders."""
+    builders.insert_edge(con, 1, lon_e6=-3200000, span_e6=1000)
+    builders.insert_services(con, 1, (("42", "OP1"), ("9A", "OP2")), n_trips=100)
+    builders.insert_edge(con, 2, lon_e6=-3190000, span_e6=1000)
+    builders.insert_services(con, 2, (("42", "FIRST"),), n_trips=50)
+    builders.insert_edge(con, 3, lon_e6=-3180000, span_e6=1000)
+    builders.insert_services(con, 3, (("7", "OP1"),), n_trips=30)
+
+    spec = art.QuerySpec(order=order)
+    proj = art.Projection.fit(BOUNDS, 800, 600)
+    held = art.Held(art.load_edges(BOUNDS, with_groups=True, con=con), spec=spec)
+    streamed = art.Window(BOUNDS, con, with_groups=True, spec=spec)
+    assert [n for n, _w, _p in held.group_paths(proj)] == [
+        n for n, _w, _p in streamed.group_paths(proj)
     ]
 
 
 def test_held_window_carries_the_groups_the_query_asked_for(con):
     """`with_groups=` populates Edge.groups, and `Held` draws from that field alone --
     so a rename that left one of the two behind would show up as an empty ribbon."""
-    _art_edge(con, 1, -3200000, trips=900, services=("42", "9A"))
-    bounds = art.Bounds(-3.30, 51.40, -3.10, 51.60)
-    assert [e.groups for e in art.load_edges(bounds, with_groups=True, con=con)] == [
+    builders.insert_edge(con, 1, lon_e6=-3200000, span_e6=1000)
+    builders.insert_services(con, 1, ("42", "9A"), n_trips=900)
+    assert [e.groups for e in art.load_edges(BOUNDS, with_groups=True, con=con)] == [
         ("42", "9A")
     ]
-    assert art.load_edges(bounds, con=con)[0].groups == ()
+    assert art.load_edges(BOUNDS, con=con)[0].groups == ()
 
 
 # --- Rendering the spec -------------------------------------------------------
 
-RENDER_BOUNDS = art.Bounds(-3.30, 51.40, -3.10, 51.60)
 RENDER_OPTS = art.RenderOpts(width_px=300)
 
 
 @pytest.fixture
 def drawable(con):
     """Enough overlap that every style has something to composite."""
-    _art_edge(con, 1, -3200000, trips=900, services=("42", "9A"))
-    _art_edge(con, 2, -3190000, trips=40, services=("42",), agency="FIRST")
-    _art_edge(con, 3, -3180000, trips=300, services=("9A", "7"))
+    builders.insert_edge(con, 1, lon_e6=-3200000, span_e6=1000)
+    builders.insert_services(con, 1, ("42", "9A"), n_trips=900)
+    builders.insert_edge(con, 2, lon_e6=-3190000, span_e6=1000)
+    builders.insert_services(con, 2, ("42",), n_trips=40, agency="FIRST")
+    builders.insert_edge(con, 3, lon_e6=-3180000, span_e6=1000)
+    builders.insert_services(con, 3, ("9A", "7"), n_trips=300)
     return con
 
 
@@ -420,8 +510,8 @@ def test_a_render_is_byte_identical_across_two_calls(drawable, style, fmt):
     """SVG is the format that can tell: it records the strokes in the order they were
     issued, where a PNG of `strands` hides an arbitrary order because SCREEN
     compositing is commutative. Two runs once differed in 180,365 of 293,842 bytes."""
-    first = art.render_bytes(RENDER_BOUNDS, style, fmt=fmt, opts=RENDER_OPTS, con=drawable)
-    second = art.render_bytes(RENDER_BOUNDS, style, fmt=fmt, opts=RENDER_OPTS, con=drawable)
+    first = art.render_bytes(BOUNDS, style, fmt=fmt, opts=RENDER_OPTS, con=drawable)
+    second = art.render_bytes(BOUNDS, style, fmt=fmt, opts=RENDER_OPTS, con=drawable)
     assert first == second
 
 
@@ -436,8 +526,8 @@ def test_a_render_is_byte_identical_across_two_calls(drawable, style, fmt):
 )
 def test_a_spec_renders_deterministically_too(drawable, query):
     kwargs = {"fmt": ".svg", "opts": RENDER_OPTS, "con": drawable, "query": query}
-    assert art.render_bytes(RENDER_BOUNDS, "strands", **kwargs) == art.render_bytes(
-        RENDER_BOUNDS, "strands", **kwargs
+    assert art.render_bytes(BOUNDS, "strands", **kwargs) == art.render_bytes(
+        BOUNDS, "strands", **kwargs
     )
 
 
@@ -445,38 +535,11 @@ def test_two_specs_do_not_draw_the_same_picture(drawable):
     """If they did, `QuerySpec.key` would be pointless and the cache could not tell
     them apart in the first place."""
     kwargs = {"fmt": ".svg", "opts": RENDER_OPTS, "con": drawable}
-    plain = art.render_bytes(RENDER_BOUNDS, "strands", **kwargs)
+    plain = art.render_bytes(BOUNDS, "strands", **kwargs)
     filtered = art.render_bytes(
-        RENDER_BOUNDS, "strands", query=art.QuerySpec(operator=("FIRST",)), **kwargs
+        BOUNDS, "strands", query=art.QuerySpec(operator=("FIRST",)), **kwargs
     )
     assert plain != filtered
-
-
-# --- Cached windows -----------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "query",
-    [
-        art.DEFAULT_SPEC,
-        art.QuerySpec(weight="density", group="way"),
-        art.QuerySpec(min_trips=100),
-    ],
-    ids=lambda q: q.key,
-)
-@pytest.mark.parametrize("style", sorted(art.STYLES))
-def test_substituting_the_source_never_changes_the_picture(drawable, style, query):
-    """`Source` names where the two tables are read from, so that a materialised or
-    extracted window can be swapped in underneath a render. Whatever is swapped in,
-    the picture has to be the same one -- a source that changed the output would make
-    every design iterated against it a picture of something other than the database.
-    """
-    kwargs = {"fmt": ".svg", "opts": RENDER_OPTS, "con": drawable, "query": query}
-    direct = art.render_bytes(RENDER_BOUNDS, style, **kwargs)
-    wrapped = art.Source(
-        edges="(SELECT * FROM edges)", services="(SELECT * FROM edge_services)"
-    )
-    assert art.render_bytes(RENDER_BOUNDS, style, source=wrapped, **kwargs) == direct
 
 
 # --- The flat geometry path -------------------------------------------------
@@ -515,31 +578,35 @@ def test_polyline_equality_ignores_how_the_points_are_held():
     assert shared != art.Polyline.of([(1.0, 1.0), (3.0, 3.0)])
 
 
-def test_bounds_in_sql_match_the_python_percentile_pass(con):
+@pytest.mark.parametrize(
+    "spec",
+    [
+        art.DEFAULT_SPEC,
+        art.QuerySpec(weight="services"),
+        art.QuerySpec(weight="density"),
+        art.QuerySpec(min_trips=10),
+    ],
+    ids=lambda s: s.key,
+)
+def test_bounds_in_sql_match_the_python_percentile_pass(con, spec):
     """SQL finds the scale rather than pulling every weight into Python, and the two
     must pick the *same* two order statistics -- an approximation would shift a
     render's contrast invisibly. See `_Sql.bounds_query`."""
     from array import array
 
     for i in range(50):
-        _art_edge(con, i + 1, -3200000 + i * 200, trips=(i * i) % 97)
-    bounds = art.Bounds(-3.30, 51.40, -3.10, 51.60)
-    for spec in (
-        art.DEFAULT_SPEC,
-        art.QuerySpec(weight="services"),
-        art.QuerySpec(weight="density"),
-        art.QuerySpec(min_trips=10),
-    ):
-        w = art.Window(bounds, con, spec=spec)
-        query, params = w.sql.weights_query()
-        expected = art.Weights.over(
-            array("d", (r[0] for r in con.execute(query, params).fetchall()))
-        )
-        assert w.weights == expected, spec.key
+        builders.insert_edge(con, i + 1, lon_e6=-3200000 + i * 200, span_e6=1000)
+        builders.insert_services(con, i + 1, n_trips=(i * i) % 97)
+    w = art.Window(BOUNDS, con, spec=spec)
+    query, params = w.sql.weights_query()
+    expected = art.Weights.over(
+        array("d", (r[0] for r in con.execute(query, params).fetchall()))
+    )
+    assert w.weights == expected
 
 
 def test_an_empty_window_still_has_a_usable_scale_from_sql(con):
-    w = art.Window(art.Bounds(-3.30, 51.40, -3.10, 51.60), con)
+    w = art.Window(BOUNDS, con)
     assert w.weights.of(10) == 0.5
 
 
@@ -547,8 +614,9 @@ def test_the_weight_scale_is_not_computed_until_it_is_asked_for(con):
     """`strands` never reads it -- it weights ribbons from the group statistics --
     so computing it eagerly was a whole extra pass over the window per render,
     thrown away. See `Window.weights`."""
-    _art_edge(con, 1, -3200000, trips=900)
-    w = art.Window(art.Bounds(-3.30, 51.40, -3.10, 51.60), con)
+    builders.insert_edge(con, 1, lon_e6=-3200000, span_e6=1000)
+    builders.insert_services(con, 1, n_trips=900)
+    w = art.Window(BOUNDS, con)
     assert w._weights is None
     list(w.group_paths(art.Projection.fit(w.bounds, 800, 600)))
     assert w._weights is None, "group_paths must not force the window scale"
@@ -572,7 +640,7 @@ def test_streaming_paths_survives_the_scale_being_resolved(con):
         "INSERT INTO edge_services SELECT i, '42', 'OP1', 1, 1 + i % 7 FROM range(?) t(i)",
         [n],
     )
-    w = art.Window(art.Bounds(-3.30, 51.40, -3.10, 51.60), con)
+    w = art.Window(BOUNDS, con)
     proj = art.Projection.fit(w.bounds, 800, 600)
     assert w._weights is None
     drawn = [w.weights.of(weight) for weight, _ in w.paths(proj)]
@@ -587,8 +655,9 @@ def test_the_edge_stream_has_a_defined_order(con):
     What is checkable at any size is that the order is *defined*, so this asserts
     the edges arrive by edge_id rather than in whatever order they were inserted."""
     for edge_id, lon in ((7, -3200000), (3, -3190000), (9, -3180000), (1, -3170000)):
-        _art_edge(con, edge_id, lon, trips=100)
-    w = art.Window(art.Bounds(-3.30, 51.40, -3.10, 51.60), con)
+        builders.insert_edge(con, edge_id, lon_e6=lon, span_e6=1000)
+        builders.insert_services(con, edge_id, n_trips=100)
+    w = art.Window(BOUNDS, con)
     query, params = w.sql.edges_query(with_groups=False, by_weight=False)
     assert [r[0] for r in con.execute(query, params).fetchall()] == [1, 3, 7, 9]
     assert [e.edge_id for e in w.edges()] == [1, 3, 7, 9]
@@ -601,8 +670,6 @@ def test_the_edge_stream_has_a_defined_order(con):
 # than the picture: which edges end up in the same run, and whether the vertices
 # survive. What the picture then looks like is a judgement, not an assertion.
 
-COALESCE_BOUNDS = art.Bounds(-3.30, 51.40, -3.10, 51.60)
-
 
 def _link(con, edge_id, pts, trips=100, services=("42",), agency="OP1"):
     """One edge with explicit geometry, so a test can decide what meets what.
@@ -610,29 +677,20 @@ def _link(con, edge_id, pts, trips=100, services=("42",), agency="OP1"):
     `pts` is (lon_e6, lat_e6) in micro-degrees and in the edge's own direction --
     which matters here, because chaining follows direction.
     """
-    lons = [p[0] for p in pts]
-    lats = [p[1] for p in pts]
-    con.execute(
-        "INSERT INTO edges VALUES (?, 1, 'R', 'secondary', 100.0, ?, ?, ?, ?, ?, ?)",
-        [edge_id, lons, lats, min(lons), min(lats), max(lons), max(lats)],
-    )
-    for s in services:
-        con.execute(
-            "INSERT INTO edge_services VALUES (?, ?, ?, 1, ?)",
-            [edge_id, s, agency, trips],
-        )
+    builders.insert_edge(con, edge_id, points=pts)
+    builders.insert_services(con, edge_id, services, agency=agency, n_trips=trips)
 
 
 def _runs(con, spec=art.DEFAULT_SPEC):
     """The window's geometry, coalesced, as lists of canvas points."""
-    proj = art.Projection.fit(COALESCE_BOUNDS, 400, 400)
-    w = art.Window(COALESCE_BOUNDS, con, spec=spec)
+    proj = art.Projection.fit(BOUNDS, 400, 400)
+    w = art.Window(BOUNDS, con, spec=spec)
     return [line.points() for _weight, line in w.paths(proj, coalesce=True)]
 
 
 def _plain(con, spec=art.DEFAULT_SPEC):
-    proj = art.Projection.fit(COALESCE_BOUNDS, 400, 400)
-    w = art.Window(COALESCE_BOUNDS, con, spec=spec)
+    proj = art.Projection.fit(BOUNDS, 400, 400)
+    w = art.Window(BOUNDS, con, spec=spec)
     return [line.points() for _weight, line in w.paths(proj)]
 
 
@@ -710,17 +768,17 @@ def test_a_closed_loop_is_entered_at_its_lowest_edge_id(con):
         _link(con, 9 - i, [ring[i], ring[(i + 1) % 4]])
     runs = _runs(con)
     assert len(runs) == 1
-    proj = art.Projection.fit(COALESCE_BOUNDS, 400, 400)
+    proj = art.Projection.fit(BOUNDS, 400, 400)
     # Edge 6 is the lowest id, and it runs from the fourth corner back to the first.
     assert runs[0][0] == proj(ring[3][0] / 1e6, ring[3][1] / 1e6)
 
 
-def test_a_coalesced_render_is_byte_identical_across_two_calls(drawable):
+@pytest.mark.parametrize("fmt", [".png", ".svg"])
+def test_a_coalesced_render_is_byte_identical_across_two_calls(drawable, fmt):
     opts = art.RenderOpts(width_px=300, coalesce=True)
-    for fmt in (".png", ".svg"):
-        first = art.render_bytes(RENDER_BOUNDS, fmt=fmt, opts=opts, con=drawable)
-        second = art.render_bytes(RENDER_BOUNDS, fmt=fmt, opts=opts, con=drawable)
-        assert first == second
+    first = art.render_bytes(BOUNDS, fmt=fmt, opts=opts, con=drawable)
+    second = art.render_bytes(BOUNDS, fmt=fmt, opts=opts, con=drawable)
+    assert first == second
 
 
 def test_coalescing_changes_the_picture(con):
@@ -728,7 +786,7 @@ def test_coalescing_changes_the_picture(con):
     something -- and only where there is a shared node to stop capping twice."""
     _link(con, 1, [(-3_200_000, 51_480_000), (-3_190_000, 51_480_000)])
     _link(con, 2, [(-3_190_000, 51_480_000), (-3_180_000, 51_480_000)])
-    kw = {"con": con, "bounds_or_name": COALESCE_BOUNDS}
+    kw = {"con": con, "bounds_or_name": BOUNDS}
     plain = art.render_bytes(opts=art.RenderOpts(width_px=300), **kw)
     joined = art.render_bytes(opts=art.RenderOpts(width_px=300, coalesce=True), **kw)
     assert plain != joined
@@ -743,7 +801,7 @@ def test_a_style_that_ignores_coalescing_says_so(drawable, style, caplog):
     assert not art.STYLES[style].coalesces
     with caplog.at_level("WARNING"):
         art.render_bytes(
-            RENDER_BOUNDS,
+            BOUNDS,
             style,
             opts=art.RenderOpts(width_px=300, coalesce=True),
             con=drawable,
@@ -772,8 +830,8 @@ def test_a_supplied_chain_assignment_is_what_gets_drawn(con):
             }
         ),
     )
-    proj = art.Projection.fit(COALESCE_BOUNDS, 400, 400)
-    w = art.Window(COALESCE_BOUNDS, con, source=art.Source(chains="wf_fixed"))
+    proj = art.Projection.fit(BOUNDS, 400, 400)
+    w = art.Window(BOUNDS, con, source=art.Source(chains="wf_fixed"))
     assert len(list(w.paths(proj, coalesce=True))) == 2
 
 
@@ -781,8 +839,8 @@ def test_held_edges_ignore_coalescing(con):
     """There is no query to reorder, so `Held` takes the flag and draws flat."""
     _link(con, 1, [(-3_200_000, 51_480_000), (-3_190_000, 51_480_000)])
     _link(con, 2, [(-3_190_000, 51_480_000), (-3_180_000, 51_480_000)])
-    edges = art.load_edges(COALESCE_BOUNDS, con=con)
-    proj = art.Projection.fit(COALESCE_BOUNDS, 400, 400)
+    edges = art.load_edges(BOUNDS, con=con)
+    proj = art.Projection.fit(BOUNDS, 400, 400)
     held = art.Held(edges)
     assert len(list(held.paths(proj, coalesce=True))) == 2
 
@@ -804,26 +862,28 @@ def _band_edge(
     agency="OP1",
     lon_span=(-3_200_000, -3_199_000),
 ):
-    """One edge at a given latitude. Banding cuts north to south, so unlike
-    `_art_edge` the geometry has to vary in latitude rather than longitude."""
+    """One edge at a given latitude. Banding cuts north to south, so the geometry has
+    to vary in latitude rather than in longitude as most of the file's does."""
     lon0, lon1 = lon_span
-    con.execute(
-        "INSERT INTO edges VALUES (?, 1, 'R', 'secondary', 100.0, "
-        "[?, ?], [?, ?], ?, ?, ?, ?)",
-        [edge_id, lon0, lon1, lat_e6, lat_e6, lon0, lat_e6, lon1, lat_e6],
-    )
-    for s in services:
-        con.execute(
-            "INSERT INTO edge_services VALUES (?, ?, ?, 1, ?)", [edge_id, s, agency, trips]
-        )
+    builders.insert_edge(con, edge_id, lon_e6=lon0, span_e6=lon1 - lon0, lat_e6=lat_e6)
+    builders.insert_services(con, edge_id, services, agency=agency, n_trips=trips)
+
+
+def _reopened_read_only(con, tmp_path, monkeypatch):
+    """The written database handed back through a *read-only* handle -- which is what
+    both `_render` and the server open, and what a band process needs the file to
+    still be openable as. `MIN_BAND_EDGES` is dropped to nothing because the floor is
+    about start-up cost, not about correctness."""
+    con.close()
+    monkeypatch.setattr(art, "MIN_BAND_EDGES", 0)
+    ro = db.connect(tmp_path / "test.duckdb", read_only=True)
+    yield ro
+    ro.close()
 
 
 @pytest.fixture
 def banded(con, tmp_path, monkeypatch):
-    """A window with edges spread over its whole height, read through a *read-only*
-    handle -- which is what both `_render` and the server open, and what a band
-    process needs the file to still be openable as. `MIN_BAND_EDGES` is dropped to
-    nothing because the floor is about start-up cost, not about correctness."""
+    """A window with edges spread over its whole height."""
     for i in range(60):
         _band_edge(
             con,
@@ -832,14 +892,7 @@ def banded(con, tmp_path, monkeypatch):
             trips=1 + i * 40,
             services=("42",) if i % 3 else ("9A", "7"),
         )
-    con.close()
-    monkeypatch.setattr(art, "MIN_BAND_EDGES", 0)
-    ro = db.connect(tmp_path / "test.duckdb", read_only=True)
-    yield ro
-    ro.close()
-
-
-BAND_BOUNDS = art.Bounds(-3.30, 51.40, -3.10, 51.60)
+    yield from _reopened_read_only(con, tmp_path, monkeypatch)
 
 
 @pytest.mark.parametrize("style", sorted(art.STYLES))
@@ -847,8 +900,8 @@ def test_a_banded_render_is_byte_identical_to_a_serial_one(banded, style):
     """The whole justification. Verified on the real 2.7M-edge database over the
     `uk` window as well, for all three styles."""
     kw = {"opts": art.RenderOpts(width_px=200), "con": banded}
-    assert art.render_bytes(BAND_BOUNDS, style, workers=1, **kw) == art.render_bytes(
-        BAND_BOUNDS, style, workers=4, **kw
+    assert art.render_bytes(BOUNDS, style, workers=1, **kw) == art.render_bytes(
+        BOUNDS, style, workers=4, **kw
     )
 
 
@@ -866,8 +919,8 @@ def test_banding_survives_the_awkward_canvases(banded, opts):
     the cuts on device rows under a scaled context; `line_scale` widens the strokes
     past the collar a band queries, which is the seam this could most easily grow."""
     kw = {"opts": opts, "con": banded}
-    assert art.render_bytes(BAND_BOUNDS, "density", workers=1, **kw) == art.render_bytes(
-        BAND_BOUNDS, "density", workers=4, **kw
+    assert art.render_bytes(BOUNDS, "density", workers=1, **kw) == art.render_bytes(
+        BOUNDS, "density", workers=4, **kw
     )
 
 
@@ -890,11 +943,7 @@ def wide_banded(con, tmp_path, monkeypatch):
             trips=5000 if i % 2 == 0 else 10,
             lon_span=(-3_290_000, -3_110_000),
         )
-    con.close()
-    monkeypatch.setattr(art, "MIN_BAND_EDGES", 0)
-    ro = db.connect(tmp_path / "test.duckdb", read_only=True)
-    yield ro
-    ro.close()
+    yield from _reopened_read_only(con, tmp_path, monkeypatch)
 
 
 WIDE_BOUNDS = art.Bounds(-3.30, 51.500, -3.10, 51.512)
@@ -935,21 +984,10 @@ def chained_banded(con, tmp_path, monkeypatch):
             # vertices do not all fall on the same column of pixels. Each edge starts
             # where the last one ended, which is what makes it a chain at all.
             nx, nlat = lon + (400 if i % 2 else -400), lat + 38
-            con.execute(
-                "INSERT INTO edges VALUES (?, 1, 'R', 'secondary', 100.0, ?, ?, "
-                "?, ?, ?, ?)",
-                [edge_id, [x, nx], [lat, nlat], min(x, nx), lat, max(x, nx), nlat],
-            )
-            con.execute(
-                "INSERT INTO edge_services VALUES (?, '42', 'OP1', 1, ?)",
-                [edge_id, trips],
-            )
+            builders.insert_edge(con, edge_id, points=[(x, lat), (nx, nlat)])
+            builders.insert_services(con, edge_id, n_trips=trips)
             x, lat = nx, nlat
-    con.close()
-    monkeypatch.setattr(art, "MIN_BAND_EDGES", 0)
-    ro = db.connect(tmp_path / "test.duckdb", read_only=True)
-    yield ro
-    ro.close()
+    yield from _reopened_read_only(con, tmp_path, monkeypatch)
 
 
 @pytest.mark.parametrize("width_px", [200, 6000])
@@ -1027,21 +1065,16 @@ def test_a_band_draws_the_chains_it_was_given(chained_banded, tmp_path):
     assert band(real)[3] != band(alone)[3]
 
 
-@pytest.mark.parametrize("style", sorted(art.STYLES))
-def test_the_collar_covers_half_the_widest_stroke(style):
-    """The arithmetic behind the render above. A band draws past its own rows by
-    `pad` and queries the same distance, so anything a stroke can reach beyond `pad`
-    is paint the band never makes -- a seam. The condition is one-sided: a collar
-    wider than it needs to be only costs work.
+def test_the_collar_is_sized_for_the_stroke_density_actually_draws():
+    """What the collar arithmetic rests on, and the only part of it a test can carry.
 
-    Checked at the widest canvas and line_scale a render can ask for, which is the
-    only configuration with teeth. `_band_pad` is half the widest stroke plus a
-    constant, so the inequality is scale-invariant and sweeping the canvas sizes
-    only re-proved `2.0 >= 0`; at the widest strokes a `pad` that stopped deriving
-    from `max_stroke_px` fails here instead."""
-    sty = art.STYLES[style]
-    opts = art.RenderOpts(width_px=20000, line_scale=6.0)
-    assert art._band_pad(sty, opts, 20000) >= sty.max_stroke_px(20000, 6.0) / 2.0
+    A band draws past its own rows by `_band_pad`, which is half `max_line_px` plus a
+    constant, so a stroke wider than `max_line_px` reaches paint the band never makes
+    -- a seam. `max_line_px` is a number declared on the style, and the width is a
+    ramp inside `draw_density`: nothing but this equality ties the two together, and
+    widening the halo without touching the declaration would leave every banded
+    render of `density` seamed while `_band_pad` still looked correct."""
+    assert art.STYLES["density"].max_line_px == art.density_halo_width(1.0)
 
 
 def test_a_style_scaling_with_the_canvas_says_so():
@@ -1063,15 +1096,15 @@ def test_a_style_scaling_with_the_canvas_says_so():
 def test_bands_hold_roughly_equal_numbers_of_edges(banded):
     """Cutting the canvas into equal heights put 48% of Great Britain's edges into
     one of eight bands, so the render waited on one core. The cuts follow the edges."""
-    proj = art.Projection.fit(BAND_BOUNDS, 200, 400)
-    w = art.Window(BAND_BOUNDS, banded)
-    n_edges, cuts = art.band_cuts(banded, w.sql, BAND_BOUNDS, proj, 400, 4)
+    proj = art.Projection.fit(BOUNDS, 200, 400)
+    w = art.Window(BOUNDS, banded)
+    n_edges, cuts = art.band_cuts(banded, w.sql, BOUNDS, proj, 400, 4)
     assert n_edges == 60
     counts = [
         sum(
             1
             for lat in range(51_420_000, 51_420_000 + 60 * 3_000, 3_000)
-            if lo <= proj(BAND_BOUNDS.min_lon, lat / 1e6)[1] < hi
+            if lo <= proj(BOUNDS.min_lon, lat / 1e6)[1] < hi
         )
         for lo, hi in zip(cuts, cuts[1:], strict=False)
     ]
@@ -1083,29 +1116,29 @@ def test_the_edge_count_respects_the_spec_filter(banded):
     """The count decides whether to band at all, so it has to be the count of what
     will actually be drawn. Reading it straight off `edges` would start eight
     processes for a spec that filters the window down to nothing."""
-    proj = art.Projection.fit(BAND_BOUNDS, 200, 400)
-    w = art.Window(BAND_BOUNDS, banded, spec=art.QuerySpec(road_class=("motorway",)))
-    n_edges, _ = art.band_cuts(banded, w.sql, BAND_BOUNDS, proj, 400, 4)
+    proj = art.Projection.fit(BOUNDS, 200, 400)
+    w = art.Window(BOUNDS, banded, spec=art.QuerySpec(road_class=("motorway",)))
+    n_edges, _ = art.band_cuts(banded, w.sql, BOUNDS, proj, 400, 4)
     assert n_edges == 0
 
 
 def test_a_band_never_queries_outside_the_window(banded):
     """An unclamped collar would select edges the serial render never drew, and for a
     grouped style those arrive with groups the window's statistics have never seen."""
-    proj = art.Projection.fit(BAND_BOUNDS, 200, 400)
-    top = art._band_window(BAND_BOUNDS, proj, 0.0, 100.0, pad=500.0)
-    assert top.max_lat <= BAND_BOUNDS.max_lat
-    assert top.min_lat >= BAND_BOUNDS.min_lat
+    proj = art.Projection.fit(BOUNDS, 200, 400)
+    top = art._band_window(BOUNDS, proj, 0.0, 100.0, pad=500.0)
+    assert top.max_lat <= BOUNDS.max_lat
+    assert top.min_lat >= BOUNDS.min_lat
 
 
 def test_injected_group_statistics_are_what_the_grouped_queries_read(banded):
     """`Source.groups` is how every band gets the whole window's ribbon widths and
     draw order rather than its own. If the substitution silently fell back to the
     derived CTE, `strands` would still render -- just differently per band."""
-    stats = art.Window(BAND_BOUNDS, banded, with_groups=True).group_stats()
+    stats = art.Window(BOUNDS, banded, with_groups=True).group_stats()
     banded.register("wf_gstat", art._stats_table([(g, n, t * 3) for g, n, t in stats]))
     injected = art.Window(
-        BAND_BOUNDS, banded, with_groups=True, source=art.Source(groups="wf_gstat")
+        BOUNDS, banded, with_groups=True, source=art.Source(groups="wf_gstat")
     )
     assert [(g, n, t * 3) for g, n, t in stats] == injected.group_stats()
 
@@ -1121,19 +1154,19 @@ def test_svg_falls_back_rather_than_failing(banded):
     their pixels are, so the comparison would fail for a reason that has nothing to
     do with banding."""
     kw = {"fmt": ".svg", "opts": art.RenderOpts(width_px=200), "con": banded}
-    out = art.render_bytes(BAND_BOUNDS, "strands", workers=4, **kw)
+    out = art.render_bytes(BOUNDS, "strands", workers=4, **kw)
     assert out.startswith(b"<?xml") and out == art.render_bytes(
-        BAND_BOUNDS, "strands", workers=1, **kw
+        BOUNDS, "strands", workers=1, **kw
     )
 
 
 def test_held_edges_fall_back_too(banded):
     """`render(edges=...)` never touches the database, and a band process has no way
     to be handed a list that lives in the parent."""
-    edges = art.load_edges(BAND_BOUNDS, con=banded)
+    edges = art.load_edges(BOUNDS, con=banded)
     kw = {"opts": art.RenderOpts(width_px=200), "edges": edges}
-    assert art.render_bytes(BAND_BOUNDS, "density", workers=4, **kw) == art.render_bytes(
-        BAND_BOUNDS, "density", workers=1, **kw
+    assert art.render_bytes(BOUNDS, "density", workers=4, **kw) == art.render_bytes(
+        BOUNDS, "density", workers=1, **kw
     )
 
 
@@ -1251,22 +1284,22 @@ CREDIT_OPTS = replace(RENDER_OPTS, credit=True)
 def test_a_render_carries_the_credit_with_no_flag(drawable):
     """Metadata is unconditional: an image served over HTTP leaves this machine
     whether or not whoever asked for it thought about the licence."""
-    png = art.render_bytes(RENDER_BOUNDS, "density", opts=RENDER_OPTS, con=drawable)
-    assert _png_text(png)["Copyright"] == config.credit_text()
+    png = art.render_bytes(BOUNDS, "density", opts=RENDER_OPTS, con=drawable)
+    assert _png_text(png)["Copyright"] == licences.text(config.credit_parts())
 
 
 def test_a_png_with_metadata_still_decodes(drawable):
     """The chunk is written by hand, so what is worth testing is that a decoder
     which validates CRCs still reads the file."""
-    png = art.render_bytes(RENDER_BOUNDS, "density", opts=RENDER_OPTS, con=drawable)
+    png = art.render_bytes(BOUNDS, "density", opts=RENDER_OPTS, con=drawable)
     width, height, _ = _rows(png)
-    assert (width, height) == (300, art.Projection.canvas_height(RENDER_BOUNDS, 300))
+    assert (width, height) == (300, art.Projection.canvas_height(BOUNDS, 300))
 
 
 def test_the_text_chunks_come_before_the_image_data(drawable):
     """Where a reader looking for a copyright expects one, rather than after
     however many megabytes of IDAT."""
-    png = art.render_bytes(RENDER_BOUNDS, "density", opts=RENDER_OPTS, con=drawable)
+    png = art.render_bytes(BOUNDS, "density", opts=RENDER_OPTS, con=drawable)
     kinds = [kind for kind, _ in _png_chunks(png)]
     assert kinds[0] == b"IHDR"
     assert kinds.index(b"tEXt") < kinds.index(b"IDAT")
@@ -1283,19 +1316,19 @@ def test_a_value_outside_latin_1_widens_the_chunk():
 
 
 def test_svg_metadata_parses_as_xml_and_holds_the_credit(drawable):
-    svg = art.render_bytes(
-        RENDER_BOUNDS, "density", fmt=".svg", opts=RENDER_OPTS, con=drawable
-    )
+    svg = art.render_bytes(BOUNDS, "density", fmt=".svg", opts=RENDER_OPTS, con=drawable)
     root = ElementTree.fromstring(svg.decode("utf-8"))
     dc = "{http://purl.org/dc/elements/1.1/}"
-    assert [e.text for e in root.findall(f".//{dc}rights")] == [config.credit_text()]
+    assert [e.text for e in root.findall(f".//{dc}rights")] == [
+        licences.text(config.credit_parts())
+    ]
     assert root.findall(f".//{dc}title")[0].text == "wayfare density: a window"
 
 
 def test_the_metadata_says_where_the_picture_is(drawable):
     """A render that has been through a chat client and back is otherwise a picture
     of somewhere nobody can name."""
-    png = art.render_bytes(RENDER_BOUNDS, "density", opts=RENDER_OPTS, con=drawable)
+    png = art.render_bytes(BOUNDS, "density", opts=RENDER_OPTS, con=drawable)
     assert "-3.3,51.4,-3.1,51.6" in _png_text(png)["Description"]
 
 
@@ -1303,7 +1336,7 @@ def test_the_metadata_holds_nothing_that_moves(tmp_path, drawable):
     """No timestamp, no version, no path. A render is compared byte for byte, so a
     field that moved would break that for every window rather than for one."""
     out = tmp_path / "a-nameable-path.png"
-    art.render(RENDER_BOUNDS, "density", out, opts=RENDER_OPTS, con=drawable, workers=1)
+    art.render(BOUNDS, "density", out, opts=RENDER_OPTS, con=drawable, workers=1)
     fields = _png_text(out.read_bytes())
     assert fields["Software"] == "wayfare"  # bare: a version string would move
     assert not any(
@@ -1317,16 +1350,16 @@ def test_a_credited_render_is_byte_identical_across_two_calls(drawable, fmt):
     """Both halves of this change sit in the hot path of the determinism claim, and
     neither may make a render a function of anything but its request."""
     kw = {"fmt": fmt, "opts": CREDIT_OPTS, "con": drawable}
-    assert art.render_bytes(RENDER_BOUNDS, "density", **kw) == art.render_bytes(
-        RENDER_BOUNDS, "density", **kw
+    assert art.render_bytes(BOUNDS, "density", **kw) == art.render_bytes(
+        BOUNDS, "density", **kw
     )
 
 
 def test_the_credit_caption_is_absent_until_it_is_asked_for(drawable):
     """Off by default because it changes the artwork; on, it changes only the strip
     it is drawn in and never the map."""
-    plain = art.render_bytes(RENDER_BOUNDS, "density", opts=RENDER_OPTS, con=drawable)
-    credited = art.render_bytes(RENDER_BOUNDS, "density", opts=CREDIT_OPTS, con=drawable)
+    plain = art.render_bytes(BOUNDS, "density", opts=RENDER_OPTS, con=drawable)
+    credited = art.render_bytes(BOUNDS, "density", opts=CREDIT_OPTS, con=drawable)
     assert plain != credited
     _, height, before = _rows(plain)
     _, _, after = _rows(credited)
@@ -1340,12 +1373,12 @@ def test_a_credited_banded_render_draws_one_caption(banded):
     once. Drawn inside `_draw_band` there would be one per band -- which is what the
     equality catches, and the strip is where it would show."""
     opts = art.RenderOpts(width_px=200, credit=True)
-    serial = art.render_bytes(BAND_BOUNDS, "density", opts=opts, con=banded, workers=1)
-    parallel = art.render_bytes(BAND_BOUNDS, "density", opts=opts, con=banded, workers=4)
+    serial = art.render_bytes(BOUNDS, "density", opts=opts, con=banded, workers=1)
+    parallel = art.render_bytes(BOUNDS, "density", opts=opts, con=banded, workers=4)
     assert serial == parallel
     plain = art.RenderOpts(width_px=200)
     _, height, before = _rows(
-        art.render_bytes(BAND_BOUNDS, "density", opts=plain, con=banded, workers=4)
+        art.render_bytes(BOUNDS, "density", opts=plain, con=banded, workers=4)
     )
     _, _, after = _rows(parallel)
     differing = [y for y in range(height) if before[y] != after[y]]
@@ -1360,14 +1393,10 @@ def test_the_credit_shrinks_to_fit_a_small_canvas(drawable):
     should look like the render reduced. What it must not do is run off the edge."""
     kw = {"con": drawable}
     plain = _rows(
-        art.render_bytes(
-            RENDER_BOUNDS, "density", opts=replace(RENDER_OPTS, width_px=120), **kw
-        )
+        art.render_bytes(BOUNDS, "density", opts=replace(RENDER_OPTS, width_px=120), **kw)
     )
     credited = _rows(
-        art.render_bytes(
-            RENDER_BOUNDS, "density", opts=replace(CREDIT_OPTS, width_px=120), **kw
-        )
+        art.render_bytes(BOUNDS, "density", opts=replace(CREDIT_OPTS, width_px=120), **kw)
     )
     width, height, before = plain
     _, _, after = credited

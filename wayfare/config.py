@@ -8,16 +8,26 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable
-from dataclasses import dataclass
 from pathlib import Path
 
-from . import licences
-
-# The licence names a `Feed` is declared with. Everything else about them -- their
-# URIs, the `Credit` type, and how a credit is rendered -- lives in `licences`,
-# because the list only grows and none of it is configuration. Imported by name so
-# that a feed reads as a description of a source rather than as a lookup.
-from .licences import CC_BY_4, OGL
+# The feed definitions, re-exported. They moved to `feeds` because the list of
+# sources grows on its own schedule and nothing else in this file moves with it, but
+# `config.FEEDS` and `config.archive_name` are what every stage reads and this keeps
+# them reading it. Edit them in `feeds`.
+#
+# Spelled `X as X` because mypy's strict mode treats a plain import as private to
+# this module, and every one of these is read through `config.` somewhere.
+from .feeds import ARCHIVE_NAMES as ARCHIVE_NAMES
+from .feeds import BODS_GTFS_URL as BODS_GTFS_URL
+from .feeds import FEEDS as FEEDS
+from .feeds import NI_PARTS as NI_PARTS
+from .feeds import NTA_GTFS_URL as NTA_GTFS_URL
+from .feeds import OPENDATANI_API as OPENDATANI_API
+from .feeds import Feed as Feed
+from .feeds import Part as Part
+from .feeds import archive_name as archive_name
+from .feeds import credit_parts as credit_parts
+from .feeds import feed as feed
 
 # --- Layout ----------------------------------------------------------------
 
@@ -27,272 +37,30 @@ WORK = DATA / "work"  # unpacked and intermediate files
 OUT = DATA / "out"  # publishable artefacts (pmtiles, geojson, art)
 DB_PATH = WORK / "wayfare.duckdb"
 
-# --- Sources ---------------------------------------------------------------
 
-# BODS publishes one national GTFS bundle. Regional slugs exist (see docs/data.md) and
-# are useful for development, but `all` is what a production run wants.
-BODS_GTFS_URL = "https://data.bus-data.dft.gov.uk/timetable/download/gtfs-file/{region}/"
+def retarget(data: Path) -> None:
+    """Point every derived path at a different data root, for `--data`.
+
+    Here rather than in the caller because the list has to be complete: a path
+    derived from DATA and not reassigned is one stage writing to the default root
+    while every other stage writes to `--data`, which looks like a stage that
+    silently did nothing. A constant added above belongs in this function in the
+    same edit, and `tests/test_cli.py` walks the module to check that it is.
+    """
+    global DATA, RAW, WORK, OUT, DB_PATH
+    DATA = data.resolve()
+    RAW = DATA / "raw"
+    WORK = DATA / "work"
+    OUT = DATA / "out"
+    DB_PATH = WORK / "wayfare.duckdb"
+
+
+# Which region this data root holds. Environment, so it stays here rather than in
+# `feeds`, which reaches it through this module at call time -- one binding, so a
+# test that patches it reaches every caller.
 BODS_REGION = os.environ.get("WAYFARE_REGION", "all")
 
-# The National Transport Authority (NTA) publishes the Republic of Ireland's whole
-# timetable as one bundle, with no key and no registration. Per-operator bundles
-# sit beside it as GTFS_<Operator>.zip; the index is transitData/PT_Data.html.
-NTA_GTFS_URL = "https://www.transportforireland.ie/transitData/Data/GTFS_All.zip"
-
-# Translink publishes Northern Ireland on OpenDataNI as four datasets and no GTFS.
-# Resource ids and filenames move on every publication, so the datasets are named
-# by slug and resolved through CKAN at fetch time -- see `translink.resource`.
-OPENDATANI_API = "https://admin.opendatani.gov.uk/api/3/action/package_show"
-
-
-@dataclass(frozen=True)
-class Part:
-    """One dataset of a feed nobody publishes whole.
-
-    `kind` is what the assembler does with it, not what it contains: `timetable`
-    is TransXChange, `geometry` is a MapInfo route bundle.
-    """
-
-    name: str
-    dataset: str
-    kind: str
-
-
-# The dataset slugs are historical names that stopped describing their contents
-# years ago -- the "metro timetable valid from 18 June until 31 August 2016" is the
-# live Metro and Glider feed. They are the identity OpenDataNI keeps stable, so
-# they are what is stored. Do not tidy them.
-NI_PARTS = (
-    Part(
-        "timetable_ulsterbus",
-        "ulsterbus-and-goldline-timetable-data-from-08-11-2023",
-        "timetable",
-    ),
-    Part(
-        "timetable_metro",
-        "metro-timetable-data-valid-from-18-june-until-31-august-2016",
-        "timetable",
-    ),
-    Part("routes_ulsterbus", "translink-ulsterbus-routes", "geometry"),
-    Part("routes_metro", "translink-metro-bus-routes", "geometry"),
-)
-
-
-@dataclass(frozen=True)
-class Feed:
-    """Where a region's timetable comes from, and what comes with it.
-
-    Everything except the Republic is a BODS slug, so `feed` builds those on
-    demand and only the exceptions need an entry in `FEEDS`. The licence and
-    attribution ride along because they differ between publishers and are the one
-    property of a source that has an obligation attached rather than a behaviour.
-    """
-
-    url: str
-    filename: str
-    licence: str
-    attribution: str
-    # NaPTAN is the GB stop register. It has nothing to say about anywhere else, so
-    # a non-GB region must not spend 102 MB fetching it.
-    stop_register: bool = True
-    # Whether the host answers a Range request with a 206, so an interrupted
-    # transfer resumes. Measured against each host, never assumed -- BODS ignores
-    # the header, Geofabrik and the NTA honour it.
-    resumable: bool = False
-    # The datasets a feed is assembled from, where no single file is the feed.
-    # `url` is empty in that case and `filename` names the bundle acquire builds.
-    parts: tuple[Part, ...] = ()
-    # The window `osmroutes` discovers this region's route relations over, as
-    # (south, west, north, east), intersected with the box the region's own stops
-    # draw. Only a region whose services leave it needs one: Translink runs coach
-    # and rail to Dublin, so a min/max over Northern Ireland's live stops reaches
-    # 53.3 N and asks Overpass for most of the Republic.
-    bounds: tuple[float, float, float, float] | None = None
-    # The names this region's own rail carries in an OSM `operator` tag. A window
-    # is a box and a border is not, so the box cannot be the only gate. A region
-    # that names none draws whatever its window returns, less anything a region
-    # here claims -- which is how Great Britain keeps drawing what it drew while
-    # stopping at the Irish Sea.
-    operators: tuple[str, ...] = ()
-
-
-FEEDS = {
-    # `ireland` is the Republic; `northern_ireland` is the province, and the two read
-    # the same OSM extract, so they share a Valhalla graph. They still need a data
-    # root each -- see OSM_EXTRACTS for why.
-    "ireland": Feed(
-        url=NTA_GTFS_URL,
-        filename="nta_gtfs_ireland.zip",
-        # The first source here that is not OGL. Attribution is a condition of the
-        # licence rather than a courtesy, so anything published from this feed has
-        # to carry it -- see the README.
-        licence=CC_BY_4,
-        attribution="National Transport Authority",
-        stop_register=False,
-        resumable=True,
-        # No bounds: a box cannot describe the Republic, because Donegal reaches
-        # further north than any part of Northern Ireland. The operator gate is
-        # the whole of the border here.
-        operators=("Iarnród Éireann", "Irish Rail"),
-    ),
-    "northern_ireland": Feed(
-        # No URL: there is no Northern Irish GTFS to download. `acquire` fetches
-        # the four Translink datasets below and `translink.build_gtfs` assembles
-        # this file out of them.
-        url="",
-        filename="translink_gtfs_northern_ireland.zip",
-        licence=OGL,
-        attribution="Translink, via OpenDataNI",
-        # NaPTAN is GB-only, and the province needs it least of anywhere: every
-        # Translink stop arrives with its ATCO code and its position attached.
-        stop_register=False,
-        resumable=True,
-        parts=NI_PARTS,
-        # The six counties, padded. Cranfield Point at 54.02 N is the southernmost
-        # of them and Burr Point at -5.43 the easternmost; Rathlin is 55.30 N and
-        # Fermanagh reaches -8.18. Dublin, at 53.35 N, falls outside, which is what
-        # stops Overpass returning the Republic's network. Donegal falls inside and
-        # has had no working railway since 1960, and the Sligo line stays south of
-        # 54 N as far west as Boyle, so neither meets the box.
-        bounds=(54.0, -8.35, 55.35, -5.35),
-        operators=("NI Railways", "Northern Ireland Railways", "Translink"),
-    ),
-}
-
-
-def feed(region: str | None = None) -> Feed:
-    """The bundle for a region slug, BODS unless something else publishes it."""
-    region = region or BODS_REGION
-    if known := FEEDS.get(region):
-        return known
-    return Feed(
-        url=BODS_GTFS_URL.format(region=region),
-        filename=f"bods_gtfs_{region}.zip",
-        licence=OGL,
-        attribution="Department for Transport",
-    )
-
-
-# What a region's archive is called when it is named after its region. Only the
-# exceptions live here; a slug is its own name everywhere else. `all` is the BODS
-# scope for the whole of Great Britain rather than a place, and the viewer builds a
-# region's label out of the filename, so `all.pmtiles` would label a map "all".
-ARCHIVE_NAMES = {"all": "great_britain"}
-
-
-def archive_name(region: str | None = None) -> str:
-    """The filename an archive gets when it is named after its region.
-
-    The name is not only a destination. The viewer carries no list of regions -- it
-    labels each archive from its filename -- so this is also what the map calls the
-    region in its "Go to..." list.
-    """
-    region = region or BODS_REGION
-    name = ARCHIVE_NAMES.get(region, region)
-    # A region slug reaches the filesystem here and nowhere else in the pipeline. A
-    # slug carrying a separator would write outside OUT rather than fail.
-    if name in ("", ".", "..") or name != Path(name).name:
-        raise ValueError(f"region {region!r} does not name an archive")
-    return f"{name}.pmtiles"
-
-
-def credit_parts(
-    region: str | None = None,
-    *,
-    road: bool = True,
-    operator: bool = False,
-    track: bool = False,
-) -> tuple[licences.Credit, ...]:
-    """Everything a picture of this region owes an acknowledgement to.
-
-    This is the only part of crediting that belongs here rather than in `licences`:
-    it needs the `Feed`, and a feed is configuration. What a licence is called and
-    how a credit is written are not.
-
-    Built from the `Feed` rather than from a table of its own, so a source added to
-    `FEEDS` is credited by the act of describing it. The timetable is always the
-    publisher's, under their licence -- a condition rather than a courtesy now that
-    the Republic's feed is CC BY 4.0.
-
-    The second credit is the one that is easy to miss, and it is *conditional*.
-    Where a route was map-matched, every edge is an OpenStreetMap way that Valhalla
-    matched onto, so the archive is a derived database and owes ODbL whatever the
-    timetable says. Where it was not -- a tram, metro or ferry drawn from the trace
-    in the feed -- no OpenStreetMap data was involved at all, and claiming ODbL over
-    the operator's own survey would be wrong in the opposite direction: asserting a
-    share-alike condition on data whose publisher never imposed one. `road` is what
-    tells the two apart, and it is the caller's to set because only the caller knows
-    what it built.
-
-    `operator` widens the first credit's noun rather than adding a third line. The
-    trace arrives in the same bundle as the timetable and is covered by the same
-    licence, so it needs naming rather than crediting separately -- and naming it
-    matters, because this is the wording that says what each credit covers.
-
-    `track` is the second way OpenStreetMap gets into an archive, and it owes the
-    same ODbL for a different reason. `road` means Valhalla matched a service onto
-    OSM ways; `track` means `wayfare trace` copied an OSM route relation's own
-    geometry, which is what draws the Underground. They are independent -- a
-    rail-only region has track and no road -- so both set the ODbL credit and
-    together they only widen its noun. Getting that noun wrong is not cosmetic: an
-    archive of nothing but tube tunnels crediting "Road geometry" describes data it
-    does not hold.
-
-    The basemap is not here. It belongs to the page that chooses it, not to the data,
-    and a render carries no basemap at all.
-    """
-    f = feed(region)
-    what = (
-        "Routes, timetables and operator geometry" if operator else "Routes and timetables"
-    )
-    parts = [licences.Credit(what, f.attribution, f.licence)]
-    if road or track:
-        geometry = (
-            "Road and track geometry"
-            if road and track
-            else "Track geometry"
-            if track
-            else "Road geometry"
-        )
-        parts.append(licences.openstreetmap(geometry))
-    return tuple(parts)
-
-
-def credit_html(
-    region: str | None = None,
-    *,
-    road: bool = True,
-    operator: bool = False,
-    track: bool = False,
-) -> str:
-    """This region's credit, rendered for a map attribution control."""
-    return licences.html(credit_parts(region, road=road, operator=operator, track=track))
-
-
-def credit_lines(
-    region: str | None = None,
-    *,
-    links: bool = True,
-    road: bool = True,
-    operator: bool = False,
-    track: bool = False,
-) -> tuple[str, ...]:
-    """This region's credit as plain text, one line per thing being credited."""
-    return licences.lines(
-        credit_parts(region, road=road, operator=operator, track=track), links=links
-    )
-
-
-def credit_text(
-    region: str | None = None,
-    *,
-    road: bool = True,
-    operator: bool = False,
-    track: bool = False,
-) -> str:
-    """This region's credit with the links spelled out, for anywhere HTML is not read."""
-    return licences.text(credit_parts(region, road=road, operator=operator, track=track))
-
+# --- The OpenStreetMap extract ----------------------------------------------
 
 # Geofabrik rebuilds these daily. Valhalla downloads its own copy at graph-build
 # time (see `tile_urls` in docker-compose.yml), so the pipeline does not need the
@@ -370,7 +138,9 @@ def british_isles_sql(lat: str, lon: str) -> str:
     A fragment rather than a table so that both the stage that drops the routes and
     the stages that size a bounding box read the same definition. A second copy
     would drift, and the way it would fail is a window that quietly reaches the
-    continent again.
+    continent again -- which is why there is no Python twin of this. Every place the
+    boundary is applied holds a connection: `gtfs` drops the routes with it, and
+    `osmroutes.bbox` and `trace.bbox` clip their windows with it.
     """
     return (
         f"({lat} BETWEEN {ISLES_LAT_MIN} AND {ISLES_LAT_MAX}"
@@ -378,12 +148,6 @@ def british_isles_sql(lat: str, lon: str) -> str:
         f"{ISLES_LON_CAP}, {ISLES_CHANNEL_LON}"
         f" + {ISLES_CHANNEL_SLOPE} * ({lat} - 50.0)))"
     )
-
-
-def in_british_isles(lat: float, lon: float) -> bool:
-    """`british_isles_sql` for a single point, for callers holding no connection."""
-    limit = min(ISLES_LON_CAP, ISLES_CHANNEL_LON + ISLES_CHANNEL_SLOPE * (lat - 50.0))
-    return ISLES_LAT_MIN <= lat <= ISLES_LAT_MAX and ISLES_LON_MIN <= lon <= limit
 
 
 NAPTAN_URL = "https://naptan.api.dft.gov.uk/v1/access-nodes?dataFormat=csv"
@@ -565,8 +329,9 @@ SEQ_PARTITIONS = int(os.environ.get("WAYFARE_SEQ_PARTITIONS", "16"))
 
 # --- Matching batch --------------------------------------------------------
 
-# Results are committed this often. Smaller means less lost work when the server is
-# restarted mid-run; larger means fewer write transactions.
+# Results are committed this often, and a batch is also the unit of concurrency.
+# Smaller means less lost work when the server is restarted mid-run; larger means
+# fewer write transactions.
 CHECKPOINT_EVERY = 200
 
 # --- Tracing from OSM route relations ---------------------------------------
@@ -623,6 +388,57 @@ TRACE_MONOTONIC_SLACK_M = 250.0
 # rounding guard rather than a tolerance; anything larger would start welding genuine
 # gaps shut.
 TRACE_JOIN_TOLERANCE_M = 1.0
+
+# How much wider than the pending patterns' own extent to ask Overpass for, in
+# degrees. A relation is only returned if it intersects the window, and a line whose
+# stops sit just inside the box still runs out of it -- the Central line reaches
+# Epping, well past anything a London window would be drawn around. 0.2 degrees is
+# about 22 km. `osmroutes` pads its own window by less, because there the window is
+# sized off a region's stops rather than one stage's backlog.
+TRACE_BBOX_PAD_DEG = 0.2
+
+# `routes` sizes its window off a region's live stops rather than one stage's
+# backlog, so the extent is already most of the country and a wide pad only buys the
+# neighbour's network.
+ROUTES_BBOX_PAD_DEG = 0.05
+
+# Results are committed this often, for the reason `CHECKPOINT_EVERY` exists. Larger
+# than the matching batch because a trace is arithmetic against relations already in
+# memory rather than a wait on another process.
+TRACE_CHECKPOINT_EVERY = 500
+
+
+def pad_and_clip(
+    box: tuple[float, float, float, float],
+    *,
+    pad: float,
+    region: str | None,
+    what: str,
+) -> tuple[float, float, float, float]:
+    """Pad a (south, west, north, east) box, then narrow it to the region's bounds.
+
+    A window is a box and a border is not, so a region whose stops reach across one
+    asks Overpass for the neighbour's network and draws it into its own archive.
+    `Feed.bounds` is what stops that, and a box the bounds leave empty raises,
+    because discovering nothing reads exactly like a region whose track is unmapped.
+
+    `what` names the stops the box was sized off, so the error says which window
+    missed its region.
+    """
+    south, west, north, east = box
+    south, west = south - pad, west - pad
+    north, east = north + pad, east + pad
+    limit = feed(region).bounds
+    if limit is not None:
+        south, west = max(south, limit[0]), max(west, limit[1])
+        north, east = min(north, limit[2]), min(east, limit[3])
+        if south >= north or west >= east:
+            raise RuntimeError(
+                f"region {region or BODS_REGION!r} has bounds {limit}, which its "
+                f"{what} never meet; no relation could be discovered"
+            )
+    return (south, west, north, east)
+
 
 # --- Publishing ------------------------------------------------------------
 
@@ -823,15 +639,17 @@ OVERVIEW_CELL = 0.02
 COVERAGE_CELL = 0.25
 # A backstop against one pathological city-centre edge, not a routine truncation.
 #
-# The original 12 assumed a long service list would dominate tile size. It does not:
-# MVT pools attribute *values* per layer per tile, so an edge carrying "1,2,42,X57"
-# costs a value-pool entry shared with every other edge carrying the same set, plus
-# two varints on the feature. Measured on Wales, only 1,405 of 169,857 edges held
+# A long service list does not dominate tile size, which is what a tight cap would be
+# for. MVT pools attribute *values* per layer per tile, so an edge carrying
+# "1,2,42,X57" costs a value-pool entry shared with every other edge carrying the same
+# set, plus two varints on the feature. Measured on Wales, 1,405 of 169,857 edges held
 # more than 12 services and the longest held 53 -- a few hundred KB across a handful
 # of city tiles, against a sidecar file, a fetch path and a cap to keep in sync.
 #
-# 64 clears Wales entirely. Where it does bite the feature still carries the true
-# count in `n`, so the viewer says so rather than quietly showing a short list.
+# 64 is set above that measured longest list, so it clears Wales entirely and only a
+# city centre denser than any there can reach it. Where it does bite the feature still
+# carries the true count in `n`, so the viewer says so rather than quietly showing a
+# short list.
 MAX_REFS_IN_TILE = 64
 
 # --- Serving ---------------------------------------------------------------

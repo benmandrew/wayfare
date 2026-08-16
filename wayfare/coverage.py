@@ -7,15 +7,14 @@ longitude and latitude. A published file can therefore be checked wherever it en
 Two things to do with that, and the second one is the one to trust.
 
 `drawn` and `bands` count features per cell per zoom. **That measurement has a blind
-spot, and it cost four rounds of a bad map to find it.** A cap on what a low zoom holds
-keeps many short features spread over many cells; no cap keeps fewer, longer ones.
-Counting features rewards the first and only the second reaches the screen, so every
-feature count rose while the map got worse. Populated cells, features per cell and bins
-holding anything all fail the same way.
+spot.** A cap on what a low zoom holds keeps many short features spread over many cells;
+no cap keeps fewer, longer ones. Counting features rewards the first and only the second
+reaches the screen, so a feature count rises while the map gets worse. Populated cells,
+features per cell and bins holding anything all fail the same way.
 
 `draw` rasterises the geometry into a window and writes a PNG, which is what a reader
-sees. It is what showed that London at z8 had been hollowed into a radial skeleton, and
-what should be reached for before believing any number in here.
+sees. A zoom hollowed into a radial skeleton shows up there and in no count in here, so
+reach for it before believing any number this module reports.
 """
 
 from __future__ import annotations
@@ -35,19 +34,25 @@ from . import config, logs
 log = logs.get("coverage")
 
 Cell = tuple[int, int]
+# A directory entry with the z/x/y its tile id decodes to.
+Tile = tuple["_Entry", int, int, int]
 
 # PMTiles v3: a 127-byte header, then a root directory, then optional leaf directories,
 # then the tile data. The eight offsets and lengths this needs start at byte 8.
 _HEADER = 127
 _OFFSETS = "<QQQQQQQQ"
 
-# MVT protobuf field numbers. Only the ones on the path to a feature's first point are
+# MVT protobuf field numbers. Only the ones on the path to a feature's geometry are
 # named; everything else is skipped by wire type.
 _TILE_LAYER = 3
+_LAYER_NAME = 1
 _LAYER_FEATURE = 2
 _LAYER_EXTENT = 5
 _FEATURE_GEOMETRY = 4
-_MOVE_TO = 1
+
+# Geometry command ids, which share the low three bits of a command word with its count.
+_MOVE_TO, _CLOSE = 1, 7
+
 _DEFAULT_EXTENT = 4096
 
 
@@ -76,6 +81,10 @@ def _skip(buf: bytes, i: int, wire: int) -> int:
     else:
         raise ValueError(f"unknown protobuf wire type {wire}")
     return i
+
+
+def _unzigzag(value: int) -> int:
+    return (value >> 1) ^ -(value & 1)
 
 
 def _decompress(blob: bytes) -> bytes:
@@ -163,12 +172,12 @@ def _tile_zxy(tile_id: int) -> tuple[int, int, int]:
     return zoom, x, y
 
 
-def _first_points(tile: bytes) -> Iterator[tuple[int, int, int]]:
-    """The first point of every feature in a tile, in tile units, with the extent.
+def _tile_layers(tile: bytes) -> Iterator[tuple[str, int, list[bytes]]]:
+    """Each layer as its name, its extent, and one geometry blob per feature.
 
-    Geometry is a command stream of zigzag-encoded deltas, and every LineString opens
-    with a MoveTo whose delta is from the tile origin. So the first pair after the first
-    command is the feature's position, and the rest of the stream can be stepped over.
+    The one walker over a tile: counting and drawing differ in what they do with a
+    command stream, not in how they reach one, and two walkers over the same wire
+    format drift apart silently because each is only exercised by its own caller.
     """
     i = 0
     while i < len(tile):
@@ -179,50 +188,66 @@ def _first_points(tile: bytes) -> Iterator[tuple[int, int, int]]:
             continue
 
         length, i = _varint(tile, i)
-        layer_end = i + length
-        # The extent can appear after the features it applies to, so the layer's points
-        # are held until the layer is finished.
-        points: list[tuple[int, int]] = []
-        extent = _DEFAULT_EXTENT
-        j = i
+        layer_end, j = i + length, i
+        # The extent can appear after the features it applies to, so the layer is held
+        # until it is finished rather than yielded feature by feature.
+        name, extent, geometries = "", _DEFAULT_EXTENT, []
         while j < layer_end:
             key, j = _varint(tile, j)
             field, wire = key >> 3, key & 7
-            if field == _LAYER_EXTENT and wire == 0:
+            if field == _LAYER_NAME and wire == 2:
+                length, j = _varint(tile, j)
+                name = tile[j : j + length].decode("utf-8", "replace")
+                j += length
+            elif field == _LAYER_EXTENT and wire == 0:
                 extent, j = _varint(tile, j)
             elif field == _LAYER_FEATURE and wire == 2:
                 length, j = _varint(tile, j)
-                point, j = _feature_point(tile, j, j + length)
-                if point is not None:
-                    points.append(point)
+                feature_end, m = j + length, j
+                # Geometry is a packed repeated field, so a writer may split it across
+                # chunks that mean nothing apart: the deltas in the second continue
+                # from where the first left off.
+                parts: list[bytes] = []
+                while m < feature_end:
+                    key, m = _varint(tile, m)
+                    if (key >> 3) == _FEATURE_GEOMETRY and (key & 7) == 2:
+                        length, m = _varint(tile, m)
+                        parts.append(tile[m : m + length])
+                        m += length
+                    else:
+                        m = _skip(tile, m, key & 7)
+                if parts:
+                    geometries.append(b"".join(parts))
+                j = feature_end
             else:
                 j = _skip(tile, j, wire)
-        yield from ((px, py, extent) for px, py in points)
+        yield name, extent, geometries
         i = layer_end
 
 
-def _feature_point(tile: bytes, i: int, end: int) -> tuple[tuple[int, int] | None, int]:
-    point: tuple[int, int] | None = None
-    while i < end:
-        key, i = _varint(tile, i)
-        field, wire = key >> 3, key & 7
-        if field != _FEATURE_GEOMETRY or wire != 2:
-            i = _skip(tile, i, wire)
-            continue
-        length, i = _varint(tile, i)
-        geometry_end = i + length
-        if point is None and i < geometry_end:
-            command, i = _varint(tile, i)
-            if (command & 7) == _MOVE_TO and i < geometry_end:
-                dx, i = _varint(tile, i)
-                dy, i = _varint(tile, i)
-                point = (_unzigzag(dx), _unzigzag(dy))
-        i = geometry_end
-    return point, end
+def _first_point(geometry: bytes) -> tuple[int, int] | None:
+    """Where a feature starts, in tile units.
+
+    Every path opens with a MoveTo, and the cursor starts at the tile origin, so the
+    pair after the first command is the position and the rest can be ignored.
+    """
+    if not geometry:
+        return None
+    command, i = _varint(geometry, 0)
+    if (command & 7) != _MOVE_TO or i >= len(geometry):
+        return None
+    dx, i = _varint(geometry, i)
+    dy, i = _varint(geometry, i)
+    return _unzigzag(dx), _unzigzag(dy)
 
 
-def _unzigzag(value: int) -> int:
-    return (value >> 1) ^ -(value & 1)
+def _first_points(tile: bytes) -> Iterator[tuple[int, int, int]]:
+    """The first point of every feature in a tile, in tile units, with the extent."""
+    for _name, extent, geometries in _tile_layers(tile):
+        for geometry in geometries:
+            point = _first_point(geometry)
+            if point is not None:
+                yield point[0], point[1], extent
 
 
 def _lonlat(z: int, x: int, y: int, px: int, py: int, extent: int) -> tuple[float, float]:
@@ -233,13 +258,15 @@ def _lonlat(z: int, x: int, y: int, px: int, py: int, extent: int) -> tuple[floa
     return lon, math.degrees(math.atan(math.sinh(math.pi * ty)))
 
 
-def _tiles_at(fh: BinaryIO, zoom: int) -> tuple[list[tuple[_Entry, int, int, int]], int]:
-    """Every tile at one zoom, with its z/x/y, and where the tile data starts.
+def _all_tiles(fh: BinaryIO) -> tuple[dict[int, list[Tile]], int]:
+    """Every tile grouped by zoom, with its z/x/y, and where the tile data starts.
 
-    Reads the whole archive's directory but decompresses only the tiles asked for, so
-    checking four zooms of a 130 MB national archive is four passes over its index
-    rather than four passes over the file.
+    One pass over the archive's index whatever a caller then asks for, and no tile
+    decompressed here. Reading the index per zoom instead costs a national archive a
+    walk of its whole directory for every zoom a tile could be at, to answer a question
+    about four of them.
     """
+    fh.seek(0)
     header = fh.read(_HEADER)
     if len(header) < _HEADER:
         raise RuntimeError("too short to be a PMTiles archive")
@@ -265,12 +292,29 @@ def _tiles_at(fh: BinaryIO, zoom: int) -> tuple[list[tuple[_Entry, int, int, int
             e for e in _read_directory(_decompress(fh.read(leaf.length))) if e.run_length
         ]
 
-    found = []
+    by_zoom: dict[int, list[Tile]] = defaultdict(list)
     for entry in tiles:
         z, x, y = _tile_zxy(entry.tile_id)
-        if z == zoom:
-            found.append((entry, z, x, y))
-    return found, tile_offset
+        by_zoom[z].append((entry, z, x, y))
+    return dict(by_zoom), tile_offset
+
+
+def _drawn_by_zoom(
+    archive: Path, zooms: list[int], cell_size: float
+) -> dict[int, dict[Cell, int]]:
+    """Count the features drawn at each zoom, per cell, in one pass over the index."""
+    out: dict[int, dict[Cell, int]] = {}
+    with archive.open("rb") as fh:
+        by_zoom, tile_offset = _all_tiles(fh)
+        for zoom in zooms:
+            counts: dict[Cell, int] = defaultdict(int)
+            for entry, z, x, y in by_zoom.get(zoom, []):
+                fh.seek(tile_offset + entry.offset)
+                for px, py, extent in _first_points(_decompress(fh.read(entry.length))):
+                    lon, lat = _lonlat(z, x, y, px, py, extent)
+                    counts[(round(lon / cell_size), round(lat / cell_size))] += 1
+            out[zoom] = dict(counts)
+    return out
 
 
 def drawn(archive: Path, zoom: int, cell_size: float | None = None) -> dict[Cell, int]:
@@ -279,16 +323,7 @@ def drawn(archive: Path, zoom: int, cell_size: float | None = None) -> dict[Cell
     Counting is the measurement with the blind spot -- see the module docstring. Use
     `draw` to judge how a zoom looks.
     """
-    cell_size = cell_size or config.COVERAGE_CELL
-    counts: dict[Cell, int] = defaultdict(int)
-    with archive.open("rb") as fh:
-        tiles, tile_offset = _tiles_at(fh, zoom)
-        for entry, z, x, y in tiles:
-            fh.seek(tile_offset + entry.offset)
-            for px, py, extent in _first_points(_decompress(fh.read(entry.length))):
-                lon, lat = _lonlat(z, x, y, px, py, extent)
-                counts[(round(lon / cell_size), round(lat / cell_size))] += 1
-    return dict(counts)
+    return _drawn_by_zoom(archive, [zoom], cell_size or config.COVERAGE_CELL)[zoom]
 
 
 @dataclass(frozen=True)
@@ -318,7 +353,10 @@ def bands(
 ) -> tuple[dict[Cell, int], list[Band]]:
     """Measure each zoom against `config.MAX_ZOOM`, which is the complete network."""
     cell_size = cell_size or config.COVERAGE_CELL
-    reference = drawn(archive, config.MAX_ZOOM, cell_size)
+    counted = _drawn_by_zoom(
+        archive, list(dict.fromkeys([config.MAX_ZOOM, *zooms])), cell_size
+    )
+    reference = counted[config.MAX_ZOOM]
     if not reference:
         raise RuntimeError(
             f"{archive} draws nothing at z{config.MAX_ZOOM}. Either it is not a wayfare "
@@ -332,7 +370,7 @@ def bands(
 
     out = []
     for zoom in zooms:
-        counts = drawn(archive, zoom, cell_size)
+        counts = counted[zoom]
         quartiles = []
         for group in groups:
             per_cell = sorted(counts.get(c, 0) for c in group)
@@ -385,8 +423,6 @@ def report(archive: Path, zooms: list[int], cell_size: float | None = None) -> l
 # disconnected, which is what a thinned overview looks like on the screen and what no
 # count in this module can see.
 
-_MOVE_TO, _CLOSE = 1, 7
-
 # Which shade each layer is drawn in. The road layer is the subject; operator geometry
 # is dimmer so a tram line is not mistaken for a road that survived a filter.
 _SHADES = {"bus": 255, "segments": 90}
@@ -397,45 +433,6 @@ def _mercator(lon: float, lat: float) -> tuple[float, float]:
     """Longitude and latitude to the 0..1 square tile coordinates live in."""
     s = math.sin(math.radians(lat))
     return (lon + 180.0) / 360.0, 0.5 - math.log((1 + s) / (1 - s)) / (4 * math.pi)
-
-
-def _tile_layers(tile: bytes) -> Iterator[tuple[str, int, list[bytes]]]:
-    """Each layer as its name, its extent, and its features' geometry blobs."""
-    i = 0
-    while i < len(tile):
-        key, i = _varint(tile, i)
-        field, wire = key >> 3, key & 7
-        if field != _TILE_LAYER or wire != 2:
-            i = _skip(tile, i, wire)
-            continue
-        length, i = _varint(tile, i)
-        end, j = i + length, i
-        name, extent, geometries = "", _DEFAULT_EXTENT, []
-        while j < end:
-            key, j = _varint(tile, j)
-            f, w = key >> 3, key & 7
-            if f == 1 and w == 2:
-                n, j = _varint(tile, j)
-                name = tile[j : j + n].decode("utf-8", "replace")
-                j += n
-            elif f == _LAYER_EXTENT and w == 0:
-                extent, j = _varint(tile, j)
-            elif f == _LAYER_FEATURE and w == 2:
-                n, j = _varint(tile, j)
-                feature_end, m = j + n, j
-                while m < feature_end:
-                    k, m = _varint(tile, m)
-                    if (k >> 3) == _FEATURE_GEOMETRY and (k & 7) == 2:
-                        gl, m = _varint(tile, m)
-                        geometries.append(tile[m : m + gl])
-                        m += gl
-                    else:
-                        m = _skip(tile, m, k & 7)
-                j = feature_end
-            else:
-                j = _skip(tile, j, w)
-        yield name, extent, geometries
-        i = end
 
 
 def _paths(geometry: bytes) -> Iterator[list[tuple[int, int]]]:
@@ -542,8 +539,8 @@ def draw(
     pixels = bytearray(width * height)
 
     with archive.open("rb") as fh:
-        tiles, tile_offset = _tiles_at(fh, zoom)
-        for entry, tz, tx, ty in tiles:
+        by_zoom, tile_offset = _all_tiles(fh)
+        for entry, tz, tx, ty in by_zoom.get(zoom, []):
             scale = 1 << tz
             # A tile's own geometry can run past its edges, so the window is widened
             # by a tile before rejecting one. Rejecting on the exact bounds clips
@@ -596,14 +593,11 @@ def sizes(archive: Path) -> dict[int, list[int]]:
     The sizes are what PMTiles stores, which is what a client fetches over a range
     request and what tippecanoe's limit is applied to.
     """
-    per: dict[int, list[int]] = defaultdict(list)
     with archive.open("rb") as fh:
-        for zoom in range(0, 24):
-            found, _ = _tiles_at(fh, zoom)
-            if found:
-                per[zoom] = [entry.length for entry, _, _, _ in found]
-            fh.seek(0)
-    return dict(per)
+        by_zoom, _ = _all_tiles(fh)
+    return {
+        zoom: [entry.length for entry, _, _, _ in by_zoom[zoom]] for zoom in sorted(by_zoom)
+    }
 
 
 def report_sizes(archive: Path, limit: int | None = None) -> dict[int, int]:

@@ -47,14 +47,13 @@ def build(con: duckdb.DuckDBPyConnection) -> None:
     # a seasonal service that returns should not be paid for twice -- but a road
     # nobody runs on any more must not still be drawn as if buses used it.
     #
-    # `matchable` is the same rule in the other direction, and it is about the past
-    # rather than the future. A database matched before the mode filter existed holds
-    # `pattern_edges` for patterns that should never have reached the matcher: Great
-    # Britain's held 1,726,822 of them for the Underground alone, plus ferries snapped
-    # to coast roads, and 16,833 edges were reachable from nothing else -- roads drawn
-    # as though buses used them, weighted by trips no bus runs. Those patterns are
-    # drawn from operator geometry by `build_segments` now, and drawing them twice, one
-    # of the copies wrong, is worse than either.
+    # `matchable` is the same rule in the other direction. `pattern_edges` is a cache
+    # too, and it can hold rows for patterns that should never have reached the
+    # matcher at all -- a ferry snapped to the coast road beside it, a metro snapped to
+    # the streets above it. Some of those edges are reachable from nothing else, so
+    # they come out as roads drawn as though buses used them and weighted by trips no
+    # bus runs. `build_segments` draws those patterns from their own geometry instead,
+    # and drawing them twice, one of the copies wrong, is worse than either.
     con.execute(f"""
         INSERT INTO edge_services
         SELECT edge_id, short_name, agency_id,
@@ -65,11 +64,11 @@ def build(con: duckdb.DuckDBPyConnection) -> None:
                    COALESCE(NULLIF(trim(p.short_name), ''), p.route_id) AS short_name
             FROM (SELECT DISTINCT pattern_id, edge_id FROM pattern_edges) pe
             JOIN patterns p USING (pattern_id)
-            WHERE {db.current_feed()} AND {db.matchable("p", con)}
+            WHERE {db.current_feed()} AND {db.matchable(con)}
         )
         GROUP BY edge_id, short_name, agency_id
     """)
-    db.index(con)
+    db.create_indices(con)
 
     n_edges, n_rows = db.row(
         con, "SELECT count(DISTINCT edge_id), count(*) FROM edge_services"
@@ -101,14 +100,13 @@ def build_segments(con: duckdb.DuckDBPyConnection) -> None:
     disjoint, and what lets `segments` keep its primary key on `pattern_id`.
 
     **A pattern the track layer draws must not be drawn here as well**, which is
-    what `_DRAWN_AS_TRACK` partitions. Every relation-built pattern was drawn in
-    both, from the day `osmroutes` landed until the per-way inversion followed it:
-    an `osm:r` pattern is live, not matchable and carries no `shape_id`, so this arm
-    took it, and each one came out as a polyline lying over the very ways
-    `build_track_services` had just collapsed it into. Two coats of the same track
-    is the visible half of that; the hover is the worse half, because the viewer
-    asks the segments layer first and got one relation's own card where the track
-    layer would have answered for every service on the way.
+    what `_DRAWN_AS_TRACK` partitions. A relation-built pattern is live, not matchable
+    and carries no `shape_id`, so it satisfies this arm on every other count and that
+    column is the only thing holding it off: take it, and it comes out as a polyline
+    lying over the very ways `build_track_services` collapsed it into. Two coats of
+    the same track is the visible half of that; the hover is the worse half, because
+    the viewer asks the segments layer first, so a way would answer with one
+    relation's own card where the track layer answers for every service on it.
 
     What is left here is the operator's own recording plus the traces this pipeline
     has not re-cut yet, and both of those are per pattern by nature.
@@ -125,14 +123,12 @@ def build_segments(con: duckdb.DuckDBPyConnection) -> None:
             SELECT p.pattern_id, p.mode, s.lon_e6, s.lat_e6
             FROM patterns p
             JOIN shapes s ON s.shape_id = p.shape_id
-            WHERE {db.current_feed()} AND NOT {db.matchable()}
+            WHERE {db.current_feed()} AND NOT {db.matchable(con)}
             UNION ALL
             SELECT p.pattern_id, p.mode, t.lon_e6, t.lat_e6
             FROM patterns p
             JOIN traces t ON t.pattern_id = p.pattern_id
-            WHERE {db.current_feed()} AND NOT {db.matchable()}
-              AND p.shape_id IS NULL
-              AND NOT {_DRAWN_AS_TRACK}
+            WHERE {db.non_road(con)} AND NOT {_DRAWN_AS_TRACK}
         )
         SELECT pattern_id, mode, lon_e6, lat_e6,
                list_min(lon_e6), list_min(lat_e6),
@@ -145,15 +141,12 @@ def build_segments(con: duckdb.DuckDBPyConnection) -> None:
         SELECT (SELECT count(*) FROM segments),
                (SELECT count(*) FROM patterns p
                 JOIN traces t ON t.pattern_id = p.pattern_id
-                WHERE {db.current_feed()} AND NOT {db.matchable()}
-                  AND p.shape_id IS NULL
-                  AND NOT {_DRAWN_AS_TRACK}),
+                WHERE {db.non_road(con)} AND NOT {_DRAWN_AS_TRACK}),
                -- No `_DRAWN_AS_TRACK` on this one and none is wanted: a pattern
                -- with no trace at all is drawn by neither layer, which is what
                -- this counts.
                (SELECT count(*) FROM patterns p
-                WHERE {db.current_feed()} AND NOT {db.matchable()}
-                  AND p.shape_id IS NULL
+                WHERE {db.non_road(con)}
                   AND NOT EXISTS (
                       SELECT 1 FROM traces t WHERE t.pattern_id = p.pattern_id))
         """,
@@ -184,7 +177,7 @@ def _clustered(con: duckdb.DuckDBPyConnection) -> str:
     return f"stale ({at} of {now} edges sorted; re-run `wayfare cluster`)"
 
 
-def coverage(con: duckdb.DuckDBPyConnection) -> dict[str, object]:
+def funnel(con: duckdb.DuckDBPyConnection) -> dict[str, object]:
     """How much of the network came out, and how much was lost on the way.
 
     Reported as a funnel rather than a single number: a run that matched 95% of
@@ -198,7 +191,7 @@ def coverage(con: duckdb.DuckDBPyConnection) -> dict[str, object]:
     `patterns_by_mode` instead.
     """
     live = db.current_feed()
-    owed = f"{live} AND {db.matchable('p', con)}"
+    owed = f"{live} AND {db.matchable(con)}"
     matched, total = db.row(
         con,
         f"""
@@ -252,8 +245,12 @@ def coverage(con: duckdb.DuckDBPyConnection) -> dict[str, object]:
                               WHERE m.pattern_id = p.pattern_id)
             """,
         ),
+        # Negated through COALESCE, because `osmroutes` withdraws a rail pattern by
+        # setting `last_seen` to NULL: `live` is then NULL rather than false, and
+        # `NOT NULL` is not true, so every retired relation would leave the count
+        # while still being outside the current feed.
         "patterns_departed": db.scalar(
-            con, f"SELECT count(*) FROM patterns p WHERE NOT ({live})"
+            con, f"SELECT count(*) FROM patterns p WHERE NOT COALESCE({live}, FALSE)"
         ),
         # The number that actually matters: share of timetabled service represented.
         "trips_pct": round(100.0 * trips_ok / max(trips_all, 1), 1),
@@ -290,11 +287,11 @@ def _traced(con: duckdb.DuckDBPyConnection, live: str) -> dict[str, object]:
     A database with no `trace_status` table reports nothing rather than raising.
     `status` connects read-only and `connect` runs `migrate` only when it is not, so
     the table may be absent from a data root this stage has never written to -- the
-    same trap `db.matchable` carries a connection to survive.
+    same trap `db.non_road` carries a connection to survive.
     """
     if not db.table_exists(con, "trace_status"):
         return {}
-    owed = f"{live} AND NOT {db.matchable('p', con)} AND p.shape_id IS NULL"
+    owed = db.non_road(con)
     pending = db.scalar(
         con,
         f"""
@@ -382,7 +379,7 @@ def build_track_services(con: duckdb.DuckDBPyConnection) -> int:
             FROM traces t
             JOIN patterns p USING (pattern_id)
             CROSS JOIN unnest(t.way_ids) AS u(way_id)
-            WHERE {db.current_feed()} AND NOT {db.matchable()}
+            WHERE {db.current_feed()} AND NOT {db.matchable(con)}
               AND {_DRAWN_AS_TRACK}
         )
         GROUP BY way_id, short_name, agency_id, mode

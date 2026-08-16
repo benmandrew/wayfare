@@ -8,6 +8,14 @@ the main thread and uses its workers only for HTTP.
 
 from __future__ import annotations
 
+import csv
+import json
+import os
+import re
+import tempfile
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -366,7 +374,7 @@ def current_feed(alias: str = "p") -> str:
     return f"{alias}.last_seen = (SELECT value FROM meta WHERE key = 'feed_version')"
 
 
-def matchable(alias: str = "p", con: duckdb.DuckDBPyConnection | None = None) -> str:
+def matchable(con: duckdb.DuckDBPyConnection, alias: str = "p") -> str:
     """Predicate restricting `patterns` to the modes Valhalla can be asked about.
 
     `patterns` may now hold trams, ferries and metros, which have no road under them
@@ -380,16 +388,52 @@ def matchable(alias: str = "p", con: duckdb.DuckDBPyConnection | None = None) ->
     migration therefore leaves the column empty rather than asserting a mode nobody
     recorded, and this predicate is what makes that safe.
 
-    Pass `con` from anywhere that reads a database it has not written to. `connect`
-    runs `migrate` only when it is not read-only, so a read-only data root may hold no
-    `mode` column at all, and a predicate naming a column that is not there fails to
-    bind rather than degrading. With `con` in hand it degrades to TRUE, which is the
-    answer a NULL mode gets and for the same reason.
+    `con` is first and has no default because it is what makes the predicate safe
+    against a database it has not written to. `connect` runs `migrate` only when it
+    is not read-only, so a read-only data root may hold no `mode` column at all, and
+    a predicate naming a column that is not there fails to bind rather than
+    degrading -- which is what `wayfare status` did against Great Britain three days
+    after the column landed. With `con` in hand it degrades to TRUE, which is the
+    answer a NULL mode gets and for the same reason. Optional, it was a safety every
+    call site had to remember, and nine of twelve did not.
     """
-    if con is not None and "mode" not in columns(con, "patterns"):
+    if "mode" not in columns(con, "patterns"):
         return "TRUE"
     keep = ", ".join(f"'{m}'" for m in sorted(config.ROAD_MODES))
     return f"({alias}.mode IS NULL OR {alias}.mode IN ({keep}))"
+
+
+def non_road(con: duckdb.DuckDBPyConnection, alias: str = "p") -> str:
+    """Predicate for the live patterns whose geometry has to come from a relation.
+
+    Three conditions and each is load-bearing. Live, because a departed pattern is
+    work spent on a journey nobody runs. Not matchable, because a bus belongs to
+    Valhalla and a road is not what these draw. And no ``shape_id``, because where
+    the operator recorded the course themselves that recording is better than
+    anything reassembled from OpenStreetMap -- it is a survey of where the vehicle
+    goes rather than of where the track is.
+
+    `con` is required for the reason :func:`matchable` requires one.
+    """
+    return (
+        f"{current_feed(alias)} AND NOT {matchable(con, alias)} "
+        f"AND {alias}.shape_id IS NULL"
+    )
+
+
+# Great-circle distance between two lat/lon expressions, in metres. A format string
+# rather than a function because it is composed into a group-by over pattern_stops
+# that DuckDB has to run out of core -- the stop chain is far too big to walk in
+# Python. The mean earth radius is the same 6,371 km `valhalla` measures with, so a
+# span computed here and a road length computed there are comparable, which is what
+# the detour ratio rests on.
+HAVERSINE_SQL = """
+    2 * 6371000 * asin(sqrt(
+        pow(sin(radians({lat2} - {lat1}) / 2), 2)
+      + cos(radians({lat1})) * cos(radians({lat2}))
+      * pow(sin(radians({lon2} - {lon1}) / 2), 2)
+    ))
+"""
 
 
 def connect(path: Path | None = None, read_only: bool = False) -> duckdb.DuckDBPyConnection:
@@ -402,9 +446,21 @@ def connect(path: Path | None = None, read_only: bool = False) -> duckdb.DuckDBP
     return con
 
 
-def index(con: duckdb.DuckDBPyConnection) -> None:
+def create_indices(con: duckdb.DuckDBPyConnection) -> None:
     for stmt in INDICES:
         con.execute(stmt)
+
+
+# `information_schema` spans every attached database, and `maintenance.cluster`
+# attaches one whose tables have the same names as ours. Without this every question
+# about our own schema -- which migration is outstanding, whether `patterns.mode`
+# exists -- can be answered by a table in a file that is only there to be copied
+# into. Every catalog read below carries it.
+#
+# `temp` is ours too, and has to be here: a staging table lives in that catalog, and
+# `insert_via_file` asks this for the types to read a file back as. An attached
+# database is the thing being excluded, not a scratch table.
+_THIS_DATABASE = "table_catalog IN (current_database(), 'temp')"
 
 
 def table_exists(con: duckdb.DuckDBPyConnection, table: str) -> bool:
@@ -414,50 +470,83 @@ def table_exists(con: duckdb.DuckDBPyConnection, table: str) -> bool:
     matching is done, so a data root that is missing one is a normal thing to be
     handed rather than a corrupt one.
     """
-    row = con.execute(
-        "SELECT count(*) FROM information_schema.tables WHERE table_name = ?",
-        [table],
-    ).fetchone()
-    return bool(row and row[0])
+    return bool(
+        scalar(
+            con,
+            "SELECT count(*) FROM information_schema.tables "
+            f"WHERE {_THIS_DATABASE} AND table_name = ?",
+            [table],
+        )
+    )
 
 
 def columns(con: duckdb.DuckDBPyConnection, table: str) -> set[str]:
     return {
         r[0]
         for r in con.execute(
-            "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+            "SELECT column_name FROM information_schema.columns "
+            f"WHERE {_THIS_DATABASE} AND table_name = ?",
             [table],
         ).fetchall()
     }
 
 
-def migrate(con: duckdb.DuckDBPyConnection) -> None:
-    """Bring an older database up to the current schema, in place.
+@dataclass(frozen=True)
+class _Migration:
+    """One in-place rewrite, and the column whose presence says it is still owed.
 
-    A national ``match`` run costs a day or two, so a schema change that forced it
-    to be redone would be a change nobody applies. Every migration here is derivable
-    from what is already stored, so it is a rewrite rather than a re-run.
+    Every gate this file has ever needed is a column that is either there or not, so
+    the whole set is decided from one read of the catalog rather than one read each --
+    which every `connect` on an already-current database pays.
     """
-    if "seq" in columns(con, "shapes"):
-        # shapes was a row per point; collapse to a row per shape.
-        con.execute("""
-            CREATE OR REPLACE TABLE shapes_new AS
-            SELECT shape_id,
-                   list(round(lat * 1e6)::INTEGER ORDER BY seq) AS lat_e6,
-                   list(round(lon * 1e6)::INTEGER ORDER BY seq) AS lon_e6
-            FROM shapes
-            WHERE lat IS NOT NULL AND lon IS NOT NULL
-            GROUP BY shape_id
-        """)
-        con.execute("DROP TABLE shapes")
-        con.execute("ALTER TABLE shapes_new RENAME TO shapes")
-        log_rows = scalar(con, "SELECT count(*) FROM shapes")
-        logs.get("db").info("migrated shapes to one row per shape (%d rows)", log_rows)
 
-    if "geom" in columns(con, "edges"):
-        # edges.geom was a WKT LINESTRING; split it into micro-degree lists and
-        # precompute the bbox that the window query now filters on.
-        con.execute("""
+    name: str
+    table: str
+    column: str
+    # Whether the column being *present* is what says the rewrite is outstanding.
+    # Two of these replace a column that is gone afterwards; the rest add one.
+    present: bool
+    apply: Callable[[duckdb.DuckDBPyConnection], None]
+
+    def outstanding(self, schema: Mapping[str, frozenset[str]]) -> bool:
+        return (self.column in schema.get(self.table, frozenset())) is self.present
+
+
+def _schema_snapshot(con: duckdb.DuckDBPyConnection) -> dict[str, frozenset[str]]:
+    """Every column of every table of *this* database, in one query."""
+    out: dict[str, set[str]] = {}
+    for table, column in con.execute(
+        "SELECT table_name, column_name FROM information_schema.columns "
+        f"WHERE {_THIS_DATABASE}"
+    ).fetchall():
+        out.setdefault(table, set()).add(column)
+    return {t: frozenset(c) for t, c in out.items()}
+
+
+def _migrate_shapes_to_one_row_per_shape(con: duckdb.DuckDBPyConnection) -> None:
+    """shapes was a row per point; collapse to a row per shape."""
+    con.execute("""
+        CREATE OR REPLACE TABLE shapes_new AS
+        SELECT shape_id,
+               list(round(lat * 1e6)::INTEGER ORDER BY seq) AS lat_e6,
+               list(round(lon * 1e6)::INTEGER ORDER BY seq) AS lon_e6
+        FROM shapes
+        WHERE lat IS NOT NULL AND lon IS NOT NULL
+        GROUP BY shape_id
+    """)
+    con.execute("DROP TABLE shapes")
+    con.execute("ALTER TABLE shapes_new RENAME TO shapes")
+    log_rows = scalar(con, "SELECT count(*) FROM shapes")
+    logs.get("db").info("migrated shapes to one row per shape (%d rows)", log_rows)
+
+
+def _migrate_edges_to_micro_degrees(con: duckdb.DuckDBPyConnection) -> None:
+    """edges.geom was a WKT LINESTRING.
+
+    Split it into micro-degree lists and precompute the bbox the window query now
+    filters on, so nothing parses text on read.
+    """
+    con.execute("""
             CREATE OR REPLACE TABLE edges_new AS
             WITH pt AS (
                 SELECT e.edge_id, u.i,
@@ -484,68 +573,93 @@ def migrate(con: duckdb.DuckDBPyConnection) -> None:
                    g.min_lon_e6, g.min_lat_e6, g.max_lon_e6, g.max_lat_e6
             FROM edges e LEFT JOIN g USING (edge_id)
         """)
-        con.execute("DROP TABLE edges")
-        con.execute("ALTER TABLE edges_new RENAME TO edges")
-        con.execute("CREATE UNIQUE INDEX edges_pk ON edges (edge_id)")
-        logs.get("db").info(
-            "migrated %d edges from WKT to micro-degree lists",
-            scalar(con, "SELECT count(*) FROM edges"),
+    con.execute("DROP TABLE edges")
+    con.execute("ALTER TABLE edges_new RENAME TO edges")
+    con.execute("CREATE UNIQUE INDEX edges_pk ON edges (edge_id)")
+    logs.get("db").info(
+        "migrated %d edges from WKT to micro-degree lists",
+        scalar(con, "SELECT count(*) FROM edges"),
+    )
+
+
+def _add_routes_route_type(con: duckdb.DuckDBPyConnection) -> None:
+    """The mode filter's column.
+
+    Nothing already stored can supply it -- it comes from routes.txt and nowhere
+    else -- so it is added empty and the next `patterns` run fills it in. Until then
+    it is NULL, which no query treats as road-going, and no matched pattern is
+    touched: a departed ferry keeps its rows and its match_status exactly like any
+    other departed pattern.
+    """
+    con.execute("ALTER TABLE routes ADD COLUMN route_type VARCHAR")
+    logs.get("db").info("added routes.route_type; run `wayfare patterns` to fill it")
+
+
+def _add_traces_ways_cut(con: duckdb.DuckDBPyConnection) -> None:
+    """What a stored `way_ids` means.
+
+    Everything written before this column existed holds the whole line's chain,
+    except the rows `osmroutes` wrote: there the relation *is* the pattern, so its
+    ways and the ways under its geometry are the same list by construction. Both are
+    derivable from what is already stored, so this is a rewrite and not a re-run --
+    and the rows left FALSE keep being drawn per pattern, unchanged, until `trace`
+    runs over them again and cuts them.
+    """
+    con.execute("ALTER TABLE traces ADD COLUMN ways_cut BOOLEAN")
+    con.execute("""
+        UPDATE traces SET ways_cut = EXISTS (
+            SELECT 1 FROM patterns p
+            WHERE p.pattern_id = traces.pattern_id
+              AND p.route_id LIKE 'osm:r%'
         )
+    """)
+    cut = scalar(con, "SELECT count(*) FROM traces WHERE ways_cut")
+    whole = scalar(con, "SELECT count(*) FROM traces WHERE NOT ways_cut")
+    logs.get("db").info(
+        "added traces.ways_cut: %d rows already cut to their pattern, %d hold "
+        "the whole line and are drawn per pattern until `wayfare trace` reruns",
+        cut,
+        whole,
+    )
 
-    if "last_seen" not in columns(con, "patterns"):
-        _migrate_pattern_ids(con)
 
-    if "route_type" not in columns(con, "routes"):
-        # The mode filter's column. Nothing already stored can supply it -- it comes
-        # from routes.txt and nowhere else -- so it is added empty and the next
-        # `patterns` run fills it in. Until then it is NULL, which no query treats
-        # as road-going, and no matched pattern is touched: a departed ferry keeps
-        # its rows and its match_status exactly like any other departed pattern.
-        con.execute("ALTER TABLE routes ADD COLUMN route_type VARCHAR")
-        logs.get("db").info("added routes.route_type; run `wayfare patterns` to fill it")
+def _add_track_services_mode(con: duckdb.DuckDBPyConnection) -> None:
+    """Rebuilt outright by every `aggregate`, so this only has to exist before the
+    next one inserts into it. Backfilled rather than left NULL because every row
+    already there came from `route=train`, and a NULL mode would draw in the fallback
+    grey for exactly as long as it took to notice."""
+    con.execute("ALTER TABLE track_services ADD COLUMN mode VARCHAR")
+    con.execute("UPDATE track_services SET mode = 'rail'")
 
-    if "ways_cut" not in columns(con, "traces"):
-        # What a stored `way_ids` means. Everything written before this column
-        # existed holds the whole line's chain, except the rows `osmroutes` wrote:
-        # there the relation *is* the pattern, so its ways and the ways under its
-        # geometry are the same list by construction. Both are derivable from what
-        # is already stored, so this is a rewrite and not a re-run -- and the rows
-        # left FALSE keep being drawn per pattern, unchanged, until `trace` runs
-        # over them again and cuts them.
-        con.execute("ALTER TABLE traces ADD COLUMN ways_cut BOOLEAN")
-        con.execute("""
-            UPDATE traces SET ways_cut = EXISTS (
-                SELECT 1 FROM patterns p
-                WHERE p.pattern_id = traces.pattern_id
-                  AND p.route_id LIKE 'osm:r%'
-            )
-        """)
-        cut = scalar(con, "SELECT count(*) FROM traces WHERE ways_cut")
-        whole = scalar(con, "SELECT count(*) FROM traces WHERE NOT ways_cut")
-        logs.get("db").info(
-            "added traces.ways_cut: %d rows already cut to their pattern, %d hold "
-            "the whole line and are drawn per pattern until `wayfare trace` reruns",
-            cut,
-            whole,
-        )
 
-    if "mode" not in columns(con, "track_services"):
-        # Rebuilt outright by every `aggregate`, so this only has to exist before
-        # the next one inserts into it. Backfilled rather than left NULL because
-        # every row already there came from `route=train` and a NULL mode would
-        # draw in the fallback grey for exactly as long as it took to notice.
-        con.execute("ALTER TABLE track_services ADD COLUMN mode VARCHAR")
-        con.execute("UPDATE track_services SET mode = 'rail'")
+def _add_patterns_mode(con: duckdb.DuckDBPyConnection) -> None:
+    """Added empty for the reason route_type was: nothing already stored can supply
+    it. It is left NULL rather than backfilled to 'bus', because a database written
+    before this column existed held road modes only -- that was the whole point of
+    the filter -- and `matchable` reads NULL as matchable for exactly that reason.
+    Backfilling would assert a mode the feed never told us."""
+    con.execute("ALTER TABLE patterns ADD COLUMN mode VARCHAR")
+    logs.get("db").info("added patterns.mode; run `wayfare patterns` to fill it")
 
-    if "mode" not in columns(con, "patterns"):
-        # Added empty for the same reason route_type was: nothing already stored can
-        # supply it. It is left NULL rather than backfilled to 'bus', because a
-        # database written before this column existed held road modes only -- that
-        # was the whole point of the filter -- and `matchable` reads NULL as
-        # matchable for exactly that reason. Backfilling would assert a mode the
-        # feed never told us.
-        con.execute("ALTER TABLE patterns ADD COLUMN mode VARCHAR")
-        logs.get("db").info("added patterns.mode; run `wayfare patterns` to fill it")
+
+# Every table keyed on `pattern_id`, and whether one row is one pattern -- a CTAS
+# carries the rows but not the key, so the tables that have a unique one get it back
+# as the index the WKT rewrite above already established as this file's idiom.
+#
+# `traces`, `trace_status` and `segments` all post-date hash ids, so nothing can be
+# holding rows in them by the time this runs. They are remapped anyway rather than
+# asserted empty: they are keyed on the id being rewritten, the remap is the same
+# operation the other four get, and a table left pointing at ids nothing holds any
+# more would surface years later as a service attributed to track it never reaches.
+# Refusing to open the database instead would strand one that cost a day of matching.
+_KEYED_ON_PATTERN = {
+    "pattern_stops": False,
+    "pattern_edges": False,
+    "match_status": True,
+    "traces": True,
+    "trace_status": True,
+    "segments": True,
+}
 
 
 def _migrate_pattern_ids(con: duckdb.DuckDBPyConnection) -> None:
@@ -561,6 +675,9 @@ def _migrate_pattern_ids(con: duckdb.DuckDBPyConnection) -> None:
     rather than a re-run: the stop sequence that produced a pattern is still in
     pattern_stops, and hashing it recovers the id the pattern would get today. A
     national match run costs a day or two; it must survive this.
+
+    Everything keyed on the old id moves with it -- see `_KEYED_ON_PATTERN`, which is
+    the list, and says why the three tables that cannot yet hold a row are on it.
     """
     log = logs.get("db")
     if not scalar(con, "SELECT count(*) FROM patterns"):
@@ -599,49 +716,40 @@ def _migrate_pattern_ids(con: duckdb.DuckDBPyConnection) -> None:
             "widening."
         )
 
-    con.execute("""
-        CREATE TABLE patterns_new (
-            pattern_id BIGINT PRIMARY KEY, route_id VARCHAR, agency_id VARCHAR,
-            short_name VARCHAR, direction INTEGER, shape_id VARCHAR,
-            n_stops INTEGER, n_trips INTEGER, span_m DOUBLE,
-            first_seen VARCHAR, last_seen VARCHAR
-        )
-    """)
+    # Derived from the live table rather than restated. The column list used to be a
+    # frozen copy of `SCHEMA`'s, which is a copy that diverges in silence the next
+    # time a column is added -- and what it would do is drop that column off every
+    # database old enough to come through here.
     con.execute(
         """
-        INSERT INTO patterns_new
-        SELECT r.new_id, p.* EXCLUDE (pattern_id), ?::VARCHAR, ?::VARCHAR
+        CREATE TABLE patterns_new AS
+        SELECT r.new_id AS pattern_id, p.* EXCLUDE (pattern_id),
+               ?::VARCHAR AS first_seen, ?::VARCHAR AS last_seen
         FROM patterns p JOIN pattern_remap r ON r.old_id = p.pattern_id
         """,
         [feed, feed],
     )
     con.execute("DROP TABLE patterns")
     con.execute("ALTER TABLE patterns_new RENAME TO patterns")
+    con.execute("ALTER TABLE patterns ADD PRIMARY KEY (pattern_id)")
 
-    con.execute("""
-        CREATE TABLE match_status_new (
-            pattern_id BIGINT PRIMARY KEY, status VARCHAR, source VARCHAR,
-            confidence DOUBLE, road_m DOUBLE, detour DOUBLE, n_edges INTEGER,
-            detail VARCHAR, matched_at TIMESTAMP
-        );
-        INSERT INTO match_status_new
-        SELECT r.new_id, m.* EXCLUDE (pattern_id)
-        FROM match_status m JOIN pattern_remap r ON r.old_id = m.pattern_id;
-        DROP TABLE match_status;
-        ALTER TABLE match_status_new RENAME TO match_status;
-    """)
-
-    for table in ("pattern_stops", "pattern_edges"):
+    for table, one_per_pattern in _KEYED_ON_PATTERN.items():
+        if not scalar(con, f"SELECT count(*) FROM {table}"):  # noqa: S608
+            # Nothing to remap, and rebuilding would trade the key `SCHEMA` has just
+            # declared on an empty table for an index, to no end.
+            continue
         con.execute(f"""
             CREATE OR REPLACE TABLE {table}_new AS
             SELECT r.new_id AS pattern_id, t.* EXCLUDE (pattern_id)
-            FROM {table} t JOIN pattern_remap r ON r.old_id = t.pattern_id;
-            DROP TABLE {table};
-            ALTER TABLE {table}_new RENAME TO {table};
-        """)
+            FROM {table} t JOIN pattern_remap r ON r.old_id = t.pattern_id
+        """)  # noqa: S608
+        con.execute(f"DROP TABLE {table}")
+        con.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
+        if one_per_pattern:
+            con.execute(f"ALTER TABLE {table} ADD PRIMARY KEY (pattern_id)")
 
     con.execute("DROP TABLE pattern_remap")
-    index(con)
+    create_indices(con)
     log.info(
         "migrated %d patterns from rank ids to identity hashes, feed %s",
         n_patterns,
@@ -649,226 +757,262 @@ def _migrate_pattern_ids(con: duckdb.DuckDBPyConnection) -> None:
     )
 
 
-# --- Spatial clustering ------------------------------------------------------
-
-# The box the Z-order grid is quantised over: Great Britain with room to spare,
-# matching `art.PRESETS["uk"]`. Deliberately wider than the data and written here
-# rather than imported, because `art` imports this module and the constant is four
-# numbers.
+# The rewrites, in the order they have to run.
 #
-# It is a fixed grid rather than the data's own extent so that a region's layout
-# does not depend on which region it is. Changing these numbers is harmless -- the
-# code is a physical row order, never an identity -- but it does mean re-running
-# `wayfare cluster` to get the benefit back.
-CLUSTER_BOX = (-8.75, 49.85, 1.95, 60.90)
-CLUSTER_BITS = 16  # per axis, so a cell is about 165 m across at this latitude
+# The order used to be whatever order the `if`s happened to be written in, and one
+# pair depended on it: `patterns.mode` is added by ALTER, and the renumbering
+# rebuilds `patterns`. That rebuild now derives its columns from the live table, so
+# the two would survive being swapped -- but the shape of the hazard does not go
+# away. A step that rebuilds a table is only ever safe before the steps that add
+# columns to it, and adding one here means deciding where it goes.
+MIGRATIONS: tuple[_Migration, ...] = (
+    _Migration(
+        "shapes to one row per shape",
+        "shapes",
+        "seq",
+        True,
+        _migrate_shapes_to_one_row_per_shape,
+    ),
+    _Migration(
+        "edges from WKT to micro-degrees",
+        "edges",
+        "geom",
+        True,
+        _migrate_edges_to_micro_degrees,
+    ),
+    # Rebuilds `patterns` and everything else keyed on pattern_id, so it precedes
+    # every step that adds a column to any of them.
+    _Migration(
+        "pattern ids from rank to identity hash",
+        "patterns",
+        "last_seen",
+        False,
+        _migrate_pattern_ids,
+    ),
+    _Migration("routes.route_type", "routes", "route_type", False, _add_routes_route_type),
+    _Migration("traces.ways_cut", "traces", "ways_cut", False, _add_traces_ways_cut),
+    _Migration(
+        "track_services.mode", "track_services", "mode", False, _add_track_services_mode
+    ),
+    _Migration("patterns.mode", "patterns", "mode", False, _add_patterns_mode),
+)
 
-# The classic bit spread: four rounds of shift-and-mask turn 16 packed bits into 16
-# bits with a zero between each, which is what interleaving two axes needs.
-_SPREAD = ((8, 0x00FF00FF), (4, 0x0F0F0F0F), (2, 0x33333333), (1, 0x55555555))
 
+def migrate(con: duckdb.DuckDBPyConnection) -> None:
+    """Bring an older database up to the current schema, in place.
 
-def morton_sql(lon: str, lat: str) -> str:
-    """SQL for a Z-order code over a lon/lat expression pair, in degrees.
-
-    Two 16-bit axes interleaved into 32 bits, which fits a signed BIGINT with room
-    to spare. Z-order rather than Hilbert because Hilbert needs the `spatial`
-    extension and only beat Morton on the smallest window measured -- see
-    `scripts/bench_window.py`, which is where the numbers behind this come from.
-
-    The quantisation is a subquery so that each spreading round can name its input
-    twice without the expression doubling in length four times over.
+    A national ``match`` run costs a day or two, so a schema change that forced it
+    to be redone would be a change nobody applies. Every migration here is derivable
+    from what is already stored, so it is a rewrite rather than a re-run.
     """
-    span_lon = CLUSTER_BOX[2] - CLUSTER_BOX[0]
-    span_lat = CLUSTER_BOX[3] - CLUSTER_BOX[1]
-    top = (1 << CLUSTER_BITS) - 1
-
-    def spread(col: str) -> str:
-        e = col
-        for shift, mask in _SPREAD:
-            e = f"(({e} | ({e} << {shift})) & {mask})"
-        return e
-
-    qx = (
-        f"least({top}, greatest(0, floor((({lon}) - {CLUSTER_BOX[0]})"
-        f" * {top}.0 / {span_lon})))::BIGINT AS qx"
-    )
-    qy = (
-        f"least({top}, greatest(0, floor((({lat}) - {CLUSTER_BOX[1]})"
-        f" * {top}.0 / {span_lat})))::BIGINT AS qy"
-    )
-    code = f"({spread('qx')} | ({spread('qy')} << 1))"
-    return f"(SELECT {code} FROM (SELECT {qx}, {qy}))"
+    schema = _schema_snapshot(con)
+    for step in MIGRATIONS:
+        if not step.outstanding(schema):
+            continue
+        step.apply(con)
+        # Retaken rather than patched: a step may rebuild a table, and a snapshot
+        # describing what that table looked like beforehand is how the next gate
+        # reads the wrong answer. Only an open that does work pays for this.
+        schema = _schema_snapshot(con)
 
 
-# The centre of the stored bbox. Both the window query and the curve are asking
-# about where an edge *is*, and this is the one point an edge has that is already
-# four plain integer columns.
-_EDGE_CX = "(min_lon_e6 + max_lon_e6) / 2e6"
-_EDGE_CY = "(min_lat_e6 + max_lat_e6) / 2e6"
+# --- Bulk insert -------------------------------------------------------------
+
+# The types a CSV round-trip cannot change the meaning of. Everything else stages as
+# newline-delimited JSON, and the two exclusions are the whole reason this list
+# exists: a list column has no CSV spelling at all, and an empty CSV field comes back
+# as NULL, so a VARCHAR staged through CSV loses the difference between "" and NULL
+# without a word. Measured on a million three-column rows, CSV loads in 0.53 s
+# against JSON's 1.86 s, which is why the safe case is not simply given up.
+_CSV_SAFE = re.compile(
+    r"^(BIGINT|INTEGER|SMALLINT|TINYINT|HUGEINT|UBIGINT|UINTEGER|USMALLINT|UTINYINT"
+    r"|DOUBLE|FLOAT|REAL|BOOLEAN|DATE|TIME|TIMESTAMP.*|DECIMAL\(.*\))$"
+)
+
+# What `on_conflict` accepts, and what each spells in SQL. A closed vocabulary rather
+# than a clause the caller supplies: this builds SQL by interpolation, so the only
+# safe caller-controlled parts are the ones enumerated here.
+_CONFLICT = {None: "INSERT", "ignore": "INSERT OR IGNORE", "replace": "INSERT OR REPLACE"}
 
 
-def cluster_edges(con: duckdb.DuckDBPyConnection) -> int:
-    """Rewrite `edges` in Z-order so its row-group zonemaps can prune a window.
+@contextmanager
+def _staged(suffix: str) -> Iterator[Path]:
+    """A scratch file beside the database, removed however the block exits.
 
-    DuckDB keeps a min/max zonemap per row group of 122,880 rows and skips a group
-    whose zonemap cannot satisfy a filter. `match` inserts edges as their patterns
-    complete, and a batch of patterns is a national sample, so insertion order
-    carries no geography at all: every group's bbox spans most of the country and
-    none can ever be skipped. A city window reads 100% of the table.
-
-    Ordering the rows by a Z-order code over the bbox centre fixes that. Measured on
-    a synthetic 4.2M-edge database, Cardiff went from reading 100% of `edges` to
-    11.7%, 22 ms to 4.4 ms, and London to 26.3%.
-
-    Two things to keep in proportion. The scan is about a quarter of a render, so
-    this is a large improvement to a small share; and `edge_services` carries no
-    bbox column, so the weights pass reads all of it under any layout. Wales, at
-    barely two row groups, cannot show the effect at all.
-
-    This leaves the file *larger*: the old table's blocks are not reclaimed. Callers
-    want :func:`cluster`, which follows it with the compaction that gets the size
-    win too. This half is separate only so it can be tested against a connection.
+    Under WORK rather than the system temp directory: a server run points
+    WAYFARE_DATA at a volume with room, and /tmp is frequently a small tmpfs.
     """
-    n = int(scalar(con, "SELECT count(*) FROM edges"))
-    if not n:
-        return 0
+    d = config.WORK / "stage"
+    d.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(suffix=suffix, dir=d)
+    os.close(fd)
+    path = Path(name)
+    try:
+        yield path
+    finally:
+        path.unlink(missing_ok=True)
 
-    # CTAS preserves the order it was handed, which is what puts the rows on disk in
-    # curve order; the PRIMARY KEY does not survive it, so it is reinstated as the
-    # unique index the WKT migration above already established as this file's idiom.
-    con.execute(f"""
-        CREATE OR REPLACE TABLE edges_clustered AS
-        SELECT * FROM edges
-        ORDER BY {morton_sql(_EDGE_CX, _EDGE_CY)}, edge_id
-    """)
-    con.execute("DROP TABLE edges")
-    con.execute("ALTER TABLE edges_clustered RENAME TO edges")
-    con.execute("CREATE UNIQUE INDEX edges_pk ON edges (edge_id)")
-    # The row count at the time of clustering, so `wayfare status` can say whether
-    # a later `match` has appended unsorted rows on the end.
-    set_meta(con, "edges_clustered", n)
-    con.execute("CHECKPOINT")
+
+def insert_via_file(
+    con: duckdb.DuckDBPyConnection,
+    table: str,
+    cols: Sequence[str],
+    rows: Iterable[Sequence[Any]],
+    types: Mapping[str, str] | None = None,
+    *,
+    on_conflict: str | None = None,
+) -> int:
+    """Insert rows by staging them to a file and having DuckDB read it back.
+
+    The only way to fill a table that grows with the network. ``executemany`` moves
+    about 2,700 rows a second; a staged file moves 1.6M, so on a national run the
+    difference is the stage finishing overnight or not at all.
+
+    ``types`` names the DuckDB type of each column, which is what stops the reader
+    guessing. Where it is not given the destination table is asked, so the file is
+    read back as exactly what the table already declares -- a column that arrives all
+    NULL, or a GTFS id that looks like a number, cannot be inferred into something
+    else on the way in.
+
+    ``on_conflict`` is ``None``, ``"ignore"`` or ``"replace"``: the first for a table
+    with no key to collide on, the second where another pattern may already have
+    inserted the same edge, the third where two stages fill one row and the later one
+    wins.
+
+    Returns the number of rows staged, which is not the number inserted when a
+    conflict rule discards some.
+
+    ``rows`` is consumed once, while the file is being written. It must not be a
+    generator that queries ``con``: a connection holds one result at a time, so a
+    query started mid-stream abandons whatever this is iterating and the truncated
+    result looks complete.
+    """
+    if on_conflict not in _CONFLICT:
+        raise ValueError(f"on_conflict must be one of {sorted(_CONFLICT, key=str)}")
+    resolved = dict(types) if types is not None else _column_types(con, table)
+    missing = [c for c in cols if c not in resolved]
+    if missing:
+        raise ValueError(f"no type for {missing} of {table}; pass `types`")
+
+    spec = ",".join(f"'{c}':'{resolved[c]}'" for c in cols)
+    named = ", ".join(cols)
+    as_json = any(not _CSV_SAFE.match(resolved[c]) for c in cols)
+    with _staged(".ndjson" if as_json else ".csv") as path:
+        n = _write_json(path, cols, rows) if as_json else _write_csv(path, rows)
+        if not n:
+            return 0
+        # The path is ours, but the data root is the operator's and an apostrophe in
+        # it would otherwise end the string literal early -- `cluster` doubles it for
+        # the same reason.
+        quoted = str(path).replace("'", "''")
+        read = (
+            f"read_json('{quoted}', format='newline_delimited', columns={{{spec}}})"
+            if as_json
+            else f"read_csv('{quoted}', header=false, columns={{{spec}}})"
+        )
+        con.execute(
+            f"{_CONFLICT[on_conflict]} INTO {table} ({named}) "  # noqa: S608
+            f"SELECT {named} FROM {read}"
+        )
     return n
 
 
-def cluster(path: Path | None = None) -> tuple[int, int, int]:
-    """Cluster `edges` and compact the file. Returns (edges, bytes before, after).
+def _column_types(con: duckdb.DuckDBPyConnection, table: str) -> dict[str, str]:
+    return {
+        r[0]: r[1]
+        for r in con.execute(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            f"WHERE {_THIS_DATABASE} AND table_name = ?",
+            [table],
+        ).fetchall()
+    }
 
-    Two steps, because neither alone is the thing wanted. The reorder is what makes
-    the zonemaps prune; the compaction is what collects the *other* half of the win,
-    which is that sorted neighbours compress better -- 528 MB to 453 MB on the
-    benchmark's 4.2M edges.
 
-    The compaction has to write a new file. DuckDB never returns space below a
-    file's high-water mark: dropping the old table leaves its blocks allocated, and
-    neither CHECKPOINT nor VACUUM gives them back, so reordering in place ends up
-    *bigger* than it started -- measured at 505 MB going to 730. `COPY FROM
-    DATABASE` into a fresh file is what actually reclaims them, and it preserves row
-    order, so the curve survives the copy.
+def _write_csv(path: Path, rows: Iterable[Sequence[Any]]) -> int:
+    n = 0
+    with path.open("w", newline="") as fh:
+        writer = csv.writer(fh)
+        for r in rows:
+            writer.writerow(r)
+            n += 1
+    return n
 
-    The original is replaced only after the copy has been reopened and checked, and
-    the replace itself is atomic, so an interruption leaves the database that cost a
-    day of matching exactly as it was. It does need room for a second copy while it
-    runs.
+
+def _write_json(path: Path, cols: Sequence[str], rows: Iterable[Sequence[Any]]) -> int:
+    n = 0
+    with path.open("w") as fh:
+        for r in rows:
+            # `default=str` so a timestamp or a Decimal stages as the text DuckDB
+            # parses back into the column's own type, rather than raising here.
+            fh.write(json.dumps(dict(zip(cols, r, strict=True)), default=str))
+            fh.write("\n")
+            n += 1
+    return n
+
+
+# --- Status caches -----------------------------------------------------------
+
+# The one outcome of `match_status` and `trace_status` that is a statement about the
+# world at that moment rather than about the pattern. Everything else in either table
+# is permanent by design: a pattern that cannot be routed will never route, and a
+# stage that retries the impossible on every restart never finishes.
+TRANSPORT_ERROR = "transport_error"
+
+# What `--retry transient` expands to. Kept as a name rather than spelled out at the
+# call site so that adding a status here reaches the CLI, the help text and the
+# recovery path together.
+RETRYABLE = (TRANSPORT_ERROR,)
+_RETRY_ALIASES: dict[str, tuple[str, ...]] = {"transient": RETRYABLE}
+
+
+def expand_statuses(statuses: Sequence[str]) -> list[str]:
+    """Resolve the ``transient`` alias, leaving any literal status alone."""
+    out: list[str] = []
+    for s in statuses:
+        out.extend(_RETRY_ALIASES.get(s, (s,)))
+    return out
+
+
+def retry_statuses(
+    con: duckdb.DuckDBPyConnection,
+    status_table: str,
+    dependents: Sequence[str],
+    statuses: Sequence[str],
+    *,
+    key: str = "pattern_id",
+) -> int:
+    """Forget outcomes with these statuses so the next run redoes them.
+
+    Failures are deliberately never retried automatically. But when the stage itself
+    was wrong, the recorded failures are wrong too, and this is how they get cleared.
+    ``transient`` is the alias for the statuses that are safe to clear unattended,
+    which is ``transport_error`` alone: nothing was ever learned about those patterns.
+
+    ``dependents`` are the tables whose rows only exist because of the status row --
+    a cleared trace has to lose its geometry with it, or the next run writes a second
+    one. Tables shared across patterns are not dependents: `edges` is re-inserted on
+    conflict, and deleting a row another pattern still references would take that
+    pattern's geometry with it.
+
+    Call this *before* the stage starts, never between batches. Work is selected by
+    the absence of a status row, so deleting one while a batch holding that pattern
+    is in flight hands the same pattern out twice -- the same trap that makes a batch
+    the unit of both concurrency and checkpointing.
     """
-    path = path or config.DB_PATH
-    before = path.stat().st_size
-
-    con = connect(path)
-    try:
-        n = cluster_edges(con)
-    finally:
-        con.close()
-    if not n:
-        return 0, before, before
-
-    # Alongside the original rather than in a temp directory, so the rename at the
-    # end is within one filesystem and therefore atomic.
-    tmp = path.with_suffix(path.suffix + ".compacting")
-    tmp.unlink(missing_ok=True)
-    con = connect(path)
-    try:
-        # ATTACH takes a literal, not a bound parameter. The path comes from config
-        # rather than a request, but doubling the quote costs nothing and means a
-        # data directory with an apostrophe in it is not a broken command.
-        con.execute(f"ATTACH '{str(tmp).replace(chr(39), chr(39) * 2)}' AS compacted")
-        source = scalar(con, "SELECT current_database()")
-        con.execute(f'COPY FROM DATABASE "{source}" TO compacted')
-        con.execute("DETACH compacted")
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
-    finally:
-        con.close()
-
-    # Reopen the copy and count it before trusting it with the original's place.
-    # `COPY FROM DATABASE` carries data, not necessarily every index, so the
-    # pipeline's own are re-asserted here -- all of them `IF NOT EXISTS`.
-    check = connect(tmp)
-    try:
-        copied = int(scalar(check, "SELECT count(*) FROM edges"))
-        if copied != n:
-            raise RuntimeError(
-                f"compacted copy has {copied} edges, expected {n}; leaving {path} alone"
-            )
-        check.execute("CREATE UNIQUE INDEX IF NOT EXISTS edges_pk ON edges (edge_id)")
-        index(check)
-        check.execute("CHECKPOINT")
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
-    finally:
-        check.close()
-
-    after = tmp.stat().st_size
-    tmp.replace(path)
-    return n, before, after
-
-
-def prune_shapes(con: duckdb.DuckDBPyConnection) -> int:
-    """Drop the operator geometry that nothing needs any more.
-
-    ``shapes`` was once input to ``match`` and nothing else, so it could go whole
-    once matching finished. It is now also the *only* geometry a non-road pattern
-    has: a tram is drawn from its operator trace rather than matched, so its shape
-    is the picture and not an input to making one. Both clauses below exist because
-    of that, and getting either wrong is silent.
-
-    The pending test counts only matchable patterns. A tram never gets a
-    ``match_status`` row, so counting it as pending would make this refuse for ever
-    on any database that keeps one.
-
-    The delete then spares every shape a live non-matchable pattern still points at.
-    Those rows are worth keeping even after ``segments`` has copied them, because
-    the copy is derived and this is the source.
-    """
-    pending = scalar(
-        con,
-        f"""
-        SELECT count(*) FROM patterns p
-        WHERE {current_feed()}
-          AND {matchable()}
-          AND NOT EXISTS (SELECT 1 FROM match_status m WHERE m.pattern_id = p.pattern_id)
-        """,
-    )
-    if pending:
-        raise RuntimeError(
-            f"{pending} patterns are still unmatched; shapes is still needed. "
-            "Finish `wayfare match` first."
-        )
-    before = scalar(con, "SELECT count(*) FROM shapes")
-    con.execute(f"""
-        DELETE FROM shapes WHERE shape_id NOT IN (
-            SELECT p.shape_id FROM patterns p
-            WHERE {current_feed()} AND NOT {matchable()} AND p.shape_id IS NOT NULL
-        )
-    """)
-    kept = scalar(con, "SELECT count(*) FROM shapes")
-    if kept:
-        logs.get("db").info("kept %d shapes drawn directly by non-road patterns", kept)
-    con.execute("CHECKPOINT")
-    return int(before - kept)
+    wanted = expand_statuses(statuses)
+    ids = [
+        r[0]
+        for r in con.execute(
+            f"SELECT {key} FROM {status_table} WHERE status IN (SELECT unnest(?))",  # noqa: S608
+            [wanted],
+        ).fetchall()
+    ]
+    if not ids:
+        return 0
+    for table in (*dependents, status_table):
+        con.execute(f"DELETE FROM {table} WHERE {key} IN (SELECT unnest(?))", [ids])  # noqa: S608
+    logs.get("db").info("cleared %d outcomes with status in %s", len(ids), wanted)
+    return len(ids)
 
 
 def row(

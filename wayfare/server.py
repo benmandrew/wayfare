@@ -9,12 +9,11 @@ viewer fetch all 24 MB for every tile it wants. That looks like "slow" rather th
 "broken", which is the annoying way to discover it.
 
 The second is ``/art``. The expensive half of this project -- acquire, match,
-aggregate -- happens on a server, and until now ``wayfare art`` could only draw
-against a database on the same machine. Iterating on a design therefore meant
-copying tens of gigabytes to a laptop, or editing a style, rebuilding an image and
-watching a log. Rendering where the data already is turns that into a query string:
-the endpoint takes a window, a style, the style's knobs and the query spec -- what
-drives the ramps, what a group is, which services count -- and answers with a PNG.
+aggregate -- happens on a server, and the design work does not, so iterating on a
+style otherwise means copying tens of gigabytes to a laptop. Rendering where the
+data already is makes that a query string: the endpoint takes a window, a style,
+the style's knobs and the query spec -- what drives the ramps, what a group is,
+which services count -- and answers with a PNG.
 
 Renders are serialised and bounded. One at a time, because a render is CPU-bound
 cairo over a full scan of ``edges`` and the same box is usually also matching --
@@ -26,6 +25,7 @@ one parameter a caller can raise without limit.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import gzip
 import hashlib
@@ -38,14 +38,15 @@ import socketserver
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import ParseResult, parse_qs, urlparse
 
 import duckdb
 
-from . import art, config, db, logs
+from . import art, config, db, licences, logs
 
 log = logs.get("server")
 
@@ -58,12 +59,13 @@ RANGE = re.compile(r"bytes=(\d*)-(\d*)")
 ARTEFACT_SUFFIXES = (".pmtiles",)
 
 # Worth compressing, and small enough that doing it per request costs nothing.
-# Both spellings of JavaScript: Python reports .js as text/javascript from 3.12
-# and application/javascript before it, and the vendored maplibre build is the
-# largest thing the page loads -- listing only one spelling shipped it, and only
-# it, uncompressed. An archive is excluded by both tests below: it is three orders
-# of magnitude past the cap, and gzipping a body the client means to read in
-# ranges would defeat PMTiles entirely.
+# Both spellings of JavaScript, because which one `guess_type` returns for .js
+# depends on the interpreter -- text/javascript from 3.12, application/javascript
+# under 3.11 -- and the vendored maplibre build is the largest thing the page
+# loads, so a list holding one spelling serves it uncompressed on half of them. An
+# archive is excluded by both tests below: it is three orders of magnitude past the
+# cap, and gzipping a body the client means to read in ranges would defeat PMTiles
+# entirely.
 COMPRESSIBLE = frozenset(
     {
         "text/html",
@@ -120,9 +122,10 @@ REVALIDATE = "no-cache"
 # Render limits. Width alone is not the thing to cap: the window's aspect ratio
 # decides the height, and `scale` multiplies both, so a modest-looking
 # `width=4000&scale=4` over a tall window is 200 megapixels. The pixel budget is
-# what actually bounds the work; the width cap is there to give a clearer error for
-# the common typo of an extra zero.
-MAX_WIDTH = 12_000
+# what actually bounds the work; the dimension cap is there to give a clearer error
+# for the common typo of an extra zero. It bounds `height` as well as `width`, which
+# is why it is not named for either.
+MAX_DIMENSION = 12_000
 MAX_PIXELS = 64_000_000
 MAX_SCALE = 4.0
 MAX_CAPTION = 120
@@ -165,6 +168,7 @@ CONTENT_TYPES = {".png": "image/png", ".svg": "image/svg+xml"}
 # An instance, not the class: RenderOpts has slots, so its defaults live in the
 # dataclass fields rather than as class attributes to read off.
 DEFAULTS = art.RenderOpts(width_px=1600)
+DEFAULT_STYLE = "density"
 
 
 class BadRequest(ValueError):
@@ -172,7 +176,9 @@ class BadRequest(ValueError):
 
 
 def archives(out_dir: Path) -> list[str]:
-    return sorted(p.name for p in out_dir.glob("*.pmtiles")) if out_dir.is_dir() else []
+    if not out_dir.is_dir():
+        return []
+    return sorted(p.name for p in out_dir.iterdir() if p.name.endswith(ARTEFACT_SUFFIXES))
 
 
 # --- The render request -----------------------------------------------------
@@ -248,6 +254,16 @@ def _flag(q: dict[str, list[str]], name: str) -> bool:
     raise BadRequest(f"{name}={raw!r} is not a yes or a no")
 
 
+def _in_range(name: str, raw: str, lo: float, hi: float) -> float:
+    try:
+        value = float(raw)
+    except ValueError:
+        raise BadRequest(f"{name}={raw!r} is not a number") from None
+    if not lo <= value <= hi:
+        raise BadRequest(f"{name}={value:g} is out of range; it runs {lo:g} to {hi:g}")
+    return value
+
+
 def _number(
     q: dict[str, list[str]], name: str, lo: float, hi: float, default: float
 ) -> float:
@@ -257,15 +273,19 @@ def _number(
     `hue=0` is red -- and falling back on a falsy value would silently ignore it.
     """
     raw = _one(q, name)
-    if raw is None:
-        return default
-    try:
-        value = float(raw)
-    except ValueError:
-        raise BadRequest(f"{name}={raw!r} is not a number") from None
-    if not lo <= value <= hi:
-        raise BadRequest(f"{name}={value:g} is out of range; it runs {lo:g} to {hi:g}")
-    return value
+    return default if raw is None else _in_range(name, raw, lo, hi)
+
+
+def _optional_number(
+    q: dict[str, list[str]], name: str, lo: float, hi: float
+) -> float | None:
+    """The same check where absence is not a number at all.
+
+    `height` has no value that stands in for leaving it out: unset, the window's
+    aspect ratio decides it, and that is not something a default could say.
+    """
+    raw = _one(q, name)
+    return None if raw is None else _in_range(name, raw, lo, hi)
 
 
 def _count(q: dict[str, list[str]], name: str, hi: int) -> int:
@@ -401,7 +421,7 @@ def parse_art(query: str) -> ArtRequest:
     except (KeyError, ValueError) as exc:
         raise BadRequest(str(exc).strip("'\"")) from None
 
-    style = _one(q, "style") or "density"
+    style = _one(q, "style") or DEFAULT_STYLE
     if style not in art.STYLES:
         raise BadRequest(
             f"unknown style {style!r}; known styles: {', '.join(sorted(art.STYLES))}"
@@ -411,8 +431,9 @@ def parse_art(query: str) -> ArtRequest:
     if fmt not in art.FORMATS:
         raise BadRequest(f"unknown format {fmt!r}; use png or svg")
 
-    width = int(_number(q, "width", 64, MAX_WIDTH, DEFAULTS.width_px))
-    height = int(_number(q, "height", 64, MAX_WIDTH, 0)) if _one(q, "height") else None
+    width = int(_number(q, "width", 64, MAX_DIMENSION, DEFAULTS.width_px))
+    given_height = _optional_number(q, "height", 64, MAX_DIMENSION)
+    height = None if given_height is None else int(given_height)
     # SVG is resolution independent, so `scale` does nothing there. Held at 1 rather
     # than accepted and ignored, which would put it in the cache key for no reason.
     scale = 1.0 if fmt == ".svg" else _number(q, "scale", 0.1, MAX_SCALE, 1.0)
@@ -474,6 +495,46 @@ class Unavailable(RuntimeError):
     """Nothing the caller did wrong; try again. Reported as 503."""
 
 
+@contextlib.contextmanager
+def _read_only() -> Iterator[duckdb.DuckDBPyConnection]:
+    """A read-only handle for the length of one job, and closed again after it.
+
+    Never kept between requests. DuckDB gives a writer an exclusive lock on the
+    file, so a handle held open by this server would stop the next `match` or
+    `aggregate` run from starting -- a viewer nobody is using would quietly block
+    the pipeline. The open is metadata; the lock is what matters.
+
+    A file that is missing or already locked is `Unavailable` rather than a
+    traceback: neither is the caller's doing, and both come right on their own.
+    """
+    if not config.DB_PATH.exists():
+        raise Unavailable(f"no database at {config.DB_PATH}; the pipeline has not run here")
+    try:
+        con = db.connect(read_only=True)
+    except Exception as exc:  # duckdb raises several types for a held lock
+        raise Unavailable(
+            f"cannot read {config.DB_PATH}: {exc}. A pipeline stage is probably "
+            "writing to it; renders work again once it finishes."
+        ) from None
+    try:
+        yield con
+    finally:
+        con.close()
+
+
+def _stamp() -> str:
+    """Identity of the current database file, for cache keys and ETags.
+
+    Size and mtime rather than a content hash: the file is up to tens of
+    gigabytes, and every stage that changes it rewrites it in place.
+    """
+    try:
+        st = config.DB_PATH.stat()
+    except OSError:
+        return "absent"
+    return f"{st.st_size}-{st.st_mtime_ns}"
+
+
 def _matches(if_none_match: str | None, etag: str) -> bool:
     """Whether an If-None-Match header covers this ETag.
 
@@ -507,16 +568,7 @@ class Renderer:
         self._held = 0
 
     def stamp(self) -> str:
-        """Identity of the current database file, for cache keys and ETags.
-
-        Size and mtime rather than a content hash: the file is up to tens of
-        gigabytes, and every stage that changes it rewrites it in place.
-        """
-        try:
-            st = config.DB_PATH.stat()
-        except OSError:
-            return "absent"
-        return f"{st.st_size}-{st.st_mtime_ns}"
+        return _stamp()
 
     def key(self, request: ArtRequest) -> str:
         """Everything a render depends on: its parameters and the database."""
@@ -565,22 +617,7 @@ class Renderer:
             self._slot.release()
 
     def _draw(self, request: ArtRequest) -> bytes:
-        if not config.DB_PATH.exists():
-            raise Unavailable(
-                f"no database at {config.DB_PATH}; the pipeline has not run here"
-            )
-        # Opened per request and closed again, deliberately. DuckDB gives a writer an
-        # exclusive lock on the file, so a read-only handle held open by this server
-        # would stop the next `match` or `aggregate` run from starting -- a viewer
-        # nobody is using would quietly block the pipeline.
-        try:
-            con = db.connect(read_only=True)
-        except Exception as exc:  # duckdb raises several types for a held lock
-            raise Unavailable(
-                f"cannot read {config.DB_PATH}: {exc}. A pipeline stage is probably "
-                "writing to it; renders work again once it finishes."
-            ) from None
-        try:
+        with _read_only() as con:
             return art.render_bytes(
                 request.area,
                 request.style,
@@ -589,8 +626,6 @@ class Renderer:
                 query=request.query,
                 con=con,
             )
-        finally:
-            con.close()
 
     def _store(self, key: str, entry: tuple[bytes, str]) -> None:
         size = len(entry[0])
@@ -640,7 +675,7 @@ def art_meta(enabled: bool) -> dict[str, Any]:
             "orders": list(art.ORDERS),
         },
         "defaults": {
-            "style": "density",
+            "style": DEFAULT_STYLE,
             "width": DEFAULTS.width_px,
             "scale": DEFAULTS.scale,
             "hue": DEFAULTS.hue,
@@ -656,7 +691,11 @@ def art_meta(enabled: bool) -> dict[str, Any]:
             "preview_sample": PREVIEW_SAMPLE,
         },
         "limits": {
-            "max_width": MAX_WIDTH,
+            # One cap under two names: it bounds `height` as much as `width`, and the
+            # studio page reads `max_width`, so dropping that name would leave the
+            # width control unbounded until the page is rewritten.
+            "max_width": MAX_DIMENSION,
+            "max_dimension": MAX_DIMENSION,
             "max_pixels": MAX_PIXELS,
             "max_scale": MAX_SCALE,
             "max_sample": MAX_SAMPLE,
@@ -668,37 +707,60 @@ def art_meta(enabled: bool) -> dict[str, Any]:
         # What a render owes, from the one definition `art` also stamps into every
         # file it writes. Served rather than written into the page because it follows
         # the region this server's database holds, not the page's markup.
-        "credit": config.credit_html(),
+        "credit": licences.html(config.credit_parts()),
         "database": {"present": config.DB_PATH.exists()},
     }
     if meta["database"]["present"]:
         # Best effort: a pipeline stage may hold the write lock, and a viewer that
         # cannot report the feed version is still a working viewer.
         try:
-            con = db.connect(read_only=True)
-            try:
-                # max() rather than a bare select, so a database with no feed_version
-                # row still returns one row and reports null instead of raising.
-                meta["database"]["feed_version"] = db.scalar(
-                    con, "SELECT max(value) FROM meta WHERE key = 'feed_version'"
-                )
-                meta["database"]["edges"] = db.scalar(con, "SELECT count(*) FROM edges")
-                # What the filters can usefully be set to. A dropdown of the operators
-                # this database actually holds beats a free-text box that answers a
-                # typo with an empty picture -- and there is no other way for a caller
-                # to learn that this region is `FIRST` and `STAGE` rather than the
-                # national list.
-                meta["database"]["operators"] = _facet(
-                    con, "SELECT DISTINCT agency_id FROM edge_services"
-                )
-                meta["database"]["road_classes"] = _facet(
-                    con, "SELECT DISTINCT road_class FROM edges"
-                )
-            finally:
-                con.close()
+            meta["database"].update(_database_meta())
         except Exception as exc:
             meta["database"]["error"] = str(exc)
     return meta
+
+
+# What the last read of the database said about itself, against the file identity it
+# was read from. `/art/meta` is a page load, and the operator facet is a DISTINCT over
+# `edge_services` -- 10.25M rows with nothing to prune -- so a studio page reloading
+# every few minutes paid for a full scan each time. Invalidated the way the render
+# cache is, on size and mtime, so a rebuilt database is never described by the
+# previous one's dropdowns. Keyed on the path as well, since a test or a second
+# region can move `config.DB_PATH` under a live process.
+_meta_lock = threading.Lock()
+_meta_cache: tuple[tuple[str, str], dict[str, Any]] | None = None
+
+
+def _database_meta() -> dict[str, Any]:
+    """The feed version, the edge count and the facet lists, in one read.
+
+    A hit opens nothing, which is the point: the connection is the cheap half and
+    the lock it competes for is not.
+    """
+    global _meta_cache
+    key = (str(config.DB_PATH), _stamp())
+    with _meta_lock:
+        if _meta_cache is not None and _meta_cache[0] == key:
+            return dict(_meta_cache[1])
+    with _read_only() as con:
+        details: dict[str, Any] = {
+            # max() rather than a bare select, so a database with no feed_version
+            # row still returns one row and reports null instead of raising.
+            "feed_version": db.scalar(
+                con, "SELECT max(value) FROM meta WHERE key = 'feed_version'"
+            ),
+            "edges": db.scalar(con, "SELECT count(*) FROM edges"),
+            # What the filters can usefully be set to. A dropdown of the operators
+            # this database actually holds beats a free-text box that answers a typo
+            # with an empty picture -- and there is no other way for a caller to
+            # learn that this region is `FIRST` and `STAGE` rather than the national
+            # list.
+            "operators": _facet(con, "SELECT DISTINCT agency_id FROM edge_services"),
+            "road_classes": _facet(con, "SELECT DISTINCT road_class FROM edges"),
+        }
+    with _meta_lock:
+        _meta_cache = (key, details)
+    return dict(details)
 
 
 def _facet(con: duckdb.DuckDBPyConnection, sql: str) -> list[str]:
@@ -762,6 +824,115 @@ def _gzipped(path: str) -> bytes | None:
     return body
 
 
+class ArtEndpoint:
+    """The three routes that answer with JSON or with an image, not with a file.
+
+    A collaborator rather than more handler methods, because the two halves of this
+    server have nothing in common past the socket. The static half is validators,
+    freshness and byte ranges over whatever is on disk; this half parses a request,
+    queues behind the render slot, and reports its faults in a form a program can
+    read. `/archives.json` sits here for that last reason alone: it is the same
+    three headers and the same encode as the other two.
+    """
+
+    PATHS = ("/archives.json", "/art/meta", "/art")
+
+    def __init__(self, handler: Handler) -> None:
+        self.handler = handler
+
+    def serve(self, url: ParseResult) -> None:
+        if url.path == "/archives.json":
+            self.json(archives(self.handler.out_dir))
+        elif url.path == "/art/meta":
+            self.json(art_meta(self.handler.renderer is not None))
+        else:
+            self.render(url.query)
+
+    def render(self, query: str) -> None:
+        handler, renderer = self.handler, self.handler.renderer
+        if renderer is None:
+            self.problem(501, "rendering is switched off on this server (--no-art)")
+            return
+        try:
+            request = parse_art(query)
+        except BadRequest as exc:
+            self.problem(400, str(exc))
+            return
+
+        # A design under iteration is requested over and over with one value moved,
+        # so the unchanged ones should cost a 304 rather than a redraw.
+        etag = renderer.etag(request)
+        if _matches(handler.headers.get("If-None-Match"), etag):
+            handler.send_response(304)
+            handler.send_header("ETag", etag)
+            handler.end_headers()
+            return
+
+        t0 = time.monotonic()
+        try:
+            body, etag = renderer.render(request)
+        except Unavailable as exc:
+            self.problem(503, str(exc), retry_after=10)
+            return
+        except ImportError as exc:
+            # pycairo missing. Reported as 501 rather than 500 because the fix is to
+            # the installation, not to the request, and the message says which.
+            self.problem(501, str(exc))
+            return
+        except (KeyError, ValueError) as exc:
+            # A window that resolve() accepted but a style rejected, and anything
+            # else the renderer considers the caller's fault.
+            self.problem(400, str(exc).strip("'\""))
+            return
+        except Exception:
+            log.exception("render failed: %s", query)
+            self.problem(500, "the render failed; see the server log")
+            return
+
+        # keep_blank_values, because `&download` on its own is how a link says it.
+        download = "download" in parse_qs(query, keep_blank_values=True)
+        disposition = "attachment" if download else "inline"
+        handler.send_response(200)
+        handler.send_header("Content-Type", CONTENT_TYPES[request.fmt])
+        handler.send_header("Content-Length", str(len(body)))
+        handler.send_header("ETag", etag)
+        # no-cache, not no-store: the browser may keep it, but must revalidate, so a
+        # rebuilt database is never served from a stale copy.
+        handler.send_header("Cache-Control", "no-cache")
+        handler.send_header(
+            "Content-Disposition", f'{disposition}; filename="{request.filename()}"'
+        )
+        if request.warning:
+            handler.send_header("X-Wayfare-Warning", request.warning)
+        elapsed = (time.monotonic() - t0) * 1e3
+        handler.send_header("Server-Timing", f"render;dur={elapsed:.0f}")
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    def json(
+        self, payload: object, status: int = 200, retry_after: int | None = None
+    ) -> None:
+        handler = self.handler
+        body = json.dumps(payload).encode()
+        handler.send_response(status)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.send_header("Cache-Control", "no-store")
+        if retry_after is not None:
+            handler.send_header("Retry-After", str(retry_after))
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    def problem(self, status: int, detail: str, retry_after: int | None = None) -> None:
+        """An error as JSON, because every caller of /art is a program.
+
+        SimpleHTTPRequestHandler's send_error writes an HTML page, which an <img> or
+        a fetch() shows as a broken image with the reason nowhere the user can see
+        it. The studio page displays this `detail` verbatim.
+        """
+        self.json({"error": detail, "status": status}, status, retry_after)
+
+
 class Handler(http.server.SimpleHTTPRequestHandler):
     # Keep-alive. The default is HTTP/1.0, so every request cost a fresh TCP
     # connection and a fresh thread -- and MapLibre issues dozens of PMTiles range
@@ -781,14 +952,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     # mid-connection (`bytes=-`, also below).
     protocol_version = "HTTP/1.1"
 
-    # Keep-alive is what makes this necessary, and it is why the cost arrived with
-    # the line above rather than before it. `BaseHTTPRequestHandler` flushes its
-    # headers and then writes the body as a second, smaller write. Nagle holds that
-    # second write until the peer acknowledges the first, and Linux delays that
-    # acknowledgement by 40 ms. Under HTTP/1.0 the close after each response flushed
-    # it immediately, so the stall could not appear; with the connection kept open it
-    # lands on every request after the first, which is every range request of a pan
-    # but one.
+    # Keep-alive is what makes this necessary, so it belongs with the line above.
+    # `BaseHTTPRequestHandler` flushes its headers and then writes the body as a
+    # second, smaller write. Nagle holds that second write until the peer
+    # acknowledges the first, and Linux delays that acknowledgement by 40 ms. Under
+    # HTTP/1.0 the close after each response flushed it immediately, so the stall
+    # could not appear; with the connection kept open it lands on every request
+    # after the first, which is every range request of a pan but one.
     #
     # Measured in the container on emel, on loopback with no network in the path:
     # 41 ms a request against 0.3 ms with this set. Over the deployed tailnet path a
@@ -839,101 +1009,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self._pending_etag = None
         self._pending_cc = REVALIDATE
         url = urlparse(self.path)
-        if url.path == "/archives.json":
-            self._json(archives(self.out_dir))
-            return
-        if url.path == "/art/meta":
-            self._json(art_meta(self.renderer is not None))
-            return
-        if url.path == "/art":
-            self._art(url.query)
+        if url.path in ArtEndpoint.PATHS:
+            ArtEndpoint(self).serve(url)
             return
         super().do_GET()
-
-    def _art(self, query: str) -> None:
-        if self.renderer is None:
-            self._problem(501, "rendering is switched off on this server (--no-art)")
-            return
-        try:
-            request = parse_art(query)
-        except BadRequest as exc:
-            self._problem(400, str(exc))
-            return
-
-        # A design under iteration is requested over and over with one value moved,
-        # so the unchanged ones should cost a 304 rather than a redraw.
-        etag = self.renderer.etag(request)
-        if _matches(self.headers.get("If-None-Match"), etag):
-            self.send_response(304)
-            self.send_header("ETag", etag)
-            self.end_headers()
-            return
-
-        t0 = time.monotonic()
-        try:
-            body, etag = self.renderer.render(request)
-        except Unavailable as exc:
-            self._problem(503, str(exc), retry_after=10)
-            return
-        except ImportError as exc:
-            # pycairo missing. Reported as 501 rather than 500 because the fix is to
-            # the installation, not to the request, and the message says which.
-            self._problem(501, str(exc))
-            return
-        except (KeyError, ValueError) as exc:
-            # A window that resolve() accepted but a style rejected, and anything
-            # else the renderer considers the caller's fault.
-            self._problem(400, str(exc).strip("'\""))
-            return
-        except Exception:
-            log.exception("render failed: %s", query)
-            self._problem(500, "the render failed; see the server log")
-            return
-
-        # keep_blank_values, because `&download` on its own is how a link says it.
-        download = "download" in parse_qs(query, keep_blank_values=True)
-        disposition = "attachment" if download else "inline"
-        self.send_response(200)
-        self.send_header("Content-Type", CONTENT_TYPES[request.fmt])
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("ETag", etag)
-        # no-cache, not no-store: the browser may keep it, but must revalidate, so a
-        # rebuilt database is never served from a stale copy.
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header(
-            "Content-Disposition", f'{disposition}; filename="{request.filename()}"'
-        )
-        if request.warning:
-            self.send_header("X-Wayfare-Warning", request.warning)
-        self.send_header("Server-Timing", f"render;dur={(time.monotonic() - t0) * 1e3:.0f}")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _json(self, payload: object, status: int = 200) -> None:
-        body = json.dumps(payload).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _problem(self, status: int, detail: str, retry_after: int | None = None) -> None:
-        """An error as JSON, because every caller of /art is a program.
-
-        SimpleHTTPRequestHandler's send_error writes an HTML page, which an <img> or
-        a fetch() shows as a broken image with the reason nowhere the user can see
-        it. The studio page displays this `detail` verbatim.
-        """
-        body = json.dumps({"error": detail, "status": status}).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        if retry_after is not None:
-            self.send_header("Retry-After", str(retry_after))
-        self.end_headers()
-        self.wfile.write(body)
 
     def send_head(self):  # type: ignore[no-untyped-def]
         path = self._resolve(self.translate_path(self.path))
@@ -1094,16 +1173,19 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.send_header("Content-Length", str(end - start + 1))
         self.send_header("Accept-Ranges", "bytes")
-        self._cors()
         self.end_headers()
         f.seek(start)
         return _Slice(f, end - start + 1)
 
     def end_headers(self) -> None:
-        sent = self._headers_buffer_str()
-        if self.command == "OPTIONS" or "Content-Range" not in sent:
-            self._cors()
-        if self._pending_etag and "ETag:" not in sent:
+        """The one hook every response passes through, whatever wrote it.
+
+        So the headers that belong on all of them are added here and nowhere else:
+        a response that also added its own would send them twice, and the only way
+        to notice would be to read back the buffer the stdlib is still building.
+        """
+        self._cors()
+        if self._pending_etag:
             self.send_header("ETag", self._pending_etag)
             self.send_header("Cache-Control", self._pending_cc)
         super().end_headers()
@@ -1114,9 +1196,6 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             "Access-Control-Expose-Headers",
             "Content-Range, Accept-Ranges, Server-Timing, X-Wayfare-Warning",
         )
-
-    def _headers_buffer_str(self) -> str:
-        return b"".join(getattr(self, "_headers_buffer", [])).decode("latin-1")
 
     def copyfile(self, source: Any, outputfile: Any) -> None:
         """Panning the map cancels every tile still in flight, so a client hanging

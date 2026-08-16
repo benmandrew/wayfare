@@ -39,8 +39,10 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass, field
-from math import cos, radians, sqrt
+from functools import cached_property
+from math import asin, cos, radians, sin, sqrt
 from pathlib import Path
 from typing import Any
 
@@ -50,10 +52,16 @@ from . import config, logs
 
 log = logs.get("osm")
 
-# One degree of latitude, near enough anywhere. Distances here are all local -- a
-# stop against a station node, a way endpoint against the next way's -- so a plane
-# through the local latitude is exact well past the precision any of it carries.
-_M_PER_DEG_LAT = 111_320.0
+# One degree of latitude, near enough anywhere. The distances this scales are all
+# local -- a stop against a station node, a way endpoint against the next way's -- so
+# a plane through the local latitude is exact well past the precision any of it
+# carries. Public because the modules that draw track measure in the same plane, and
+# a second copy of the number is a second thing to get wrong.
+M_PER_DEG_LAT = 111_320.0
+
+# Mean earth radius, the same figure `db.HAVERSINE_SQL` and Valhalla measure with, so
+# a length computed here is comparable with a stop span computed in SQL.
+EARTH_RADIUS_M = 6_371_000.0
 
 
 class TransportError(RuntimeError):
@@ -116,6 +124,15 @@ class Chain:
 
 # -- fetching ----------------------------------------------------------------
 
+# Overpass sheds load rather than queueing, and a national query is the only request
+# a whole `trace` run makes: without these, one 429 arriving after a minutes-long
+# wait ends the stage having learned nothing about any pattern. The waits are long
+# because what is being waited for is a free slot on a metered public service, not a
+# flapping socket -- `acquire.download` backs off over the same shape and the same
+# arithmetic, and the two are separate only because they retry different exceptions.
+OVERPASS_RETRIES = 4
+OVERPASS_BACKOFF = 30.0  # seconds, multiplied by attempt number
+
 
 def query(bbox: tuple[float, float, float, float]) -> str:
     """The Overpass QL for every route relation over a window, geometry included.
@@ -153,6 +170,11 @@ def fetch(
     re-run of `trace` after a code change must not pay for it again -- and keeping
     the body means a parser fix can be applied to the bytes that were already
     fetched, which is the failure this actually protects against.
+
+    Retried while the failure is a transport one, because this is the only request a
+    `trace` run makes and the stage has nowhere to record a fault that was never
+    about any pattern. A `TransportError` still escapes once the attempts are spent,
+    so the caller's own handling of it is unchanged.
     """
     if cache is not None and cache.exists() and not refresh:
         log.info("reading OSM relations from %s", cache)
@@ -160,7 +182,44 @@ def fetch(
 
     ql = query(bbox)
     log.info("querying Overpass over %s (this takes minutes at national scale)", bbox)
-    sess = session or requests.Session()
+    data = _fetch_body(ql, session or requests.Session())
+
+    relations = parse(data)
+    if cache is not None:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(data))
+        log.info("cached %d relations to %s", len(relations), cache)
+    return relations
+
+
+def _fetch_body(ql: str, sess: requests.Session) -> dict[str, Any]:
+    """One Overpass query, retried while the failure says nothing about the query.
+
+    `TransportError` is the retryable outcome and the only one: it means the request
+    never got an answer, so trying again can learn something. An `OverpassError` is
+    the server saying the query itself is wrong, and it will be just as wrong in
+    thirty seconds.
+    """
+    attempt = 1
+    while True:
+        try:
+            return _post(ql, sess)
+        except TransportError as exc:
+            if attempt >= OVERPASS_RETRIES:
+                raise
+            wait = OVERPASS_BACKOFF * attempt
+            log.warning(
+                "Overpass attempt %d of %d failed (%s); retrying in %.0fs",
+                attempt,
+                OVERPASS_RETRIES,
+                exc,
+                wait,
+            )
+            time.sleep(wait)
+            attempt += 1
+
+
+def _post(ql: str, sess: requests.Session) -> dict[str, Any]:
     try:
         r = sess.post(
             config.OVERPASS_URL,
@@ -176,18 +235,12 @@ def fetch(
     if not r.ok:
         raise OverpassError(f"{r.status_code}: {r.text[:500]}")
     try:
-        data = r.json()
+        body: dict[str, Any] = r.json()
     except ValueError as exc:
         # A body that will not parse is a truncated read, not a bad query. Overpass
         # also answers an over-quota query with HTTP 200 and an HTML error page.
         raise TransportError(f"Overpass response did not parse: {exc}") from exc
-
-    relations = parse(data)
-    if cache is not None:
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_text(json.dumps(data))
-        log.info("cached %d relations to %s", len(relations), cache)
-    return relations
+    return body
 
 
 def parse(data: dict[str, Any]) -> list[Relation]:
@@ -295,9 +348,7 @@ def _near(a: tuple[float, float], b: tuple[float, float]) -> bool:
     They should be identical to the 1e-7 of a degree Overpass prints, so this is a
     rounding guard and not a tolerance -- see `config.TRACE_JOIN_TOLERANCE_M`.
     """
-    dy = (b[0] - a[0]) * _M_PER_DEG_LAT
-    dx = (b[1] - a[1]) * _M_PER_DEG_LAT * cos(radians(a[0]))
-    return dy * dy + dx * dx <= config.TRACE_JOIN_TOLERANCE_M**2
+    return planar_m(a, b) <= config.TRACE_JOIN_TOLERANCE_M
 
 
 # -- names -------------------------------------------------------------------
@@ -395,8 +446,36 @@ def to_metres(
     one line -- so a plane is exact well past the precision the geometry carries,
     and it keeps the projection loop to arithmetic.
     """
-    scale = _M_PER_DEG_LAT * cos(radians(ref_lat))
-    return [(lon * scale, lat * _M_PER_DEG_LAT) for lat, lon in points]
+    scale = M_PER_DEG_LAT * cos(radians(ref_lat))
+    return [(lon * scale, lat * M_PER_DEG_LAT) for lat, lon in points]
+
+
+def haversine_m(a: tuple[float, float], b: tuple[float, float]) -> float:
+    """Great-circle distance between two (lat, lon) points, in metres.
+
+    The exact one. Use it wherever the two points may be far apart or in different
+    parts of the country -- a stop chain's span, two stations that share a name --
+    because that is where :func:`planar_m` stops being a rounding difference.
+    """
+    lat1, lon1 = radians(a[0]), radians(a[1])
+    lat2, lon2 = radians(b[0]), radians(b[1])
+    h = sin((lat2 - lat1) / 2) ** 2 + cos(lat1) * cos(lat2) * sin((lon2 - lon1) / 2) ** 2
+    return 2 * EARTH_RADIUS_M * asin(sqrt(h))
+
+
+def planar_m(a: tuple[float, float], b: tuple[float, float]) -> float:
+    """Distance between two (lat, lon) points on a plane through the first's latitude.
+
+    An approximation, and named so it cannot be mistaken for the exact one. It is
+    what :func:`to_metres` measures in, so anything compared against a projected
+    chain has to use it, and over the tens of metres those comparisons cover it
+    agrees with :func:`haversine_m` to well inside the precision the geometry
+    carries. Over a national span it does not: the error grows with the north-south
+    separation, and `tests/test_osm.py` pins where it stops being negligible.
+    """
+    dy = (b[0] - a[0]) * M_PER_DEG_LAT
+    dx = (b[1] - a[1]) * M_PER_DEG_LAT * cos(radians(a[0]))
+    return sqrt(dy * dy + dx * dx)
 
 
 def cumulative(pts: list[tuple[float, float]]) -> list[float]:
@@ -505,3 +584,88 @@ def ways_between(
         idx = min(range(len(cum)), key=lambda i: abs(cum[i] - start_m))
         out.append(way_at[idx])
     return out
+
+
+# -- preparing a relation ----------------------------------------------------
+
+
+@dataclass
+class Measured:
+    """One relation's ways chained, and measured along that chain.
+
+    Every stage that draws from a relation needs the same four things in the same
+    order -- the chain, a metre plane to project in, the distance to each vertex, and
+    the stop names normalised for the join -- and each pays for them once per
+    relation and then fits many patterns against them.
+
+    What the stages do *not* share is the gate. `trace` also demands two stops,
+    `osmroutes` counts a break separately from every other refusal, and `railtrips`
+    wants only the routes its mode map names. So nothing is rejected here: the chain
+    is handed back however it came out and the caller decides, with `chains` and
+    `breaks` there to decide on.
+
+    The measurement is computed on first use so that a relation refused for its
+    breaks does not pay for a projection nobody reads.
+    """
+
+    relation: Relation
+    chain: Chain
+
+    @property
+    def breaks(self) -> int:
+        return self.chain.breaks
+
+    @property
+    def chains(self) -> bool:
+        """Whether the ways form one continuous path with something drawable on it."""
+        return not self.chain.breaks and len(self.chain.points) >= 2
+
+    @property
+    def points(self) -> list[tuple[float, float]]:
+        """The chain in (lat, lon), which is what gets stored and drawn."""
+        return self.chain.points
+
+    @property
+    def way_ids(self) -> list[int]:
+        return self.chain.way_ids
+
+    @property
+    def way_at(self) -> list[int]:
+        return self.chain.way_at
+
+    @cached_property
+    def ref_lat(self) -> float:
+        """The latitude the metre plane passes through: the chain's own first point."""
+        return self.chain.points[0][0] if self.chain.points else 0.0
+
+    @cached_property
+    def metres(self) -> list[tuple[float, float]]:
+        return to_metres(self.chain.points, self.ref_lat)
+
+    @cached_property
+    def cum(self) -> list[float]:
+        return cumulative(self.metres)
+
+    @cached_property
+    def names(self) -> list[str]:
+        """Normalised stop names, in relation order and one per stop.
+
+        One per stop, including the unnamed ones, because a caller matching a stop
+        sequence needs the positions to line up with `relation.stops`. A caller that
+        only wants the names it can join on filters the empties out.
+        """
+        return [normalise(s.name) for s in self.relation.stops]
+
+    def place(self, lat: float, lon: float) -> tuple[float, float]:
+        """Where a coordinate falls on this chain: (distance along, distance from).
+
+        Both in metres. The caller wants the first to cut the chain and the second to
+        decide whether the point belongs to this line at all.
+        """
+        (point,) = to_metres([(lat, lon)], self.ref_lat)
+        return project(self.metres, self.cum, point)
+
+
+def prepare(relation: Relation) -> Measured:
+    """Chain a relation and hand back everything measured off that chain."""
+    return Measured(relation, chain(relation))

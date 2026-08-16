@@ -82,6 +82,15 @@ window.__heads = (async () => {
 })();
 </script>
 <link rel="stylesheet" href="vendor/maplibre-gl.css">
+<!-- The palette and the panel chrome, shared with art.html. Linked before the
+     page's own rules, so those still win. -->
+<link rel="stylesheet" href="base.css">
+<!-- Up here, and blocking, for the one line under it: the theme has to be on the
+     document before the first paint, and everything the page draws is behind the
+     803 KB vendored library. Applied down there, a reader who chose dark got a
+     screenful of white while the library parsed. -->
+<script src="util.js"></script>
+<script>bootTheme();</script>
 <style>
 /* Visible to a screen reader, not on screen. The search input is identified only
    by its placeholder otherwise, and a placeholder is not an accessible name. */
@@ -94,32 +103,6 @@ window.__heads = (async () => {
   white-space: nowrap;
   border: 0;
 }
-:root {
-  --bg:        #ffffff;
-  --panel:     rgba(255,255,255,.94);
-  --border:    #dcdfe4;
-  --text:      #16181d;
-  --muted:     #6b7280;
-  --chip-bg:   #eef1f5;
-  --chip-text: #2b3440;
-  --accent:    #d64512;
-  --shadow:    0 1px 2px rgba(16,24,40,.06), 0 8px 24px rgba(16,24,40,.10);
-  --radius:    8px;
-}
-[data-theme="dark"] {
-  --bg:        #0d1014;
-  --panel:     rgba(20,24,30,.92);
-  --border:    #2b323c;
-  --text:      #e8ecf1;
-  --muted:     #8b949e;
-  --chip-bg:   #232a33;
-  --chip-text: #d7dee7;
-  --accent:    #ffd15c;
-  --shadow:    0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.45);
-}
-
-* { box-sizing: border-box; }
-html, body { height: 100%; margin: 0; }
 /* The map, the panels and the boot overlay are all absolutely positioned, so this
    is the box every one of them measures. `dvh` rather than `%`, because a phone's
    layout viewport is the *large* viewport -- the one with the browser's toolbars
@@ -138,14 +121,7 @@ body {
 }
 #map { position: absolute; inset: 0; }
 
-/* --- panel chrome --- */
-.panel {
-  background: var(--panel);
-  backdrop-filter: blur(8px);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow);
-}
+/* --- the two panel stacks --- */
 .stack { position: absolute; z-index: 2; display: flex; flex-direction: column; gap: 8px; }
 /* Capped at the screen and scrolled inside that cap, at every width. The header,
    the search, the help and a national archive's eight-row key add up to more than
@@ -163,40 +139,6 @@ body {
    panels keep the height their content asks for. */
 .stack--tl > .panel { flex: none; }
 .stack--tr { top: 12px; right: 12px; width: 300px; max-height: calc(100% - 100px); }
-
-h1 {
-  margin: 0;
-  font-size: 13px;
-  font-weight: 600;
-  letter-spacing: .02em;
-}
-.sub { color: var(--muted); font-size: 11.5px; margin-top: 2px; }
-/* The floor on the title column is what forces the wrap on a narrow panel:
-   without it flexbox spends the whole row on the controls and squeezes the
-   strapline down to one word per line. 110px is under what is free with the three
-   buttons alone, so the ordinary case is still the one-row header. */
-.head { padding: 10px 12px; display: flex; align-items: flex-start; gap: 8px; flex-wrap: wrap; }
-.head > div { flex: 1; min-width: 110px; }
-
-.btn {
-  font: inherit;
-  font-size: 11.5px;
-  color: var(--muted);
-  background: none;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 3px 7px;
-  cursor: pointer;
-  white-space: nowrap;
-}
-/* Guarded, because a touchscreen has no hover to leave: the browser fakes one on
-   tap and then holds it, so every button anyone has pressed stays lit. `:active`
-   is the feedback that belongs to a finger. */
-@media (hover: hover) {
-  .btn:hover { color: var(--text); border-color: var(--muted); }
-}
-.btn:active { color: var(--text); border-color: var(--muted); }
-a.btn { text-decoration: none; }
 
 /* --- search --- */
 .search { padding: 0 12px 10px; }
@@ -217,18 +159,15 @@ a.btn { text-decoration: none; }
 .card { padding: 11px 12px; overflow-y: auto; min-height: 0; }
 .road { font-size: 14px; font-weight: 600; margin: 0 0 1px; }
 .road.empty { color: var(--muted); font-weight: 400; font-size: 13px; }
-.meta { color: var(--muted); font-size: 11.5px; }
-.meta b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
 .chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 9px; }
 .chip {
-  font: 500 11.5px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 500 11.5px/1 var(--mono);
   background: var(--chip-bg);
   color: var(--chip-text);
   border-radius: 4px;
   padding: 4px 6px;
 }
 .chip.on { background: var(--accent); color: var(--bg); }
-.note { color: var(--muted); font-size: 11px; margin-top: 8px; font-style: italic; }
 
 /* --- legend --- */
 .legend { padding: 10px 12px; }
@@ -257,7 +196,6 @@ a.btn { text-decoration: none; }
 .help { padding: 0 12px 11px; color: var(--muted); font-size: 11.5px; }
 .help p { margin: 0 0 6px; }
 .help p:last-child { margin: 0; }
-[hidden] { display: none !important; }
 
 /* --- boot / error overlay --- */
 #boot {
@@ -270,12 +208,12 @@ a.btn { text-decoration: none; }
 #boot h2 { margin: 0 0 8px; font-size: 15px; }
 #boot p { margin: 0 0 10px; color: var(--muted); }
 #boot code {
-  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 12px/1.5 var(--mono);
   background: var(--chip-bg); color: var(--chip-text);
   padding: 1px 5px; border-radius: 4px;
 }
 #boot pre {
-  font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+  font: 12px/1.6 var(--mono);
   background: var(--chip-bg); color: var(--chip-text);
   padding: 10px 12px; border-radius: 6px; margin: 0 0 10px; overflow-x: auto;
 }
@@ -467,6 +405,10 @@ a.btn { text-decoration: none; }
 const WANTED = new URLSearchParams(location.search).get("tiles");
 
 let ARCHIVES = [];
+// What `failed` names when it has to report. `boot` overwrites it as soon as the
+// index answers; until then it is what the URL alone says, so a throw ahead of
+// that still names something a reader can act on rather than nothing.
+let TRIED = WANTED ? [WANTED] : ["./bus.pmtiles"];
 // One entry per archive that opened, carrying the ids it owns in the style. Ids
 // are per-archive because MapLibre needs one source per PMTiles file: the format
 // is one archive, one tile pyramid, and there is no union source.
@@ -493,10 +435,6 @@ const RAMP_COLOURS = {
   dark:  ["#2f4d6b","#3d7ea8","#3fa8bd","#5fcf9f","#c0e86f","#ffdf5c"],
 };
 const RAMP_STEPS = RAMP_COLOURS.light.length;
-const BASEMAP = {
-  light: "light_all",
-  dark:  "dark_all",
-};
 const HOVER_COLOUR = { light: "#d64512", dark: "#ffffff" };
 
 // One colour per non-road mode, and deliberately outside the road ramp rather than
@@ -663,16 +601,21 @@ function rampFrom(hex, t, steps = RAMP_STEPS) {
   });
 }
 
-// Cached: eight modes times two themes, rebuilt on every repaint and every
-// expression otherwise, for a result that never changes.
-const rampCache = new Map();
-function modeRamp(t, mode) {
-  const key = `${t}|${mode}`;
-  if (!rampCache.has(key)) {
-    rampCache.set(key, rampFrom(MODE_COLOUR[t][mode] || FALLBACK_MODE_COLOUR[t], t));
-  }
-  return rampCache.get(key);
+// Eight modes times two themes, rebuilt on every repaint and inside every
+// expression otherwise, for a result that never changes. One memo rather than a
+// cache per function, because every one of these is keyed on the same pair.
+function memo(fn) {
+  const cache = new Map();
+  return (t, mode) => {
+    const key = `${t}|${mode}`;
+    if (!cache.has(key)) cache.set(key, fn(t, mode));
+    return cache.get(key);
+  };
 }
+
+const modeColour = (t, mode) => MODE_COLOUR[t][mode] || FALLBACK_MODE_COLOUR[t];
+
+const modeRamp = memo((t, mode) => rampFrom(modeColour(t, mode), t));
 
 // The one flat colour relation track is drawn in: the middle of the mode's own
 // ramp. Flat because the track has no journey count to shade by -- `trips` is null
@@ -684,15 +627,7 @@ function modeRamp(t, mode) {
 // Taken at u = 0.5 of the ramp rather than by indexing it, because six steps have
 // no middle one -- steps 2 and 3 straddle the midpoint. Three steps put one exactly
 // on it, and the same generator produces both.
-const midCache = new Map();
-function modeMid(t, mode) {
-  const key = `${t}|${mode}`;
-  if (!midCache.has(key)) {
-    const hex = MODE_COLOUR[t][mode] || FALLBACK_MODE_COLOUR[t];
-    midCache.set(key, rampFrom(hex, t, 3)[1]);
-  }
-  return midCache.get(key);
-}
+const modeMid = memo((t, mode) => rampFrom(modeColour(t, mode), t, 3)[1]);
 
 // What a track feature is drawn as. `rail` where the tile carries no `mode`, which
 // is every archive built before the traced modes joined this layer: those hold
@@ -703,7 +638,7 @@ const TRACK_MODE = "rail";
 const trackMode = ["case", ["has", "mode"], ["to-string", ["get", "mode"]], TRACK_MODE];
 
 // Which modes have been drawn, and so which rows the legend carries. Declared up
-// here rather than beside `noteRenderedModes`, which fills it: `paintLegend`
+// here rather than beside `noteRendered`, which fills it: `paintLegend`
 // reads it and boot paints the legend before the map exists, so a declaration
 // further down leaves that first paint throwing on the temporal dead zone.
 //
@@ -733,10 +668,6 @@ const seenTrackModes = new Set();
 const hiddenRows = new Set();
 const rowKey = (mode) => `mode:${mode}`;
 const trackRowKey = (mode) => `track:${mode}`;
-
-const $ = (id) => document.getElementById(id);
-let theme = localStorage.getItem("wayfare-theme")
-  || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
 
 // Whether the thing pointing at this page is a finger. It decides what the page
 // says as well as how it is drawn: an instruction to hover, and a keyboard
@@ -795,14 +726,21 @@ const PER_DAY = ["/", ["to-number", ["get", "trips"], 0], 7];
 //
 // The top still clamps 0.9%, and that is one fixed scale serving a country where
 // the busiest road carries 9,445 journeys a day and the median lane carries 31.
+// The half-decade sequence the argument above arrives at. One array under both
+// of the names below, because a tick has to sit on the colour it names: two
+// arrays is a stop that can move on its own, leaving a bar whose labels describe
+// a ramp it is no longer drawn from.
+const RAMP_AT = [3, 10, 30, 100, 300, 1000];
+
 const RAMP = {
   // Clamped above zero before the log: an edge with no trips is not something the
   // pipeline publishes, but -Infinity reaching a paint property is a blank map
   // rather than an error, so it is not left to chance.
   expr: ["log10", ["max", PER_DAY, 0.01]],
   at: Math.log10,
-  stops: [3, 10, 30, 100, 300, 1000],
-  ticks: [3, 10, 30, 100, 300, 1000],
+  // Where a colour changes, and where a label goes: the same six numbers.
+  stops: RAMP_AT,
+  ticks: RAMP_AT,
   // The attribute this ramp cannot be drawn without. An archive published before
   // `trips` was taken out of `_DETAIL_ONLY` answers every zoom below 11 without
   // it, and MapLibre has no way to say so: the fallback in `to-number` is read,
@@ -1004,25 +942,46 @@ const segTokenFilter = (tokens) => [
   "any",
   ...tokens.map((tok) => ["==", ["upcase", ["to-string", ["get", "ref"]]], tok]),
 ];
-// Dimmed in place rather than given a match layer of its own. A segment is one
-// feature per service, so "the matching ones" is a property test on the layer
-// already drawn -- where a road carries many services and needs a second pass.
-const segOpacity = (tokens) =>
-  tokens.length ? ["case", segTokenFilter(tokens), 0.95, 0.1] : 0.95;
-// Track dims on the same rule and reads `refs`, the comma-joined list, because a
-// way carries every service that runs over it. `segOpacity` was doing this and
-// testing `ref`, which no track feature has: the property is absent, no token ever
-// matched, and a search dimmed the whole rail network to 0.1 without ever lighting
-// the line it named.
-const trackOpacity = (tokens) =>
-  tokens.length ? ["case", tokenFilter(tokens), 0.95, 0.1] : 0.95;
+// How hard everything on the map is drawn, and the two states each thing has:
+// lit, and dimmed because a search is on and this is not it. Named because the
+// layer that paints a road and the filter that dims it are in different
+// functions, and a figure in both is two figures that can come to disagree with
+// nothing on screen to say which is right.
+//
+// Roads are drawn under the modes because there are so many more of them, and
+// they dim further than a mode does: a filtered road network is the ground a
+// match is read against, where a filtered tram line is one line among a few.
+const OPACITY = {
+  road: 0.85,
+  roadDim: 0.12,
+  line: 0.95,
+  lineDim: 0.1,
+  // A shadow is the separation between a line and the mesh it crosses, so it is
+  // drawn at full strength and dims only with the line it belongs to.
+  shadow: 1,
+};
+
+// Dimmed in place rather than given a match layer of its own. A segment or a way
+// of track is one feature per service, so "the matching ones" is a property test
+// on the layer already drawn -- where a road carries many services and needs a
+// second pass.
+//
+// `filter` is what a match means on that layer and `lit` is what a match is drawn
+// at, and those are the only two things the four of these ever differed in.
+const dimBy = (filter, lit) => (tokens) =>
+  tokens.length ? ["case", filter(tokens), lit, OPACITY.lineDim] : lit;
+
+const segOpacity = dimBy(segTokenFilter, OPACITY.line);
+// Track reads `refs`, the comma-joined list, because a way carries every service
+// that runs over it -- `ref` is a property no track feature has, so a token would
+// never match and a search would dim the whole rail network without lighting the
+// line it named.
+const trackOpacity = dimBy(tokenFilter, OPACITY.line);
 // A shadow dims with the line above it, on that line's own test. Left at full
 // strength it would be the outline of a service the search has just said no to --
 // and against a dimmed line it would be the darker of the two.
-const segShadowOpacity = (tokens) =>
-  tokens.length ? ["case", segTokenFilter(tokens), 1, 0.1] : 1;
-const trackShadowOpacity = (tokens) =>
-  tokens.length ? ["case", tokenFilter(tokens), 1, 0.1] : 1;
+const segShadowOpacity = dimBy(segTokenFilter, OPACITY.shadow);
+const trackShadowOpacity = dimBy(tokenFilter, OPACITY.shadow);
 const NEVER = ["==", ["id"], -1];
 
 // Every mode's traces share one layer per region, so switching a mode off is a
@@ -1039,8 +998,10 @@ const withoutTrackModes = (modes) => ["!", ["in", trackMode, ["literal", modes]]
 
 /* ---------- boot ---------- */
 
-document.documentElement.dataset.theme = theme;
-$("theme").textContent = theme === "dark" ? "Light" : "Dark";
+// The theme itself is already on the document, applied by `bootTheme` in <head>
+// before anything was painted. The button is what is left: it does not exist
+// until the body is parsed.
+$("theme").textContent = themeLabel();
 paintLegend();
 
 // `metadata: true` is what makes the archive's credit reach the map, and it is
@@ -1106,7 +1067,15 @@ class HeadSource {
 }
 
 chrome();
-boot();
+// Nothing awaits this, so anything thrown inside it is an unhandled rejection and
+// the overlay is left reading "Loading tiles..." with one line in the console.
+// Every failure the page can name is already caught below; this is the one that
+// answers for the rest, because an overlay that never resolves is the worst of
+// them to look at.
+boot().catch((err) => {
+  console.error(err);
+  failed(TRIED);
+});
 
 // The page's own furniture: the two folding panels, and the copy that depends on
 // what is pointing at the page. Wired before the archives are asked for and
@@ -1154,29 +1123,33 @@ async function boot() {
   // ?tiles= names one archive and only one, because its job is pointing the page
   // at a bucket rather than choosing between regions: the server's index is what
   // enumerates those. Everything the server lists otherwise.
-  const wanted = WANTED ? [WANTED] : ARCHIVES.length ? ARCHIVES : ["./bus.pmtiles"];
+  TRIED = WANTED ? [WANTED] : ARCHIVES.length ? ARCHIVES : ["./bus.pmtiles"];
 
   // In parallel, and one failure does not sink the rest: a half-copied archive in
   // the output directory should cost its own region, not the map. What it must not
   // do is cost it silently, so the count of what did not open is carried into the
   // header rather than left in the console.
-  REGIONS = (await Promise.all(wanted.map(openArchive))).filter(Boolean);
+  REGIONS = (await Promise.all(TRIED.map(openArchive))).filter(Boolean);
   if (!REGIONS.length) {
-    failed(wanted);
+    failed(TRIED);
     return;
   }
-  start(wanted.length - REGIONS.length);
+  start(TRIED.length - REGIONS.length);
 }
 
 async function openArchive(name, i) {
-  const url = new URL(name, location.href).href;
-  // Already in flight since <head>, keyed by the same absolute URL built there.
-  // A miss is a null head, and a null head is a source that reads the network for
-  // everything, so the prefetch is an optimisation and never a requirement.
-  const heads = await window.__heads.catch(() => new Map());
-  const archive = new pmtiles.PMTiles(new HeadSource(url, heads.get(url) || null));
-  protocol.add(archive); // share the instance so the header is fetched once
+  // The whole of it is guarded, not just the header read. `?tiles=` is whatever
+  // was typed at the page, and a name `new URL` cannot resolve throws here -- which
+  // rejects the `Promise.all` above and leaves the overlay on "Loading tiles..."
+  // instead of costing the one archive that could not be opened.
   try {
+    const url = new URL(name, location.href).href;
+    // Already in flight since <head>, keyed by the same absolute URL built there.
+    // A miss is a null head, and a null head is a source that reads the network for
+    // everything, so the prefetch is an optimisation and never a requirement.
+    const heads = await window.__heads.catch(() => new Map());
+    const archive = new pmtiles.PMTiles(new HeadSource(url, heads.get(url) || null));
+    protocol.add(archive); // share the instance so the header is fetched once
     return {
       name,
       url,
@@ -1190,7 +1163,7 @@ async function openArchive(name, i) {
       trackShadow: `track-shadow-${i}`,
     };
   } catch (err) {
-    console.error(`could not read ${url}`, err);
+    console.error(`could not read ${name}`, err);
     return null;
   }
 }
@@ -1218,10 +1191,7 @@ wayfare serve</pre>
 // The page is a static bundle and cannot list a directory, so the server says
 // which archives it has, and every one of them is on screen at once. A ?tiles=
 // URL is a name we cannot label -- it may be somebody's bucket -- so it is left
-// unnamed rather than title-cased into nonsense.
-const regionLabel = (n) =>
-  n.replace(/\.pmtiles$/, "").replace(/[-_]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-
+// out rather than title-cased into nonsense.
 const named = () => REGIONS.filter((r) => !r.name.includes("/") && framed(r.header));
 
 // The strapline the page ships with already covers the ordinary case, so several
@@ -1235,7 +1205,7 @@ function describeRegions(missing) {
       `${REGIONS.length} region${REGIONS.length === 1 ? "" : "s"}, ${missing} unavailable` +
       ` — public transport services`;
   } else if (REGIONS.length === 1 && here.length === 1) {
-    $("sub").textContent = `${regionLabel(here[0].name)} — public transport services`;
+    $("sub").textContent = `${label(here[0].name)} — public transport services`;
   }
 }
 
@@ -1255,34 +1225,6 @@ function coveredBounds() {
   ];
 }
 
-/* ---------- how far you may roam ---------- */
-
-// West of the Blaskets to east of Lowestoft, Scilly up to Unst, with enough
-// margin that coastal places do not sit jammed against the edge. The data is
-// British Isles only, so there is nothing to find outside this.
-const ISLES = [[-11.5, 49.4], [2.6, 61.3]];
-
-// maxBounds constrains the whole viewport, not just the centre: MapLibre zooms
-// *in* until the visible area fits inside the box, taking whichever of width and
-// height binds harder. In Web Mercator the isles are taller than they are wide --
-// 0.059 of the world against 0.039 -- so on any landscape window it was the width
-// that bound, and full zoom out showed a slice of the middle of the country
-// rather than the whole of it.
-//
-// So widen the box, and only the box, until it is at least as wide as the
-// viewport. Height then governs, and zooming out fits the country end to end. A
-// portrait phone already has room and gets no widening at all.
-function roamingBounds(el) {
-  const merc = (lat) =>
-    0.5 - Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360)) / (2 * Math.PI);
-  const [[w, s], [e, n]] = ISLES;
-  const tall = merc(s) - merc(n); // north is the smaller y
-  const wide = (e - w) / 360;
-  const aspect = el.clientWidth / Math.max(el.clientHeight, 1);
-  const grow = (Math.max(0, aspect * tall - wide) * 360) / 2;
-  return [[w - grow, s], [e + grow, n]];
-}
-
 /* ---------- one pair of layers per region ---------- */
 
 const busLayer = (r) => ({
@@ -1294,7 +1236,7 @@ const busLayer = (r) => ({
   paint: {
     "line-color": hoverOr(colourExpr(theme)),
     "line-width": width(HOVER_BUMP),
-    "line-opacity": 0.85,
+    "line-opacity": OPACITY.road,
   },
 });
 
@@ -1349,7 +1291,7 @@ const shadowLayer = (r, id, source, f) => ({
     "line-color": shadowColour(theme),
     "line-width": shadowWidth(f, HOVER_BUMP),
     "line-blur": SHADOW.blur,
-    "line-opacity": 1,
+    "line-opacity": OPACITY.shadow,
   },
 });
 const segShadowLayer = (r) => shadowLayer(r, r.segShadow, LAYER_SEG, WIDTH.seg);
@@ -1366,7 +1308,7 @@ const segLayer = (r) => ({
   paint: {
     "line-color": hoverOr(segColourExpr(theme)),
     "line-width": segWidth(HOVER_BUMP),
-    "line-opacity": 0.95,
+    "line-opacity": OPACITY.line,
   },
 });
 
@@ -1384,7 +1326,7 @@ const trackLayer = (r) => ({
   paint: {
     "line-color": hoverOr(trackColourExpr(theme)),
     "line-width": trackWidth(HOVER_BUMP),
-    "line-opacity": 0.95,
+    "line-opacity": OPACITY.line,
   },
 });
 
@@ -1403,15 +1345,11 @@ const matchLayer = (r) => ({
   },
 });
 
-function start(missing) {
-  $("boot").remove();
-
-  // Frame what is loaded rather than the country. A regional build is a small
-  // part of the British Isles, and opening at a UK-wide view puts London on
-  // screen as a smudge a few pixels across. The headers carry the bounds, and
-  // they have already been fetched to get here.
-  const covered = coveredBounds();
-
+// Everything the map is drawn from: a basemap, a vector source per archive, and
+// one layer per family per archive. None of it depends on the map existing --
+// this is what the map is constructed out of -- so it is assembled here rather
+// than in the middle of `start`.
+function buildStyle() {
   const sources = {
     basemap: {
       type: "raster",
@@ -1478,16 +1416,35 @@ function start(missing) {
   for (const r of REGIONS) layers.push(segLayer(r));
   for (const r of REGIONS) layers.push(matchLayer(r));
 
-  const BUS = REGIONS.map((r) => r.layer);
-  const TRACK = REGIONS.map((r) => r.track);
-  const SEG = REGIONS.map((r) => r.seg);
-  const MATCH = REGIONS.map((r) => r.match);
-  // Kept apart from the lines they follow, because a shadow is drawn and nothing
-  // else: it is in no hover query, no legend count and no mode discovery. What it
-  // does share is every filter and every dimming, and a shadow that misses one is
-  // the ghost of a line the map is no longer drawing.
-  const SEG_SHADOW = REGIONS.map((r) => r.segShadow);
-  const TRACK_SHADOW = REGIONS.map((r) => r.trackShadow);
+  return { version: 8, sources, layers };
+}
+
+// The ids each family owns, one per region, which is what every filter, dimming
+// and query below addresses. An object rather than six module constants, so a
+// function that wires part of the map is handed the part it wires.
+//
+// The shadows are kept apart from the lines they follow, because a shadow is
+// drawn and nothing else: it is in no hover query, no legend count and no mode
+// discovery. What it does share is every filter and every dimming, and a shadow
+// that misses one is the ghost of a line the map is no longer drawing.
+const layerIds = () => ({
+  bus: REGIONS.map((r) => r.layer),
+  track: REGIONS.map((r) => r.track),
+  seg: REGIONS.map((r) => r.seg),
+  match: REGIONS.map((r) => r.match),
+  segShadow: REGIONS.map((r) => r.segShadow),
+  trackShadow: REGIONS.map((r) => r.trackShadow),
+});
+
+function start(missing) {
+  $("boot").remove();
+
+  // Frame what is loaded rather than the country. A regional build is a small
+  // part of the British Isles, and opening at a UK-wide view puts London on
+  // screen as a smudge a few pixels across. The headers carry the bounds, and
+  // they have already been fetched to get here.
+  const covered = coveredBounds();
+  const ids = layerIds();
 
   const map = new maplibregl.Map({
     container: "map",
@@ -1497,10 +1454,12 @@ function start(missing) {
     maxBounds: roamingBounds($("map")),
     // Below this the tiles run out -- the overview build starts at z5 -- so
     // zooming further would drop the network rather than show more of it.
-    // Take the floor from the archives themselves, not a constant: a hardcoded
-    // 4.6 sat *below* z5, and MapLibre floors the map zoom to pick a tile level,
-    // so every view between 4.6 and 5 asked for z4, got nothing, and drew the
-    // basemap alone. That reads as "this region has no services", not as a limit.
+    //
+    // Read off the archives rather than written here as a number, because a
+    // number under the overview build's own floor names a tile level that does
+    // not exist: MapLibre takes the floor of the map zoom to pick one, asks for
+    // it, gets nothing, and draws the basemap alone. That reads as "this region
+    // has no services" rather than as the edge of the archive.
     //
     // The deepest floor of the several, not the shallowest: at a zoom one archive
     // cannot answer, its region alone goes blank, which is the same lie told about
@@ -1510,7 +1469,7 @@ function start(missing) {
     // Off here so it can be positioned; added below. The two are exclusive --
     // configuring it in the constructor and adding a second one gives two.
     attributionControl: false,
-    style: { version: 8, sources, layers },
+    style: buildStyle(),
   });
 
   // A resize changes the aspect, and with it how wide the box has to be for the
@@ -1523,56 +1482,69 @@ function start(missing) {
   }
 
   describeRegions(missing);
+  addControls(map);
 
-  /* ---------- zoom readout ---------- */
+  // Four things wired onto the one map, each handed the ids it addresses. None
+  // of them is per-call: `start` runs once, and what they build lives as long as
+  // the page does.
+  const card = wireCard();
+  wireSelection(map, ids, card);
+  wireFilter(map, ids, card);
+  wireTheme(map, ids);
+}
 
-  // The deepest zoom any loaded archive carries. Past it MapLibre keeps drawing,
-  // overzooming the deepest tiles it has, so the camera's zoom and the zoom the
-  // geometry came from stop agreeing -- which is exactly when someone is trying
-  // to work out why detail stopped arriving.
-  function maxArchiveZoom() {
-    const zooms = REGIONS.map((r) => r.header && r.header.maxZoom).filter(
-      (z) => typeof z === "number",
-    );
-    return zooms.length ? Math.max(...zooms) : null;
+/* ---------- the map's own controls ---------- */
+
+// The deepest zoom any loaded archive carries. Past it MapLibre keeps drawing,
+// overzooming the deepest tiles it has, so the camera's zoom and the zoom the
+// geometry came from stop agreeing -- which is exactly when someone is trying
+// to work out why detail stopped arriving.
+function maxArchiveZoom() {
+  const zooms = REGIONS.map((r) => r.header && r.header.maxZoom).filter(
+    (z) => typeof z === "number",
+  );
+  return zooms.length ? Math.max(...zooms) : null;
+}
+
+// Which zoom you are on is the first question whenever the map looks wrong,
+// because what a zoom holds is decided per band.
+class ZoomLevelControl {
+  constructor(maxZoom) {
+    this._maxZoom = maxZoom;
   }
-
-  class ZoomLevelControl {
-    constructor(maxZoom) {
-      this._maxZoom = maxZoom;
-    }
-    onAdd(map) {
-      this._map = map;
-      this._el = document.createElement("div");
-      this._el.className = "maplibregl-ctrl zoomlevel";
-      this._el.title = "Camera zoom, and the zoom the tiles being drawn came from";
-      this._el.setAttribute("aria-live", "off");
-      this._update = () => {
-        const z = map.getZoom();
-        // MapLibre asks a vector source for floor(zoom), and stops at the
-        // source's own maximum rather than requesting tiles that do not exist.
-        const tiles =
-          this._maxZoom === null
-            ? Math.floor(z)
-            : Math.min(Math.floor(z), this._maxZoom);
-        this._el.innerHTML =
-          "z" +
-          z.toFixed(1) +
-          (tiles === Math.floor(z)
-            ? ""
-            : ' <span class="tiles">tiles z' + tiles + "</span>");
-      };
-      map.on("zoom", this._update);
-      this._update();
-      return this._el;
-    }
-    onRemove() {
-      this._map.off("zoom", this._update);
-      this._el.remove();
-      this._map = undefined;
-    }
+  onAdd(map) {
+    this._map = map;
+    this._el = document.createElement("div");
+    this._el.className = "maplibregl-ctrl zoomlevel";
+    this._el.title = "Camera zoom, and the zoom the tiles being drawn came from";
+    this._el.setAttribute("aria-live", "off");
+    this._update = () => {
+      const z = map.getZoom();
+      // MapLibre asks a vector source for floor(zoom), and stops at the
+      // source's own maximum rather than requesting tiles that do not exist.
+      const tiles =
+        this._maxZoom === null
+          ? Math.floor(z)
+          : Math.min(Math.floor(z), this._maxZoom);
+      this._el.innerHTML =
+        "z" +
+        z.toFixed(1) +
+        (tiles === Math.floor(z)
+          ? ""
+          : ' <span class="tiles">tiles z' + tiles + "</span>");
+    };
+    map.on("zoom", this._update);
+    this._update();
+    return this._el;
   }
+  onRemove() {
+    this._map.off("zoom", this._update);
+    this._el.remove();
+    this._map = undefined;
+  }
+}
 
+function addControls(map) {
   map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom-right");
   map.addControl(new maplibregl.ScaleControl({ maxWidth: 90, unit: "metric" }), "bottom-left");
   map.addControl(new ZoomLevelControl(maxArchiveZoom()), "bottom-left");
@@ -1592,8 +1564,21 @@ function start(missing) {
   // after a flash of the open panel.
   map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-left");
   collapseCredit(map);
+}
 
-  /* ---------- selection ---------- */
+/* ---------- selection ---------- */
+
+// How far from the point a touch is allowed to land. A road is drawn two pixels
+// wide and a fingertip covers forty, so a selection that has to be exact is one
+// a phone can never make: every line on the map, and no way to ask about any of
+// them.
+const SLOP = 12;
+
+// Hover and tap: what is under the pointer, lit on the map and described in the
+// card. `card` is what the description is written into, handed in rather than
+// reached for, because the two halves are wired separately.
+function wireSelection(map, ids, card) {
+  const { bus, seg, track } = ids;
 
   // A feature is identified by its source as well as its id: the id is the OSM
   // way id from DETAIL_ZOOM up and tippecanoe's edge id below it, and neither
@@ -1606,12 +1591,6 @@ function start(missing) {
       { source: h.src, sourceLayer: h.sourceLayer, id: h.id },
       { hover: on }
     );
-
-  // How far from the point a touch is allowed to land. A road is drawn two pixels
-  // wide and a fingertip covers forty, so a selection that has to be exact is one
-  // a phone can never make -- which is what this map was: every line on it, and no
-  // way to ask about any of them.
-  const SLOP = 12;
 
   // One query over every region's layer, rather than a handler bound to each.
   // Every hit goes to the card, because on a road two archives both hold, one
@@ -1629,11 +1608,11 @@ function start(missing) {
     const box = slop
       ? [[point.x - slop, point.y - slop], [point.x + slop, point.y + slop]]
       : point;
-    const at = (ids) =>
-      map.queryRenderedFeatures(box, { layers: liveLayers(map, ids) });
-    const segHits = at(SEG);
-    const trackHits = segHits.length ? [] : at(TRACK);
-    const hits = segHits.length ? segHits : trackHits.length ? trackHits : at(BUS);
+    const at = (layers) =>
+      map.queryRenderedFeatures(box, { layers: liveLayers(map, layers) });
+    const segHits = at(seg);
+    const trackHits = segHits.length ? [] : at(track);
+    const hits = segHits.length ? segHits : trackHits.length ? trackHits : at(bus);
     const f = hits[0];
     map.getCanvas().style.cursor = f ? "pointer" : "";
     if (hovered && (!f || hovered.id !== f.id || hovered.src !== f.source)) {
@@ -1643,9 +1622,9 @@ function start(missing) {
     if (!f || hovered) return; // nothing under the cursor, or the same line still
     hovered = { src: f.source, sourceLayer: f.sourceLayer, id: f.id };
     setHover(hovered, true);
-    if (segHits.length) showSegment(f.properties);
-    else if (trackHits.length) showTrack(f.properties, f.id);
-    else showFeature(mergeRegions(hits), f.id);
+    if (segHits.length) card.segment(f.properties);
+    else if (trackHits.length) card.track(f.properties, f.id);
+    else card.feature(mergeRegions(hits), f.id);
   }
 
   // A cursor is exact and asks continuously, so it asks about the point it is on:
@@ -1661,10 +1640,19 @@ function start(missing) {
     const mouse = e.originalEvent && e.originalEvent.pointerType === "mouse";
     selectAt(e.point, mouse ? 0 : SLOP);
   });
+}
 
-  /* ---------- filter ---------- */
+/* ---------- filter and mode switches ---------- */
 
-  let active = [];
+// The search tokens, upcased. Module scope because the card reads them as well:
+// a chip is drawn lit when the search names it, and the search and the card are
+// wired separately.
+let active = [];
+
+// The search box, the legend's switches, and everything both of them dim. One
+// function because they are one decision to the map: what is drawn, and how hard.
+function wireFilter(map, ids, card) {
+  const { bus, seg, track, match, segShadow, trackShadow } = ids;
   const input = $("q");
 
   function applyFilter() {
@@ -1678,19 +1666,23 @@ function start(missing) {
     const on = active.length > 0;
     // The match layer's own visibility is left to `applyRows`: it draws over the
     // road network, so it has two reasons to be off and only one of them is here.
-    for (const id of MATCH) map.setFilter(id, on ? tokenFilter(active) : NEVER);
-    for (const id of BUS) map.setPaintProperty(id, "line-opacity", on ? 0.12 : 0.85);
-    for (const id of SEG) map.setPaintProperty(id, "line-opacity", segOpacity(active));
+    for (const id of match) map.setFilter(id, on ? tokenFilter(active) : NEVER);
+    for (const id of bus) {
+      map.setPaintProperty(id, "line-opacity", on ? OPACITY.roadDim : OPACITY.road);
+    }
+    for (const id of seg) map.setPaintProperty(id, "line-opacity", segOpacity(active));
     // Track dims on the same rule and for the same reason. `refs` here is the same
     // comma-joined list the road layer carries, so searching "XC" finds the
     // CrossCountry track as well as the coaches -- which is the point of the search
     // being national rather than per-layer.
-    for (const id of TRACK) map.setPaintProperty(id, "line-opacity", trackOpacity(active));
+    for (const id of track) {
+      map.setPaintProperty(id, "line-opacity", trackOpacity(active));
+    }
     // And each shadow with the line it belongs to.
-    for (const id of SEG_SHADOW) {
+    for (const id of segShadow) {
       map.setPaintProperty(id, "line-opacity", segShadowOpacity(active));
     }
-    for (const id of TRACK_SHADOW) {
+    for (const id of trackShadow) {
       map.setPaintProperty(id, "line-opacity", trackShadowOpacity(active));
     }
 
@@ -1700,10 +1692,8 @@ function start(missing) {
     } else {
       $("hint").innerHTML = SEARCH_HINT;
     }
-    redrawChips();
+    card.chips();
   }
-
-  /* ---------- mode switches ---------- */
 
   // What each legend row switches. The road network is a layer, so it goes off by
   // visibility; the modes share one layer per region -- one for segments and one
@@ -1712,24 +1702,24 @@ function start(missing) {
   function applyRows() {
     const show = (id, on) => map.setLayoutProperty(id, "visibility", on ? "visible" : "none");
     const busOn = !hiddenRows.has("bus");
-    for (const id of BUS) show(id, busOn);
+    for (const id of bus) show(id, busOn);
     // The match highlight is the road network drawn a second time, so hiding the
     // roads has to take it with them -- left alone it would keep drawing the very
     // services the box was cleared to be rid of, and brighter than they were.
-    for (const id of MATCH) show(id, busOn && active.length > 0);
+    for (const id of match) show(id, busOn && active.length > 0);
     const offRows = (prefix) =>
       [...hiddenRows].filter((k) => k.startsWith(prefix)).map((k) => k.slice(prefix.length));
     // The shadows take every filter their lines take. A shadow the switch missed
     // is the outline of a mode the legend says is off.
     const off = offRows("mode:");
-    for (const id of [...SEG, ...SEG_SHADOW]) {
+    for (const id of [...seg, ...segShadow]) {
       map.setFilter(id, off.length ? withoutModes(off) : null);
     }
     // Track reads its mode through the same rail fallback the paint does, so a row
     // switched off clears the archives that name the mode and the older ones that
     // only imply it.
     const offTrack = offRows("track:");
-    for (const id of [...TRACK, ...TRACK_SHADOW]) {
+    for (const id of [...track, ...trackShadow]) {
       map.setFilter(id, offTrack.length ? withoutTrackModes(offTrack) : null);
     }
   }
@@ -1753,8 +1743,7 @@ function start(missing) {
     // Nothing is drawn to count with the roads switched off, and "nothing in view"
     // would read as a search that found no such service.
     if (hiddenRows.has("bus")) {
-      const label = active.map((t) => `<b>${escapeHtml(t)}</b>`).join(", ");
-      $("hint").innerHTML = `${label} — bus and coach are switched off in the key.`;
+      $("hint").innerHTML = `${shownTokens()} — bus and coach are switched off in the key.`;
       return;
     }
     // Counted by OSM way, the one identity every archive holding the road agrees
@@ -1767,14 +1756,13 @@ function start(missing) {
     // rather than a branch that never fires. `refs` is the test, because it is
     // stripped from exactly the same bands the way id is.
     const seen = new Set(
-      map.queryRenderedFeatures({ layers: liveLayers(map, MATCH) }).map((f) =>
+      map.queryRenderedFeatures({ layers: liveLayers(map, match) }).map((f) =>
         f.properties.refs !== undefined ? `w${f.id}` : `${f.source}:${f.id}`
       )
     );
-    const label = active.map((t) => `<b>${escapeHtml(t)}</b>`).join(", ");
     $("hint").innerHTML = seen.size
-      ? `${label} — ${seen.size} segment${seen.size === 1 ? "" : "s"} in view.`
-      : `${label} — nothing in view. Try zooming out.`;
+      ? `${shownTokens()} — ${seen.size} segment${seen.size === 1 ? "" : "s"} in view.`
+      : `${shownTokens()} — nothing in view. Try zooming out.`;
   }
 
   // setFilter re-evaluates the expression across everything rendered and
@@ -1782,19 +1770,15 @@ function start(missing) {
   // keystroke made typing "X26" three full passes over central London. Collapsing
   // a burst into one pass is invisible to a person at this delay and much
   // cheaper. Escape still calls applyFilter directly, so clearing stays instant.
-  const debounce = (fn, ms) => {
-    let timer;
-    return (...args) => {
-      clearTimeout(timer);
-      timer = setTimeout(() => fn(...args), ms);
-    };
-  };
   input.addEventListener("input", debounce(applyFilter, 120));
   map.on("idle", countMatches);
   // On idle rather than on load: an archive's segments are not necessarily in the
   // opening view, and the tiles holding them arrive whenever the user reaches them.
-  map.on("idle", () => noteRenderedModes(map, SEG));
-  map.on("idle", () => noteRenderedTrack(map, TRACK));
+  // A segment files under "other" where it names no mode; a way of track files
+  // under heavy rail, which is what an archive built before this layer carried a
+  // mode at all is holding.
+  map.on("idle", () => noteRendered(map, seg, seenModes, "other"));
+  map.on("idle", () => noteRendered(map, track, seenTrackModes, TRACK_MODE));
   addEventListener("keydown", (e) => {
     if (e.key === "/" && document.activeElement !== input) {
       e.preventDefault();
@@ -1806,42 +1790,53 @@ function start(missing) {
       input.blur();
     }
   });
+}
 
-  /* ---------- theme ---------- */
+// The search tokens as the hint prints them, bold and comma-joined.
+const shownTokens = () => active.map((t) => `<b>${escapeHtml(t)}</b>`).join(", ");
 
-  // The two ramps on the map and the legend under them all change together, so
-  // they are repainted together. Every layer of every region is reassigned,
-  // because a colour expression is built from the theme and there is no partial
-  // version of it.
+/* ---------- theme ---------- */
+
+// The two ramps on the map and the legend under them all change together, so
+// they are repainted together. Every layer of every region is reassigned,
+// because a colour expression is built from the theme and there is no partial
+// version of it.
+function wireTheme(map, ids) {
+  const { bus, seg, track, match, segShadow, trackShadow } = ids;
+
   function repaintColours() {
     const colour = hoverOr(colourExpr(theme));
-    for (const id of BUS) map.setPaintProperty(id, "line-color", colour);
-    for (const id of MATCH) map.setPaintProperty(id, "line-color", HOVER_COLOUR[theme]);
+    for (const id of bus) map.setPaintProperty(id, "line-color", colour);
+    for (const id of match) map.setPaintProperty(id, "line-color", HOVER_COLOUR[theme]);
     const segColour = hoverOr(segColourExpr(theme));
-    for (const id of SEG) map.setPaintProperty(id, "line-color", segColour);
+    for (const id of seg) map.setPaintProperty(id, "line-color", segColour);
     const trackColour = hoverOr(trackColourExpr(theme));
-    for (const id of TRACK) map.setPaintProperty(id, "line-color", trackColour);
+    for (const id of track) map.setPaintProperty(id, "line-color", trackColour);
     // The shadow's ink is the one colour here that is not off a ramp, and it still
     // changes with the theme: near-black over a pale map, black over a dark one.
-    for (const id of [...SEG_SHADOW, ...TRACK_SHADOW]) {
+    for (const id of [...segShadow, ...trackShadow]) {
       map.setPaintProperty(id, "line-color", shadowColour(theme));
     }
     paintLegend();
   }
 
   $("theme").addEventListener("click", () => {
-    theme = theme === "dark" ? "light" : "dark";
-    localStorage.setItem("wayfare-theme", theme);
-    document.documentElement.dataset.theme = theme;
-    $("theme").textContent = theme === "dark" ? "Light" : "Dark";
+    toggleTheme($("theme"));
     map.getSource("basemap").setTiles(basemapTiles(theme));
     repaintColours();
   });
+}
 
-  /* ---------- info card ---------- */
+/* ---------- info card ---------- */
 
-  let current = null;
+// What the card is describing, so that a search can relight its chips without
+// asking the map again.
+let current = null;
 
+// Everything that writes the card, handed back as four functions rather than
+// wired to anything: what decides a card is drawn at all is the pointer, and
+// that is `wireSelection`'s business.
+function wireCard() {
   // Journeys a day leads, because that is what a colour on the map stands for.
   // Trips a week follows: it is the number the pipeline stores, it answers a
   // different question about the same road, and the card is where both are free.
@@ -1911,8 +1906,7 @@ function start(missing) {
   }
 
   // A way of relation track, which is the one layer that answers for several
-  // services at once -- 75.8% of GB rail ways carry two or more, and eleven
-  // Underground lines were 1,040 coincident polylines before the inversion. So it
+  // services at once -- 75.8% of GB rail ways carry two or more relations. So it
   // gets the chips, the same as a road does, and unlike a segment it has a way id
   // to show: this geometry *is* an OpenStreetMap way rather than something snapped
   // to one.
@@ -1956,15 +1950,17 @@ function start(missing) {
       .join("");
   }
 
+  return { feature: showFeature, segment: showSegment, track: showTrack, chips: redrawChips };
 }
 
 /* ---------- helpers ---------- */
 
 // One card for a road that several archives hold. Northern Ireland and the
 // Republic were matched against one island graph, so a cross-border road is a
-// feature in each, carrying that feed's services and no others. Showing the
-// topmost hit alone gave one country's list and dropped the other's without
-// saying so — a wrong answer rather than a thin one. The OSM way id is the only
+// feature in each, carrying that feed's services and no others. Every hit is
+// merged rather than the topmost taken, because one hit is one feed's list and
+// the road's list is the union: a card off the top hit alone names one country's
+// services and drops the other's without saying so. The OSM way id is the only
 // identity the archives share, and from DETAIL_ZOOM up it is the feature id
 // itself; an edge id is per-archive.
 //
@@ -2008,37 +2004,6 @@ function mergeRegions(hits) {
   return { ...top, n, trips, refs: refs.join(",") };
 }
 
-// What the browser will say about the connection, where it says anything. Save-Data
-// is a header the user asked for and is honoured wherever it appears; effectiveType
-// is the browser's own estimate. Both are Chromium-only, so this is an improvement
-// where it exists and never a requirement -- Safari and Firefox take the full
-// basemap, exactly as every browser did before.
-function thriftyConnection() {
-  const c = navigator.connection;
-  if (!c) return false;
-  return Boolean(c.saveData) || ["slow-2g", "2g", "3g"].includes(c.effectiveType);
-}
-
-// Cold profiling put the basemap at 447,036 bytes over 30 requests, 40.9% of
-// everything transferred, and blocking it took a throttled load from 19.4 s to
-// 12.1 s. It competes with the archive for the same pipe while being the context
-// rather than the subject, so on a connection that says it is slow it is drawn at
-// half resolution: `tileSize: 512` against 256-pixel tiles makes MapLibre ask for
-// one zoom level lower and scale it up, which is a quarter of the tiles for a
-// blurrier backdrop. The roads on top are unaffected -- they are vector.
-const basemapTileSize = () => (thriftyConnection() ? 512 : 256);
-
-function basemapTiles(t) {
-  // MapLibre has no {s} or {r} placeholder: expand the subdomains itself and
-  // pick the retina variant up front. A thrifty connection takes the plain tile
-  // whatever the screen is: a retina backdrop is the first thing to give up when
-  // the road network underneath it is still arriving.
-  const r = devicePixelRatio > 1.4 && !thriftyConnection() ? "@2x" : "";
-  return ["a", "b", "c", "d"].map(
-    (s) => `https://${s}.basemaps.cartocdn.com/${BASEMAP[t]}/{z}/{x}/{y}${r}.png`
-  );
-}
-
 // queryRenderedFeatures throws on a layer id the style does not hold, so every
 // caller filters first. A layer is missing whenever the style failed to add it --
 // one bad paint expression is enough -- and the handler that reads it runs on
@@ -2048,31 +2013,18 @@ function liveLayers(map, ids) {
   return ids.filter((id) => map.getLayer(id));
 }
 
-function noteRenderedModes(map, ids) {
+// Which modes have been drawn, so the legend carries a row for each. `absent` is
+// what a feature with no `mode` counts as, and it differs by layer: a segment
+// that names none is "other", where a way of track came out of an archive built
+// when this layer was heavy rail alone, which is a fact rather than a guess.
+function noteRendered(map, ids, seen, absent) {
   const live = liveLayers(map, ids);
   if (!live.length) return;
   let added = false;
   for (const f of map.queryRenderedFeatures({ layers: live })) {
-    const m = f.properties?.mode || "other";
-    if (!seenModes.has(m)) {
-      seenModes.add(m);
-      added = true;
-    }
-  }
-  if (added) paintLegend();
-}
-
-// The same, for the track layer. Its own set, because these rows are flat swatches
-// rather than ramps, and the fallback matches the paint: a feature with no `mode`
-// came out of an archive built when this layer was heavy rail alone.
-function noteRenderedTrack(map, ids) {
-  const live = liveLayers(map, ids);
-  if (!live.length) return;
-  let added = false;
-  for (const f of map.queryRenderedFeatures({ layers: live })) {
-    const m = f.properties?.mode || TRACK_MODE;
-    if (!seenTrackModes.has(m)) {
-      seenTrackModes.add(m);
+    const m = f.properties?.mode || absent;
+    if (!seen.has(m)) {
+      seen.add(m);
       added = true;
     }
   }
@@ -2143,12 +2095,6 @@ function paintLegend() {
       return `<span style="left:${p}%;transform:translateX(-${p}%)">${label}</span>`;
     })
     .join("");
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
-  );
 }
 </script>
 </body>
