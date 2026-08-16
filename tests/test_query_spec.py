@@ -196,19 +196,22 @@ def test_every_weight_and_group_combination_executes(net, weight, group):
             net.execute(query, params).fetchall()
 
 
+# Weight and order run inside the body rather than as two more parametrize axes: the
+# full cross product is 900 cases carrying 4 distinct `?`/parameter counts, and only
+# `filters` moves that count at all. Group stays an axis because the services fragment
+# appearing twice is a property of the grouped queries, so a failure should name it.
 @pytest.mark.parametrize("filters", FILTERS, ids=lambda f: "+".join(f) or "none")
-@pytest.mark.parametrize("order", sorted(art.ORDERS))
 @pytest.mark.parametrize("group", sorted(art.GROUPS))
-@pytest.mark.parametrize("weight", sorted(art.WEIGHTS))
-def test_bound_parameters_match_the_holes(weight, group, order, filters):
+def test_bound_parameters_match_the_holes(group, filters):
     """A `?` with no parameter behind it, or the other way round, is a bind error at
     render time. The services fragment appears twice in the grouped queries, so its
     parameters have to be repeated in textual order -- which is exactly the mistake
     that got through once already."""
-    spec = art.QuerySpec(weight=weight, group=group, order=order, **filters)
-    sql = art._Sql(spec, art.DEFAULT_SOURCE, BBOX)
-    for query, params in _every_query(sql):
-        assert query.count("?") == len(params)
+    for weight, order in itertools.product(sorted(art.WEIGHTS), sorted(art.ORDERS)):
+        spec = art.QuerySpec(weight=weight, group=group, order=order, **filters)
+        sql = art._Sql(spec, art.DEFAULT_SOURCE, BBOX)
+        for query, params in _every_query(sql):
+            assert query.count("?") == len(params), (weight, order)
 
 
 # --- Filters ----------------------------------------------------------------
