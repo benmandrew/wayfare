@@ -7,7 +7,7 @@ import pytest
 import requests
 from builders import FakeClient
 
-from wayfare import aggregate, config, gtfs, match, valhalla
+from wayfare import aggregate, config, db, gtfs, match, valhalla
 
 
 @pytest.fixture
@@ -263,7 +263,7 @@ def test_aggregate_inverts_to_services(loaded):
 def test_coverage_reports_service_weighted_share(loaded):
     match.run(loaded, client_=FakeClient())
     aggregate.build(loaded)
-    cov = aggregate.coverage(loaded)
+    cov = aggregate.funnel(loaded)
     assert cov["patterns_total"] == 2
     assert cov["patterns_matched"] == 2
     assert cov["trips_pct"] == 100.0
@@ -280,7 +280,7 @@ def test_bulk_insert_survives_awkward_text_and_missing_geometry(con, tmp_path, m
         (1, 10, nasty, "secondary", 100.0, [1, 2], [3, 4], 1, 3, 2, 4),
         (2, 20, None, None, 0.0, None, None, None, None, None, None),
     ]
-    match._insert_edges(con, rows)
+    db.insert_via_file(con, "edges", match._EDGE_COLS, rows, on_conflict="ignore")
 
     got = con.execute(
         "SELECT edge_id, road_name, lon_e6 FROM edges ORDER BY edge_id"
@@ -294,8 +294,9 @@ def test_bulk_insert_ignores_an_edge_another_batch_wrote(con, tmp_path, monkeypa
     """edges is shared across patterns, so the same edge arrives in many batches."""
     monkeypatch.setattr(config, "WORK", tmp_path)
     first = (1, 10, "Oxford Road", "secondary", 100.0, [1, 2], [3, 4], 1, 3, 2, 4)
-    match._insert_edges(con, [first])
-    match._insert_edges(con, [(1, 10, "Renamed", "primary", 999.0, [9], [9], 9, 9, 9, 9)])
+    second = (1, 10, "Renamed", "primary", 999.0, [9], [9], 9, 9, 9, 9)
+    db.insert_via_file(con, "edges", match._EDGE_COLS, [first], on_conflict="ignore")
+    db.insert_via_file(con, "edges", match._EDGE_COLS, [second], on_conflict="ignore")
 
     assert con.execute("SELECT count(*) FROM edges").fetchone()[0] == 1
     assert con.execute("SELECT road_name FROM edges").fetchone()[0] == "Oxford Road"
@@ -305,7 +306,8 @@ def test_staging_file_is_removed_even_when_the_insert_fails(con, tmp_path, monke
     monkeypatch.setattr(config, "WORK", tmp_path)
     bad = [("not a number", 10, "x", "y", 1.0, [1], [1], 1, 1, 1, 1)]
     with pytest.raises(duckdb.Error):
-        match._insert_edges(con, bad)  # read_json refuses text where a BIGINT belongs
+        # read_json refuses text where a BIGINT belongs.
+        db.insert_via_file(con, "edges", match._EDGE_COLS, bad, on_conflict="ignore")
     assert list((tmp_path / "stage").iterdir()) == []
 
 

@@ -390,8 +390,9 @@ def test_fetch_caches_the_body_and_does_not_ask_twice(tmp_path) -> None:
     assert [r.relation_id for r in first] == [r.relation_id for r in second] == [900]
 
 
-def test_fetch_treats_overpass_load_shedding_as_retryable(tmp_path) -> None:
+def test_fetch_treats_overpass_load_shedding_as_retryable(tmp_path, monkeypatch) -> None:
     """429 says nothing about the query, so it must not become a permanent failure."""
+    monkeypatch.setattr(osm, "OVERPASS_BACKOFF", 0.0)
     sess = FakeSession(FakeResponse({}, 429))
     with pytest.raises(osm.TransportError):
         osm.fetch((51.0, -1.0, 52.0, 1.0), tmp_path / "r.json", session=sess)
@@ -601,7 +602,7 @@ def test_an_untraceable_pattern_never_gates_a_publish(rail_con) -> None:
     scheduled region publishing again for good.
     """
     trace.run(rail_con, relations=[])
-    funnel = aggregate.coverage(rail_con)
+    funnel = aggregate.funnel(rail_con)
     assert funnel["traced"]["by_status"] == {"no_relation": 1}
     assert funnel["traced"]["patterns_owed"] == 1
     assert funnel["traced"]["patterns_pending"] == 0
@@ -614,7 +615,7 @@ def test_the_funnel_survives_a_database_from_before_this_stage(con, gtfs_dir) ->
     """`status` connects read-only, so an unmigrated data root must not raise."""
     gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB", modes=frozenset({"bus", "rail"}))
     con.execute("DROP TABLE trace_status")
-    assert aggregate.coverage(con)["traced"] == {}
+    assert aggregate.funnel(con)["traced"] == {}
 
 
 def test_credit_nouns_cover_both_kinds_of_osm_geometry() -> None:

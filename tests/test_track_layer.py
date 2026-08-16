@@ -24,7 +24,7 @@ def built(con):
     """A database holding one two-way rail relation, drawn and aggregated."""
     db.set_meta(con, "feed_version", FEED)
     rels = [relation(relation_id=1, tags={"ref": "XC", "operator": "CrossCountry"})]
-    osmroutes.write(con, osmroutes.candidates(rels)[0])
+    osmroutes.write(con, osmroutes.candidates(rels).kept)
     osmroutes.write_ways(con, rels)
     return con
 
@@ -73,7 +73,7 @@ def test_two_relations_over_one_way_collapse_to_one_way(built):
         relation(relation_id=1, tags={"ref": "XC", "operator": "CrossCountry"}),
         relation(relation_id=2, name="Other", tags={"ref": "TP"}),
     ]
-    osmroutes.write(built, osmroutes.candidates(both)[0])
+    osmroutes.write(built, osmroutes.candidates(both).kept)
     aggregate.build_track_services(built)
     assert db.scalar(built, "SELECT count(DISTINCT way_id) FROM track_services") == 2
     assert db.scalar(built, "SELECT count(*) FROM track_services") == 4
@@ -189,7 +189,7 @@ def test_refs_is_a_string_rather_than_an_array(built, tmp_path):
         relation(relation_id=1, tags={"ref": "XC", "operator": "CrossCountry"}),
         relation(relation_id=2, name="Other", tags={"ref": "TP"}),
     ]
-    osmroutes.write(built, osmroutes.candidates(both)[0])
+    osmroutes.write(built, osmroutes.candidates(both).kept)
     aggregate.build_track_services(built)
     path = publish.export_track_geojsonl(built, tmp_path / "track.geojsonl")
     assert path is not None

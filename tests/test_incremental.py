@@ -202,7 +202,7 @@ def test_departed_patterns_keep_their_edges_but_leave_the_map(gtfs_dir: Path, co
     assert con.execute("SELECT count(*) FROM match_status").fetchone()[0] == 3
     assert con.execute("SELECT count(*) FROM pattern_edges").fetchone()[0] == 6
 
-    cov = aggregate.coverage(con)
+    cov = aggregate.funnel(con)
     assert cov["feed_version"] == FEED_2
     assert cov["patterns_total"] == 1
     assert cov["patterns_departed"] == 2
@@ -218,7 +218,7 @@ def test_an_unmatchable_mode_never_counts_as_pending(gtfs_dir: Path, con):
     match.run(con, client_=FakeClient())
     assert match.pending_count(con) == 0
 
-    cov = aggregate.coverage(con)
+    cov = aggregate.funnel(con)
     assert cov["patterns_pending"] == 0
     assert cov["patterns_pct"] == 100.0
     # ...and the ferry is still visible, so losing one is not silent either.

@@ -197,6 +197,20 @@ def test_an_offset_of_zero_means_straight_after_the_one_before():
     assert [e.length for e in entries] == [10, 20]
 
 
+def test_every_zoom_the_archive_holds_is_sized(tmp_path):
+    """One pass over the index has to reach the leaves and every zoom in them, because
+    a zoom that is missed reads as a zoom holding no tiles at all."""
+    tiles = {
+        0: gzip.compress(mvt([at(-3.0, 51.5)])),
+        1: gzip.compress(mvt([(1, 1)])),
+        5: gzip.compress(mvt([(2, 2), (3, 3)])),
+    }
+    path = archive(tmp_path / "a.pmtiles", tiles, leaves=True)
+    per = coverage.sizes(path)
+    assert sorted(per) == [0, 1, 2]
+    assert [per[0], per[1], per[2]] == [[len(tiles[0])], [len(tiles[1])], [len(tiles[5])]]
+
+
 def test_an_archive_that_draws_nothing_at_max_zoom_is_an_error(tmp_path):
     """A detail band that came out empty is the one failure a per-zoom comparison
     cannot report, because there is nothing left to compare against."""
@@ -206,19 +220,18 @@ def test_an_archive_that_draws_nothing_at_max_zoom_is_an_error(tmp_path):
 
 
 def test_the_tilt_is_what_a_hole_shows_up_in(monkeypatch, tmp_path):
-    """Both filters that reached the map drew every populated cell and carried more
-    features than the build before them. What separates them is how much the emptiest
-    quarter of the country draws against the busiest."""
+    """A filter can draw every populated cell and carry more features than one that
+    thins nothing, and still leave a hole. What separates them is how much the
+    emptiest quarter of the country draws against the busiest."""
     reference = {(i, 0): 100 + i for i in range(8)}
 
-    def fake(_archive, zoom, _cell=None):
-        if zoom == config.MAX_ZOOM:
-            return reference
+    def fake(_archive, zooms, _cell):
         # Thin the sparse half hard and the dense half barely, which is what a quota
         # shared out in proportion to cell size does.
-        return {c: (2 if c[0] < 4 else 90) for c in reference}
+        thinned = {c: (2 if c[0] < 4 else 90) for c in reference}
+        return {z: (reference if z == config.MAX_ZOOM else thinned) for z in zooms}
 
-    monkeypatch.setattr(coverage, "drawn", fake)
+    monkeypatch.setattr(coverage, "_drawn_by_zoom", fake)
     _, bands = coverage.bands(tmp_path / "a.pmtiles", [5])
     assert bands[0].empty == []
     assert bands[0].quartiles[0][0] == 2
@@ -328,6 +341,49 @@ def test_the_layers_are_drawn_in_different_shades(tmp_path):
     # One shade each, and the road brighter: two values that a viewer can tell apart.
     assert len(road) == len(track) == 1
     assert max(road) > max(track)
+
+
+def _geometry(points, split: bool):
+    """A three-point LineString, as one command stream or as two."""
+    (sx, sy), (mx, my), (ex, ey) = points
+    head = ((1 << 3) | 1, zigzag(sx), zigzag(sy))
+    if not split:
+        vals = (*head, (2 << 3) | 2, zigzag(mx - sx), zigzag(my - sy), zigzag(ex - mx))
+        return [b"".join(varint(v) for v in (*vals, zigzag(ey - my)))]
+    first = (*head, (1 << 3) | 2, zigzag(mx - sx), zigzag(my - sy))
+    second = ((1 << 3) | 2, zigzag(ex - mx), zigzag(ey - my))
+    return [b"".join(varint(v) for v in part) for part in (first, second)]
+
+
+def _one_feature_tile(points, split: bool, extent=4096):
+    feature = blob(
+        2, key(3, 0) + varint(1) + b"".join(blob(4, g) for g in _geometry(points, split))
+    )
+    layer = blob(1, b"bus") + feature + key(5, 0) + varint(extent) + key(15, 0) + varint(2)
+    return blob(3, layer)
+
+
+def test_a_geometry_split_across_chunks_is_one_road(tmp_path):
+    """Geometry is a packed repeated field, so a writer may split it across chunks
+    that mean nothing apart: the second continues from where the first stopped.
+
+    Counting the chunks makes one road two features. Reading each chunk from the tile
+    origin snaps the tail of every split road back to the corner. The archive has to
+    read the same either way, which is what having one walker over a tile buys.
+    """
+    points = [at(-20.0, 20.0), at(0.0, 0.0), at(20.0, -20.0)]
+    window, out = (-40.0, -40.0, 40.0, 40.0), {}
+    for name, split in (("split", True), ("whole", False)):
+        path = archive(
+            tmp_path / f"{name}.pmtiles",
+            {0: gzip.compress(_one_feature_tile(points, split))},
+        )
+        out[name] = tmp_path / f"{name}.png"
+        coverage.draw(path, 0, window, out[name], width=100)
+        assert coverage.drawn(path, 0, 0.25) == {
+            (round(-20.0 / 0.25), round(20.0 / 0.25)): 1
+        }
+    assert out["split"].read_bytes() == out["whole"].read_bytes()
 
 
 def test_an_empty_window_is_refused_rather_than_drawn(tmp_path):

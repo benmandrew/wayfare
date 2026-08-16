@@ -29,16 +29,6 @@ from . import config, db, logs
 
 log = logs.get("gtfs")
 
-# Distance between two lat/lon pairs, in metres. Written out rather than pulled
-# from the spatial extension so the stage has no extension dependency.
-_HAVERSINE = """
-    2 * 6371000 * asin(sqrt(
-        pow(sin(radians({lat2} - {lat1}) / 2), 2)
-      + cos(radians({lat1})) * cos(radians({lat2}))
-      * pow(sin(radians({lon2} - {lon1}) / 2), 2)
-    ))
-"""
-
 
 def _csv(gtfs_dir: Path, name: str) -> str:
     """A read_csv call that keeps every column as text.
@@ -233,6 +223,48 @@ def build_patterns(
     con.execute(f"SET temp_directory = '{gtfs_dir.parent / 'duckdb_tmp'}'")
     con.execute("SET preserve_insertion_order = false")
 
+    n_trips = _load_source_tables(gtfs_dir, con, kept_modes)
+    _collapse_to_sequences(gtfs_dir, con)
+    _build_pattern_raw(con)
+    _merge_patterns(con, feed, kept_modes)
+
+    _fill_span(con)
+    _load_shapes(gtfs_dir, con)
+    db.index(con)
+    _report_churn(con, feed)
+    _upgraded_to_shapes(con, apply=upgrade_shapes)
+
+    n_patterns, n_with_shape, n_refs = db.row(
+        con,
+        f"""
+        SELECT count(*),
+               sum(CASE WHEN shape_id IS NOT NULL THEN 1 ELSE 0 END),
+               sum(n_stops)
+        FROM patterns p WHERE {db.current_feed()}
+        """,
+    )
+    log.info(
+        "%d patterns from %d trips (%.1f%% with operator geometry), %d stop references",
+        n_patterns,
+        n_trips,
+        100.0 * (n_with_shape or 0) / max(n_patterns, 1),
+        n_refs or 0,
+    )
+
+
+def _load_source_tables(
+    gtfs_dir: Path, con: duckdb.DuckDBPyConnection, kept_modes: frozenset[str]
+) -> int:
+    """Read stops, routes and trips out of the feed, and return the trips kept.
+
+    Everything the group-by needs except ``stop_times.txt``, which is two orders of
+    magnitude larger and has a pass of its own.
+
+    The mode filter belongs here because it is a filter on trips and ``route_type``
+    reaches a trip only through the join to routes.txt, which is one of the tables
+    this loads. Doing it before the collapse also keeps the unwanted modes out of the
+    group-by rather than deleting their patterns afterwards.
+    """
     log.info("loading stops, routes, trips")
     # A latitude of exactly zero is the equator, and no feed this pipeline reads
     # runs a bus there. It is worth a clause of its own because it is not a null:
@@ -286,9 +318,20 @@ def build_patterns(
         n_dropped,
     )
     _report_kept_modes(con)
+    return int(n_trips)
 
-    _collapse_to_sequences(gtfs_dir, con)
 
+def _build_pattern_raw(con: duckdb.DuckDBPyConnection) -> None:
+    """Collapse the trips to distinct patterns, in a temp table nothing else keeps.
+
+    The stage's whole reason for existing: 1.55M trips are the same physical journeys
+    repeated through the day, and grouping them by ``(route_id, direction, ordered
+    stop sequence)`` is what makes a national match run affordable.
+
+    The two checks that follow belong to this table rather than to `patterns`, because
+    both delete rows and `pattern_raw` is the last point at which deleting one costs
+    nothing downstream.
+    """
     log.info("deduplicating to patterns")
     pattern_id = db.pattern_id_sql(
         "t.route_id", "t.direction", "array_to_string(ts.stop_seq, '>')"
@@ -320,6 +363,17 @@ def build_patterns(
     _check_unique_ids(con)
     _drop_routes_off_the_isles(con)
 
+
+def _merge_patterns(
+    con: duckdb.DuckDBPyConnection, feed: str, kept_modes: frozenset[str]
+) -> None:
+    """Write `pattern_raw` into the two stored tables, and stamp the feed version.
+
+    The stamp goes last on purpose. Every other stage reads `feed_version` to decide
+    which patterns are live, so writing it only once the merge has succeeded is what
+    leaves a crash part-way through holding the previous feed's dataset intact and
+    usable rather than half-replaced.
+    """
     # pattern_stops is derived and cheap, so it is rebuilt outright and holds only
     # the current feed. patterns is not: match_status and pattern_edges hang off
     # it, so rows are merged in and departed patterns are left behind rather than
@@ -363,36 +417,10 @@ def build_patterns(
         [feed, feed],
     )
     _retire_unselected_modes(con, kept_modes)
-    # Written only once the merge has succeeded. Every other stage reads this to
-    # decide which patterns are live, so a crash part-way through leaves the
-    # previous feed's dataset intact and usable rather than half-replaced.
     db.set_meta(con, "feed_version", feed)
     # Beside it, and for the same reason: the next run has to know what this one
     # chose, or it reverts to the default and takes the other modes out with it.
     db.set_meta(con, "modes", ",".join(sorted(kept_modes)))
-
-    _fill_span(con)
-    _load_shapes(gtfs_dir, con)
-    db.index(con)
-    _report_churn(con, feed)
-    _upgraded_to_shapes(con, apply=upgrade_shapes)
-
-    n_patterns, n_with_shape, n_refs = db.row(
-        con,
-        f"""
-        SELECT count(*),
-               sum(CASE WHEN shape_id IS NOT NULL THEN 1 ELSE 0 END),
-               sum(n_stops)
-        FROM patterns p WHERE {db.current_feed()}
-        """,
-    )
-    log.info(
-        "%d patterns from %d trips (%.1f%% with operator geometry), %d stop references",
-        n_patterns,
-        n_trips,
-        100.0 * (n_with_shape or 0) / max(n_patterns, 1),
-        n_refs or 0,
-    )
 
 
 def _drop_routes_off_the_isles(con: duckdb.DuckDBPyConnection) -> None:
@@ -582,12 +610,11 @@ def _fill_span(con: duckdb.DuckDBPyConnection) -> None:
     onto the wrong roads.
     """
     log.info("computing stop-chain lengths")
-    dist = _HAVERSINE.format(lat1="a.lat", lon1="a.lon", lat2="b.lat", lon2="b.lon")
+    dist = db.HAVERSINE_SQL.format(lat1="a.lat", lon1="a.lon", lat2="b.lat", lon2="b.lon")
     con.execute(f"""
         CREATE OR REPLACE TEMP TABLE span AS
         SELECT ps.pattern_id,
-               sum({dist}) AS span_m,
-               max({dist}) AS max_gap_m
+               sum({dist}) AS span_m
         FROM pattern_stops ps
         JOIN pattern_stops ps2
           ON ps2.pattern_id = ps.pattern_id AND ps2.seq = ps.seq + 1

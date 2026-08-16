@@ -565,8 +565,9 @@ SEQ_PARTITIONS = int(os.environ.get("WAYFARE_SEQ_PARTITIONS", "16"))
 
 # --- Matching batch --------------------------------------------------------
 
-# Results are committed this often. Smaller means less lost work when the server is
-# restarted mid-run; larger means fewer write transactions.
+# Results are committed this often, and a batch is also the unit of concurrency.
+# Smaller means less lost work when the server is restarted mid-run; larger means
+# fewer write transactions.
 CHECKPOINT_EVERY = 200
 
 # --- Tracing from OSM route relations ---------------------------------------
@@ -623,6 +624,57 @@ TRACE_MONOTONIC_SLACK_M = 250.0
 # rounding guard rather than a tolerance; anything larger would start welding genuine
 # gaps shut.
 TRACE_JOIN_TOLERANCE_M = 1.0
+
+# How much wider than the pending patterns' own extent to ask Overpass for, in
+# degrees. A relation is only returned if it intersects the window, and a line whose
+# stops sit just inside the box still runs out of it -- the Central line reaches
+# Epping, well past anything a London window would be drawn around. 0.2 degrees is
+# about 22 km. `osmroutes` pads its own window by less, because there the window is
+# sized off a region's stops rather than one stage's backlog.
+TRACE_BBOX_PAD_DEG = 0.2
+
+# `routes` sizes its window off a region's live stops rather than one stage's
+# backlog, so the extent is already most of the country and a wide pad only buys the
+# neighbour's network.
+ROUTES_BBOX_PAD_DEG = 0.05
+
+# Results are committed this often, for the reason `CHECKPOINT_EVERY` exists. Larger
+# than the matching batch because a trace is arithmetic against relations already in
+# memory rather than a wait on another process.
+TRACE_CHECKPOINT_EVERY = 500
+
+
+def pad_and_clip(
+    box: tuple[float, float, float, float],
+    *,
+    pad: float,
+    region: str | None,
+    what: str,
+) -> tuple[float, float, float, float]:
+    """Pad a (south, west, north, east) box, then narrow it to the region's bounds.
+
+    A window is a box and a border is not, so a region whose stops reach across one
+    asks Overpass for the neighbour's network and draws it into its own archive.
+    `Feed.bounds` is what stops that, and a box the bounds leave empty raises,
+    because discovering nothing reads exactly like a region whose track is unmapped.
+
+    `what` names the stops the box was sized off, so the error says which window
+    missed its region.
+    """
+    south, west, north, east = box
+    south, west = south - pad, west - pad
+    north, east = north + pad, east + pad
+    limit = feed(region).bounds
+    if limit is not None:
+        south, west = max(south, limit[0]), max(west, limit[1])
+        north, east = min(north, limit[2]), min(east, limit[3])
+        if south >= north or west >= east:
+            raise RuntimeError(
+                f"region {region or BODS_REGION!r} has bounds {limit}, which its "
+                f"{what} never meet; no relation could be discovered"
+            )
+    return (south, west, north, east)
+
 
 # --- Publishing ------------------------------------------------------------
 

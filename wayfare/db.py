@@ -8,6 +8,13 @@ the main thread and uses its workers only for HTTP.
 
 from __future__ import annotations
 
+import csv
+import json
+import os
+import re
+import tempfile
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -390,6 +397,41 @@ def matchable(alias: str = "p", con: duckdb.DuckDBPyConnection | None = None) ->
         return "TRUE"
     keep = ", ".join(f"'{m}'" for m in sorted(config.ROAD_MODES))
     return f"({alias}.mode IS NULL OR {alias}.mode IN ({keep}))"
+
+
+def non_road(alias: str = "p", con: duckdb.DuckDBPyConnection | None = None) -> str:
+    """Predicate for the live patterns whose geometry has to come from a relation.
+
+    Three conditions and each is load-bearing. Live, because a departed pattern is
+    work spent on a journey nobody runs. Not matchable, because a bus belongs to
+    Valhalla and a road is not what these draw. And no ``shape_id``, because where
+    the operator recorded the course themselves that recording is better than
+    anything reassembled from OpenStreetMap -- it is a survey of where the vehicle
+    goes rather than of where the track is.
+
+    Pass `con` for the reason :func:`matchable` takes one: a read-only data root may
+    predate `patterns.mode`, and a predicate naming a column that is not there fails
+    to bind rather than degrading.
+    """
+    return (
+        f"{current_feed(alias)} AND NOT {matchable(alias, con)} "
+        f"AND {alias}.shape_id IS NULL"
+    )
+
+
+# Great-circle distance between two lat/lon expressions, in metres. A format string
+# rather than a function because it is composed into a group-by over pattern_stops
+# that DuckDB has to run out of core -- the stop chain is far too big to walk in
+# Python. The mean earth radius is the same 6,371 km `valhalla` measures with, so a
+# span computed here and a road length computed there are comparable, which is what
+# the detour ratio rests on.
+HAVERSINE_SQL = """
+    2 * 6371000 * asin(sqrt(
+        pow(sin(radians({lat2} - {lat1}) / 2), 2)
+      + cos(radians({lat1})) * cos(radians({lat2}))
+      * pow(sin(radians({lon2} - {lon1}) / 2), 2)
+    ))
+"""
 
 
 def connect(path: Path | None = None, read_only: bool = False) -> duckdb.DuckDBPyConnection:
@@ -869,6 +911,205 @@ def prune_shapes(con: duckdb.DuckDBPyConnection) -> int:
         logs.get("db").info("kept %d shapes drawn directly by non-road patterns", kept)
     con.execute("CHECKPOINT")
     return int(before - kept)
+
+
+# --- Bulk insert -------------------------------------------------------------
+
+# The types a CSV round-trip cannot change the meaning of. Everything else stages as
+# newline-delimited JSON, and the two exclusions are the whole reason this list
+# exists: a list column has no CSV spelling at all, and an empty CSV field comes back
+# as NULL, so a VARCHAR staged through CSV loses the difference between "" and NULL
+# without a word. Measured on a million three-column rows, CSV loads in 0.53 s
+# against JSON's 1.86 s, which is why the safe case is not simply given up.
+_CSV_SAFE = re.compile(
+    r"^(BIGINT|INTEGER|SMALLINT|TINYINT|HUGEINT|UBIGINT|UINTEGER|USMALLINT|UTINYINT"
+    r"|DOUBLE|FLOAT|REAL|BOOLEAN|DATE|TIME|TIMESTAMP.*|DECIMAL\(.*\))$"
+)
+
+# What `on_conflict` accepts, and what each spells in SQL. A closed vocabulary rather
+# than a clause the caller supplies: this builds SQL by interpolation, so the only
+# safe caller-controlled parts are the ones enumerated here.
+_CONFLICT = {None: "INSERT", "ignore": "INSERT OR IGNORE", "replace": "INSERT OR REPLACE"}
+
+
+@contextmanager
+def _staged(suffix: str) -> Iterator[Path]:
+    """A scratch file beside the database, removed however the block exits.
+
+    Under WORK rather than the system temp directory: a server run points
+    WAYFARE_DATA at a volume with room, and /tmp is frequently a small tmpfs.
+    """
+    d = config.WORK / "stage"
+    d.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(suffix=suffix, dir=d)
+    os.close(fd)
+    path = Path(name)
+    try:
+        yield path
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def insert_via_file(
+    con: duckdb.DuckDBPyConnection,
+    table: str,
+    cols: Sequence[str],
+    rows: Iterable[Sequence[Any]],
+    types: Mapping[str, str] | None = None,
+    *,
+    on_conflict: str | None = None,
+) -> int:
+    """Insert rows by staging them to a file and having DuckDB read it back.
+
+    The only way to fill a table that grows with the network. ``executemany`` moves
+    about 2,700 rows a second; a staged file moves 1.6M, so on a national run the
+    difference is the stage finishing overnight or not at all.
+
+    ``types`` names the DuckDB type of each column, which is what stops the reader
+    guessing. Where it is not given the destination table is asked, so the file is
+    read back as exactly what the table already declares -- a column that arrives all
+    NULL, or a GTFS id that looks like a number, cannot be inferred into something
+    else on the way in.
+
+    ``on_conflict`` is ``None``, ``"ignore"`` or ``"replace"``: the first for a table
+    with no key to collide on, the second where another pattern may already have
+    inserted the same edge, the third where two stages fill one row and the later one
+    wins.
+
+    Returns the number of rows staged, which is not the number inserted when a
+    conflict rule discards some.
+
+    ``rows`` is consumed once, while the file is being written. It must not be a
+    generator that queries ``con``: a connection holds one result at a time, so a
+    query started mid-stream abandons whatever this is iterating and the truncated
+    result looks complete.
+    """
+    if on_conflict not in _CONFLICT:
+        raise ValueError(f"on_conflict must be one of {sorted(_CONFLICT, key=str)}")
+    resolved = dict(types) if types is not None else _column_types(con, table)
+    missing = [c for c in cols if c not in resolved]
+    if missing:
+        raise ValueError(f"no type for {missing} of {table}; pass `types`")
+
+    spec = ",".join(f"'{c}':'{resolved[c]}'" for c in cols)
+    named = ", ".join(cols)
+    as_json = any(not _CSV_SAFE.match(resolved[c]) for c in cols)
+    with _staged(".ndjson" if as_json else ".csv") as path:
+        n = _write_json(path, cols, rows) if as_json else _write_csv(path, rows)
+        if not n:
+            return 0
+        # The path is ours, but the data root is the operator's and an apostrophe in
+        # it would otherwise end the string literal early -- `cluster` doubles it for
+        # the same reason.
+        quoted = str(path).replace("'", "''")
+        read = (
+            f"read_json('{quoted}', format='newline_delimited', columns={{{spec}}})"
+            if as_json
+            else f"read_csv('{quoted}', header=false, columns={{{spec}}})"
+        )
+        con.execute(
+            f"{_CONFLICT[on_conflict]} INTO {table} ({named}) "  # noqa: S608
+            f"SELECT {named} FROM {read}"
+        )
+    return n
+
+
+def _column_types(con: duckdb.DuckDBPyConnection, table: str) -> dict[str, str]:
+    return {
+        r[0]: r[1]
+        for r in con.execute(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_name = ?",
+            [table],
+        ).fetchall()
+    }
+
+
+def _write_csv(path: Path, rows: Iterable[Sequence[Any]]) -> int:
+    n = 0
+    with path.open("w", newline="") as fh:
+        writer = csv.writer(fh)
+        for r in rows:
+            writer.writerow(r)
+            n += 1
+    return n
+
+
+def _write_json(path: Path, cols: Sequence[str], rows: Iterable[Sequence[Any]]) -> int:
+    n = 0
+    with path.open("w") as fh:
+        for r in rows:
+            # `default=str` so a timestamp or a Decimal stages as the text DuckDB
+            # parses back into the column's own type, rather than raising here.
+            fh.write(json.dumps(dict(zip(cols, r, strict=True)), default=str))
+            fh.write("\n")
+            n += 1
+    return n
+
+
+# --- Status caches -----------------------------------------------------------
+
+# The one outcome of `match_status` and `trace_status` that is a statement about the
+# world at that moment rather than about the pattern. Everything else in either table
+# is permanent by design: a pattern that cannot be routed will never route, and a
+# stage that retries the impossible on every restart never finishes.
+TRANSPORT_ERROR = "transport_error"
+
+# What `--retry transient` expands to. Kept as a name rather than spelled out at the
+# call site so that adding a status here reaches the CLI, the help text and the
+# recovery path together.
+RETRYABLE = (TRANSPORT_ERROR,)
+_RETRY_ALIASES: dict[str, tuple[str, ...]] = {"transient": RETRYABLE}
+
+
+def expand_statuses(statuses: Sequence[str]) -> list[str]:
+    """Resolve the ``transient`` alias, leaving any literal status alone."""
+    out: list[str] = []
+    for s in statuses:
+        out.extend(_RETRY_ALIASES.get(s, (s,)))
+    return out
+
+
+def retry_statuses(
+    con: duckdb.DuckDBPyConnection,
+    status_table: str,
+    dependents: Sequence[str],
+    statuses: Sequence[str],
+    *,
+    key: str = "pattern_id",
+) -> int:
+    """Forget outcomes with these statuses so the next run redoes them.
+
+    Failures are deliberately never retried automatically. But when the stage itself
+    was wrong, the recorded failures are wrong too, and this is how they get cleared.
+    ``transient`` is the alias for the statuses that are safe to clear unattended,
+    which is ``transport_error`` alone: nothing was ever learned about those patterns.
+
+    ``dependents`` are the tables whose rows only exist because of the status row --
+    a cleared trace has to lose its geometry with it, or the next run writes a second
+    one. Tables shared across patterns are not dependents: `edges` is re-inserted on
+    conflict, and deleting a row another pattern still references would take that
+    pattern's geometry with it.
+
+    Call this *before* the stage starts, never between batches. Work is selected by
+    the absence of a status row, so deleting one while a batch holding that pattern
+    is in flight hands the same pattern out twice -- the same trap that makes a batch
+    the unit of both concurrency and checkpointing.
+    """
+    wanted = expand_statuses(statuses)
+    ids = [
+        r[0]
+        for r in con.execute(
+            f"SELECT {key} FROM {status_table} WHERE status IN (SELECT unnest(?))",  # noqa: S608
+            [wanted],
+        ).fetchall()
+    ]
+    if not ids:
+        return 0
+    for table in (*dependents, status_table):
+        con.execute(f"DELETE FROM {table} WHERE {key} IN (SELECT unnest(?))", [ids])  # noqa: S608
+    logs.get("db").info("cleared %d outcomes with status in %s", len(ids), wanted)
+    return len(ids)
 
 
 def row(

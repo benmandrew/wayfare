@@ -452,13 +452,13 @@ def test_status_reports_clustering_going_stale(con):
     Read through `coverage`, which is what `wayfare status` prints, so the wording
     is free to change while the three states it has to distinguish are not."""
     builders.insert_edge(con, 1, lon_e6=-3200000, lat_e6=51480000)
-    assert aggregate.coverage(con)["edges_clustered"] == "no"
+    assert aggregate.funnel(con)["edges_clustered"] == "no"
 
     db.cluster_edges(con)
-    assert aggregate.coverage(con)["edges_clustered"] == "yes"
+    assert aggregate.funnel(con)["edges_clustered"] == "yes"
 
     builders.insert_edge(con, 2, lon_e6=-100000, lat_e6=51500000)
-    stale = aggregate.coverage(con)["edges_clustered"]
+    stale = aggregate.funnel(con)["edges_clustered"]
     assert isinstance(stale, str)
     # The shortfall itself, rather than the sentence it is reported in: one of the
     # two edges is sorted and the other is not.
@@ -512,3 +512,292 @@ def test_prune_keeps_the_geometry_a_non_road_pattern_is_drawn_from(con):
     # The bus's shape goes; the tram's stays.
     assert db.prune_shapes(con) == 1
     assert [r[0] for r in con.execute("SELECT shape_id FROM shapes").fetchall()] == ["SH2"]
+
+
+# --- Bulk insert -------------------------------------------------------------
+
+
+def test_insert_via_file_loads_flat_rows(con, staging):
+    """The shape `pattern_edges` grows in: three numbers, hundreds of millions of
+    rows, and the only reason this helper exists instead of an insert loop."""
+    n = db.insert_via_file(
+        con,
+        "pattern_edges",
+        ("pattern_id", "seq", "edge_id"),
+        [(1, 0, 1001), (1, 1, 1002), (2, 0, 1001)],
+    )
+    assert n == 3
+    assert con.execute(
+        "SELECT pattern_id, seq, edge_id FROM pattern_edges ORDER BY pattern_id, seq"
+    ).fetchall() == [(1, 0, 1001), (1, 1, 1002), (2, 0, 1001)]
+
+
+def test_insert_via_file_keeps_list_columns_whole(con, staging):
+    """`ways` and `edges` store geometry as micro-degree lists, so a staging format
+    that cannot carry a list carries nothing this pipeline needs."""
+    db.insert_via_file(
+        con,
+        "ways",
+        (
+            "way_id",
+            "lon_e6",
+            "lat_e6",
+            "min_lon_e6",
+            "min_lat_e6",
+            "max_lon_e6",
+            "max_lat_e6",
+        ),
+        [
+            (
+                7,
+                [-2245000, -2240000],
+                [53480000, 53481000],
+                -2245000,
+                53480000,
+                -2240000,
+                53481000,
+            )
+        ],
+    )
+    assert db.row(con, "SELECT lon_e6, lat_e6 FROM ways") == (
+        [-2245000, -2240000],
+        [53480000, 53481000],
+    )
+
+
+def test_insert_via_file_tells_an_empty_string_from_a_null(con, staging):
+    """A CSV round-trip reads an empty field back as NULL, so text stages as JSON.
+    The two mean different things -- a road with no name and a road named "" -- and
+    the difference disappearing is the kind of failure nothing downstream reports."""
+    db.insert_via_file(
+        con,
+        "edges",
+        ("edge_id", "way_id", "road_name", "road_class"),
+        [
+            (1, 10, "", "residential"),
+            (2, 11, None, "residential"),
+            (3, 12, 'High Street, "the" one\nsecond line', "residential"),
+        ],
+    )
+    assert con.execute(
+        "SELECT edge_id, road_name FROM edges ORDER BY edge_id"
+    ).fetchall() == [
+        (1, ""),
+        (2, None),
+        (3, 'High Street, "the" one\nsecond line'),
+    ]
+
+
+def test_insert_via_file_keeps_a_gtfs_id_a_string(con, staging):
+    """Route "07" must not become 7. The destination column's declared type is what
+    the file is read back as, so nothing is left for a sniffer to decide."""
+    db.set_meta(con, "feed_version", "F1")
+    db.insert_via_file(
+        con,
+        "routes",
+        ("route_id", "short_name", "route_type"),
+        [("07", "07", "3")],
+    )
+    assert db.row(con, "SELECT route_id, short_name FROM routes") == ("07", "07")
+
+
+def test_insert_via_file_stages_nothing_for_no_rows(con, staging):
+    assert db.insert_via_file(con, "pattern_edges", ("pattern_id",), []) == 0
+    assert db.scalar(con, "SELECT count(*) FROM pattern_edges") == 0
+
+
+def test_insert_via_file_ignores_a_row_another_pattern_already_wrote(con, staging):
+    """`edges` is shared across every pattern that traverses it, so the second
+    arrival keeps the geometry the first one stored rather than replacing it."""
+    cols = ("edge_id", "way_id", "road_name")
+    db.insert_via_file(con, "edges", cols, [(1, 10, "first")], on_conflict="ignore")
+    db.insert_via_file(con, "edges", cols, [(1, 99, "second")], on_conflict="ignore")
+    assert db.row(con, "SELECT way_id, road_name FROM edges") == (10, "first")
+
+
+def test_insert_via_file_replaces_where_the_later_writer_wins(con, staging):
+    """`ways` is filled by two stages that never see each other's relations."""
+    cols = ("way_id", "lon_e6", "lat_e6")
+    db.insert_via_file(con, "ways", cols, [(7, [1], [2])], on_conflict="replace")
+    db.insert_via_file(con, "ways", cols, [(7, [3], [4])], on_conflict="replace")
+    assert db.row(con, "SELECT lon_e6, lat_e6 FROM ways") == ([3], [4])
+
+
+def test_insert_via_file_takes_explicit_types_for_a_table_it_cannot_ask(con, staging):
+    """A staging table the caller creates itself is still a table this can fill."""
+    con.execute("CREATE TEMP TABLE staged (way_id BIGINT, way_ids BIGINT[])")
+    db.insert_via_file(
+        con,
+        "staged",
+        ("way_id", "way_ids"),
+        [(1, [10, 11])],
+        types={"way_id": "BIGINT", "way_ids": "BIGINT[]"},
+    )
+    assert db.row(con, "SELECT way_id, way_ids FROM staged") == (1, [10, 11])
+
+
+def test_insert_via_file_refuses_a_column_it_has_no_type_for(con, staging):
+    with pytest.raises(ValueError, match="no type for"):
+        db.insert_via_file(con, "edges", ("edge_id", "nonesuch"), [(1, 2)])
+
+
+def test_insert_via_file_refuses_a_conflict_rule_it_does_not_know(con, staging):
+    with pytest.raises(ValueError, match="on_conflict"):
+        db.insert_via_file(
+            con, "edges", ("edge_id",), [(1,)], on_conflict="do nothing at all"
+        )
+
+
+# --- The non-road predicate --------------------------------------------------
+
+
+def _non_road_ids(con) -> list[int]:
+    return [
+        r[0]
+        for r in con.execute(
+            f"SELECT p.pattern_id FROM patterns p WHERE {db.non_road()} ORDER BY 1"
+        ).fetchall()
+    ]
+
+
+def test_non_road_selects_only_what_a_relation_has_to_draw(con):
+    """Live, not matchable, and no operator shape. Each condition drops something
+    that would otherwise be drawn twice or drawn from the wrong source."""
+    db.set_meta(con, "feed_version", "F1")
+    builders.insert_pattern(con, 1, mode="bus")  # matchable: Valhalla's
+    builders.insert_pattern(con, 2, mode="tram")  # nothing else draws it
+    builders.insert_pattern(con, 3, mode="tram", last_seen=None)  # departed
+    con.execute("UPDATE patterns SET shape_id = 'SH1' WHERE pattern_id = 2")
+    builders.insert_pattern(con, 4, mode="metro")
+    builders.insert_pattern(con, 5, mode="tram")
+
+    assert _non_road_ids(con) == [4, 5]
+
+
+def test_non_road_binds_against_a_database_with_no_mode_column(legacy_db):
+    """`status` connects read-only, so `migrate` never runs and the column may not
+    be there. A predicate that names it fails to bind rather than degrading."""
+    path = legacy_db(
+        "CREATE TABLE patterns (pattern_id BIGINT, shape_id VARCHAR, last_seen VARCHAR)",
+        "CREATE TABLE meta (key VARCHAR, value VARCHAR)",
+        "INSERT INTO patterns VALUES (1, NULL, 'F1')",
+        "INSERT INTO meta VALUES ('feed_version', 'F1')",
+    )
+    con = duckdb.connect(str(path), read_only=True)
+    try:
+        sql = f"SELECT count(*) FROM patterns p WHERE {db.non_road('p', con)}"
+        # Everything stored in such a database is road-going by construction, so
+        # nothing in it is owed geometry from a relation.
+        assert db.scalar(con, sql) == 0
+    finally:
+        con.close()
+
+
+# --- Distance in SQL ---------------------------------------------------------
+
+
+def test_haversine_sql_agrees_with_the_python_one(con):
+    """`patterns` measures a stop chain in SQL because it is far too big to walk in
+    Python, and `art` and `trace` measure the same geometry in Python. The two have
+    to be the same distance or a detour ratio compares one against the other."""
+    from wayfare import osm
+
+    a, b = (51.5074, -0.1278), (53.4808, -2.2426)
+    sql = db.HAVERSINE_SQL.format(lat1=a[0], lon1=a[1], lat2=b[0], lon2=b[1])
+    assert db.scalar(con, f"SELECT {sql}") == pytest.approx(osm.haversine_m(a, b))
+
+
+def test_haversine_sql_composes_into_a_group_by(con):
+    """The shape both callers use it in: a max over consecutive stops of a pattern."""
+    con.execute(
+        "INSERT INTO stops VALUES ('S1', 'Alpha', 53.48, -2.245), "
+        "('S2', 'Bravo', 53.48, -2.240), ('S3', 'Charlie', 53.48, -2.200)"
+    )
+    con.execute("INSERT INTO pattern_stops VALUES (1, 1, 'S1'), (1, 2, 'S2'), (1, 3, 'S3')")
+    dist = db.HAVERSINE_SQL.format(lat1="a.lat", lon1="a.lon", lat2="b.lat", lon2="b.lon")
+    gap = db.scalar(
+        con,
+        f"""
+        SELECT max({dist}) FROM pattern_stops ps
+        JOIN pattern_stops ps2
+          ON ps2.pattern_id = ps.pattern_id AND ps2.seq = ps.seq + 1
+        JOIN stops a ON a.stop_id = ps.stop_id
+        JOIN stops b ON b.stop_id = ps2.stop_id
+        GROUP BY ps.pattern_id
+        """,
+    )
+    assert gap == pytest.approx(2646.0, abs=1.0)
+
+
+# --- Clearing a status cache -------------------------------------------------
+
+
+def _status(con, table, pattern_id, status) -> None:
+    con.execute(
+        f"INSERT INTO {table} (pattern_id, status) VALUES (?, ?)", [pattern_id, status]
+    )
+
+
+def test_transport_error_is_the_one_status_both_caches_call_retryable():
+    """Two stages record it and one alias clears it, so the spelling is shared."""
+    from wayfare import match, trace
+
+    assert db.TRANSPORT_ERROR == match.TRANSPORT_ERROR == trace.TRANSPORT_ERROR
+    assert db.expand_statuses(["transient"]) == [db.TRANSPORT_ERROR]
+    # Anything else is a literal status, passed through untouched.
+    assert db.expand_statuses(["no_route", "transient"]) == [
+        "no_route",
+        db.TRANSPORT_ERROR,
+    ]
+
+
+def test_retry_statuses_clears_the_transport_faults_and_their_edges(con):
+    """Nothing was ever learned about those patterns, so the row is a lie about
+    them -- and the edges written under it have to go with it."""
+    _status(con, "match_status", 1, "ok")
+    _status(con, "match_status", 2, db.TRANSPORT_ERROR)
+    _status(con, "match_status", 3, "no_route")
+    con.execute("INSERT INTO pattern_edges VALUES (2, 0, 1001), (1, 0, 1002)")
+
+    assert db.retry_statuses(con, "match_status", ["pattern_edges"], ["transient"]) == 1
+    assert [
+        r[0]
+        for r in con.execute("SELECT pattern_id FROM match_status ORDER BY 1").fetchall()
+    ] == [1, 3]
+    # The dependent row goes with the status; the other pattern's is untouched.
+    assert [
+        r[0] for r in con.execute("SELECT pattern_id FROM pattern_edges").fetchall()
+    ] == [1]
+
+
+def test_retry_statuses_leaves_a_permanent_failure_alone(con):
+    """A pattern that cannot be routed will never route. Retrying it every restart
+    is how a national run stops finishing."""
+    _status(con, "match_status", 1, "no_route")
+    _status(con, "match_status", 2, "low_confidence")
+
+    assert db.retry_statuses(con, "match_status", ["pattern_edges"], ["transient"]) == 0
+    assert db.scalar(con, "SELECT count(*) FROM match_status") == 2
+
+
+def test_retry_statuses_takes_a_literal_status_too(con):
+    """The escape hatch for when the stage itself was wrong: the recorded failures
+    are wrong with it, and only an operator can say so."""
+    _status(con, "match_status", 1, "low_confidence")
+    _status(con, "match_status", 2, "ok")
+
+    assert db.retry_statuses(con, "match_status", [], ["low_confidence"]) == 1
+    assert db.scalar(con, "SELECT count(*) FROM match_status") == 1
+
+
+def test_retry_statuses_clears_a_trace_and_its_geometry(con):
+    """The same call against the other cache: a trace_status row cleared without its
+    `traces` row leaves geometry no status admits to, and the next run writes a
+    second one over it."""
+    _status(con, "trace_status", 1, db.TRANSPORT_ERROR)
+    _status(con, "trace_status", 2, "no_relation")
+    con.execute("INSERT INTO traces (pattern_id, relation_id) VALUES (1, 900), (2, 901)")
+
+    assert db.retry_statuses(con, "trace_status", ["traces"], ["transient"]) == 1
+    assert db.scalar(con, "SELECT count(*) FROM trace_status") == 1
+    assert [r[0] for r in con.execute("SELECT pattern_id FROM traces").fetchall()] == [2]

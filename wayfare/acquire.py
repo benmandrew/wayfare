@@ -14,7 +14,8 @@ import re
 import shutil
 import time
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -66,11 +67,13 @@ class Source:
     # continue instead of starting over. Measured, not assumed -- of our three
     # sources only Geofabrik does, and it is also much the largest.
     resumable: bool = False
-    # The *name* of a credential pair, never the credentials. Network Rail's
-    # SCHEDULE feed is the first source here behind a login, and a `Source` is a
-    # frozen dataclass that gets logged, compared and held in lists -- a password
-    # in it would reach a log line eventually. The name resolves through
-    # `credentials` at request time and nothing holds the secret in between.
+    # The *name* of a credential pair, never the credentials: a `Source` is a frozen
+    # dataclass that gets logged, compared and held in lists, so a password in it
+    # would reach a log line eventually. The name resolves through `credentials` at
+    # request time and nothing holds the secret in between. No source built here
+    # sets it. The one feed behind a login is Network Rail's SCHEDULE extract, and
+    # `wayfare routes --cif` takes that as a path it is handed rather than fetching
+    # it, which is what keeps an unattended refresh from waiting on a login.
     credentials_from: str | None = None
 
 
@@ -215,7 +218,14 @@ def credentials(name: str) -> tuple[str, str]:
     return user, password
 
 
-def _stream(src: Source, part: Path) -> None:
+@contextmanager
+def _negotiate(src: Source, part: Path) -> Iterator[tuple[requests.Response, int]]:
+    """Open the transfer, and say how many bytes of `part` it continues from.
+
+    Nonzero means the host agreed to resume and the caller appends; zero means the
+    body carries the whole file and the partial must go, whether or not a range was
+    asked for.
+    """
     headers = {"User-Agent": config.USER_AGENT}
     have = part.stat().st_size if (src.resumable and part.exists()) else 0
     if have:
@@ -243,36 +253,48 @@ def _stream(src: Source, part: Path) -> None:
         # remainder and is appended; anything else carries the whole file from byte
         # zero, so the partial must be discarded or the two get concatenated into
         # a corrupt file that is the right shape and the wrong size.
-        resumed = have > 0 and r.status_code == 206
-        if have and not resumed:
+        if have and r.status_code != 206:
             log.info("%s: server ignored the range request; starting over", src.name)
             have = 0
-
-        # BODS sends no Content-Length, so progress is reported in absolute bytes
-        # rather than as a percentage. Every other host does send one -- see the
-        # completeness check below, which is the cheap version of check_gtfs.
-        total = int(r.headers.get("Content-Length") or 0) + have
-        # requests transparently decodes a compressed body, so the bytes written
-        # are not the bytes declared and the check below would fire on a perfectly
-        # good transfer.
-        declared = total if not r.headers.get("Content-Encoding") else 0
-        written = have
-        next_report = written
-        if resumed:
+        if have:
             log.info("%s: resuming from %.2f GB", src.name, have / 1e9)
+        yield r, have
 
-        with part.open("ab" if resumed else "wb") as fh:
-            for chunk in r.iter_content(config.DOWNLOAD_CHUNK):
-                fh.write(chunk)
-                written += len(chunk)
-                if written >= next_report:
-                    log.info(
-                        "%s: %.2f GB%s",
-                        src.name,
-                        written / 1e9,
-                        f" of {total / 1e9:.2f}" if total else "",
-                    )
-                    next_report = written + (250 << 20)
+
+def _write_body(
+    src: Source, r: requests.Response, part: Path, have: int
+) -> tuple[int, int]:
+    """Drain the body onto disk. Returns the bytes written and the length the host
+    declared, which is zero where there is nothing to compare against."""
+    # BODS sends no Content-Length, so progress is reported in absolute bytes
+    # rather than as a percentage. Every other host does send one -- see the
+    # completeness check in `_stream`, which is the cheap version of check_gtfs.
+    total = int(r.headers.get("Content-Length") or 0) + have
+    # requests transparently decodes a compressed body, so the bytes written are
+    # not the bytes declared and the check on them would fire on a perfectly good
+    # transfer.
+    declared = total if not r.headers.get("Content-Encoding") else 0
+    written = have
+    next_report = written
+
+    with part.open("ab" if have else "wb") as fh:
+        for chunk in r.iter_content(config.DOWNLOAD_CHUNK):
+            fh.write(chunk)
+            written += len(chunk)
+            if written >= next_report:
+                log.info(
+                    "%s: %.2f GB%s",
+                    src.name,
+                    written / 1e9,
+                    f" of {total / 1e9:.2f}" if total else "",
+                )
+                next_report = written + (250 << 20)
+    return written, declared
+
+
+def _stream(src: Source, part: Path) -> None:
+    with _negotiate(src, part) as (r, have):
+        written, declared = _write_body(src, r, part, have)
 
     # A host that declares a length has told us what complete means, so a short
     # read is knowable here rather than three stages later. This is a dropped

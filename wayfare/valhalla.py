@@ -27,13 +27,13 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from math import asin, cos, radians, sin, sqrt
+from math import cos, radians
 from typing import Any
 from urllib.parse import urljoin
 
 import requests
 
-from . import config, logs, polyline
+from . import config, logs, osm, polyline
 
 log = logs.get("valhalla")
 
@@ -72,9 +72,6 @@ MAX_CHUNK_M = config.VALHALLA_MAX_DISTANCE_M * config.VALHALLA_DISTANCE_HEADROOM
 # synthesised road shape first -- it runs about 24 points per kilometre, so 180 km is
 # some 4,300 points -- so this is a backstop rather than a working limit.
 MAX_SHAPE_POINTS = 16_000
-# The same sphere `gtfs._HAVERSINE` uses, so a chunk bound and a stored `span_m` are
-# the same measurement of the same leg.
-EARTH_RADIUS_M = 6_371_000.0
 
 # How close two stops have to be before the second counts as the route coming back
 # to the first. The two directions of one stop are separate NaPTAN ids on opposite
@@ -85,8 +82,6 @@ EARTH_RADIUS_M = 6_371_000.0
 # only 0.38% of stop-to-stop-after-next pairs -- the closest two the rule can even
 # consider -- fall within 50 m of each other.
 REVISIT_M = 50.0
-
-_M_PER_DEG_LAT = 111_320.0
 
 
 class ValhallaError(RuntimeError):
@@ -368,13 +363,6 @@ def _to_match(data: dict[str, Any], source: str) -> Match:
     )
 
 
-def _haversine_m(a: tuple[float, float], b: tuple[float, float]) -> float:
-    lat1, lon1 = radians(a[0]), radians(a[1])
-    lat2, lon2 = radians(b[0]), radians(b[1])
-    h = sin((lat2 - lat1) / 2) ** 2 + cos(lat1) * cos(lat2) * sin((lon2 - lon1) / 2) ** 2
-    return 2 * EARTH_RADIUS_M * asin(sqrt(h))
-
-
 def _as_point(item: Any) -> tuple[float, float]:
     """The identity extractor, for chunking a list that is already coordinates."""
     return item
@@ -412,13 +400,13 @@ def _location_types(points: list[tuple[float, float]]) -> list[str]:
         return types
     # One longitude scale for the whole pattern. Over a bus route's extent the
     # error against a proper haversine is centimetres, against a 50 m test.
-    lon_scale = _M_PER_DEG_LAT * cos(radians(points[0][0]))
+    lon_scale = osm.M_PER_DEG_LAT * cos(radians(points[0][0]))
     for i in range(n):
         lat_i, lon_i = points[i]
         for j in range(i + 2, n):
             if i == 0 and j == n - 1:
                 continue
-            dy = (points[j][0] - lat_i) * _M_PER_DEG_LAT
+            dy = (points[j][0] - lat_i) * osm.M_PER_DEG_LAT
             if abs(dy) > REVISIT_M:
                 continue  # cheap reject before the multiply; kills nearly every pair
             dx = (points[j][1] - lon_i) * lon_scale
@@ -461,7 +449,7 @@ def _chunks[T](
         run = 0.0
         while end + 1 < len(items) and end - start + 2 <= size:
             if max_m is not None:
-                step = _haversine_m(at(items[end]), at(items[end + 1]))
+                step = osm.haversine_m(at(items[end]), at(items[end + 1]))
                 if end > start and run + step > max_m:
                     break
                 run += step

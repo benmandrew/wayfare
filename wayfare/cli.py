@@ -628,7 +628,7 @@ def _dispatch(args: argparse.Namespace) -> int:
     if args.cmd == "status":
         _require_db()
         con = db.connect(read_only=True)
-        print(json.dumps(aggregate.coverage(con), indent=2))
+        print(json.dumps(aggregate.funnel(con), indent=2))
         con.close()
         return 0
 
@@ -697,7 +697,7 @@ def _dispatch(args: argparse.Namespace) -> int:
             log.warning("skipping trace: %s", exc)
         aggregate.build(con)
         publish.build(con, region=args.region, out=out)
-        print(json.dumps(aggregate.coverage(con), indent=2))
+        print(json.dumps(aggregate.funnel(con), indent=2))
         con.close()
         return 0
 

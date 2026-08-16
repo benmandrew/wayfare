@@ -12,7 +12,7 @@ reboots, Valhalla runs out of memory, the process is killed. So:
   restart never finishes. That rule holds only while "failed" means "impossible",
   so a fault that was never about the pattern -- the connection refused, the read
   timed out, Valhalla restarting -- is recorded as ``transport_error`` and is the
-  one status a later run is invited to clear. See RETRYABLE.
+  one status a later run is invited to clear. See `db.RETRYABLE`.
 * One batch is both the unit of concurrency and the unit of checkpointing. Those
   cannot be separated: because work is selected by the absence of a status row, a
   batch still in flight is still selectable, so loading the next batch before
@@ -24,16 +24,9 @@ HTTP, and DuckDB takes a single writer. Workers do HTTP, the main thread writes.
 
 from __future__ import annotations
 
-import csv
-import json
-import os
-import tempfile
 import time
-from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import duckdb
@@ -43,15 +36,7 @@ from . import config, db, logs, valhalla
 
 log = logs.get("match")
 
-# The one outcome that is a statement about the world at that moment rather than
-# about the pattern. Everything else in match_status is permanent by design.
-TRANSPORT_ERROR = "transport_error"
-
-# What `--retry transient` expands to. Kept as a name rather than spelled out at
-# the call site so that adding a status here reaches the CLI, the help text and
-# the recovery path together.
-RETRYABLE = (TRANSPORT_ERROR,)
-_RETRY_ALIASES = {"transient": RETRYABLE}
+TRANSPORT_ERROR = db.TRANSPORT_ERROR
 
 
 @dataclass
@@ -103,43 +88,11 @@ def pending_count(con: duckdb.DuckDBPyConnection) -> int:
 def retry(con: duckdb.DuckDBPyConnection, statuses: list[str]) -> int:
     """Forget outcomes with these statuses so the next run redoes them.
 
-    Failures are deliberately never retried automatically -- a pattern that cannot
-    be routed will never route, and retrying it every restart means never
-    finishing. But when the matcher itself was wrong, the recorded failures are
-    wrong too, and this is how they get cleared. ``transient`` is the alias for the
-    statuses that are safe to clear unattended, which is ``transport_error`` alone:
-    nothing was ever learned about those patterns.
-
-    Call this *before* matching starts, never between batches. Work is selected by
-    the absence of a status row, so deleting one while a batch holding that pattern
-    is in flight hands the same pattern out twice -- the same trap that makes a
-    batch the unit of both concurrency and checkpointing.
+    ``pattern_edges`` is the only dependent. `edges` is shared across patterns and
+    re-inserted on conflict, so a stale row costs nothing and deleting one that
+    another pattern still references would lose that pattern's geometry.
     """
-    wanted = expand_statuses(statuses)
-    ids = [
-        r[0]
-        for r in con.execute(
-            "SELECT pattern_id FROM match_status WHERE status IN (SELECT unnest(?))",
-            [wanted],
-        ).fetchall()
-    ]
-    if not ids:
-        return 0
-    con.execute("DELETE FROM pattern_edges WHERE pattern_id IN (SELECT unnest(?))", [ids])
-    con.execute("DELETE FROM match_status WHERE pattern_id IN (SELECT unnest(?))", [ids])
-    # `edges` is left alone: it is shared across patterns and re-inserted by
-    # ON CONFLICT DO NOTHING, so a stale row costs nothing and deleting one that
-    # another pattern still references would lose that pattern's geometry.
-    log.info("cleared %d outcomes with status in %s", len(ids), wanted)
-    return len(ids)
-
-
-def expand_statuses(statuses: list[str]) -> list[str]:
-    """Resolve the ``transient`` alias, leaving any literal status alone."""
-    out: list[str] = []
-    for s in statuses:
-        out.extend(_RETRY_ALIASES.get(s, (s,)))
-    return out
+    return db.retry_statuses(con, "match_status", ("pattern_edges",), statuses)
 
 
 def reclassify_transport_faults(con: duckdb.DuckDBPyConnection) -> int:
@@ -277,9 +230,7 @@ def _fetch_shapes(
 
 
 def _fetch_max_gap(con: duckdb.DuckDBPyConnection, ids: list[int]) -> dict[int, float]:
-    from .gtfs import _HAVERSINE
-
-    dist = _HAVERSINE.format(lat1="a.lat", lon1="a.lon", lat2="b.lat", lon2="b.lon")
+    dist = db.HAVERSINE_SQL.format(lat1="a.lat", lon1="a.lon", lat2="b.lat", lon2="b.lon")
     rows = con.execute(
         f"""
         SELECT ps.pattern_id, max({dist})
@@ -565,8 +516,8 @@ def _commit(con: duckdb.DuckDBPyConnection, batch: list[Outcome]) -> None:
         seen: dict[int, tuple[Any, ...]] = {}
         for row in edge_rows:
             seen.setdefault(row[0], row)
-        _insert_edges(con, list(seen.values()))
-        _insert_links(con, link_rows)
+        db.insert_via_file(con, "edges", _EDGE_COLS, seen.values(), on_conflict="ignore")
+        db.insert_via_file(con, "pattern_edges", _LINK_COLS, link_rows)
 
 
 # -- bulk insert ------------------------------------------------------------
@@ -578,14 +529,10 @@ def _commit(con: duckdb.DuckDBPyConnection, batch: list[Outcome]) -> None:
 # and 169,857 edges, so roughly 450 of the run's 983 seconds went on inserting
 # rather than matching, with Valhalla sitting at under 1% CPU throughout.
 #
-# Staging the batch to a file and letting DuckDB read it back columnar is the same
-# work at 1.6M rows/s for the flat table and 186k rows/s for the one with list
-# columns. Measured: 400k link rows in 0.25s against 150s.
-#
-# pattern_edges is flat, so CSV. edges carries INTEGER[] geometry and a road_name
-# that can hold quotes, commas and newlines, so newline-delimited JSON, with the
-# column types stated rather than sniffed -- a batch whose geometry is entirely
-# NULL would otherwise infer the wrong type and fail the insert.
+# `db.insert_via_file` is the same work at 1.6M rows/s for the flat table and 186k
+# rows/s for the one with list columns. Measured: 400k link rows in 0.25s against
+# 150s. It takes the column types off the destination table, which is what stops a
+# batch whose geometry is entirely NULL being read back as something else.
 
 _EDGE_COLS: tuple[str, ...] = (
     "edge_id",
@@ -600,54 +547,7 @@ _EDGE_COLS: tuple[str, ...] = (
     "max_lon_e6",
     "max_lat_e6",
 )
-_EDGE_TYPES = (
-    "'edge_id':'BIGINT','way_id':'BIGINT','road_name':'VARCHAR',"
-    "'road_class':'VARCHAR','length_m':'DOUBLE',"
-    "'lon_e6':'INTEGER[]','lat_e6':'INTEGER[]',"
-    "'min_lon_e6':'INTEGER','min_lat_e6':'INTEGER',"
-    "'max_lon_e6':'INTEGER','max_lat_e6':'INTEGER'"
-)
-
-
-@contextmanager
-def _staged(suffix: str) -> Iterator[Path]:
-    """A scratch file beside the database, removed however the block exits.
-
-    Under WORK rather than the system temp directory: a server run points
-    WAYFARE_DATA at a volume with room, and /tmp is frequently a small tmpfs.
-    """
-    d = config.WORK / "stage"
-    d.mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(suffix=suffix, dir=d)
-    os.close(fd)
-    path = Path(name)
-    try:
-        yield path
-    finally:
-        path.unlink(missing_ok=True)
-
-
-def _insert_edges(con: duckdb.DuckDBPyConnection, rows: list[tuple[Any, ...]]) -> None:
-    with _staged(".ndjson") as p:
-        with p.open("w") as fh:
-            for r in rows:
-                fh.write(json.dumps(dict(zip(_EDGE_COLS, r, strict=True))))
-                fh.write("\n")
-        con.execute(
-            f"INSERT INTO edges SELECT {', '.join(_EDGE_COLS)} "
-            f"FROM read_json('{p}', format='newline_delimited', columns={{{_EDGE_TYPES}}}) "
-            "ON CONFLICT (edge_id) DO NOTHING"
-        )
-
-
-def _insert_links(con: duckdb.DuckDBPyConnection, rows: list[tuple[int, int, int]]) -> None:
-    with _staged(".csv") as p:
-        with p.open("w", newline="") as fh:
-            csv.writer(fh).writerows(rows)
-        con.execute(
-            f"INSERT INTO pattern_edges SELECT * FROM read_csv('{p}', header=false, "
-            "columns={'pattern_id':'BIGINT','seq':'INTEGER','edge_id':'BIGINT'})"
-        )
+_LINK_COLS: tuple[str, ...] = ("pattern_id", "seq", "edge_id")
 
 
 # lon_e6, lat_e6, then the bounding box. Empty for an edge with too few points, so

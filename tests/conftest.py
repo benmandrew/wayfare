@@ -96,6 +96,16 @@ def con(tmp_path: Path):
     c.close()
 
 
+@pytest.fixture(autouse=True)
+def staging(monkeypatch, tmp_path: Path) -> None:
+    """`db.insert_via_file` stages under WORK, which a test must not be writing to.
+
+    Autouse rather than opt-in: a test reaching the real working directory is a
+    fault wherever it happens, and the staging path is not visible from the call.
+    """
+    monkeypatch.setattr(db.config, "WORK", tmp_path / "work")
+
+
 @pytest.fixture
 def legacy_db(tmp_path: Path) -> Callable[..., Path]:
     """Build a database at an older schema, then hand back its path for `db.connect`

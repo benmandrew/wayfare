@@ -41,7 +41,6 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass
-from math import cos, radians, sqrt
 from pathlib import Path
 
 import duckdb
@@ -59,8 +58,9 @@ ROUTE_MODES: dict[str, str] = {"train": "rail"}
 
 # Padding on the window asked of Overpass, in degrees. A relation is kept when it
 # chains, not when it fits, so this only has to be wide enough that a service near
-# the edge of the region has its relation returned at all.
-BBOX_PAD = 0.05
+# the edge of the region has its relation returned at all. It sits beside `trace`'s
+# own pad in `config`, because the two are read together whenever either moves.
+BBOX_PAD = config.ROUTES_BBOX_PAD_DEG
 
 # An `operator` tag is a `;`-separated list where a line is run jointly. Some
 # mappers write a bilingual pair with a slash instead, so both separate.
@@ -158,8 +158,8 @@ def bbox(
     ran out of memory before the clip existed, and a database built by an older
     `patterns` would do it again.
 
-    Then clipped again to `config.Feed.bounds` where the region has them, which is
-    the same failure one border in rather than one sea. Translink runs to Dublin,
+    Then padded and clipped to `config.Feed.bounds` by `config.pad_and_clip`, which
+    is the same failure one border in rather than one sea. Translink runs to Dublin,
     so Northern Ireland's stops draw a box over most of the island and every
     relation of the Republic's network comes back inside it.
     """
@@ -176,29 +176,23 @@ def bbox(
     )
     if row is None or row[0] is None:
         return None
-    south, west, north, east = (float(v) for v in row)
-    south, west = south - BBOX_PAD, west - BBOX_PAD
-    north, east = north + BBOX_PAD, east + BBOX_PAD
-    limit = config.feed(region).bounds
-    if limit is not None:
-        south, west = max(south, limit[0]), max(west, limit[1])
-        north, east = min(north, limit[2]), min(east, limit[3])
-        if south >= north or west >= east:
-            raise RuntimeError(
-                f"region {region or config.BODS_REGION!r} has bounds {limit}, which "
-                "its live stops never meet; no relation could be discovered"
-            )
-    return (south, west, north, east)
+    return config.pad_and_clip(
+        (float(row[0]), float(row[1]), float(row[2]), float(row[3])),
+        pad=BBOX_PAD,
+        region=region,
+        what="live stops",
+    )
 
 
 def _span_m(points: list[tuple[float, float]]) -> float:
-    """Straight-line length of a chain of (lat, lon), in metres."""
-    total = 0.0
-    for (y1, x1), (y2, x2) in zip(points, points[1:], strict=False):
-        dy = (y2 - y1) * 111_320.0
-        dx = (x2 - x1) * 111_320.0 * cos(radians(y1))
-        total += sqrt(dy * dy + dx * dx)
-    return total
+    """Straight-line length of a chain of (lat, lon), in metres.
+
+    Summed segment by segment on `osm.planar_m`'s plane rather than measured end to
+    end, so a line that turns is its own length and not the distance between its
+    terminals. Each segment is short enough that the plane costs nothing against
+    `osm.haversine_m`.
+    """
+    return sum(osm.planar_m(a, b) for a, b in zip(points, points[1:], strict=False))
 
 
 @dataclass(frozen=True)
@@ -218,40 +212,72 @@ class Candidate:
     lat_e6: list[int]
 
 
+@dataclass(frozen=True)
+class Sifted:
+    """What one body of relations came to: the ones kept, and why the rest were not.
+
+    Every relation of a drawn route lands in exactly one of these, so the four
+    refusals and the kept list add back up to `considered`. That is the property
+    `chained` leans on, and a refusal that skips the count silently inflates it.
+    """
+
+    # Every relation of a drawn route, this region's or not.
+    considered: int
+    kept: list[Candidate]
+    broken: int
+    no_stops: int
+    not_ours: int
+    no_ways: int
+
+    @property
+    def chained(self) -> int:
+        """Of the relations this region draws, those whose ways form one path.
+
+        A relation carrying no ways chains nothing, so it comes out here beside the
+        two refusals rather than being credited with a path it has no members for.
+        """
+        return self.considered - self.broken - self.not_ours - self.no_ways
+
+
 def candidates(
     relations: list[osm.Relation],
     routes: dict[str, str] | None = None,
     region: str | None = None,
-) -> tuple[list[Candidate], int, int, int]:
-    """The relations that can stand as a service, and counts of the three refusals.
+) -> Sifted:
+    """The relations that can stand as a service, and counts of the four refusals.
 
-    A relation qualifies when it is this region's to draw, its ways chain end to end
-    with no break, and it names at least two stops. The last two are the tests
-    `trace` already applies, for the same reason: a break draws confident track
-    across a gap, and a relation with no stops can be neither identified nor joined
-    to anything later.
+    A relation qualifies when it carries ways at all, is this region's to draw, its
+    ways chain end to end with no break, and it names at least two stops. The last
+    two are the tests `trace` already applies, for the same reason: a break draws
+    confident track across a gap, and a relation with no stops can be neither
+    identified nor joined to anything later.
 
-    The first is `ours`, and it is what the window cannot do. A window is a box, a
+    Ownership is `ours`, and it is what the window cannot do. A window is a box, a
     border is not, and two archives are loaded onto one map -- so a relation kept by
     both regions is a line the viewer draws twice.
     """
     routes = routes or ROUTE_MODES
     mine, others = claims(region)
     out: list[Candidate] = []
-    broken = no_stops = not_ours = 0
+    considered = broken = no_stops = not_ours = no_ways = 0
     for r in relations:
         mode = routes.get(r.route or "")
-        if mode is None or not r.ways:
+        if mode is None:
+            continue
+        considered += 1
+        if not r.ways:
+            no_ways += 1
             continue
         if not ours(r.tags.get("operator"), mine, others):
             not_ours += 1
             continue
-        chain = osm.chain(r)
-        if chain.breaks:
+        # Measured lazily, so a relation refused for its breaks pays for the chain
+        # and nothing that hangs off it.
+        measured = osm.prepare(r)
+        if measured.breaks:
             broken += 1
             continue
-        names = [osm.normalise(s.name) for s in r.stops if s.name]
-        names = [n for n in names if n]
+        names = [n for n in measured.names if n]
         if len(names) < 2:
             no_stops += 1
             continue
@@ -270,12 +296,19 @@ def candidates(
                 names=names,
                 n_stops=len(names),
                 span_m=_span_m([(s.lat, s.lon) for s in r.stops if s.name]),
-                way_ids=list(chain.way_ids),
-                lon_e6=[round(lon * 1e6) for _, lon in chain.points],
-                lat_e6=[round(lat * 1e6) for lat, _ in chain.points],
+                way_ids=list(measured.way_ids),
+                lon_e6=[round(lon * 1e6) for _, lon in measured.points],
+                lat_e6=[round(lat * 1e6) for lat, _ in measured.points],
             )
         )
-    return out, broken, no_stops, not_ours
+    return Sifted(
+        considered=considered,
+        kept=out,
+        broken=broken,
+        no_stops=no_stops,
+        not_ours=not_ours,
+        no_ways=no_ways,
+    )
 
 
 def write(con: duckdb.DuckDBPyConnection, found: list[Candidate]) -> int:
@@ -288,10 +321,9 @@ def write(con: duckdb.DuckDBPyConnection, found: list[Candidate]) -> int:
       carried forward, which is what keeps a line retired in OSM from being drawn
       for ever.
     * `traces`, which is where `aggregate.build_track_services` reads the ways each
-      relation runs over. It drew them through `build_segments` as well until the
-      per-way inversion arrived; that arm now skips them, because a relation drawn
-      once per way and again as a whole polyline is the same track painted twice
-      and a hover that lands on the wrong one of the two.
+      relation runs over. `build_segments` leaves them alone, because a relation
+      drawn once per way and again as a whole polyline is the same track painted
+      twice and a hover that lands on the wrong one of the two.
     * `trace_status`, marked ``ok``. Without it `trace._pending_sql` selects every
       one of these -- they are live, not matchable and carry no ``shape_id``, which
       is exactly its definition of pending -- and spends a national Overpass query
@@ -318,8 +350,24 @@ def write(con: duckdb.DuckDBPyConnection, found: list[Candidate]) -> int:
                 way_ids BIGINT[], lon_e6 INTEGER[], lat_e6 INTEGER[]
             )
         """)
-        con.executemany(
-            "INSERT INTO osm_route_raw VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        # Staged to a file rather than inserted a row at a time: this is one row per
+        # relation now, and it is the same table a national body fills.
+        db.insert_via_file(
+            con,
+            "osm_route_raw",
+            (
+                "relation_id",
+                "route_id",
+                "agency_id",
+                "short_name",
+                "mode",
+                "stop_key",
+                "n_stops",
+                "span_m",
+                "way_ids",
+                "lon_e6",
+                "lat_e6",
+            ),
             [
                 (
                     c.relation_id,
@@ -412,8 +460,21 @@ def write_ways(con: duckdb.DuckDBPyConnection, relations: list[osm.Relation]) ->
         lons = [round(lon * 1e6) for _, lon in way.points]
         lats = [round(lat * 1e6) for lat, _ in way.points]
         rows.append((way.way_id, lons, lats, min(lons), min(lats), max(lons), max(lats)))
-    con.executemany("INSERT OR REPLACE INTO ways VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
-    return len(rows)
+    return db.insert_via_file(
+        con,
+        "ways",
+        (
+            "way_id",
+            "lon_e6",
+            "lat_e6",
+            "min_lon_e6",
+            "min_lat_e6",
+            "max_lon_e6",
+            "max_lat_e6",
+        ),
+        rows,
+        on_conflict="replace",
+    )
 
 
 def prune_ways(con: duckdb.DuckDBPyConnection) -> int:
@@ -467,28 +528,27 @@ def run(
         raise RuntimeError("no live patterns to derive a window from")
     relations = osm.fetch(window, cache or config.RAW / "osm_routes.json", refresh=refresh)
     wanted = routes or ROUTE_MODES
-    considered = [r for r in relations if (r.route or "") in wanted]
-    found, broken, no_stops, not_ours = candidates(relations, wanted, region)
-    n_patterns = write(con, found)
+    sifted = candidates(relations, wanted, region)
+    n_patterns = write(con, sifted.kept)
     # Only the relations that became patterns. `ways` is joined to `track_services`
     # on the way out, so a refused relation's ways are rows nothing can reach --
     # and in Northern Ireland's database they were the whole Republic's track.
-    drawn = {c.relation_id for c in found}
+    drawn = {c.relation_id for c in sifted.kept}
     n_ways = write_ways(con, [r for r in relations if r.relation_id in drawn])
     # And the ones a previous run wrote that nothing reaches any more, which is the
     # same claim over time rather than over one body. Narrowing the write keeps a
     # refused relation's ways out; this is what takes out the ways of a relation
     # that was drawn last week and is not drawn now.
     prune_ways(con)
-    km = sum(c.span_m for c in found) / 1000.0
+    km = sum(c.span_m for c in sifted.kept) / 1000.0
     built = Built(
-        considered=len(considered),
-        chained=len(considered) - broken - not_ours,
+        considered=sifted.considered,
+        chained=sifted.chained,
         patterns=n_patterns,
         ways=n_ways,
-        skipped_no_stops=no_stops,
-        skipped_broken=broken,
-        skipped_not_ours=not_ours,
+        skipped_no_stops=sifted.no_stops,
+        skipped_broken=sifted.broken,
+        skipped_not_ours=sifted.not_ours,
         track_km=km,
     )
     log.info(

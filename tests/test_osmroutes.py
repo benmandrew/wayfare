@@ -20,9 +20,9 @@ FEED = "20260812_test"
 
 
 def test_a_chaining_relation_becomes_a_candidate():
-    found, broken, no_stops, not_ours = osmroutes.candidates([relation()])
-    assert (broken, no_stops, not_ours) == (0, 0, 0)
-    (c,) = found
+    sifted = osmroutes.candidates([relation()])
+    assert (sifted.broken, sifted.no_stops, sifted.not_ours, sifted.no_ways) == (0, 0, 0, 0)
+    (c,) = sifted.kept
     assert c.route_id == "osm:r1"
     assert c.mode == "rail"
     assert c.names == ["alpha", "beta"]
@@ -31,36 +31,64 @@ def test_a_chaining_relation_becomes_a_candidate():
 
 def test_a_relation_that_does_not_chain_is_refused():
     """A break draws confident track across a gap no service crosses."""
-    found, broken, *_ = osmroutes.candidates([broken_relation()])
-    assert found == []
-    assert broken == 1
+    sifted = osmroutes.candidates([broken_relation()])
+    assert sifted.kept == []
+    assert sifted.broken == 1
 
 
 def test_a_relation_naming_fewer_than_two_stops_is_refused():
     one = [stop(100, "Alpha Rail Station", 51.0, -1.0)]
-    found, _, no_stops, _ = osmroutes.candidates([relation(stops=one)])
-    assert found == []
-    assert no_stops == 1
+    sifted = osmroutes.candidates([relation(stops=one)])
+    assert sifted.kept == []
+    assert sifted.no_stops == 1
 
 
 def test_a_mode_with_its_own_timetable_is_not_admitted():
     """Admitting `subway` would draw a second Underground beside the BODS one."""
-    found, broken, no_stops, _ = osmroutes.candidates([relation(route="subway")])
-    assert (found, broken, no_stops) == ([], 0, 0)
+    sifted = osmroutes.candidates([relation(route="subway")])
+    assert (sifted.kept, sifted.broken, sifted.no_stops) == ([], 0, 0)
+    assert sifted.considered == 0
+
+
+def test_a_relation_with_no_ways_is_counted_rather_than_dropped_quietly():
+    """`chained` is the considered count less the refusals, so a relation that leaves
+    the funnel uncounted is reported as one whose ways formed an unbroken path -- and
+    a relation with no ways has no path at all."""
+    sifted = osmroutes.candidates([relation(ways=[])])
+    assert (sifted.kept, sifted.no_ways, sifted.considered) == ([], 1, 1)
+    assert sifted.chained == 0
+
+
+def test_every_relation_of_a_drawn_route_lands_in_exactly_one_count():
+    """The funnel adds up, which is the only thing making `chained` a subtraction."""
+    sifted = osmroutes.candidates(
+        [
+            relation(relation_id=1),
+            relation(relation_id=2, ways=[]),
+            broken_relation(relation_id=3),
+            relation(relation_id=4, stops=[stop(100, "Alpha Rail Station", 51.0, -1.0)]),
+            relation(relation_id=5, tags={"operator": "Iarnród Éireann"}),
+            relation(relation_id=6, route="subway"),
+        ]
+    )
+    refused = sifted.broken + sifted.no_stops + sifted.not_ours + sifted.no_ways
+    assert sifted.considered == 5
+    assert len(sifted.kept) + refused == sifted.considered
+    assert sifted.chained == 2
 
 
 def test_ref_is_preferred_over_the_relation_name():
-    (c,) = osmroutes.candidates([relation(tags={"ref": "XC"})])[0]
+    (c,) = osmroutes.candidates([relation(tags={"ref": "XC"})]).kept
     assert c.short_name == "XC"
 
 
 def test_the_relation_name_is_the_fallback():
-    (c,) = osmroutes.candidates([relation()])[0]
+    (c,) = osmroutes.candidates([relation()]).kept
     assert c.short_name == "Test Line"
 
 
 def test_the_operator_becomes_the_agency():
-    (c,) = osmroutes.candidates([relation(tags={"operator": "ScotRail"})])[0]
+    (c,) = osmroutes.candidates([relation(tags={"operator": "ScotRail"})]).kept
     assert c.agency_id == "ScotRail"
 
 
@@ -74,10 +102,8 @@ def test_the_operator_becomes_the_agency():
 
 def ni(tags: dict[str, str]) -> tuple[int, int]:
     """How many candidates and how many refusals a Northern Ireland run gets."""
-    found, _, _, not_ours = osmroutes.candidates(
-        [relation(tags=tags)], region="northern_ireland"
-    )
-    return len(found), not_ours
+    sifted = osmroutes.candidates([relation(tags=tags)], region="northern_ireland")
+    return len(sifted.kept), sifted.not_ours
 
 
 def test_another_regions_operator_is_refused():
@@ -99,17 +125,15 @@ def test_a_relation_naming_no_operator_is_left_to_the_window():
 
 def test_an_operator_no_region_claims_is_left_to_the_window():
     """What keeps every BODS slug drawing what it has always drawn."""
-    found, *_ = osmroutes.candidates([relation(tags={"operator": "ScotRail"})])
-    assert len(found) == 1
+    sifted = osmroutes.candidates([relation(tags={"operator": "ScotRail"})])
+    assert len(sifted.kept) == 1
 
 
 def test_a_region_with_no_operators_still_refuses_a_claimed_one():
     """Great Britain's window is clipped to the British Isles, so Iarnród
     Éireann's relations reach it and were drawn into its archive too."""
-    found, _, _, not_ours = osmroutes.candidates(
-        [relation(tags={"operator": "Iarnród Éireann"})]
-    )
-    assert (len(found), not_ours) == (0, 1)
+    sifted = osmroutes.candidates([relation(tags={"operator": "Iarnród Éireann"})])
+    assert (len(sifted.kept), sifted.not_ours) == (0, 1)
 
 
 def test_a_jointly_run_line_goes_to_the_operator_named_first():
@@ -117,7 +141,7 @@ def test_a_jointly_run_line_goes_to_the_operator_named_first():
     arbitrary and its landing in only one of them is not."""
     joint = {"operator": "Iarnród Éireann;NI Railways"}
     assert ni(joint) == (0, 1)
-    kept, _, _, _ = osmroutes.candidates([relation(tags=joint)], region="ireland")
+    kept = osmroutes.candidates([relation(tags=joint)], region="ireland").kept
     assert len(kept) == 1
 
 
@@ -135,8 +159,8 @@ def seeded(con):
 
 
 def test_a_pattern_is_written_live_and_without_trips(seeded):
-    found, *_ = osmroutes.candidates([relation()])
-    assert osmroutes.write(seeded, found) == 1
+    sifted = osmroutes.candidates([relation()])
+    assert osmroutes.write(seeded, sifted.kept) == 1
     row = db.row(
         seeded,
         "SELECT route_id, mode, n_trips, shape_id, last_seen, n_stops FROM patterns",
@@ -145,8 +169,7 @@ def test_a_pattern_is_written_live_and_without_trips(seeded):
 
 
 def test_the_geometry_lands_in_traces(seeded):
-    found, *_ = osmroutes.candidates([relation()])
-    osmroutes.write(seeded, found)
+    osmroutes.write(seeded, osmroutes.candidates([relation()]).kept)
     way_ids, lon = db.row(seeded, "SELECT way_ids, lon_e6 FROM traces")
     assert way_ids == [10, 11]
     assert lon[0] == -1_000_000
@@ -156,18 +179,17 @@ def test_a_trace_status_row_stops_trace_redoing_the_work(seeded):
     """Without it these are live, not matchable and shapeless -- `trace`'s
     definition of pending -- so a national Overpass query gets spent re-deriving
     geometry this stage already holds."""
-    found, *_ = osmroutes.candidates([relation()])
-    osmroutes.write(seeded, found)
+    osmroutes.write(seeded, osmroutes.candidates([relation()]).kept)
     status, relation_id = db.row(seeded, "SELECT status, relation_id FROM trace_status")
     assert status == "ok"
     assert relation_id == 1
 
 
 def test_the_pattern_id_is_stable_across_runs(seeded):
-    found, *_ = osmroutes.candidates([relation()])
-    osmroutes.write(seeded, found)
+    kept = osmroutes.candidates([relation()]).kept
+    osmroutes.write(seeded, kept)
     first = db.scalar(seeded, "SELECT pattern_id FROM patterns")
-    osmroutes.write(seeded, found)
+    osmroutes.write(seeded, kept)
     assert db.scalar(seeded, "SELECT count(*) FROM patterns") == 1
     assert db.scalar(seeded, "SELECT pattern_id FROM patterns") == first
 
@@ -181,7 +203,7 @@ def test_the_pattern_id_is_the_relation_id_and_its_normalised_stops(seeded):
     key: widening one of them re-mints every `osm:r` pattern in the country and
     leaves its `traces` and `trace_status` rows behind under ids nothing selects.
     """
-    osmroutes.write(seeded, osmroutes.candidates([relation()])[0])
+    osmroutes.write(seeded, osmroutes.candidates([relation()]).kept)
     # hash('osm:r1' || '|' || '' || '|' || 'alpha\x1fbeta') >> 1, where the two
     # names are "Alpha Rail Station" and "Beta Rail Station" normalised.
     assert db.scalar(seeded, "SELECT pattern_id FROM patterns") == 5764178481033107580
@@ -190,8 +212,8 @@ def test_the_pattern_id_is_the_relation_id_and_its_normalised_stops(seeded):
 def test_a_relation_that_stops_qualifying_stops_being_drawn(seeded):
     """Retired rather than deleted, so its row survives and its geometry does not
     keep appearing in the current feed."""
-    osmroutes.write(seeded, osmroutes.candidates([relation(relation_id=1)])[0])
-    osmroutes.write(seeded, osmroutes.candidates([relation(relation_id=2)])[0])
+    osmroutes.write(seeded, osmroutes.candidates([relation(relation_id=1)]).kept)
+    osmroutes.write(seeded, osmroutes.candidates([relation(relation_id=2)]).kept)
     live = seeded.execute(
         "SELECT route_id FROM patterns WHERE last_seen = ?", [FEED]
     ).fetchall()
@@ -200,9 +222,9 @@ def test_a_relation_that_stops_qualifying_stops_being_drawn(seeded):
 
 
 def test_writing_without_a_feed_version_is_refused(con):
-    found, *_ = osmroutes.candidates([relation()])
+    kept = osmroutes.candidates([relation()]).kept
     with pytest.raises(RuntimeError, match="feed_version"):
-        osmroutes.write(con, found)
+        osmroutes.write(con, kept)
 
 
 # --- ways --------------------------------------------------------------------
@@ -243,7 +265,7 @@ def test_two_writers_both_reach_the_table(seeded):
 def test_a_way_no_trace_runs_over_is_pruned(seeded):
     """A way is in the table because some pattern's geometry runs over it, so one
     named by no `traces` row is drawn by nothing and is dead weight."""
-    osmroutes.write(seeded, osmroutes.candidates([relation()])[0])
+    osmroutes.write(seeded, osmroutes.candidates([relation()]).kept)
     osmroutes.write_ways(seeded, [relation()])
     osmroutes.write_ways(seeded, [relation(ways=[way(99, [(50.0, 0.0), (50.1, 0.0)])])])
     assert osmroutes.prune_ways(seeded) == 1

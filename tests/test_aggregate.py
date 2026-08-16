@@ -71,7 +71,7 @@ def test_a_withdrawn_osm_pattern_counts_as_departed(con):
     builders.insert_pattern(con, 1, mode="bus", feed="F1")
     builders.insert_pattern(con, 2, mode="rail", feed="F1", last_seen=None)
 
-    cov = aggregate.coverage(con)
+    cov = aggregate.funnel(con)
 
     assert cov["patterns_total"] == 1
     assert cov["patterns_departed"] == 1

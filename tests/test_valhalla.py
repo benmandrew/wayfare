@@ -4,7 +4,7 @@ import builders
 import pytest
 import requests
 
-from wayfare import config, polyline, valhalla
+from wayfare import config, osm, polyline, valhalla
 
 # Two edges along a street, in the shape trace_attributes actually returns:
 # lengths in kilometres, geometry as one shared polyline indexed by each edge.
@@ -78,9 +78,7 @@ def test_chunking_covers_long_services(n, expected_chunks):
 
 
 def _chain_m(points):
-    return sum(
-        valhalla._haversine_m(a, b) for a, b in zip(points, points[1:], strict=False)
-    )
+    return sum(osm.haversine_m(a, b) for a, b in zip(points, points[1:], strict=False))
 
 
 @pytest.mark.parametrize(("n", "expected_chunks"), [(40, 1), (41, 2), (80, 3)])

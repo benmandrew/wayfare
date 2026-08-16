@@ -34,6 +34,7 @@ and where two relations both cover it the shorter is the one it ran on.
 
 from __future__ import annotations
 
+import json
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import date
@@ -41,7 +42,7 @@ from pathlib import Path
 
 import duckdb
 
-from . import cif, logs, naptan, osm, osmroutes
+from . import cif, db, logs, naptan, osm, osmroutes
 
 log = logs.get("railtrips")
 
@@ -97,34 +98,24 @@ def lines(
     for r in relations:
         if (r.route or "") not in routes or not r.ways:
             continue
-        chain = osm.chain(r)
-        if chain.breaks or len(chain.points) < 2:
+        measured = osm.prepare(r)
+        if not measured.chains:
             continue
-        ref_lat = chain.points[0][0]
-        metres = osm.to_metres(chain.points, ref_lat)
-        cum = osm.cumulative(metres)
         along: dict[str, list[float]] = defaultdict(list)
         latlon: dict[str, list[tuple[float, float]]] = defaultdict(list)
         for s in r.stops:
             if not s.name:
                 continue
-            (node,) = osm.to_metres([(s.lat, s.lon)], ref_lat)
-            d, _off = osm.project(metres, cum, node)
+            d, _off = measured.place(s.lat, s.lon)
             for spelling in osm.spellings(s.name):
                 if spelling:
                     along[spelling].append(d)
                     latlon[spelling].append((s.lat, s.lon))
         if along:
-            out.append(Line(r.relation_id, chain, cum, dict(along), dict(latlon)))
+            out.append(
+                Line(r.relation_id, measured.chain, measured.cum, dict(along), dict(latlon))
+            )
     return out
-
-
-def _haversine_m(a: tuple[float, float], b: tuple[float, float]) -> float:
-    from math import cos, radians, sqrt
-
-    dy = (b[0] - a[0]) * 111_320.0
-    dx = (b[1] - a[1]) * 111_320.0 * cos(radians(a[0]))
-    return sqrt(dy * dy + dx * dx)
 
 
 def _best_pair(
@@ -135,6 +126,11 @@ def _best_pair(
     Refused where the track between them runs more than `MAX_DETOUR_RATIO` times
     the straight line, which is what stops two unrelated stations sharing a name
     from being paired across half the country.
+
+    The straight line is `osm.planar_m` and not the exact distance, because it is
+    compared against a gap measured along `osm.to_metres`' own plane. Mixing the two
+    would move the ratio by the plane's error rather than by anything about the
+    railway.
     """
     best: tuple[float, float] | None = None
     best_gap = float("inf")
@@ -149,10 +145,55 @@ def _best_pair(
                     gap = abs(a - b)
                     if gap >= best_gap or gap == 0.0:
                         continue
-                    direct = _haversine_m(a_ll, b_ll)
+                    direct = osm.planar_m(a_ll, b_ll)
                     if direct > 0.0 and gap > direct * MAX_DETOUR_RATIO:
                         continue
                     best, best_gap = (a, b), gap
+    return best
+
+
+def _resolve_sequence(
+    sequence: tuple[str, ...],
+    register: dict[str, naptan.Station],
+    unresolved: set[str],
+) -> list[frozenset[str]] | None:
+    """Every spelling of every call in order, or None if one TIPLOC does not resolve.
+
+    The whole sequence goes rather than the call that failed. Dropping the one call
+    joins its neighbours into a leg that no train runs, which draws a service past a
+    station it stops at -- and the unplaceable code is recorded instead, because a
+    register gap nobody can see reads as a quiet railway.
+    """
+    out: list[frozenset[str]] = []
+    for tiploc in sequence:
+        station = register.get(tiploc)
+        if station is None:
+            unresolved.add(tiploc)
+            return None
+        out.append(osm.spellings(station.name))
+    return out
+
+
+def _place_leg(
+    found: list[Line], shared: set[int], first: frozenset[str], second: frozenset[str]
+) -> tuple[Line, tuple[float, float]] | None:
+    """The one line a leg is attributed to, and where on it the two stations sit.
+
+    One rather than every line covering it: 75.8% of GB rail ways carry two or more
+    relations, and adding the leg's trips to each multiplies the national total by
+    how thoroughly a corridor happens to be mapped. The most direct wins, because a
+    leg is one train's journey between two stations and the shorter of two covering
+    lines is the one it ran on.
+    """
+    best: tuple[Line, tuple[float, float]] | None = None
+    best_gap = float("inf")
+    for i in shared:
+        pair = _best_pair(found[i], first, second)
+        if pair is None:
+            continue
+        gap = abs(pair[0] - pair[1])
+        if gap < best_gap:
+            best, best_gap = (found[i], pair), gap
     return best
 
 
@@ -180,16 +221,8 @@ def attribute(
     unresolved: set[str] = set()
 
     for sequence, weekly in trips_by_sequence.items():
-        spellings = []
-        ok = True
-        for tiploc in sequence:
-            station = register.get(tiploc)
-            if station is None:
-                unresolved.add(tiploc)
-                ok = False
-                break
-            spellings.append(osm.spellings(station.name))
-        if not ok:
+        spellings = _resolve_sequence(sequence, register, unresolved)
+        if spellings is None:
             continue
         for first, second in zip(spellings, spellings[1:], strict=False):
             legs += 1
@@ -197,21 +230,13 @@ def attribute(
             shared = {i for n in first for i in by_name.get(n, [])} & {
                 i for n in second for i in by_name.get(n, [])
             }
-            best_line: Line | None = None
-            best: tuple[float, float] | None = None
-            best_gap = float("inf")
-            for i in shared:
-                pair = _best_pair(found[i], first, second)
-                if pair is None:
-                    continue
-                gap = abs(pair[0] - pair[1])
-                if gap < best_gap:
-                    best_line, best, best_gap = found[i], pair, gap
-            if best_line is None or best is None:
+            placed_on = _place_leg(found, shared, first, second)
+            if placed_on is None:
                 continue
+            line, cut = placed_on
             legs_placed += 1
             placed += weekly
-            for way_id in osm.ways_between(best_line.chain.way_at, best_line.cum, *best):
+            for way_id in osm.ways_between(line.chain.way_at, line.cum, *cut):
                 trips[way_id] += weekly
 
     out = Attributed(
@@ -243,11 +268,14 @@ def write(con: duckdb.DuckDBPyConnection, trips: dict[int, int]) -> int:
     a relation set that are both re-read every run, and a way that stopped carrying
     a service must stop being drawn as busy. A stale row here is not a missing
     number, it is a wrong one.
+
+    One row per way carrying a train, which is 55,114 of them nationally, so it is
+    staged to a file rather than inserted a row at a time.
     """
     con.execute("DELETE FROM way_trips")
-    if trips:
-        con.executemany("INSERT INTO way_trips VALUES (?, ?)", sorted(trips.items()))
-    return len(trips)
+    return db.insert_via_file(
+        con, "way_trips", ("way_id", "n_trips"), sorted(trips.items())
+    )
 
 
 def run(
@@ -290,10 +318,16 @@ def run_cached(
     not be able to change which track is drawn. If the relations have moved, the
     fix is to re-run `routes`, so that the geometry and the trips over it always
     describe the same snapshot.
+
+    Parsed straight off the file rather than asked for through `osm.fetch`, which
+    would need a window to fall back on and there is no honest one to give: a query
+    is the outcome this refuses, so a bounding box here could only be a placeholder
+    that a missing cache would turn into a national Overpass request.
     """
     from . import config
 
     path = cache or config.RAW / "osm_routes.json"
     if not path.exists():
         raise RuntimeError(f"{path} is not there; run `wayfare routes` first")
-    return run(con, schedule, stops, osm.fetch((0.0, 0.0, 0.0, 0.0), path), on=on)
+    log.info("reading OSM relations from %s", path)
+    return run(con, schedule, stops, osm.parse(json.loads(path.read_text())), on=on)
