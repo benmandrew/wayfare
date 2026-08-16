@@ -467,6 +467,10 @@ a.btn { text-decoration: none; }
 const WANTED = new URLSearchParams(location.search).get("tiles");
 
 let ARCHIVES = [];
+// What `failed` names when it has to report. `boot` overwrites it as soon as the
+// index answers; until then it is what the URL alone says, so a throw ahead of
+// that still names something a reader can act on rather than nothing.
+let TRIED = WANTED ? [WANTED] : ["./bus.pmtiles"];
 // One entry per archive that opened, carrying the ids it owns in the style. Ids
 // are per-archive because MapLibre needs one source per PMTiles file: the format
 // is one archive, one tile pyramid, and there is no union source.
@@ -1106,7 +1110,15 @@ class HeadSource {
 }
 
 chrome();
-boot();
+// Nothing awaits this, so anything thrown inside it is an unhandled rejection and
+// the overlay is left reading "Loading tiles..." with one line in the console.
+// Every failure the page can name is already caught below; this is the one that
+// answers for the rest, because an overlay that never resolves is the worst of
+// them to look at.
+boot().catch((err) => {
+  console.error(err);
+  failed(TRIED);
+});
 
 // The page's own furniture: the two folding panels, and the copy that depends on
 // what is pointing at the page. Wired before the archives are asked for and
@@ -1154,29 +1166,33 @@ async function boot() {
   // ?tiles= names one archive and only one, because its job is pointing the page
   // at a bucket rather than choosing between regions: the server's index is what
   // enumerates those. Everything the server lists otherwise.
-  const wanted = WANTED ? [WANTED] : ARCHIVES.length ? ARCHIVES : ["./bus.pmtiles"];
+  TRIED = WANTED ? [WANTED] : ARCHIVES.length ? ARCHIVES : ["./bus.pmtiles"];
 
   // In parallel, and one failure does not sink the rest: a half-copied archive in
   // the output directory should cost its own region, not the map. What it must not
   // do is cost it silently, so the count of what did not open is carried into the
   // header rather than left in the console.
-  REGIONS = (await Promise.all(wanted.map(openArchive))).filter(Boolean);
+  REGIONS = (await Promise.all(TRIED.map(openArchive))).filter(Boolean);
   if (!REGIONS.length) {
-    failed(wanted);
+    failed(TRIED);
     return;
   }
-  start(wanted.length - REGIONS.length);
+  start(TRIED.length - REGIONS.length);
 }
 
 async function openArchive(name, i) {
-  const url = new URL(name, location.href).href;
-  // Already in flight since <head>, keyed by the same absolute URL built there.
-  // A miss is a null head, and a null head is a source that reads the network for
-  // everything, so the prefetch is an optimisation and never a requirement.
-  const heads = await window.__heads.catch(() => new Map());
-  const archive = new pmtiles.PMTiles(new HeadSource(url, heads.get(url) || null));
-  protocol.add(archive); // share the instance so the header is fetched once
+  // The whole of it is guarded, not just the header read. `?tiles=` is whatever
+  // was typed at the page, and a name `new URL` cannot resolve throws here -- which
+  // rejects the `Promise.all` above and leaves the overlay on "Loading tiles..."
+  // instead of costing the one archive that could not be opened.
   try {
+    const url = new URL(name, location.href).href;
+    // Already in flight since <head>, keyed by the same absolute URL built there.
+    // A miss is a null head, and a null head is a source that reads the network for
+    // everything, so the prefetch is an optimisation and never a requirement.
+    const heads = await window.__heads.catch(() => new Map());
+    const archive = new pmtiles.PMTiles(new HeadSource(url, heads.get(url) || null));
+    protocol.add(archive); // share the instance so the header is fetched once
     return {
       name,
       url,
@@ -1190,7 +1206,7 @@ async function openArchive(name, i) {
       trackShadow: `track-shadow-${i}`,
     };
   } catch (err) {
-    console.error(`could not read ${url}`, err);
+    console.error(`could not read ${name}`, err);
     return null;
   }
 }

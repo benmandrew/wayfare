@@ -60,3 +60,18 @@ def test_one_number_run_by_two_operators_stays_two_rows(con):
         "ORDER BY agency_id"
     ).fetchall()
     assert rows == [("OP1", 1, 10), ("OP2", 1, 4)]
+
+
+def test_a_withdrawn_osm_pattern_counts_as_departed(con):
+    """`osmroutes` withdraws a relation by setting `last_seen` to NULL, so the live
+    predicate answers NULL for it and `NOT NULL` is not true. The pattern is out of
+    the feed and out of the count of what left it, which reads as a region whose rail
+    never moves."""
+    db.set_meta(con, "feed_version", "F1")
+    builders.insert_pattern(con, 1, mode="bus", feed="F1")
+    builders.insert_pattern(con, 2, mode="rail", feed="F1", last_seen=None)
+
+    cov = aggregate.coverage(con)
+
+    assert cov["patterns_total"] == 1
+    assert cov["patterns_departed"] == 1

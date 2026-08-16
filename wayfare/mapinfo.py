@@ -112,9 +112,18 @@ def header(lines: Iterator[str]) -> Header:
 
 
 def _points(lines: Iterator[str], n: int) -> tuple[tuple[float, float], ...]:
-    out = []
+    out: list[tuple[float, float]] = []
     for _ in range(n):
-        parts = next(lines).split()
+        # `next(lines)` bare would raise StopIteration inside `objects`, and PEP 479
+        # turns that into a RuntimeError -- an error naming the generator rather than
+        # the file, out of the one module whose job is to say where a pair stopped
+        # lining up.
+        line = next(lines, None)
+        if line is None:
+            raise Malformed(
+                f"expected {n} coordinate pairs, the file ended after {len(out)}"
+            )
+        parts = line.split()
         out.append((float(parts[0]), float(parts[1])))
     return tuple(out)
 
@@ -145,8 +154,14 @@ def objects(lines: Iterator[str]) -> Iterator[tuple[tuple[float, float], ...]]:
             # `PLINE MULTIPLE n` is n sections, each a count and its coordinates.
             if fields and fields[0].upper() == "MULTIPLE":
                 pts: list[tuple[float, float]] = []
-                for _ in range(int(fields[1])):
-                    pts.extend(_points(lines, int(next(lines).strip())))
+                for section in range(int(fields[1])):
+                    count = next(lines, None)
+                    if count is None:
+                        raise Malformed(
+                            f"PLINE MULTIPLE {fields[1]}: the file ended before "
+                            f"section {section + 1} declared its point count"
+                        )
+                    pts.extend(_points(lines, int(count.strip())))
                 yield tuple(pts)
             else:
                 yield _points(lines, int(fields[0]))
@@ -175,7 +190,16 @@ def read(mif: Path, mid: Path) -> Iterator[Feature]:
                     row = next(rows)
                 except StopIteration:
                     raise Malformed(f"{mid.name}: ran out of rows at object {n}") from None
-                yield Feature(dict(zip(head.columns, row, strict=False)), points)
+                # A row of the wrong width is the same failure as a row in the wrong
+                # place: the header and the file disagree about the delimiter or the
+                # column count, and mapping what does line up leaves an attribute
+                # missing off a feature that still draws.
+                if len(row) != len(head.columns):
+                    raise Malformed(
+                        f"{mid.name}: row {n} holds {len(row)} values for "
+                        f"{len(head.columns)} columns"
+                    )
+                yield Feature(dict(zip(head.columns, row, strict=True)), points)
             # A MID longer than the MIF means an object type went unread above,
             # so every feature already yielded may be joined to the wrong row.
             if next(rows, None) is not None:

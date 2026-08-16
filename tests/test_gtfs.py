@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 
 import pytest
+from builders import insert_pattern
 
 from wayfare import db, gtfs
 
@@ -101,6 +102,23 @@ def test_rebuild_is_idempotent(gtfs_dir: Path, con):
     gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB")
     assert con.execute("SELECT count(*) FROM patterns").fetchone()[0] == 2
     assert con.execute("SELECT count(*) FROM pattern_stops").fetchone()[0] == 6
+
+
+def test_a_withdrawn_osm_pattern_is_reported_as_departed(gtfs_dir: Path, con, caplog):
+    """`osmroutes` retires a relation by setting `last_seen` to NULL, and SQL
+    answers NULL rather than true to `last_seen <> 'F1'`. The churn line is how a
+    monthly run sees a line leave, so a whole mode leaving silently reads as a feed
+    that did not change."""
+    modes = frozenset({"bus", "rail"})
+    gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB", modes=modes)
+    feed = db.get_meta(con, "feed_version")
+    insert_pattern(con, 4242, mode="rail", feed=feed, last_seen=None)
+
+    with caplog.at_level(logging.INFO, logger="wayfare.gtfs"):
+        gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB", modes=modes)
+
+    churn = [r.getMessage() for r in caplog.records if "departed" in r.getMessage()]
+    assert churn and churn[-1].endswith("1 departed")
 
 
 # --- Modes -------------------------------------------------------------------

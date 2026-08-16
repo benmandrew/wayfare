@@ -252,8 +252,12 @@ def coverage(con: duckdb.DuckDBPyConnection) -> dict[str, object]:
                               WHERE m.pattern_id = p.pattern_id)
             """,
         ),
+        # Negated through COALESCE, because `osmroutes` withdraws a rail pattern by
+        # setting `last_seen` to NULL: `live` is then NULL rather than false, and
+        # `NOT NULL` is not true, so every retired relation would leave the count
+        # while still being outside the current feed.
         "patterns_departed": db.scalar(
-            con, f"SELECT count(*) FROM patterns p WHERE NOT ({live})"
+            con, f"SELECT count(*) FROM patterns p WHERE NOT COALESCE({live}, FALSE)"
         ),
         # The number that actually matters: share of timetabled service represented.
         "trips_pct": round(100.0 * trips_ok / max(trips_all, 1), 1),

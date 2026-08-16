@@ -265,6 +265,43 @@ def test_fewer_attribute_rows_than_objects_is_an_error(tmp_path: Path):
         list(mapinfo.read(mif, mid))
 
 
+def test_a_polyline_the_file_ends_in_the_middle_of_is_an_error(tmp_path: Path):
+    """A truncated download is the ordinary way this file arrives broken, and a
+    generator that runs its iterator dry reports the generator rather than the pair:
+    PEP 479 turns the StopIteration into `RuntimeError`, out of the one module whose
+    whole thesis is that a misalignment must name itself."""
+    mif, mid = _mif_mid(
+        tmp_path, LINKS_MIF.split("PLINE 4")[0] + "PLINE 4\n-5.9300 54.5900\n", LINKS_MID
+    )
+    with pytest.raises(mapinfo.Malformed, match="coordinate pairs"):
+        list(mapinfo.read(mif, mid))
+
+
+def test_a_multiple_polyline_missing_its_section_count_is_an_error(tmp_path: Path):
+    mif, mid = _mif_mid(
+        tmp_path,
+        LINKS_MIF.replace(
+            "PLINE 2\n-5.9200 54.5910\n-5.9100 54.5920\n", "PLINE MULTIPLE 2\n"
+        ),
+        LINKS_MID,
+    )
+    with pytest.raises(mapinfo.Malformed, match="section"):
+        list(mapinfo.read(mif, mid))
+
+
+def test_an_attribute_row_of_the_wrong_width_is_an_error(tmp_path: Path):
+    """Position is the only join, so a row that does not hold the columns the header
+    declared means the delimiter or the column count is being misread. Mapping the
+    values that do line up leaves the ATCO code off a road that still draws."""
+    mif, mid = _mif_mid(
+        tmp_path,
+        STOPPING_MIF,
+        STOPPING_MID.replace('"nir", 2, 0, "22", "700000000002"', '"nir", 2, 0, "22"'),
+    )
+    with pytest.raises(mapinfo.Malformed, match="columns"):
+        list(mapinfo.read(mif, mid))
+
+
 def test_a_projected_coordinate_system_is_refused(tmp_path: Path):
     """Irish Grid eastings read as degrees are still numbers, so this would put
     Belfast in the Atlantic and raise nothing."""

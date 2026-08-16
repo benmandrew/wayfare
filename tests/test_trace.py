@@ -502,6 +502,43 @@ def test_bbox_covers_the_pending_stops_with_room_for_the_line(rail_con) -> None:
     assert west < -3.18 and east > -2.245
 
 
+_BELFAST = (54.60, -5.93)
+_DUBLIN = (53.35, -6.25)
+
+
+def _pending_at(con, stops: list[tuple[float, float]]) -> None:
+    """One pending pattern calling at these coordinates, and nothing else.
+
+    Rail with no `shape_id`, which is what makes it this stage's work.
+    """
+    db.set_meta(con, "feed_version", "F1")
+    insert_pattern(con, 1, mode="rail", feed="F1", n_stops=len(stops))
+    for i, (lat, lon) in enumerate(stops):
+        con.execute(
+            "INSERT INTO stops VALUES (?, ?, ?, ?)", [f"S{i}", f"Stop {i}", lat, lon]
+        )
+        con.execute("INSERT INTO pattern_stops VALUES (1, ?, ?)", [i, f"S{i}"])
+
+
+def test_a_cross_border_stop_does_not_widen_the_window(con) -> None:
+    """`osmroutes.bbox`'s failure, in the stage beside it. NI Railways runs the
+    Enterprise to Dublin, so a box round the province's pending stops reaches 53.3 N
+    and comes back holding the Republic's own lines -- which this region would then
+    trace and draw over the Republic's own archive."""
+    _pending_at(con, [_BELFAST, _DUBLIN])
+    box = trace.bbox(con, "northern_ireland")
+    assert box is not None
+    assert box[0] == 54.0
+
+
+def test_bounds_that_never_meet_the_pending_stops_are_an_error(con) -> None:
+    """An empty window is answered, and an answer of nothing reads as a region whose
+    track is unmapped rather than as a misconfigured box."""
+    _pending_at(con, [_DUBLIN])
+    with pytest.raises(RuntimeError, match="bounds"):
+        trace.bbox(con, "northern_ireland")
+
+
 # -- what the rest of the pipeline does with it ------------------------------
 
 

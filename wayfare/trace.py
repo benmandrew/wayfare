@@ -142,7 +142,9 @@ def pending_count(con: duckdb.DuckDBPyConnection) -> int:
     return int(db.scalar(con, f"SELECT count(*) {_pending_sql()}"))
 
 
-def bbox(con: duckdb.DuckDBPyConnection) -> tuple[float, float, float, float] | None:
+def bbox(
+    con: duckdb.DuckDBPyConnection, region: str | None = None
+) -> tuple[float, float, float, float] | None:
     """The window to ask Overpass for: every pending pattern's stops, padded.
 
     Computed from the work rather than from the region, because the region is a feed
@@ -154,6 +156,12 @@ def bbox(con: duckdb.DuckDBPyConnection) -> tuple[float, float, float, float] | 
     never met a continental stop -- it spans the pending non-road patterns, which are
     urban rail -- but nothing about the construction stops it, and the mode selection
     is the only thing standing in the way.
+
+    Then clipped to `config.Feed.bounds` where the region has them, which is
+    `osmroutes.bbox`'s second clip and the same failure one border in. Northern
+    Ireland's rail reaches Dublin Connolly, so a box round its pending patterns
+    covers most of the island and returns the Republic's own lines, which this
+    region's archive then draws over the Republic's.
     """
     row = db.row(
         con,
@@ -168,12 +176,20 @@ def bbox(con: duckdb.DuckDBPyConnection) -> tuple[float, float, float, float] | 
     if row is None or row[0] is None:
         return None
     south, west, north, east = (float(v) for v in row)
-    return (
-        south - _BBOX_PAD_DEG,
-        west - _BBOX_PAD_DEG,
-        north + _BBOX_PAD_DEG,
-        east + _BBOX_PAD_DEG,
-    )
+    south, west = south - _BBOX_PAD_DEG, west - _BBOX_PAD_DEG
+    north, east = north + _BBOX_PAD_DEG, east + _BBOX_PAD_DEG
+    limit = config.feed(region).bounds
+    if limit is not None:
+        south, west = max(south, limit[0]), max(west, limit[1])
+        north, east = min(north, limit[2]), min(east, limit[3])
+        # An empty box is answered, and an answer of nothing reads as a region whose
+        # track is simply unmapped rather than as a window that could hold none.
+        if south >= north or west >= east:
+            raise RuntimeError(
+                f"region {region or config.BODS_REGION!r} has bounds {limit}, which "
+                "its pending stops never meet; no relation could be discovered"
+            )
+    return (south, west, north, east)
 
 
 def load_pending(con: duckdb.DuckDBPyConnection, limit: int | None = None) -> list[Pattern]:

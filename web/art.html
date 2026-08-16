@@ -551,7 +551,20 @@ $("theme").addEventListener("click", () => {
 
 /* ---------- boot ---------- */
 
-boot();
+// Nothing awaits this, and only the fetch inside it is guarded: a META body that
+// answers 200 without `limits`, `styles` or `presets` throws out of `defaults()`
+// or `build()`, which is an unhandled rejection and a stage left reading
+// "Loading..." for good. Whatever fails, the page has to say what it was.
+boot().catch((err) => {
+  console.error(err);
+  offline(
+    "Cannot set up the studio",
+    `<p>${escapeHtml(String((err && err.message) || err))}</p>
+     <p>The server answered <code>/art/meta</code>, but this page could not build
+        its controls from what came back. Check that <code>wayfare serve</code>
+        and this page are the same version.</p>`
+  );
+});
 
 async function boot() {
   try {
@@ -1293,6 +1306,9 @@ const BASEMAP = { light: "light_all", dark: "dark_all" };
 const PICK_LINE = { light: "#3f6d9e", dark: "#79c6c9" };
 
 let pickMap = null;
+// One network layer per archive that opened, so a theme change repaints all of
+// them rather than whichever one happened to be first.
+const pickLayers = [];
 let syncing = false;    // a camera move of our own, which must not be read back
 
 function initPicker() {
@@ -1395,8 +1411,8 @@ function showPicker(open) {
 function repaintPicker() {
   if (!pickMap) return;
   pickMap.getSource("basemap").setTiles(basemapTiles(theme));
-  if (pickMap.getLayer("bus")) {
-    pickMap.setPaintProperty("bus", "line-color", PICK_LINE[theme]);
+  for (const id of pickLayers) {
+    if (pickMap.getLayer(id)) pickMap.setPaintProperty(id, "line-color", PICK_LINE[theme]);
   }
 }
 
@@ -1412,37 +1428,57 @@ async function addNetwork(map) {
   } catch {
     archives = [];
   }
-  const url = new URL(archives[0] || "./bus.pmtiles", location.href).href;
+  // `bus.pmtiles` is the convention on a static host with no index, the same
+  // fallback the viewer makes.
+  const wanted = archives.length ? archives : ["./bus.pmtiles"];
   // `metadata: true`, and it is off by default: without it the plugin answers
   // MapLibre's TileJSON request from the PMTiles header alone and the credit
   // written into the archive's metadata block never leaves the file. This picker
   // draws the published network, so it owes that credit as much as the viewer does.
   const protocol = new pmtiles.Protocol({ metadata: true });
   maplibregl.addProtocol("pmtiles", protocol.tile);
-  const archive = new pmtiles.PMTiles(url);
-  protocol.add(archive);
-  let header;
-  try {
-    header = await archive.getHeader();
-  } catch {
-    return; // no archive here, or an unreadable one: the basemap is enough
-  }
-  map.addSource("bus", {
-    type: "vector",
-    url: "pmtiles://" + url,
-    maxzoom: header.maxZoom,
-  });
-  map.addLayer({
-    id: "bus",
-    type: "line",
-    source: "bus",
-    "source-layer": "bus",
-    layout: { "line-cap": "round", "line-join": "round" },
-    paint: {
-      "line-color": PICK_LINE[theme],
-      "line-opacity": 0.75,
-      "line-width": ["interpolate", ["linear"], ["zoom"], 6, 0.4, 10, 0.9, 14, 1.8],
-    },
+  // Every archive the server lists, as the viewer opens them: a multi-region
+  // server holds one archive per region, and the first of them is one region's
+  // network drawn under a window that may be framed over another. One failing
+  // archive costs itself and not the rest, and a header that will not read is no
+  // error here at all -- the basemap alone is a working picker.
+  const opened = (
+    await Promise.all(
+      wanted.map(async (name) => {
+        try {
+          const url = new URL(name, location.href).href;
+          const archive = new pmtiles.PMTiles(url);
+          protocol.add(archive);
+          return { url, header: await archive.getHeader() };
+        } catch {
+          return null;
+        }
+      })
+    )
+  ).filter(Boolean);
+  opened.forEach((r, i) => {
+    const id = `bus-${i}`;
+    // No `attribution`: each archive carries its own credit in its own metadata,
+    // which the protocol hands back as TileJSON, and MapLibre merges the credits
+    // of every source into the one control.
+    map.addSource(id, {
+      type: "vector",
+      url: "pmtiles://" + r.url,
+      maxzoom: r.header.maxZoom,
+    });
+    map.addLayer({
+      id,
+      type: "line",
+      source: id,
+      "source-layer": "bus",
+      layout: { "line-cap": "round", "line-join": "round" },
+      paint: {
+        "line-color": PICK_LINE[theme],
+        "line-opacity": 0.75,
+        "line-width": ["interpolate", ["linear"], ["zoom"], 6, 0.4, 10, 0.9, 14, 1.8],
+      },
+    });
+    pickLayers.push(id);
   });
 }
 

@@ -478,7 +478,10 @@ def _report_churn(con: duckdb.DuckDBPyConnection, feed: str) -> None:
           (SELECT count(*) FROM patterns p WHERE p.last_seen = ? AND p.first_seen <> ?
              AND NOT EXISTS (SELECT 1 FROM match_status m
                              WHERE m.pattern_id = p.pattern_id)),
-          (SELECT count(*) FROM patterns WHERE last_seen <> ?)
+          -- IS DISTINCT FROM, because `osmroutes` withdraws a rail pattern by
+          -- setting `last_seen` to NULL, and `<>` answers NULL to that rather than
+          -- true: every retired relation would sit outside both counts.
+          (SELECT count(*) FROM patterns WHERE last_seen IS DISTINCT FROM ?)
         """,
         [feed, feed, feed, feed, feed],
     )

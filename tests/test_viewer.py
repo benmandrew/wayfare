@@ -393,7 +393,7 @@ def test_the_viewer_folds_its_key_away_where_there_is_no_room_for_it():
     where the help is most wanted."""
     text = _source("index.html")
     tight = _tight(text)
-    assert tight.index("chrome();") < tight.index("boot();")
+    assert tight.index("chrome();") < tight.index("boot().catch(")
     assert re.search(r'fold\(\s*"keyBtn"\s*,\s*"legend"', text)
     # The query itself is a string the browser parses, so it is matched as written.
     assert 'matchMedia("(max-width: 720px), (max-height: 600px)")' in text
@@ -402,3 +402,88 @@ def test_the_viewer_folds_its_key_away_where_there_is_no_room_for_it():
     assert _holds(
         "index.html", '$(btn).addEventListener("click", () => set($(panel).hidden));'
     )
+
+
+# --- What the pages do when they cannot start ---------------------------------
+#
+# Both open on an overlay that the boot path is meant to take down: the viewer's
+# "Loading tiles...", the studio's "Loading...". Nothing awaits either boot, so a
+# throw anywhere inside one is an unhandled rejection, and an unhandled rejection
+# there is a page that keeps saying it is loading. Neither failure is visible to a
+# test that only reads what the page draws when it works.
+
+
+def test_the_viewer_reports_a_boot_it_could_not_finish():
+    """`boot()` is called and not awaited, so every throw inside it has to be caught
+    at the call or it goes nowhere: `failed` never runs and the overlay reads
+    "Loading tiles..." for good, with one line in the console under it.
+
+    `TRIED` is what the handler names, and it is set before anything is awaited, so
+    a page that fell over ahead of the index still reports the archive it would have
+    read rather than an empty list."""
+    text = _source("index.html")
+    assert _holds("index.html", "boot().catch((err) => {")
+    handler = _between(text, "boot().catch(", "\n});")
+    assert "failed(TRIED)" in _tight(handler)
+    assert re.search(r"let\s+TRIED\s*=", text)
+    # And the reporting path takes the same list the opening path took, so the two
+    # cannot come to name different archives.
+    assert _holds("index.html", "REGIONS = (await Promise.all(TRIED.map(openArchive)))")
+    assert _holds("index.html", "failed(TRIED);")
+
+
+def test_the_viewer_guards_the_whole_of_opening_an_archive():
+    """`?tiles=` is whatever was typed at the page, and `new URL` throws on a name it
+    cannot resolve. Outside the try that was not one archive failing to open -- it
+    rejected the `Promise.all` over all of them, which is the hang above.
+
+    So the URL is built inside the guard, and what the console names is the name as
+    given: the URL is what could not be built."""
+    opener = _between(_source("index.html"), "async function openArchive", "\n}\n")
+    tight = _tight(opener)
+    assert tight.index("try{") < tight.index("consturl=newURL(name,location.href).href;")
+    assert _tight("console.error(`could not read ${name}`, err)") in tight
+    assert _tight("return null;") in tight
+
+
+def test_the_studio_reports_a_boot_it_could_not_finish():
+    """Only the `/art/meta` fetch is inside the studio's own try. A server that
+    answers 200 with a body missing `limits`, `styles` or `presets` throws out of
+    `defaults()` or `build()` instead, past the guard, and the stage stays on
+    "Loading..." with nothing said.
+
+    It routes to `offline`, which is the page's one way of saying why nothing will be
+    drawn, and it carries the error rather than a fixed sentence -- a studio that
+    only says "something went wrong" is the console line again."""
+    text = _source("art.html")
+    assert _holds("art.html", "boot().catch((err) => {")
+    handler = _between(text, "boot().catch(", "\n});")
+    assert "offline(" in handler
+    assert "escapeHtml(" in handler and "err" in handler
+    assert re.search(r"function\s+offline\s*\(", text)
+
+
+def test_the_studio_picker_draws_every_archive_the_server_lists():
+    """The picker exists to frame a window against the network it will contain. Opening
+    `archives[0]` alone drew one region's network under a window framed over another,
+    on exactly the multi-region server where the framing matters most.
+
+    Each archive is a source of its own, because PMTiles is one archive to one tile
+    pyramid and there is no union source -- which is also what keeps the credits
+    right: no source states an `attribution`, each carries its own in its own
+    metadata, and MapLibre merges what every source reports into the one control. A
+    source given a credit here would be the page overriding the archive's."""
+    text = _source("art.html")
+    network = _between(text, "async function addNetwork", "\n}\n")
+    tight = _tight(network)
+    assert "archives[0]" not in tight, "the picker still opens only the first archive"
+    assert _tight("wanted.map(async (name) => {") in tight
+    assert _tight("const id = `bus-${i}`;") in tight
+    assert _tight("map.addSource(id, {") in tight
+    # No credit of the page's own on a source that brings one.
+    assert "attribution:" not in tight
+    # One archive that will not open costs itself and not the picker.
+    assert _tight(").filter(Boolean);") in tight
+    # A theme change has to reach every layer drawn, not the one named `bus`.
+    assert _holds("art.html", "for (const id of pickLayers) {")
+    assert '"bus"' not in _tight(_between(text, "function repaintPicker", "\n}\n"))
