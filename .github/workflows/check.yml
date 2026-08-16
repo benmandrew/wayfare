@@ -116,9 +116,26 @@ jobs:
       # ever turns flaky are the byte-identical render comparisons in
       # test_art.py, which are what the ORDER BY tiebreak rule in CLAUDE.md
       # exists to protect.
+      #
+      # `--cov` rides along on this run rather than getting one of its own: the
+      # badge check below needs a report, and measuring it in a second full suite
+      # costs another 25s of runner time for a number this run already has. The
+      # figure is the same either way -- xdist's workers write separate data files
+      # that coverage combines, measured at 93.85% both serial and under `-n auto`.
       - if: ${{ !cancelled() }}
         name: tests
-        run: nix develop --command pytest -q -n auto
+        run: >-
+          nix develop --command pytest -q -n auto
+          --cov=wayfare --cov-report=json:coverage.json
+
+      # The badge is a committed file, so nothing makes it wrong except a commit
+      # that moves the number and leaves it behind. This is the step that says so,
+      # and it reads the report above rather than re-running anything.
+      - if: ${{ !cancelled() }}
+        name: coverage badge
+        run: >-
+          nix develop --command
+          python scripts/coverage_badge.py --check --json coverage.json
 
       # After the checks, so a store that failed them is never the one the next
       # run starts from, and only from main for the quota reason above. The

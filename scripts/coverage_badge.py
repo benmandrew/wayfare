@@ -146,6 +146,12 @@ def measure(pytest_args: list[str]) -> float:
 
 
 def read_report(path: Path) -> float:
+    # CI hands `--json` the report the test step wrote, and runs this step even when
+    # that step failed, so that a formatting slip does not hide a broken test. A
+    # collection error leaves no report at all, and the bare traceback from that reads
+    # as a fault in the badge rather than in the run that was supposed to produce it.
+    if not path.exists():
+        raise SystemExit(f"{path} does not exist; the run that writes it did not finish")
     totals = json.loads(path.read_text())["totals"]
     percent: float = totals["percent_covered"]
     return percent

@@ -37,9 +37,10 @@ outside the flake: a Valhalla server reachable at `WAYFARE_VALHALLA`, which defa
 state is one DuckDB file under `WAYFARE_DATA`.
 
 `python scripts/coverage_badge.py` runs the suite under coverage and rewrites
-`docs/coverage.svg`, currently 94.2% from a 36s run. The badge is committed rather than
+`docs/coverage.svg`, the badge at the top of this page. It is committed rather than
 fetched from a service, so it renders in an offline clone and on a fork with no secrets.
-`--check` fails when the committed file has gone stale against a fresh measurement.
+`--check` fails when the committed file has gone stale against a fresh measurement, and
+CI runs it against the report the test step already wrote.
 
 ## Quick start
 
