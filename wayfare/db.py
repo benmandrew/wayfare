@@ -215,6 +215,36 @@ CREATE TABLE IF NOT EXISTS trace_status (
     traced_at    TIMESTAMP
 );
 
+-- What `snap` decided about each pattern it was handed, and why.
+--
+-- Its own table rather than a status on `trace_status`, because the two stages ask
+-- different questions of the same pattern and both answers are worth keeping. A
+-- pattern can be refused by the relation fit for having a stop sequence no relation
+-- carries and still snap cleanly onto the track under its shape; folding the two
+-- into one row would lose whichever ran second. Work is selected by the absence of a
+-- row here, so a permanent cache in the sense `match_status` is permanent.
+--
+-- `covered_pct` is the number that matters and the one a partial refusal is decided
+-- on. It is the share of the shape's length that found track within
+-- `config.SNAP_MAX_M`, so a refusal reads as "this much of it is mapped" rather than
+-- as a bare failure, and a region whose track is thin says so in one column.
+--
+--   ok             every metre of the shape found track and the ways were stored
+--   partial_cover  under `config.SNAP_MIN_COVER` of it did; refused rather than trimmed
+--   no_track       nothing fetched came within tolerance of any vertex
+--   too_short      fewer than two points to snap
+--   error          a bug or malformed geometry; permanent until the code changes
+CREATE TABLE IF NOT EXISTS snap_status (
+    pattern_id  BIGINT PRIMARY KEY,
+    status      VARCHAR,
+    n_ways      INTEGER,  -- distinct ways under this shape, in first-appearance order
+    covered_pct DOUBLE,   -- share of shape length that found track, 0-100
+    worst_m     DOUBLE,   -- furthest a covered vertex sits from the way it took
+    length_m    DOUBLE,
+    detail      VARCHAR,
+    snapped_at  TIMESTAMP
+);
+
 -- The geometry that came back, for the patterns where it did.
 --
 -- Separate from `edges` and deliberately so. These way ids are OpenStreetMap's and

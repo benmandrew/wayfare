@@ -10,16 +10,18 @@ The stages run in this order, each reading what the last one wrote:
     patterns -> trips collapse to distinct ordered stop sequences
     match    -> Valhalla; the stage that runs for a day or two
     trace    -> OSM route relations as geometry for patterns with none
+    snap     -> OSM way ids for the rail shapes an operator already publishes
     routes   -> OSM route relations as services, for modes with no timetable
     aggregate-> invert pattern->edges into edge->services
     publish  -> GeoJSONL -> tippecanoe -> PMTiles
 
 What the feeds themselves hold is [docs/data.md](data.md), and `art` is
 [docs/rendering.md](rendering.md). `wayfare all` chains acquire, patterns, match, the
-publish gate, trace, routes, aggregate, prune, cluster and publish — the same stages in the
-same order as [`deploy/refresh.sh`](../deploy/refresh.sh), and a test parses that script to
-keep the two from drifting. `trace` and `routes` are tolerated failures, because they ask
-Overpass. Every stage checkpoints, and an interrupt is
+publish gate, trace, snap, routes, aggregate, prune, cluster and publish — the same stages in
+the same order as [`deploy/refresh.sh`](../deploy/refresh.sh), and a test parses that script
+to keep the two from drifting. `trace`, `snap` and `routes` are tolerated failures, because
+they ask Overpass, and each is tolerated separately because the three ask it different
+questions. Every stage checkpoints, and an interrupt is
 caught and reported; re-running the same command resumes.
 
 ## acquire
@@ -410,6 +412,76 @@ reasoning.
 - **Ferries resolve to nothing by design.** `route=ferry` sits outside
   `config.OSM_ROUTE_VALUES`, so 166 of the national run's 170 `no_relation` rows are
   ferries.
+
+## snap
+
+**What it does.** Gives an operator's own rail shape the OpenStreetMap way ids it does not
+carry, so overlapping services share the track they run over. `trace` fits a pattern to a
+route relation by station sequence and `snap` takes the other side of the same problem: the
+operator already published where the train goes, so nothing has to be inferred about the
+route, and OpenStreetMap supplies only the identity. It writes `snap_status`, `traces` and
+`ways`.
+
+    wayfare snap
+    wayfare snap --refresh
+    wayfare snap --retry partial_cover
+
+**Flags.** `--track PATH` moves the Overpass cache, default `raw/osm_track.json`,
+deliberately not the files `trace` and `routes` use: this stage asks for bare `railway=*`
+ways rather than route relations, and sharing a body would let whichever ran first decide
+this one's coverage. `--refresh` re-queries. `--limit N` stops after N patterns. `--retry`
+takes statuses; `partial_cover` is the one worth redoing after the track is better mapped.
+
+**Cost.** Seconds. Against the Republic's feed `20260814_21a88e41` the Overpass query
+returned 6,147 ways in 7.2 MB, and indexing and snapping 319 patterns is arithmetic over a
+grid.
+
+**Interrupting.** Safe. Work is selected by the absence of a `snap_status` row, exactly as
+`match` selects on `match_status`, and patterns are handed out busiest first.
+
+**Why a relation is the wrong instrument here.** A relation covers only the track somebody
+drew a route over. Measured against the Republic's rail, the ways `trace` and `routes` left
+in the `ways` table cover 78.7% of the timetabled shape length, with Dublin–Belfast at 7.1%
+and Limerick–Waterford at 3.3%. Asking Overpass for the track itself covers 100.0% within
+25 m, which is why the stage has its own query and its own cache.
+
+**The tolerance is a margin rather than a knob.** Over 3,000.6 km of Irish rail shape the
+covered share is 99.5% at 5 m, 99.8% at 10 m and 100.0% at 25 m and at 50 m. A survey
+either follows the track or is somewhere else, so `config.SNAP_MAX_M` sits at 25 m in the
+middle of a range where the answer does not move.
+
+**A partial cover is refused rather than trimmed**, and that is the one way this stage
+could lie. Attributing the half of a shape that found track and dropping the half that did
+not reports a short working over a line the service runs the length of, and nothing
+downstream could tell. `config.SNAP_MIN_COVER` is 0.98, and a refused pattern keeps its own
+shape in `segments` exactly as before — so widening the stage to a mode whose track is
+unmapped costs the sharing and never the line.
+
+**Parallel track is where a nearest-vertex answer flaps.** Four tracks through a station
+throat sit within a few metres of each other, and taking the nearest way at every vertex
+independently hops between them, turning one line into a shredded list of ways each
+carrying a fragment of the service. The snapper holds the way the run is already on, and
+`config.SNAP_HOLD_M` is what bounds the hold: 3 m against the *nearest* way rather than 25 m
+against nothing. The first run held to the tolerance and every one of the 319 patterns came
+back with a worst vertex in the 20–25 m band, over track with something inside 5 m of 99.5%
+of it — each one a junction where the run should have changed way and instead gave the old
+way another 25 m of track it does not carry.
+
+**`service=*` track is excluded in the query.** A siding, a yard road and a crossover sit
+within metres of the running line, so a shape snaps onto one happily and reports a service
+running through a depot.
+
+**Statuses.**
+
+    ok             every metre of the shape found track and the ways were stored
+    partial_cover  under `SNAP_MIN_COVER` of it did; refused rather than trimmed
+    no_track       nothing fetched came within tolerance of any vertex
+    too_short      fewer than two points to snap
+    error          a bug or malformed geometry, permanent until the code moves
+
+A pattern `trace` already resolved is left alone, because `traces` holds one row per pattern
+and a relation fitted by stop sequence is the stronger evidence of the two. A snapped trace
+is told from a fitted one afterwards by its NULL `relation_id`.
 
 ## routes
 

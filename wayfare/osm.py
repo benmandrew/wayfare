@@ -288,6 +288,85 @@ def parse(data: dict[str, Any]) -> list[Relation]:
     return out
 
 
+def way_query(bbox: tuple[float, float, float, float]) -> str:
+    """The Overpass QL for every piece of running track over a window.
+
+    Bare ways rather than relation members, because a relation only covers track
+    somebody drew a route over and `snap` needs the track itself. `service` excludes
+    sidings, yards and crossovers: they sit within metres of the running line, so a
+    shape would snap onto one and report a service running through a depot.
+    """
+    south, west, north, east = bbox
+    values = "|".join(config.OSM_RAILWAY_VALUES)
+    return (
+        f"[out:json][timeout:{config.OVERPASS_QUERY_TIMEOUT}];\n"
+        f'way["railway"~"^({values})$"]["service"!~"."]'
+        f"({south:.6f},{west:.6f},{north:.6f},{east:.6f});\n"
+        "out geom;\n"
+    )
+
+
+def parse_ways(data: dict[str, Any]) -> list[Way]:
+    """Overpass JSON to bare ways. A way of one point cannot be snapped onto."""
+    return [
+        Way(int(e["id"]), pts)
+        for e in data.get("elements") or []
+        if e.get("type") == "way" and e.get("id") is not None
+        for pts in [
+            tuple(
+                (float(p["lat"]), float(p["lon"])) for p in (e.get("geometry") or []) if p
+            )
+        ]
+        if len(pts) >= 2
+    ]
+
+
+def fetch_ways(
+    bbox: tuple[float, float, float, float],
+    cache: Path | None = None,
+    *,
+    refresh: bool = False,
+    session: requests.Session | None = None,
+) -> list[Way]:
+    """Every running-track way over a window, from the cache where there is one.
+
+    The body is cached rather than the parsed ways, and the cache file is `snap`'s
+    own, for the reason `routes` keeps its cache apart from `trace`'s: the three
+    stages ask for different windows and different elements, and sharing one file
+    would let whichever ran first decide the others' coverage.
+    """
+    if cache is not None and cache.exists() and not refresh:
+        log.info("reading OSM track from %s", cache)
+        return parse_ways(json.loads(cache.read_text()))
+
+    log.info("querying Overpass for track over %s", bbox)
+    sess = session or requests.Session()
+    try:
+        r = sess.post(
+            config.OVERPASS_URL,
+            data={"data": way_query(bbox)},
+            timeout=config.OVERPASS_TIMEOUT,
+            headers={"User-Agent": config.USER_AGENT},
+        )
+    except requests.RequestException as exc:
+        raise TransportError(f"{type(exc).__name__}: {exc}") from exc
+    if r.status_code in (429, 504):
+        raise TransportError(f"Overpass is refusing load: {r.status_code}")
+    if not r.ok:
+        raise OverpassError(f"{r.status_code}: {r.text[:500]}")
+    try:
+        data = r.json()
+    except ValueError as exc:
+        raise TransportError(f"Overpass response did not parse: {exc}") from exc
+
+    ways = parse_ways(data)
+    if cache is not None:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(data))
+        log.info("cached %d track ways to %s", len(ways), cache)
+    return ways
+
+
 # -- chaining ----------------------------------------------------------------
 
 

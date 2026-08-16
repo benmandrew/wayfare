@@ -282,6 +282,34 @@ the join is by normalised station name with a coordinate check.
 [`docs/pipeline.md`](pipeline.md) covers the stage and [`wayfare/osm.py`](../wayfare/osm.py)
 the parsing.
 
+### A relation is a poor source of track, and OSM's track is an excellent one
+
+The stop members that make a relation a good join key for the Underground are what make it
+a bad one for heavy rail. OpenStreetMap models an intercity line with the stations that
+define it rather than every station on it: `Cork - Dublin` lists four, Cork Kent, Mallow,
+Limerick Junction and Dublin Heuston, while the National Transport Authority's patterns are
+stopping services over branches. `trace` needs a pattern's calling points to be a
+subsequence of a relation's, so 269 of the Republic's 319 shaped rail patterns match none of
+the 67 relations fetched. Nothing is wrong with the names — the feed writes "Cork (Kent)"
+and the relation "Cork Kent", and `osm.normalise` folds both to `cork kent`.
+
+Relations are a poor source of the track *itself* for the same reason. Measured against the
+Republic's 3,000.6 km of rail shape, the ways reachable through route relations cover 78.7%
+of it, with Dublin–Belfast at 7.1% and Limerick–Waterford at 3.3%: nobody has drawn a route
+over them. A bare `way[railway~"rail|light_rail|subway|narrow_gauge|tram"]` query over the
+same window covers **100.0% within 25 m** and costs 7.2 MB in one request. That is what
+`snap` asks for, and why it keeps its own cache.
+
+The distance distribution is what makes snapping safe rather than a threshold to tune. The
+covered share is 99.5% at 5 m, 99.8% at 10 m and 100.0% at 25 m and at 50 m, so a survey
+either follows the track or is somewhere else and there is no near miss to adjudicate.
+`service=*` is excluded because a siding sits within metres of the running line and a shape
+snaps onto one happily.
+
+The operator's shape is not thrown away by any of this. It stays the evidence — the snap
+follows it and OpenStreetMap supplies only the way id — and it stays the fallback for every
+pattern refused, so a region whose track is unmapped loses the sharing and never the line.
+
 ### Three gates on what a region draws
 
 `osmroutes` discovers route relations over a window and turns each into a pattern. It is

@@ -32,6 +32,7 @@ from wayfare import (
     osmroutes,
     publish,
     railtrips,
+    snap,
     trace,
 )
 
@@ -277,6 +278,55 @@ def test_trace_reports_an_overpass_failure_as_an_exit_code(monkeypatch, root, co
 
     monkeypatch.setattr(trace, "run", boom)
     assert cli.main(["trace"]) == 1
+    assert con.closed == 1
+
+
+# --- snap ----------------------------------------------------------------------
+
+
+def test_snap_forwards_the_track_cache_and_the_limit(monkeypatch, root, con, tmp_path):
+    run = spy(monkeypatch, snap, "run", {})
+    spy(monkeypatch, snap, "summary", [])
+    cache = tmp_path / "track.json"
+    code = cli.main(["snap", "--track", str(cache), "--refresh", "--limit", "9"])
+    assert code == 0
+    assert run.kwargs == {"cache": cache, "refresh": True, "limit": 9}
+    assert con.closed == 1
+
+
+def test_snap_has_its_own_cache_flag_and_does_not_answer_to_trace_s(monkeypatch, root):
+    """One file per Overpass question, and the flags are what keep them apart: this
+    stage asks for bare railway ways where `trace` asks for route relations, and a
+    shared body would let whichever ran first decide this one's coverage."""
+    with pytest.raises(SystemExit):
+        cli.main(["snap", "--relations", "x.json"])
+
+
+def test_snap_retries_the_statuses_it_was_given_before_running(monkeypatch, root, con):
+    """Before the run and never during, for `trace`'s reason: work is selected by
+    the absence of a status row, so clearing mid-run re-offers what is in flight."""
+    order: list[str] = []
+    got = Spy(0)
+
+    def retry(con: Any, statuses: list[str]) -> int:
+        order.append("retry")
+        got(statuses)
+        return 0
+
+    monkeypatch.setattr(snap, "retry", retry)
+    monkeypatch.setattr(snap, "run", lambda *a, **k: order.append("run") or {})
+    spy(monkeypatch, snap, "summary", [])
+    assert cli.main(["snap", "--retry", "partial_cover,ok"]) == 0
+    assert order == ["retry", "run"]
+    assert got.args == (["partial_cover", "ok"],)
+
+
+def test_snap_reports_an_overpass_failure_as_an_exit_code(monkeypatch, root, con):
+    def boom(*a: Any, **k: Any) -> dict[str, int]:
+        raise RuntimeError("Overpass said no")
+
+    monkeypatch.setattr(snap, "run", boom)
+    assert cli.main(["snap"]) == 1
     assert con.closed == 1
 
 
@@ -751,6 +801,9 @@ def test_all_hands_every_stage_argv_its_own_parser_accepts(monkeypatch, feed, co
         (trace, "retry", 0),
         (trace, "run", {}),
         (trace, "summary", []),
+        (snap, "retry", 0),
+        (snap, "run", {}),
+        (snap, "summary", []),
         (osmroutes, "run", BUILT),
         (aggregate, "build", None),
         (maintenance, "prune_shapes", 0),
@@ -773,7 +826,7 @@ def test_every_subcommand_the_table_names_reaches_the_parser(capsys):
         cli.main(["--help"])
     declared = set(re.findall(r"^\s{4}(\w[\w-]*)", capsys.readouterr().out, re.M))
     assert set(cli._SUBCOMMANDS) <= declared
-    assert len(cli._SUBCOMMANDS) == 15
+    assert len(cli._SUBCOMMANDS) == 16
 
 
 def test_data_retargets_every_path_config_computed_at_import(monkeypatch, tmp_path):

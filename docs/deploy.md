@@ -108,16 +108,22 @@ live patterns per mode, matchable or not, beside a `modes` field echoing the sel
 database was built with. The gate reads work still owed to the matcher, the mode census
 sits beside it, and that census is the only place a mode going missing is visible.
 
-## The two Overpass stages run after the gate
+## The three Overpass stages run after the gate
 
 `wayfare trace --retry transient` draws the modes with no road under them and no operator
-geometry: the Underground, the Docklands Light Railway (DLR), London Trams.
-`wayfare routes` runs immediately after and draws the modes with no timetable at all —
-Great Britain's National Rail, which the Bus Open Data Service (BODS) does not carry, and
-Northern Ireland's, which Translink's four datasets do not. Both depend on Overpass, a
-third party's metered public service, so each is followed by `|| echo` and the run carries
-on. A pattern neither draws keeps no `trace_status` row, so the next refresh selects it
-again unchanged.
+geometry: the Underground, the Docklands Light Railway (DLR), London Trams. `wayfare snap`
+follows and gives the rail an operator *does* publish a shape for the way ids that shape
+does not carry, which is what lets two services over one stretch share it. `wayfare routes`
+runs last and draws the modes with no timetable at all — Great Britain's National Rail,
+which the Bus Open Data Service (BODS) does not carry, and Northern Ireland's, which
+Translink's four datasets do not. All three depend on Overpass, a third party's metered
+public service, so each is followed by `|| echo` and the run carries on. A pattern none of
+them draws keeps no status row, so the next refresh selects it again unchanged.
+
+The three are separate lines rather than a chain, because they issue different queries and
+one being refused says nothing about the others. `snap` gets no `--retry`: a request that
+never arrived writes no row at all, and `partial_cover` means the track is not mapped, which
+clearing weekly would re-ask a question OpenStreetMap has not changed its answer to.
 
 `routes` reads `WAYFARE_REGION` to decide both the window it asks Overpass for and which
 operators' relations it keeps, so a run against the wrong data root draws another region's
@@ -133,15 +139,16 @@ Their failures stay out of the gate deliberately. Folding an unresolvable relati
 the mistake the mode filter already made once. `wayfare status` reports a separate
 `traced` block instead: patterns owed, patterns pending, and a count per status.
 
-Neither stage re-queries Overpass on a schedule, and the geometry ages because of it.
+No stage re-queries Overpass on a schedule, and the geometry ages because of it.
 `osm.fetch` reads `raw/osm_relations.json` or `raw/osm_routes.json` where one exists, and
-only `--refresh` overrides that, which [`refresh.sh`](../deploy/refresh.sh) never passes.
+`osm.fetch_ways` reads `raw/osm_track.json`; only `--refresh` overrides that, which
+[`refresh.sh`](../deploy/refresh.sh) never passes.
 The national query cost 131 MB and 27 seconds once, and every run since has read the file,
 so "next run draws it" covers a fit that failed rather than a relation the map has gained
 since. Deleting the two files is what re-queries; the external Ansible role does that on a
 second stamp, `wayfare_refresh_osm_days` old.
 
-Both stages must run after `patterns`, which sets the feed version their rows are stamped
+All three must run after `patterns`, which sets the feed version their rows are stamped
 with. A relation written against the previous version is departed the moment the new feed
 lands, so placed first the stage would draw the country's rail for exactly one refresh
 and then silently stop. There is no `--cif`, so `trips` stays null and nothing in the
