@@ -198,6 +198,46 @@ with no change to its design; what it turned out to need was two spellings of a 
 name. Until the remaining 440 refusals are triaged there is no way to tell a mapping gap
 from a convention neither publisher has written down.
 
+## The Republic's rail, drawn twice, 2026-08-16
+
+National Transport Authority feed `20260814_21a88e41`. The `segments` and
+`track_services` partition had already stopped the 44 relation-built patterns being
+drawn in both layers, and the archive still drew every line twice, because the two
+copies are different patterns from different sources: 319 timetabled rail patterns with
+the operator's shapes, and 44 patterns built from OSM route relations.
+
+The two layers were rendered separately from the published archive and their ink
+compared, each dilated three pixels so a small offset does not read as unique coverage.
+
+| view | segments | track | segments only | track only |
+|---|---|---|---|---|
+| Dublin z11 | 23,859 px | 16,997 px | 36 (0.2%) | 2 (0.0%) |
+| midlands z10 | 10,940 px | 10,270 px | 0 | 0 |
+
+The relation track covers nothing the operator's shapes do not. What the two carry
+differs, and that is the whole of the trade. In the Dublin z11 tile the 263 rail
+segments all carry `trips` under labels that are the feed's route categories — 153
+`rail`, 51 `InterCity`, 41 `DART`, 18 `Commuter` — while the 449 track features name
+services (`Dublin - Cork`, `South Western Commuter: Grand Canal Dock -> Newbridge`) and
+carry no counts at all. Journeys with weak names against names with no journeys, over
+the same geometry, and the map shades by journeys a day.
+
+`config.Feed.route_relations=()` on the Republic. One `routes` run after it:
+
+| | before | after |
+|---|---|---|
+| relations drawn | 44 | 0 |
+| live `osm:r` patterns | 44 | 0, all 44 retired |
+| `segments` | rail 363, tram 40 | rail 319, tram 40 |
+| `track_services` | 5,565 pairs over 2,761 ways | 0 |
+| archive layers | `bus`, `segments`, `track` | `bus`, `segments` |
+| archive | 16.0 MB | 14.7 MB |
+
+The retire is the half worth keeping in mind. `routes` drew nothing that run, and the
+early return on an empty result meant it also retired nothing, so the setting was inert
+and the 44 stayed live. Great Britain keeps `ROUTE_MODES` and is unaffected: it has no
+rail timetable, which is the case the stage exists for.
+
 ## Determinism
 
 All three `art` styles are byte-identical run to run, which none of them were. Ties

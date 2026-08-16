@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 from builders import broken_relation, relation, stop, way
 
-from wayfare import db, osmroutes
+from wayfare import config, db, osmroutes
 
 FEED = "20260812_test"
 
@@ -225,6 +225,56 @@ def test_writing_without_a_feed_version_is_refused(con):
     kept = osmroutes.candidates([relation()]).kept
     with pytest.raises(RuntimeError, match="feed_version"):
         osmroutes.write(con, kept)
+
+
+def test_a_run_that_draws_nothing_still_retires_the_last_one(seeded):
+    """A region that has stopped drawing relations is not a no-op run.
+
+    Returning early on an empty `found` left the previous run's patterns live and
+    on the map, so the setting that stops drawing them would not take effect until
+    something else happened to rewrite the table.
+    """
+    osmroutes.write(seeded, osmroutes.candidates([relation()]).kept)
+    assert osmroutes.write(seeded, []) == 0
+    live = db.scalar(seeded, "SELECT count(*) FROM patterns WHERE last_seen = ?", [FEED])
+    assert live == 0
+    assert db.scalar(seeded, "SELECT count(*) FROM patterns") == 1
+
+
+# --- which relations a region draws -------------------------------------------
+#
+# `routes` is for a mode with no timetable behind it. Where the region publishes
+# one, the relation and the operator's own shape are the same line drawn twice --
+# measured on the Republic, the track lay on the shapes to within two pixels and
+# covered nothing they did not.
+
+
+def test_an_empty_selection_admits_nothing():
+    """`or` would read `{}` as unset and hand back the default it just refused."""
+    sifted = osmroutes.candidates([relation()], routes={})
+    assert (sifted.kept, sifted.broken, sifted.no_stops, sifted.not_ours) == ([], 0, 0, 0)
+    assert sifted.considered == 0
+
+
+def test_no_selection_is_the_default_rather_than_nothing():
+    assert len(osmroutes.candidates([relation()], routes=None).kept) == 1
+
+
+def test_the_republic_draws_no_relations():
+    """Iarnród Éireann is in the NTA feed, timetable and shapes both."""
+    assert config.feed("ireland").route_relations == ()
+
+
+def test_a_region_that_names_none_takes_the_default():
+    assert config.feed("all").route_relations is None
+
+
+def test_the_republic_still_claims_its_operators():
+    """The claim is what makes Great Britain refuse these relations, so it outlives
+    the Republic's own reason for naming them."""
+    mine, others = osmroutes.claims("all")
+    assert osmroutes.operator_key("Iarnród Éireann") in others
+    assert not osmroutes.ours("Iarnród Éireann", mine, others)
 
 
 # --- ways --------------------------------------------------------------------

@@ -93,7 +93,10 @@ def lines(
     where a feed's point is a station entrance, and projecting the further of the
     two risks landing on a parallel line.
     """
-    routes = routes or osmroutes.ROUTE_MODES
+    # `is None`, not falsy, for the reason `osmroutes.candidates` gives: an empty
+    # selection is a caller that wants none of them, and `or` overrides it.
+    if routes is None:
+        routes = osmroutes.ROUTE_MODES
     out: list[Line] = []
     for r in relations:
         if (r.route or "") not in routes or not r.ways:
