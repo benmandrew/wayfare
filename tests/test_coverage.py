@@ -517,6 +517,49 @@ def test_the_layers_are_drawn_in_different_shades(tmp_path):
     assert max(road) > max(track)
 
 
+def test_supersampling_grades_a_diagonal_rather_than_stepping_it(tmp_path):
+    """Every line here is a Bresenham run, so at one pixel a step a diagonal road is
+    the ink or the ground and nothing between the two -- a staircase, which is what
+    the national picture at the top of the README was made of.
+
+    Read off the picture rather than off the buffer, because the averaging is the
+    last thing that happens to it and a buffer that antialiased nothing still
+    reports the same size and the same lit share.
+    """
+    path = archive(
+        tmp_path / "a.pmtiles",
+        {0: gzip.compress(_line_tile(at(-20.0, 20.0), at(20.0, -20.0)))},
+    )
+    window = (-40.0, -40.0, 40.0, 40.0)
+    hard, soft = tmp_path / "hard.png", tmp_path / "soft.png"
+    coverage.draw(path, 0, window, hard, width=100)
+    fraction = coverage.draw(path, 0, window, soft, width=100, supersample=3)
+
+    hard_w, hard_h, stepped = _rgb(hard)
+    soft_w, soft_h, graded = _rgb(soft)
+    # The supersampling is spent on the edges, not on the size: a picture asked for
+    # at 100 wide is 100 wide however large it was drawn.
+    assert (soft_w, soft_h) == (hard_w, hard_h)
+
+    ink = {p for p in stepped if p != (0, 0, 0)}
+    assert len(ink) == 1, "the unsampled draw is one flat shade, by construction"
+    partial = {p for p in graded if p != (0, 0, 0)} - ink
+    assert partial, "no shade between the road and the ground: nothing was averaged"
+
+    # The lit share still counts pixels of the picture, so it means the same thing at
+    # any supersampling and two renders of one window stay comparable.
+    lit, _size = _lit(soft)
+    assert fraction == lit / (soft_w * soft_h)
+
+
+def test_supersampling_under_one_is_refused(tmp_path):
+    """Zero is a buffer of no pixels and a division by nothing; a negative one is a
+    bytearray of negative length, which raises somewhere unrelated."""
+    path = archive(tmp_path / "a.pmtiles", {0: gzip.compress(mvt([at(0.0, 0.0)]))})
+    with pytest.raises(ValueError, match="under one"):
+        coverage.draw(path, 0, (-1.0, -1.0, 1.0, 1.0), tmp_path / "a.png", supersample=0)
+
+
 def _geometry(points, split: bool):
     """A three-point LineString, as one command stream or as two."""
     (sx, sy), (mx, my), (ex, ey) = points

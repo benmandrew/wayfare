@@ -3,7 +3,7 @@
 ![Coverage](docs/coverage.svg)
 
 <p align="center">
-  <img src="docs/map.png" width="50%"
+  <img src="docs/map.png" width="66%"
        alt="Every service across mainland Great Britain and Ireland, drawn from the three published archives: road in blue through yellow by journeys a day, rail in orange, ferry in crimson">
 </p>
 

@@ -794,6 +794,30 @@ missing from the table. And weight 0 meant "unlit", so the quietest road of the 
 layer was drawn and then counted as background, and a national render reported 0.2% lit
 against the greyscale's 5.1%. Every drawn weight is offset by one.
 
+**Every line `draw` lays down is a one-pixel *Bresenham* run, so a road off the axes comes
+out a staircase.** The committed README picture was made of those, and at national scale
+they read as pixelation rather than as thin roads. `draw` takes `supersample` now, exposed
+as `--supersample` on `wayfare draw`. It draws into a buffer that many times wider and
+taller, with a nib that many pixels square so a line still comes out one *output* pixel
+wide, and averages each block back down when it resolves the buffer to PNG scanlines. Unlit
+buffer pixels count as background in that average, which is what grades an edge into the
+ground. Averaging at the resolve step rather than while drawing is what keeps the
+compositing rule intact, since every buffer pixel still states one feature whole and a mixed
+hue can only appear where two of them fall inside one output pixel, which is the width of
+the blend *antialiasing* is. Blending while drawing would have put a third hue naming
+neither mode along every crossing. The default is 1, and at 1 the output is byte-identical
+to the bytes of the picture already committed, so the diagnostics keep the render they were
+judged on. The lit fraction counts pixels of the *picture* rather than of the buffer and so
+means the same thing at any factor, but it moves: these islands at z11 read 9.7% lit at 1
+and 16.7% at 6, because an antialiased edge lights pixels Bresenham left dark. Cost is the
+square of the factor in memory and much less in time, the whole-islands z11 render going
+from 15s to 42s at 6, since about 8s of either is spent before any of it is drawn: `draw`
+walks one zoom, so these three archives are 16.5 MB of z11 tiles rather than the 147.7 MB
+they hold, and 0.7s of that is the read and the gunzip against 7.2s of parsing 1.14M
+features out of the wire format. The committed PNG goes from 288 KB to 796 KB, because an
+antialiased edge is what does not compress. `scripts/readme_map.py` passes 6, and it is the
+only caller that asks for more than 1.
+
 **`scripts/readme_map.py` draws `docs/map.png`, which the README embeds.** It has no
 `--check` and CI cannot run it, since every data root is gitignored and a national build
 is a match run of a day or two, so the picture is committed and the script is run by hand
@@ -804,6 +828,14 @@ an archive built before `trips` reached the overview bands has it in the detail 
 and comes out every road in the "no answer" grey below z11.
 `coverage.layer_attributes` is what lets it warn about the band it was given rather than
 write that map.
+
+It draws 1200 wide, which is what the page it is embedded in displays rather than what
+the archives could fill. GitHub's readme column is around 900 CSS pixels beside the About
+sidebar and the picture is set to two thirds of it, so 1200 is the two device pixels a
+retina screen draws each of them and the 1800 this began at was paying for a third size
+nothing shows. The width is where the supersampling is paid for twice over: fewer output
+pixels is a cheaper render and a smaller file, and every one of them is carrying more of
+the network, which is the case for antialiasing them well.
 
 Its window is mainland Great Britain and Ireland, north to 58.8 — above Dunnet Head at
 58.67 and below Orkney at 58.7. What the crop buys is the sea rather than the islands:

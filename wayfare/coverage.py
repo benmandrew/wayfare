@@ -637,6 +637,7 @@ def _stroke(
     y1: int,
     rgb: tuple[int, int, int],
     weight: int,
+    pen: int = 1,
 ) -> None:
     """Bresenham, clipped per pixel rather than per line.
 
@@ -650,20 +651,35 @@ def _stroke(
     prevent -- so the pixel states one of them, and `weight` decides which. The
     greyscale path passes its shade as the weight, which is the brighter-wins rule
     this had before there was any colour in it.
+
+    `pen` is the square nib in buffer pixels, and is the supersampling factor when
+    the buffer is a supersampled one: a line has to stay one *output* pixel wide, or
+    drawing at three times the size and averaging back down leaves every road at a
+    third of its ink. It is centred on the run, so a pen of one is the single-pixel
+    line this drew before there was a nib at all.
     """
     dx, dy = abs(x1 - x0), -abs(y1 - y0)
     sx = 1 if x0 < x1 else -1
     sy = 1 if y0 < y1 else -1
     err = dx + dy
     red, green, blue = rgb
+    nib = range(-(pen // 2), -(pen // 2) + pen)
     while True:
-        if 0 <= x0 < w and 0 <= y0 < h:
-            at = (y0 * w + x0) * _CHANNELS
-            if pixels[at + _WEIGHT] <= weight:
-                pixels[at] = red
-                pixels[at + 1] = green
-                pixels[at + 2] = blue
-                pixels[at + _WEIGHT] = weight
+        for oy in nib:
+            py = y0 + oy
+            if not 0 <= py < h:
+                continue
+            row = py * w
+            for ox in nib:
+                px = x0 + ox
+                if not 0 <= px < w:
+                    continue
+                at = (row + px) * _CHANNELS
+                if pixels[at + _WEIGHT] <= weight:
+                    pixels[at] = red
+                    pixels[at + 1] = green
+                    pixels[at + 2] = blue
+                    pixels[at + _WEIGHT] = weight
         if x0 == x1 and y0 == y1:
             return
         step = 2 * err
@@ -675,36 +691,90 @@ def _stroke(
             y0 += sy
 
 
-def _png(
-    path: Path,
+def _resolve(
+    pixels: bytearray,
     width: int,
     height: int,
-    pixels: bytearray,
     background: tuple[int, int, int],
-) -> None:
+    supersample: int = 1,
+) -> tuple[bytes, int]:
+    """The buffer as PNG scanlines, and how many output pixels carry ink.
+
+    The fourth channel of the buffer is the compositing weight and is not written:
+    PNG has no room for it and nothing downstream reads it. Unlit pixels take
+    `background`, which is where a dark render gets its ground.
+
+    Above one, `supersample` is where the antialiasing happens: an output pixel is
+    the mean of the s * s buffer pixels under it, with the unlit ones counted as
+    background, so a diagonal road comes out as a graded edge rather than a stair.
+    Averaging here rather than while drawing is what keeps the compositing rule
+    intact -- every buffer pixel still states one feature whole, and a mixed hue can
+    only appear where two of them fall inside one output pixel, which is the width
+    of the blend antialiasing is.
+
+    The count is of output pixels rather than buffer pixels, so the lit fraction
+    means the same thing at any supersampling: a road covers the same share of the
+    picture whether or not it was drawn large and shrunk.
+    """
+    stride = width * _CHANNELS
+    rows = []
+    lit = 0
+    if supersample == 1:
+        for y in range(height):
+            row = bytearray(b"\x00")
+            base = y * stride
+            for x in range(width):
+                at = base + x * _CHANNELS
+                if pixels[at + _WEIGHT]:
+                    row += pixels[at : at + 3]
+                    lit += 1
+                else:
+                    row += bytes(background)
+            rows.append(bytes(row))
+        return b"".join(rows), lit
+
+    s = supersample
+    area = s * s
+    ground = bytes(background)
+    back_r, back_g, back_b = background
+    for y in range(height // s):
+        row = bytearray(b"\x00")
+        bases = [(y * s + dy) * stride for dy in range(s)]
+        for x in range(width // s):
+            left = x * s * _CHANNELS
+            red = green = blue = covered = 0
+            for base in bases:
+                at = base + left
+                for _ in range(s):
+                    if pixels[at + _WEIGHT]:
+                        red += pixels[at]
+                        green += pixels[at + 1]
+                        blue += pixels[at + 2]
+                        covered += 1
+                    at += _CHANNELS
+            if not covered:
+                row += ground
+                continue
+            lit += 1
+            bare = area - covered
+            row += bytes(
+                (
+                    (red + back_r * bare) // area,
+                    (green + back_g * bare) // area,
+                    (blue + back_b * bare) // area,
+                )
+            )
+        rows.append(bytes(row))
+    return b"".join(rows), lit
+
+
+def _png(path: Path, width: int, height: int, raw: bytes) -> None:
     """Eight-bit truecolour, written by hand.
 
     No pillow and no numpy, because `art` owns the drawing dependencies and this has
     to run anywhere an archive does -- including inside the pipeline image, which does
     not carry the art extra.
-
-    The fourth channel of the buffer is the compositing weight and is not written:
-    PNG has no room for it and nothing downstream reads it. Unlit pixels take
-    `background`, which is where a dark render gets its ground.
     """
-    stride = width * _CHANNELS
-    rows = []
-    for y in range(height):
-        row = bytearray(b"\x00")
-        base = y * stride
-        for x in range(width):
-            at = base + x * _CHANNELS
-            if pixels[at + _WEIGHT]:
-                row += pixels[at : at + 3]
-            else:
-                row += bytes(background)
-        rows.append(bytes(row))
-    raw = b"".join(rows)
 
     def chunk(tag: bytes, data: bytes) -> bytes:
         body = tag + data
@@ -788,6 +858,7 @@ def draw(
     width: int = 1400,
     theme: palette.Theme | None = None,
     underlay: Sequence[Sequence[tuple[float, float]]] | None = None,
+    supersample: int = 1,
 ) -> float:
     """Rasterise one zoom of some archives into a window. Returns the fraction lit.
 
@@ -814,19 +885,33 @@ def draw(
     passed in rather than loaded here because this module reads archives and
     nothing else -- no network, no data files -- which is what lets it run
     wherever an archive does.
+
+    `supersample` draws into a buffer that many times wider and taller and averages
+    it back down, which is the whole of the antialiasing: every line here is one
+    pixel of a hand-written Bresenham, so at 1 a diagonal road is a staircase, which
+    is unreadable in a picture anybody looks at rather than measures. It costs the
+    square of itself in memory, and much less than that in time -- these islands at
+    z11 go from 15s to 42s at 6, since about 8s of either is reading the band and
+    parsing its features, which the drawing happens after. 1 stays the default that
+    every diagnostic call takes, and a picture asks for more.
     """
     # One archive is the ordinary diagnostic call and reads better without a list
     # around it, so both spellings are taken rather than one being the only one.
     archives = [archives] if isinstance(archives, Path) else list(archives)
     if not archives:
         raise ValueError("no archives to draw")
+    if supersample < 1:
+        raise ValueError(f"supersample {supersample} is under one")
     west, south, east, north = bbox
     if west >= east or south >= north:
         raise ValueError(f"window {bbox} is empty; wanted west<east and south<north")
     x0, y0 = _mercator(west, north)
     x1, y1 = _mercator(east, south)
     height = max(1, round(width * (y1 - y0) / (x1 - x0)))
-    pixels = bytearray(width * height * _CHANNELS)
+    # The picture is `width` by `height`; everything below this draws into the
+    # buffer, which is that times the supersampling in each direction.
+    buf_w, buf_h = width * supersample, height * supersample
+    pixels = bytearray(buf_w * buf_h * _CHANNELS)
     greys = _layer_greys()
 
     # First, so every feature composites over it: the weight ordering would hold
@@ -837,13 +922,24 @@ def draw(
         for line in underlay:
             points = [
                 (
-                    round((mx - x0) / (x1 - x0) * width),
-                    round((my - y0) / (y1 - y0) * height),
+                    round((mx - x0) / (x1 - x0) * buf_w),
+                    round((my - y0) / (y1 - y0) * buf_h),
                 )
                 for mx, my in (_mercator(lon, lat) for lon, lat in line)
             ]
             for (ax, ay), (bx, by) in itertools.pairwise(points):
-                _stroke(pixels, width, height, ax, ay, bx, by, ink, _UNDERLAY_WEIGHT)
+                _stroke(
+                    pixels,
+                    buf_w,
+                    buf_h,
+                    ax,
+                    ay,
+                    bx,
+                    by,
+                    ink,
+                    _UNDERLAY_WEIGHT,
+                    supersample,
+                )
 
     for archive in archives:
         with archive.open("rb") as fh:
@@ -871,12 +967,12 @@ def draw(
                                     round(
                                         ((tx + px / extent) / scale - x0)
                                         / (x1 - x0)
-                                        * width
+                                        * buf_w
                                     ),
                                     round(
                                         ((ty + py / extent) / scale - y0)
                                         / (y1 - y0)
-                                        * height
+                                        * buf_h
                                     ),
                                 )
                                 for px, py in path
@@ -884,11 +980,22 @@ def draw(
                             # Deliberately not strict: this is a sliding pair over
                             # one list, so the shorter tail is the point.
                             for (ax, ay), (bx, by) in itertools.pairwise(points):
-                                _stroke(pixels, width, height, ax, ay, bx, by, rgb, weight)
+                                _stroke(
+                                    pixels,
+                                    buf_w,
+                                    buf_h,
+                                    ax,
+                                    ay,
+                                    bx,
+                                    by,
+                                    rgb,
+                                    weight,
+                                    supersample,
+                                )
 
     background = _BACKGROUND[theme] if theme else (0, 0, 0)
-    _png(out, width, height, pixels, background)
-    drawn = sum(pixels[i + _WEIGHT] != 0 for i in range(0, len(pixels), _CHANNELS))
+    raw, drawn = _resolve(pixels, buf_w, buf_h, background, supersample)
+    _png(out, width, height, raw)
     lit = drawn / (width * height)
     log.info(
         "%s z%d over %s -> %s, %dx%d, %.1f%% lit",

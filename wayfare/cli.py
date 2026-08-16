@@ -416,6 +416,15 @@ def _add_draw_parser(sub: _Sub) -> None:
         "and the country around it",
     )
     p.add_argument("--width", type=int, default=1400, help="output width in pixels")
+    p.add_argument(
+        "--supersample",
+        type=int,
+        default=1,
+        help="draw this many times larger and average back down, which is the whole "
+        "of the antialiasing. 1 is the diagnostic default and every line is a hard "
+        "pixel; 2 or 3 is what a picture somebody looks at wants, at the square of "
+        "itself in memory and roughly that in time",
+    )
 
 
 def _add_status_parser(sub: _Sub) -> None:
@@ -734,6 +743,7 @@ def _cmd_draw(args: argparse.Namespace) -> int:
         args.out,
         args.width,
         args.theme,
+        supersample=args.supersample,
     )
     return 0
 

@@ -65,6 +65,22 @@ REGIONS = ("great_britain", "ireland", "northern_ireland")
 # README. So the zoom is a flag and the mismatch is reported rather than written.
 DEFAULT_ZOOM = 11
 
+# Every line in `coverage.draw` is a one-pixel Bresenham run, so at national scale a
+# road that is not axis-aligned -- which is most of them -- comes out a staircase.
+# Six times over costs less than the 36 times the buffer suggests: 42s against the 15s
+# of no supersampling at all, of which about 8s is reading the z11 band and parsing
+# 1.14M features out of the wire format, which no amount of supersampling repeats. That
+# is a script run by hand a few times a year. Past 3 the gain is small -- the whole
+# picture moves by an RMSE of 0.9% between 4 and 6 -- but at this width every output
+# pixel is an edge somewhere.
+SUPERSAMPLE = 6
+
+# Wide enough for the two device pixels a retina screen draws each of the roughly 600
+# CSS pixels the README gives it, and no wider. GitHub's readme column is about 900
+# wide beside the About sidebar, the picture is set to two thirds of it, and the 1800
+# this was drawn at was paying for a third size nothing displays.
+WIDTH = 1200
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
@@ -76,7 +92,14 @@ def main() -> None:
         help=f"the .pmtiles to draw (default: {', '.join(REGIONS)} under OUT)",
     )
     ap.add_argument("--zoom", type=int, default=DEFAULT_ZOOM)
-    ap.add_argument("--width", type=int, default=1800, help="output width in pixels")
+    ap.add_argument("--width", type=int, default=WIDTH, help="output width in pixels")
+    ap.add_argument(
+        "--supersample",
+        type=int,
+        default=SUPERSAMPLE,
+        help="draw this many times larger and average back down (default "
+        f"{SUPERSAMPLE}); 1 is the unantialiased diagnostic render",
+    )
     ap.add_argument("--theme", choices=("light", "dark"), default="dark")
     ap.add_argument("--out", type=Path, default=OUT, help="the .png to write")
     args = ap.parse_args()
@@ -125,6 +148,7 @@ def main() -> None:
         args.width,
         theme=args.theme,
         underlay=underlay,
+        supersample=args.supersample,
     )
     # `--out` can be anywhere, so the path is only shortened when it is under the
     # repository. `relative_to` raises rather than falling back on its own.
