@@ -125,10 +125,10 @@ one being refused says nothing about the others. `snap` gets no `--retry`: a req
 never arrived writes no row at all, and `partial_cover` means the track is not mapped, which
 clearing weekly would re-ask a question OpenStreetMap has not changed its answer to.
 
-`routes` reads `WAYFARE_REGION` to decide both the window it asks Overpass for and which
-operators' relations it keeps, so a run against the wrong data root draws another region's
-rail into this one's archive. The stage names the region it thinks it is in its own log
-line.
+All three read `WAYFARE_REGION` to decide the window they ask Overpass for, through
+`config.Feed.bounds`, and `routes` reads it again to decide which operators' relations it
+keeps. So a run against the wrong data root draws another region's rail into this one's
+archive. `routes` names the region it thinks it is in its own log line.
 
 Track arrives under the Open Database License (ODbL), and `config.credit_parts` adds the
 OpenStreetMap credit when an archive holds matched road *or* track. An archive with

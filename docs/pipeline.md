@@ -439,6 +439,19 @@ grid.
 **Interrupting.** Safe. Work is selected by the absence of a `snap_status` row, exactly as
 `match` selects on `match_status`, and patterns are handed out busiest first.
 
+**The window is the pending patterns' shape vertex extent padded by 0.05 degrees, where
+`trace`'s is their stop extent padded by 0.2.** The shape is what is being snapped and it
+already runs past the stops it calls at, so a stop-sized window leaves the approach to a
+terminus with no track under it. Every vertex is tested against `config.british_isles_sql`
+rather than the corners alone, since a feed carrying international coach holds correct
+coordinates in Warsaw and one of those in the min/max asks Overpass for every railway
+between here and Poland. A vertex outside the bounds leaves the window and not the pattern,
+so track it cannot reach surfaces as `partial_cover`, which is already refused.
+`config.pad_and_clip` then clips to `config.Feed.bounds` off `WAYFARE_REGION`, as
+`trace.bbox` and `osmroutes.bbox` do, because Northern Ireland's rail shapes reach Dublin
+Connolly. Bounds that meet no pending shape raise, and a run with no pending shape in the
+British Isles gets None back, which the stage logs as a warning before returning.
+
 **Why a relation is the wrong instrument here.** A relation covers only the track somebody
 drew a route over. Measured against the Republic's rail, the ways `trace` and `routes` left
 in the `ways` table cover 78.7% of the timetabled shape length, with Dublin–Belfast at 7.1%

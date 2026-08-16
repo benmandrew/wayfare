@@ -247,7 +247,9 @@ has already diverged keeps the shape for another 25 m — which is what put all 
 Republic's patterns in the 20–25 m band on the first run. Its three writes are one
 transaction, since work is selected by the absence of a `snap_status` row and a status
 committed without its geometry is a pattern marked resolved that nothing will ever ask about
-again.
+again. Its Overpass window is sized off the pending shapes' vertices rather than their stops,
+since a shape runs past the stops it calls at, and is clipped by `config.Feed.bounds` like
+`trace`'s and `routes`'.
 
 **A licence condition travels with the data, not with the page.** `publish` stamps the
 credit into the archive's own tileset metadata, derived from `config.Feed`, so a copied
