@@ -20,7 +20,7 @@ from builders import (
     overpass,
 )
 
-from wayfare import aggregate, config, db, gtfs, osm, publish, trace
+from wayfare import aggregate, config, db, gtfs, licences, osm, publish, trace
 
 # A straight line east along one latitude, in three ways that join end to end.
 # Coordinates are near the mini feed's Manchester stops so that a pattern built
@@ -576,7 +576,7 @@ def test_a_traced_archive_owes_openstreetmap_for_its_track(rail_con) -> None:
     # relation's, not a recording the timetable's publisher shipped. It read True
     # only while a trace was copied into `segments` alongside the operator shapes.
     assert held == {"road": False, "operator": False, "track": True}
-    credit = config.credit_html("all", **held)
+    credit = licences.html(config.credit_parts("all", **held))
     assert "Track geometry" in credit
     assert "Road geometry" not in credit
     assert "OpenStreetMap contributors" in credit

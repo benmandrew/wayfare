@@ -89,21 +89,24 @@ class Prepared:
 # -- work selection ---------------------------------------------------------
 
 
-def _pending_sql() -> str:
+def _pending_sql(con: duckdb.DuckDBPyConnection) -> str:
     """The patterns this stage owes an answer for: the non-road ones with no outcome.
 
     `trace_status` is a permanent cache, so work is selected by the absence of a row
     rather than by a status, and a recorded failure is never asked again.
+
+    Takes the connection because `db.non_road` does: a data root that predates
+    `patterns.mode` needs the predicate to degrade rather than fail to bind.
     """
     return f"""
         FROM patterns p
-        WHERE {db.non_road()}
+        WHERE {db.non_road(con)}
           AND NOT EXISTS (SELECT 1 FROM trace_status t WHERE t.pattern_id = p.pattern_id)
     """
 
 
 def pending_count(con: duckdb.DuckDBPyConnection) -> int:
-    return int(db.scalar(con, f"SELECT count(*) {_pending_sql()}"))
+    return int(db.scalar(con, f"SELECT count(*) {_pending_sql(con)}"))
 
 
 def bbox(
@@ -132,7 +135,7 @@ def bbox(
         SELECT min(s.lat), min(s.lon), max(s.lat), max(s.lon)
         FROM pattern_stops ps
         JOIN stops s USING (stop_id)
-        WHERE ps.pattern_id IN (SELECT p.pattern_id {_pending_sql()})
+        WHERE ps.pattern_id IN (SELECT p.pattern_id {_pending_sql(con)})
           AND {config.british_isles_sql("s.lat", "s.lon")}
         """,
     )
@@ -155,7 +158,7 @@ def load_pending(con: duckdb.DuckDBPyConnection, limit: int | None = None) -> li
     rows = con.execute(
         f"""
         SELECT p.pattern_id, p.mode, p.short_name
-        {_pending_sql()}
+        {_pending_sql(con)}
         ORDER BY p.n_trips DESC, p.pattern_id
         {"LIMIT ?" if limit else ""}
         """,

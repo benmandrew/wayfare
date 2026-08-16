@@ -9,9 +9,10 @@ are not open at all -- so the names and their URIs live here rather than scatter
 through the module that also holds paths and tunables.
 
 This module knows nothing about regions or feeds. It is the vocabulary and the
-rendering; `config.credit_parts` is what decides which credits a given region owes,
-because that needs the `Feed` and `Feed` needs the licence names from here. The
-dependency runs one way, and it has to: `config` imports this, never the reverse.
+rendering: `html`, `lines` and `text` take a tuple of credits and know nothing about
+where it came from. `feeds.credit_parts` is what decides which credits a given region
+owes, because that needs the `Feed` and `Feed` needs the licence names from here. The
+dependency runs one way, and it has to: `feeds` imports this, never the reverse.
 """
 
 from __future__ import annotations
@@ -62,13 +63,10 @@ class Credit:
 # Only the noun varies, and it has to: since `wayfare trace` an archive may hold OSM
 # geometry that is track rather than road -- the Underground drawn from route
 # relations -- and an archive holding only that would credit "Road geometry" for a
-# tube tunnel. Which noun applies is `config.credit_parts`'s to decide, because only
+# tube tunnel. Which noun applies is `feeds.credit_parts`'s to decide, because only
 # it knows what was built.
 def openstreetmap(what: str = "Road geometry") -> Credit:
     return Credit(what, "OpenStreetMap contributors", ODBL, OSM_COPYRIGHT)
-
-
-OPENSTREETMAP = openstreetmap()
 
 
 # --- Rendering ----------------------------------------------------------------

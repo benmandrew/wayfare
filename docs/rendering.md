@@ -277,7 +277,7 @@ road or traced track.
 
 Four fields go in. `Title` is "wayfare density: cardiff", `Description` carries the
 window as `minlon,minlat,maxlon,maxlat`, `Software` is "wayfare" bare, and `Copyright`
-is `config.credit_text()`. Style and window are in there because a render that has been
+is `licences.text(config.credit_parts())`. Style and window are in there because a render that has been
 through a chat client and back is otherwise a picture of somewhere nobody can name. The
 feed version was left out: it would make a render's bytes a function of when the
 timetable was downloaded rather than of what was asked for.
@@ -307,7 +307,7 @@ fraction too small to see. That starting size is then shrunk to fit between the 
 and *that* shrink has no floor, for the reason `density`'s line widths have none: a
 thumbnail should look like the render reduced, and the metadata carries the obligation
 once the text is a grey mark. The licence URIs are dropped through
-`config.credit_lines(links=False)`, because a URI in 7px text is unclickable and is
+`licences.lines(config.credit_parts(), links=False)`, because a URI in 7px text is unclickable and is
 spelled out in full in the same file's metadata. `credit` reaches the `/art` cache key,
 since a credited render and a plain one are different pictures.
 

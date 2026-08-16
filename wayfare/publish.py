@@ -27,7 +27,7 @@ from typing import Any, NamedTuple
 
 import duckdb
 
-from . import config, db, logs
+from . import config, db, licences, logs
 
 log = logs.get("publish")
 
@@ -700,7 +700,7 @@ def build_tiles(
     # answers the question the same way `build` does -- including its refusal to
     # write the default beside an archive this data root already publishes by name.
     out = out or default_out()
-    attribution = attribution or config.credit_html()
+    attribution = attribution or licences.html(config.credit_parts())
     out.parent.mkdir(parents=True, exist_ok=True)
 
     # Every intermediate goes in a scratch directory, and only the finished archive
@@ -1098,7 +1098,7 @@ def build(
     return build_tiles(
         from_export,
         out or default_out(region),
-        attribution=config.credit_html(region, **held),
+        attribution=licences.html(config.credit_parts(region, **held)),
         segments=export_segments_geojsonl(con) if con is not None else None,
         track=export_track_geojsonl(con) if con is not None else None,
     )

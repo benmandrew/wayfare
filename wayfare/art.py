@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Protocol
 from xml.sax.saxutils import escape
 
-from . import config, db, logs
+from . import config, db, licences, logs
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import cairo
@@ -2164,7 +2164,7 @@ def _captions(
         # One line per thing being credited, rather than one long sentence: the
         # break falls where the meaning does, and two short lines fit a canvas that
         # one long one does not.
-        lines = config.credit_lines(links=False)
+        lines = licences.lines(config.credit_parts(), links=False)
         c_size = max(CREDIT_MIN_PX, proj.width / CREDIT_REF_PX)
         room = proj.width - 2 * x
         widest = max(_text_width(ctx, line, c_size, 0.0) for line in lines)
@@ -2238,7 +2238,7 @@ def _provenance(bounds: Bounds, bounds_or_name: Bounds | str, style: str) -> dic
         "Title": f"wayfare {style}: {where}",
         "Description": f"Bus routes on the road network, window {box}.",
         "Software": "wayfare",
-        "Copyright": config.credit_text(),
+        "Copyright": licences.text(config.credit_parts()),
     }
 
 

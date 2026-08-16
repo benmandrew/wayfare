@@ -21,7 +21,7 @@ from pathlib import Path
 import builders
 import pytest
 
-from wayfare import art, config, db, server
+from wayfare import art, config, db, licences, server
 
 # The preset that covers `builders.WINDOW_Q`, at a width small enough to draw fast.
 BASE = "area=cardiff&width=200"
@@ -533,7 +533,7 @@ def test_meta_serves_the_credit_the_renders_carry(art_db):
     """The studio states it at the download, which is where the obligation lands.
     Served rather than written into the page: it follows the region this server's
     database holds, not the markup."""
-    assert server.art_meta(True)["credit"] == config.credit_html()
+    assert server.art_meta(True)["credit"] == licences.html(config.credit_parts())
 
 
 def test_meta_publishes_the_query_vocabularies_in_a_stable_order(art_db):

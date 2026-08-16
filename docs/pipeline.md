@@ -15,9 +15,11 @@ The stages run in this order, each reading what the last one wrote:
     publish  -> GeoJSONL -> tippecanoe -> PMTiles
 
 What the feeds themselves hold is [docs/data.md](data.md), and `art` is
-[docs/rendering.md](rendering.md). `wayfare all` chains acquire, patterns, match, trace,
-aggregate and publish. It does not run `routes`, which is invoked on its own or from
-[`deploy/refresh.sh`](../deploy/refresh.sh). Every stage checkpoints, and an interrupt is
+[docs/rendering.md](rendering.md). `wayfare all` chains acquire, patterns, match, the
+publish gate, trace, routes, aggregate, prune, cluster and publish — the same stages in the
+same order as [`deploy/refresh.sh`](../deploy/refresh.sh), and a test parses that script to
+keep the two from drifting. `trace` and `routes` are tolerated failures, because they ask
+Overpass. Every stage checkpoints, and an interrupt is
 caught and reported; re-running the same command resumes.
 
 ## acquire
@@ -38,7 +40,8 @@ National Transport Authority (NTA), or `northern_ireland` for Translink's four O
 datasets. `--force` re-downloads, re-assembles and re-unpacks, since nothing here is
 fetched again while a good copy is on disk. `--with-osm` also archives the Geofabrik
 extract; Valhalla fetches its own copy, so this only records which extract a set of edge
-ids belongs to. `wayfare all` passes neither flag.
+ids belongs to. `wayfare all` passes neither flag, and withholds
+`--force` deliberately: an attended first run should not re-fetch 1.28 GB it already has.
 
 **Cost.** The transfer, and then the unzip. Nationally the BODS bundle is 1.28 GB zipped
 and 7.84 GB unpacked, of which `stop_times.txt` is 5.09 GB; the National Public Transport
@@ -688,7 +691,7 @@ geometry and road names holding quotes and commas. Multi-row VALUES and unnest o
 arrays are no better than `executemany`.
 
 **`wayfare prune` drops operator geometry, and it spares what is still drawn.**
-`db.prune_shapes` refuses while any matchable pattern is unmatched, counting matchable
+`maintenance.prune_shapes` refuses while any matchable pattern is unmatched, counting matchable
 patterns only, since a tram never gets a `match_status` row and would otherwise block it
 for ever. The delete then spares every shape a live non-matchable pattern points at,
 because for a tram or a ferry `shapes` is the only geometry there is and `segments` is a
@@ -716,9 +719,9 @@ reads 100% of `edges` down to 11.7%, 22 ms to 4.4 ms, and London 100% to 26.3%, 
 ms. Both verified from DuckDB's own `operator_rows_scanned` rather than inferred from wall
 time. Hilbert reaches 5.9% on Cardiff and only beats Morton on the smallest window, so it
 stays benchmark-only rather than earning the `spatial` extension. Wales, at roughly 2 row
-groups, cannot show any of this. `db.morton_sql` is the one implementation and
+groups, cannot show any of this. `maintenance.morton_sql` is the one implementation and
 [`scripts/bench_window.py`](../scripts/bench_window.py) calls it, so the benchmark and the
-command cannot drift. `db.CLUSTER_BOX` is a fixed grid over Great Britain rather than the
+command cannot drift. `maintenance.CLUSTER_BOX` is a fixed grid over Great Britain rather than the
 data's extent, and the code is a physical row order and never an identity, so changing the
 box costs a re-run.
 
@@ -726,7 +729,7 @@ box costs a re-run.
 mark: the dropped table's blocks stay allocated and neither `CHECKPOINT` nor `VACUUM`
 reclaims them, so reordering in place makes the database bigger, measured at 505 MB going to
 730 MB. `COPY FROM DATABASE` into a freshly attached file reclaims them and preserves row
-order, so the curve survives the copy. `db.cluster` reorders in place, copies to
+order, so the curve survives the copy. `maintenance.cluster` reorders in place, copies to
 `<db>.compacting`, reopens and counts it, re-asserts the indexes and only then renames
 atomically. Sorted neighbours also compress better, which is the other half of the win: 528
 MB to 453 MB on the benchmark's 4.2M edges.

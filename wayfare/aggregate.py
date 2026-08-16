@@ -64,11 +64,11 @@ def build(con: duckdb.DuckDBPyConnection) -> None:
                    COALESCE(NULLIF(trim(p.short_name), ''), p.route_id) AS short_name
             FROM (SELECT DISTINCT pattern_id, edge_id FROM pattern_edges) pe
             JOIN patterns p USING (pattern_id)
-            WHERE {db.current_feed()} AND {db.matchable("p", con)}
+            WHERE {db.current_feed()} AND {db.matchable(con)}
         )
         GROUP BY edge_id, short_name, agency_id
     """)
-    db.index(con)
+    db.create_indices(con)
 
     n_edges, n_rows = db.row(
         con, "SELECT count(DISTINCT edge_id), count(*) FROM edge_services"
@@ -123,12 +123,12 @@ def build_segments(con: duckdb.DuckDBPyConnection) -> None:
             SELECT p.pattern_id, p.mode, s.lon_e6, s.lat_e6
             FROM patterns p
             JOIN shapes s ON s.shape_id = p.shape_id
-            WHERE {db.current_feed()} AND NOT {db.matchable()}
+            WHERE {db.current_feed()} AND NOT {db.matchable(con)}
             UNION ALL
             SELECT p.pattern_id, p.mode, t.lon_e6, t.lat_e6
             FROM patterns p
             JOIN traces t ON t.pattern_id = p.pattern_id
-            WHERE {db.non_road()} AND NOT {_DRAWN_AS_TRACK}
+            WHERE {db.non_road(con)} AND NOT {_DRAWN_AS_TRACK}
         )
         SELECT pattern_id, mode, lon_e6, lat_e6,
                list_min(lon_e6), list_min(lat_e6),
@@ -141,12 +141,12 @@ def build_segments(con: duckdb.DuckDBPyConnection) -> None:
         SELECT (SELECT count(*) FROM segments),
                (SELECT count(*) FROM patterns p
                 JOIN traces t ON t.pattern_id = p.pattern_id
-                WHERE {db.non_road()} AND NOT {_DRAWN_AS_TRACK}),
+                WHERE {db.non_road(con)} AND NOT {_DRAWN_AS_TRACK}),
                -- No `_DRAWN_AS_TRACK` on this one and none is wanted: a pattern
                -- with no trace at all is drawn by neither layer, which is what
                -- this counts.
                (SELECT count(*) FROM patterns p
-                WHERE {db.non_road()}
+                WHERE {db.non_road(con)}
                   AND NOT EXISTS (
                       SELECT 1 FROM traces t WHERE t.pattern_id = p.pattern_id))
         """,
@@ -191,7 +191,7 @@ def funnel(con: duckdb.DuckDBPyConnection) -> dict[str, object]:
     `patterns_by_mode` instead.
     """
     live = db.current_feed()
-    owed = f"{live} AND {db.matchable('p', con)}"
+    owed = f"{live} AND {db.matchable(con)}"
     matched, total = db.row(
         con,
         f"""
@@ -291,7 +291,7 @@ def _traced(con: duckdb.DuckDBPyConnection, live: str) -> dict[str, object]:
     """
     if not db.table_exists(con, "trace_status"):
         return {}
-    owed = db.non_road("p", con)
+    owed = db.non_road(con)
     pending = db.scalar(
         con,
         f"""
@@ -379,7 +379,7 @@ def build_track_services(con: duckdb.DuckDBPyConnection) -> int:
             FROM traces t
             JOIN patterns p USING (pattern_id)
             CROSS JOIN unnest(t.way_ids) AS u(way_id)
-            WHERE {db.current_feed()} AND NOT {db.matchable()}
+            WHERE {db.current_feed()} AND NOT {db.matchable(con)}
               AND {_DRAWN_AS_TRACK}
         )
         GROUP BY way_id, short_name, agency_id, mode

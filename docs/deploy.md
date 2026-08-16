@@ -23,10 +23,11 @@ serving an archive that is already built needs no routing engine, and gating it 
 graph would take the viewer down for the 90 minutes of a rebuild.
 
 `pipeline`, `wayfare` and `matcher` sit behind the `manual` profile and never start with
-`docker compose up`. `pipeline` runs `wayfare all`, which is `acquire`, `patterns`, `match`,
-`trace`, `aggregate` and `publish`, with `trace` inside a `try`/`except RuntimeError` and
-`routes`, `prune` and `cluster` absent. The scheduled sequence in
-[`refresh.sh`](../deploy/refresh.sh) is the longer one, so the two are not the same chain.
+`docker compose up`. `pipeline` runs `wayfare all`, which is `acquire`, `patterns`,
+`match`, the publish gate, `trace`, `routes`, `aggregate`, `prune`, `cluster` and `publish`
+— the sequence in [`refresh.sh`](../deploy/refresh.sh), on the same two counts, with the two
+Overpass stages tolerated failures. The one difference is `acquire`: the script forces it
+and `all` does not, because an attended first run should not re-fetch a feed it already has.
 
 `web` is the only service `up` starts. It runs
 `serve --dir web --out /data/out --port 8099` and answers the HTTP range requests PMTiles

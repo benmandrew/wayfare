@@ -6,7 +6,7 @@ import builders
 import duckdb
 import pytest
 
-from wayfare import aggregate, db
+from wayfare import aggregate, db, maintenance
 
 # `routes` as it stood before the mode filter: no route_type at all.
 _OLD_ROUTES = (
@@ -72,7 +72,8 @@ def test_patterns_gains_mode_empty_rather_than_backfilled(legacy_db):
         assert db.row(con, "SELECT mode FROM patterns") == (None,)
         # NULL is matchable, so the upgrade does not quietly stall a match run.
         assert (
-            db.scalar(con, f"SELECT count(*) FROM patterns p WHERE {db.matchable()}") == 1
+            db.scalar(con, f"SELECT count(*) FROM patterns p WHERE {db.matchable(con)}")
+            == 1
         )
     finally:
         con.close()
@@ -159,19 +160,28 @@ def test_a_read_only_connection_never_migrates_so_the_predicate_must_degrade(leg
     con = db.connect(path, read_only=True)
     try:
         assert "mode" not in db.columns(con, "patterns")
-        # Without the connection the predicate names a column that is not there.
+        # What the predicate would be if it named the column regardless: it does not
+        # bind, which is the failure this degrade exists to stop.
         with pytest.raises(duckdb.Error):
-            db.scalar(con, f"SELECT count(*) FROM patterns p WHERE {db.matchable()}")
-        # With it, every stored row counts as matchable, which is what an old database
+            db.scalar(con, "SELECT count(*) FROM patterns p WHERE p.mode IS NULL")
+        # Every stored row counts as matchable instead, which is what an old database
         # means: its loader deleted everything that was not road-going.
         assert (
-            db.scalar(
-                con, f"SELECT count(*) FROM patterns p WHERE {db.matchable('p', con)}"
-            )
+            db.scalar(con, f"SELECT count(*) FROM patterns p WHERE {db.matchable(con)}")
             == 1
         )
     finally:
         con.close()
+
+
+def test_the_predicates_cannot_be_called_without_a_connection():
+    """The degrade above was optional, and nine of twelve call sites forgot it. The
+    parameter is what makes forgetting impossible, so its being required is the fix
+    and is pinned here rather than left to a reviewer."""
+    with pytest.raises(TypeError):
+        db.matchable()  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        db.non_road()  # type: ignore[call-arg]
 
 
 def test_an_old_database_migrates_and_then_builds(gtfs_dir: Path, legacy_db):
@@ -246,12 +256,12 @@ def test_edges_migrate_from_wkt_text_to_micro_degree_lists(legacy_db):
 
 
 def test_two_migrations_apply_in_one_open(legacy_db):
-    """A database is rarely old on one axis only, and `migrate` runs its steps in
-    the order they are written. That order carries a contract nothing states: the
-    renumbering rebuilds `patterns` from a column list of its own, which has no
-    `mode` in it, so the step that adds `mode` is only sound after it. Swap the two
-    and the column is added and then thrown away, on exactly the databases old
-    enough to need both."""
+    """A database is rarely old on one axis only, and `migrate` runs `MIGRATIONS` in
+    order. That order used to carry a contract nothing stated: the renumbering
+    rebuilt `patterns` from a column list of its own, which had no `mode` in it, so
+    the step that adds `mode` was only sound after it. Swap the two and the column
+    was added and then thrown away, on exactly the databases old enough to need
+    both."""
     path = legacy_db(
         db.SCHEMA,
         "ALTER TABLE patterns DROP COLUMN first_seen",
@@ -278,10 +288,99 @@ def test_two_migrations_apply_in_one_open(legacy_db):
         )
         assert db.scalar(con, "SELECT pattern_id FROM patterns") == expected
         assert (
-            db.scalar(con, f"SELECT count(*) FROM patterns p WHERE {db.matchable()}") == 1
+            db.scalar(con, f"SELECT count(*) FROM patterns p WHERE {db.matchable(con)}")
+            == 1
         )
     finally:
         con.close()
+
+
+def test_the_renumbering_carries_a_column_it_was_never_told_about(legacy_db):
+    """The rebuilt `patterns` is derived from the live table, not restated.
+
+    The column list used to be a frozen copy of `SCHEMA`'s, and a frozen copy
+    diverges the moment a column is added -- silently, and only on the databases old
+    enough to come through here. A column `SCHEMA` does not know about stands in for
+    that next addition: it has to survive, or the rewrite is a data loss.
+    """
+    path = legacy_db(
+        db.SCHEMA,
+        "ALTER TABLE patterns DROP COLUMN first_seen",
+        "ALTER TABLE patterns DROP COLUMN last_seen",
+        "ALTER TABLE patterns ADD COLUMN operator_notes VARCHAR",
+        "INSERT INTO patterns (pattern_id, route_id, direction, n_stops, mode, "
+        "operator_notes) VALUES (7, 'R1', 0, 4, 'bus', 'kept')",
+        "INSERT INTO pattern_stops VALUES (7, 0, 'S1'), (7, 1, 'S2')",
+        "INSERT INTO meta VALUES ('feed_version', 'F1')",
+    )
+
+    con = db.connect(path)
+    try:
+        assert db.row(con, "SELECT operator_notes, mode FROM patterns") == ("kept", "bus")
+        # ...and the key it is rebuilt with is a key, not merely an index.
+        with pytest.raises(Exception, match="onstraint|nique"):
+            con.execute(
+                "INSERT INTO patterns (pattern_id, route_id) "
+                "SELECT pattern_id, 'R2' FROM patterns"
+            )
+    finally:
+        con.close()
+
+
+def test_the_renumbering_moves_every_table_keyed_on_the_old_id(legacy_db):
+    """`traces`, `trace_status` and `segments` are keyed on pattern_id too.
+
+    All three post-date hash ids, so no real database can reach this state -- which
+    is exactly why it is pinned. Left behind, they would point at ids nothing holds
+    any more, and the way that surfaces is a service drawn onto track it never
+    reaches, years later, with nothing to trace it back to.
+    """
+    path = legacy_db(
+        db.SCHEMA,
+        "ALTER TABLE patterns DROP COLUMN first_seen",
+        "ALTER TABLE patterns DROP COLUMN last_seen",
+        "INSERT INTO patterns (pattern_id, route_id, direction, n_stops, mode) "
+        "VALUES (7, 'R1', 0, 2, 'rail')",
+        "INSERT INTO pattern_stops VALUES (7, 0, 'S1'), (7, 1, 'S2')",
+        "INSERT INTO traces (pattern_id, relation_id, way_ids, ways_cut, lon_e6, "
+        "lat_e6) VALUES (7, 900, [10], TRUE, [-1000000], [51000000])",
+        "INSERT INTO trace_status (pattern_id, status) VALUES (7, 'ok')",
+        "INSERT INTO segments VALUES (7, 'rail', [-1000000], [51000000], "
+        "-1000000, 51000000, -1000000, 51000000)",
+        "INSERT INTO meta VALUES ('feed_version', 'F1')",
+    )
+
+    con = db.connect(path)
+    try:
+        new_id = db.scalar(con, "SELECT pattern_id FROM patterns")
+        assert new_id != 7
+        for table in ("traces", "trace_status", "segments"):
+            assert db.scalar(con, f"SELECT pattern_id FROM {table}") == new_id, table
+    finally:
+        con.close()
+
+
+def test_the_catalog_is_read_from_this_database_alone(con, tmp_path):
+    """`maintenance.cluster` attaches a second database, and `information_schema`
+    spans every one of them. Unfiltered, a table in the file being copied into
+    answers "does `patterns` have a `mode` column" -- which is every migration gate
+    and every `matchable` degrade decision."""
+    other = tmp_path / "other.duckdb"
+    o = duckdb.connect(str(other))
+    o.execute("CREATE TABLE patterns (pattern_id BIGINT, ghost VARCHAR)")
+    o.execute("CREATE TABLE nowhere (x INTEGER)")
+    o.close()
+
+    con.execute(f"ATTACH '{other}' AS other")
+    try:
+        assert "ghost" not in db.columns(con, "patterns")
+        assert not db.table_exists(con, "nowhere")
+        # A staging table is ours, though, and `insert_via_file` asks the catalog for
+        # the types to read its file back as.
+        con.execute("CREATE TEMP TABLE staged (way_id BIGINT)")
+        assert db.columns(con, "staged") == {"way_id"}
+    finally:
+        con.execute("DETACH other")
 
 
 def _one_live_pattern(con) -> None:
@@ -301,7 +400,7 @@ def test_prune_refuses_while_patterns_are_still_pending(con):
     con.execute("INSERT INTO shapes VALUES ('SH1', [53480000], [-2245000])")
 
     with pytest.raises(RuntimeError, match="still unmatched"):
-        db.prune_shapes(con)
+        maintenance.prune_shapes(con)
     assert db.scalar(con, "SELECT count(*) FROM shapes") == 1
 
 
@@ -313,7 +412,7 @@ def test_prune_drops_shapes_once_every_pattern_is_resolved(con):
         "VALUES (1, 'ok', 'shape', 0.9, 100.0, 1.0, 2, NULL, now())"
     )
 
-    assert db.prune_shapes(con) == 1
+    assert maintenance.prune_shapes(con) == 1
     assert db.scalar(con, "SELECT count(*) FROM shapes") == 0
 
 
@@ -324,12 +423,12 @@ def test_morton_interleaves_the_two_axes(con):
     """The code is two 16-bit axes woven together, so the low bit is longitude and
     the next is latitude. Getting the order wrong still clusters, just along the
     wrong diagonal, which is why this is pinned rather than eyeballed."""
-    sql = f"SELECT {db.morton_sql('?::DOUBLE', '?::DOUBLE')}"
-    lo_lon, lo_lat = db.CLUSTER_BOX[0], db.CLUSTER_BOX[1]
+    sql = f"SELECT {maintenance.morton_sql('?::DOUBLE', '?::DOUBLE')}"
+    lo_lon, lo_lat = maintenance.CLUSTER_BOX[0], maintenance.CLUSTER_BOX[1]
     # Aimed at the middle of a cell rather than its edge: one cell width lands
     # exactly on the boundary, where floating point decides which side by a hair.
-    dx = (db.CLUSTER_BOX[2] - db.CLUSTER_BOX[0]) / 65535.0
-    dy = (db.CLUSTER_BOX[3] - db.CLUSTER_BOX[1]) / 65535.0
+    dx = (maintenance.CLUSTER_BOX[2] - maintenance.CLUSTER_BOX[0]) / 65535.0
+    dy = (maintenance.CLUSTER_BOX[3] - maintenance.CLUSTER_BOX[1]) / 65535.0
 
     assert db.scalar(con, sql, [lo_lon + dx / 2, lo_lat + dy / 2]) == 0
     assert db.scalar(con, sql, [lo_lon + dx * 1.5, lo_lat + dy / 2]) == 1
@@ -341,7 +440,7 @@ def test_morton_clamps_outside_the_box(con):
     """A window off West Africa is a real thing this has to survive -- see
     art.parse_bbox. Anything outside the grid pins to its edge rather than
     producing a negative code that would sort in front of Great Britain."""
-    sql = f"SELECT {db.morton_sql('?::DOUBLE', '?::DOUBLE')}"
+    sql = f"SELECT {maintenance.morton_sql('?::DOUBLE', '?::DOUBLE')}"
     below = db.scalar(con, sql, [-180.0, -90.0])
     above = db.scalar(con, sql, [180.0, 90.0])
     assert below == 0
@@ -357,7 +456,7 @@ def test_clustering_keeps_every_edge_and_its_geometry(con):
         )
     before = con.execute("SELECT * FROM edges ORDER BY edge_id").fetchall()
 
-    assert db.cluster_edges(con) == 20
+    assert maintenance.cluster_edges(con) == 20
 
     after = con.execute("SELECT * FROM edges ORDER BY edge_id").fetchall()
     assert after == before
@@ -371,7 +470,7 @@ def test_clustering_puts_neighbours_together(con):
     builders.insert_edge(
         con, 3, lon_e6=-3200100, lat_e6=51480100
     )  # Cardiff again, inserted last
-    db.cluster_edges(con)
+    maintenance.cluster_edges(con)
 
     order = [r[0] for r in con.execute("SELECT edge_id FROM edges").fetchall()]
     assert abs(order.index(1) - order.index(3)) == 1
@@ -381,7 +480,7 @@ def test_clustering_reinstates_the_unique_edge_id(con):
     """CTAS does not carry the PRIMARY KEY over, so the rewrite has to put it back
     or the next `match` could double-insert an edge in silence."""
     builders.insert_edge(con, 1, lon_e6=-3200000, lat_e6=51480000)
-    db.cluster_edges(con)
+    maintenance.cluster_edges(con)
     with pytest.raises(Exception, match="onstraint|nique"):
         builders.insert_edge(con, 1, lon_e6=-3200000, lat_e6=51480000)
 
@@ -391,14 +490,14 @@ def test_clustering_is_idempotent(con):
         builders.insert_edge(
             con, i + 1, lon_e6=-3200000 + i * 40000, lat_e6=51480000 + i * 30000
         )
-    db.cluster_edges(con)
+    maintenance.cluster_edges(con)
     once = [r[0] for r in con.execute("SELECT edge_id FROM edges").fetchall()]
-    db.cluster_edges(con)
+    maintenance.cluster_edges(con)
     assert [r[0] for r in con.execute("SELECT edge_id FROM edges").fetchall()] == once
 
 
 def test_clustering_an_empty_table_is_not_an_error(con):
-    assert db.cluster_edges(con) == 0
+    assert maintenance.cluster_edges(con) == 0
     # ...and it does not claim to have clustered anything, so status stays honest.
     assert db.get_meta(con, "edges_clustered") is None
 
@@ -418,7 +517,7 @@ def test_cluster_rewrites_the_file_and_keeps_everything(tmp_path):
     db.set_meta(con, "feed_version", "20260806_022608")
     con.close()
 
-    n, before, after = db.cluster(path)
+    n, before, after = maintenance.cluster(path)
 
     assert n == 30
     assert before > 0 and after > 0
@@ -440,7 +539,7 @@ def test_cluster_rewrites_the_file_and_keeps_everything(tmp_path):
 def test_cluster_leaves_an_empty_database_alone(tmp_path):
     path = tmp_path / "wayfare.duckdb"
     db.connect(path).close()
-    n, before, after = db.cluster(path)
+    n, before, after = maintenance.cluster(path)
     assert n == 0 and before == after
     assert not (tmp_path / "wayfare.duckdb.compacting").exists()
 
@@ -454,7 +553,7 @@ def test_status_reports_clustering_going_stale(con):
     builders.insert_edge(con, 1, lon_e6=-3200000, lat_e6=51480000)
     assert aggregate.funnel(con)["edges_clustered"] == "no"
 
-    db.cluster_edges(con)
+    maintenance.cluster_edges(con)
     assert aggregate.funnel(con)["edges_clustered"] == "yes"
 
     builders.insert_edge(con, 2, lon_e6=-100000, lat_e6=51500000)
@@ -493,7 +592,7 @@ def test_prune_is_not_blocked_by_a_pattern_that_is_never_matched(con):
 
     # Nothing to drop -- the bus's own shape was never inserted -- and the tram's
     # is spared, so the count is the proof that the refusal did not fire either.
-    assert db.prune_shapes(con) == 0
+    assert maintenance.prune_shapes(con) == 0
     assert db.scalar(con, "SELECT count(*) FROM shapes") == 1
 
 
@@ -510,7 +609,7 @@ def test_prune_keeps_the_geometry_a_non_road_pattern_is_drawn_from(con):
     _tram_pattern(con)
 
     # The bus's shape goes; the tram's stays.
-    assert db.prune_shapes(con) == 1
+    assert maintenance.prune_shapes(con) == 1
     assert [r[0] for r in con.execute("SELECT shape_id FROM shapes").fetchall()] == ["SH2"]
 
 
@@ -655,7 +754,7 @@ def _non_road_ids(con) -> list[int]:
     return [
         r[0]
         for r in con.execute(
-            f"SELECT p.pattern_id FROM patterns p WHERE {db.non_road()} ORDER BY 1"
+            f"SELECT p.pattern_id FROM patterns p WHERE {db.non_road(con)} ORDER BY 1"
         ).fetchall()
     ]
 
@@ -685,7 +784,7 @@ def test_non_road_binds_against_a_database_with_no_mode_column(legacy_db):
     )
     con = duckdb.connect(str(path), read_only=True)
     try:
-        sql = f"SELECT count(*) FROM patterns p WHERE {db.non_road('p', con)}"
+        sql = f"SELECT count(*) FROM patterns p WHERE {db.non_road(con)}"
         # Everything stored in such a database is road-going by construction, so
         # nothing in it is owed geometry from a relation.
         assert db.scalar(con, sql) == 0

@@ -12,7 +12,7 @@ from xml.etree import ElementTree
 import builders
 import pytest
 
-from wayfare import art, config, db
+from wayfare import art, config, db, licences
 
 # One window over Cardiff, shared by every test here that needs somewhere to draw.
 BOUNDS = art.Bounds(*builders.WINDOW)
@@ -1285,7 +1285,7 @@ def test_a_render_carries_the_credit_with_no_flag(drawable):
     """Metadata is unconditional: an image served over HTTP leaves this machine
     whether or not whoever asked for it thought about the licence."""
     png = art.render_bytes(BOUNDS, "density", opts=RENDER_OPTS, con=drawable)
-    assert _png_text(png)["Copyright"] == config.credit_text()
+    assert _png_text(png)["Copyright"] == licences.text(config.credit_parts())
 
 
 def test_a_png_with_metadata_still_decodes(drawable):
@@ -1319,7 +1319,9 @@ def test_svg_metadata_parses_as_xml_and_holds_the_credit(drawable):
     svg = art.render_bytes(BOUNDS, "density", fmt=".svg", opts=RENDER_OPTS, con=drawable)
     root = ElementTree.fromstring(svg.decode("utf-8"))
     dc = "{http://purl.org/dc/elements/1.1/}"
-    assert [e.text for e in root.findall(f".//{dc}rights")] == [config.credit_text()]
+    assert [e.text for e in root.findall(f".//{dc}rights")] == [
+        licences.text(config.credit_parts())
+    ]
     assert root.findall(f".//{dc}title")[0].text == "wayfare density: a window"
 
 

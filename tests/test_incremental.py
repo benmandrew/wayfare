@@ -13,7 +13,7 @@ import duckdb
 import pytest
 from builders import FakeClient
 
-from wayfare import aggregate, config, db, gtfs, match
+from wayfare import aggregate, config, db, gtfs, maintenance, match
 
 FEED_1 = "20260806_022608"
 FEED_2 = "20260903_014412"
@@ -235,7 +235,7 @@ def test_departed_patterns_do_not_block_pruning(gtfs_dir: Path, con):
     match.run(con, client_=FakeClient())
     # Would raise if departed patterns counted as pending, and the count says the
     # geometry actually went rather than the refusal merely not firing.
-    assert db.prune_shapes(con) == 1
+    assert maintenance.prune_shapes(con) == 1
     assert db.scalar(con, "SELECT count(*) FROM shapes") == 0
 
 

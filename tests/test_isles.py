@@ -46,35 +46,28 @@ OUTSIDE = [
 ]
 
 
+def _inside(con, lat: float, lon: float) -> bool:
+    """The boundary as the pipeline runs it, over one point.
+
+    `config.british_isles_sql` is the only implementation there is, deliberately:
+    `gtfs` drops the routes with it, and `osmroutes.bbox` and `trace.bbox` clip
+    their windows with it, and every one of those holds a connection. A Python twin
+    kept for readability was a second definition that nothing else exercised, so a
+    drift in it would have been invisible and a drift in the SQL would not have been
+    caught by comparing them.
+    """
+    sql = config.british_isles_sql("?::DOUBLE", "?::DOUBLE")
+    return bool(db.scalar(con, f"SELECT {sql}", [lat, lon, lat]))
+
+
 @pytest.mark.parametrize(("name", "lat", "lon"), INSIDE)
-def test_the_awkward_corners_are_kept(name: str, lat: float, lon: float):
-    assert config.in_british_isles(lat, lon), name
+def test_the_awkward_corners_are_kept(con, name: str, lat: float, lon: float):
+    assert _inside(con, lat, lon), name
 
 
 @pytest.mark.parametrize(("name", "lat", "lon"), OUTSIDE)
-def test_the_continent_is_dropped(name: str, lat: float, lon: float):
-    assert not config.in_british_isles(lat, lon), name
-
-
-@pytest.mark.parametrize(
-    ("name", "lat", "lon", "inside"),
-    [(n, la, lo, True) for n, la, lo in INSIDE]
-    + [(n, la, lo, False) for n, la, lo in OUTSIDE],
-)
-def test_sql_and_python_agree(con, name: str, lat: float, lon: float, inside: bool):
-    """Two implementations of one boundary, each checked against the answer first.
-
-    `config.british_isles_sql` is the one the pipeline runs: `gtfs` drops the routes
-    with it, and `osmroutes.bbox` and `trace.bbox` clip their windows with it.
-    `config.in_british_isles` has no caller outside this file -- it is the same
-    boundary written out in Python, kept as the readable statement of it. So a
-    disagreement here is a drift in the SQL that nothing else would report, and
-    checking the two only against each other would pass just as happily if both had
-    drifted together.
-    """
-    sql = config.british_isles_sql("?::DOUBLE", "?::DOUBLE")
-    assert db.scalar(con, f"SELECT {sql}", [lat, lon, lat]) is inside, name
-    assert config.in_british_isles(lat, lon) is inside, name
+def test_the_continent_is_dropped(con, name: str, lat: float, lon: float):
+    assert not _inside(con, lat, lon), name
 
 
 def test_margins_are_wider_than_the_error_in_a_stop_position():

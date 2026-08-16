@@ -230,7 +230,7 @@ def build_patterns(
 
     _fill_span(con)
     _load_shapes(gtfs_dir, con)
-    db.index(con)
+    db.create_indices(con)
     _report_churn(con, feed)
     _upgraded_to_shapes(con, apply=upgrade_shapes)
 

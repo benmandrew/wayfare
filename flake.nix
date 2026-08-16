@@ -33,6 +33,10 @@
             pkgs.duckdb
             # ruff formats the Python, nixfmt formats this file. CI checks both.
             pkgs.nixfmt
+            # deploy/refresh.sh is the whole of the deployed pipeline, runs
+            # unattended under `set -euo pipefail`, and is vendored into Ansible
+            # rather than tested by running it. CI checks it.
+            pkgs.shellcheck
           ];
 
           # buildInputs rather than nativeBuildInputs so the linker wrapper adds

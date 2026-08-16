@@ -46,7 +46,7 @@ from urllib.parse import ParseResult, parse_qs, urlparse
 
 import duckdb
 
-from . import art, config, db, logs
+from . import art, config, db, licences, logs
 
 log = logs.get("server")
 
@@ -707,7 +707,7 @@ def art_meta(enabled: bool) -> dict[str, Any]:
         # What a render owes, from the one definition `art` also stamps into every
         # file it writes. Served rather than written into the page because it follows
         # the region this server's database holds, not the page's markup.
-        "credit": config.credit_html(),
+        "credit": licences.html(config.credit_parts()),
         "database": {"present": config.DB_PATH.exists()},
     }
     if meta["database"]["present"]:

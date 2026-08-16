@@ -585,7 +585,7 @@ def test_the_credit_names_the_publisher_the_licence_and_openstreetmap():
     """Two obligations, and the second is the one that is easy to miss: every edge is
     an OSM way, which makes the archive a derived database under ODbL whatever the
     timetable's licence says."""
-    credit = config.credit_html("wales")
+    credit = licences.html(config.credit_parts("wales"))
     assert "Department for Transport" in credit
     assert licences.OGL in credit
     assert licences.URLS[licences.OGL] in credit
@@ -599,19 +599,21 @@ def test_the_credit_names_the_publisher_the_licence_and_openstreetmap():
 def test_a_region_on_a_different_licence_gets_a_different_credit():
     """The Republic is CC BY 4.0 where every BODS slug is OGL. One string for both
     would be wrong for whichever region is not showing."""
-    assert config.credit_html("ireland") != config.credit_html("all")
-    assert "National Transport Authority" in config.credit_html("ireland")
-    assert licences.URLS[licences.CC_BY_4] in config.credit_html("ireland")
-    assert "Department for Transport" not in config.credit_html("ireland")
+    assert licences.html(config.credit_parts("ireland")) != licences.html(
+        config.credit_parts("all")
+    )
+    assert "National Transport Authority" in licences.html(config.credit_parts("ireland"))
+    assert licences.URLS[licences.CC_BY_4] in licences.html(config.credit_parts("ireland"))
+    assert "Department for Transport" not in licences.html(config.credit_parts("ireland"))
     # Northern Ireland is OGL like GB but a different publisher, so the licence
     # alone does not decide the string.
-    assert "Translink" in config.credit_html("northern_ireland")
+    assert "Translink" in licences.html(config.credit_parts("northern_ireland"))
 
 
 def test_the_plain_text_credit_says_the_same_thing_without_markup():
     """What a PNG tEXt chunk or an SVG <metadata> block can carry. The links have to
     survive, since a licence identified by name alone is not identified."""
-    text = config.credit_text("ireland")
+    text = licences.text(config.credit_parts("ireland"))
     assert "<a href" not in text and "&copy;" not in text
     assert "National Transport Authority" in text
     assert licences.URLS[licences.CC_BY_4] in text
@@ -624,21 +626,23 @@ def test_dropping_the_links_keeps_every_name_and_still_credits_both():
     """What `art` burns into a corner, where a URI is unclickable and twice the
     length of the line that has to fit. It is the same credit, shortened -- not a
     second one, which is the failure this whole arrangement exists to prevent."""
-    lines = config.credit_lines("ireland", links=False)
+    lines = licences.lines(config.credit_parts("ireland"), links=False)
     assert len(lines) == len(config.credit_parts("ireland")) == 2
     joined = " ".join(lines)
     assert "http" not in joined
     assert "National Transport Authority" in joined
     assert licences.CC_BY_4 in joined
     assert "OpenStreetMap contributors" in joined and licences.ODBL in joined
-    assert " ".join(config.credit_lines("ireland")) == config.credit_text("ireland")
+    assert " ".join(licences.lines(config.credit_parts("ireland"))) == licences.text(
+        config.credit_parts("ireland")
+    )
 
 
 def test_every_zoom_band_is_stamped_with_the_credit(tippecanoe_calls, tmp_path):
     *bands, join = _argv(tippecanoe_calls, tmp_path)
     assert len(bands) == 4
     for band in bands:
-        assert _attribution(band) == config.credit_html()
+        assert _attribution(band) == licences.html(config.credit_parts())
     # tile-join carries an input's attribution through to the joined archive --
     # measured against tippecanoe 2.79.0, including where only one input has one --
     # so it needs no flag of its own.
@@ -649,7 +653,11 @@ def test_the_credit_follows_the_region_rather_than_the_call_site(
     tippecanoe_calls, tmp_path
 ):
     """Derived from `config.Feed`, so it cannot drift from what `acquire` fetched."""
-    far, *_ = _argv(tippecanoe_calls, tmp_path, attribution=config.credit_html("ireland"))
+    far, *_ = _argv(
+        tippecanoe_calls,
+        tmp_path,
+        attribution=licences.html(config.credit_parts("ireland")),
+    )
     assert "National Transport Authority" in _attribution(far)
     assert licences.OGL not in _attribution(far)
 
@@ -683,7 +691,7 @@ def test_publish_stamps_the_region_it_was_given(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "OUT", tmp_path)
     seen = _stub_build(monkeypatch, tmp_path)
     publish.build(_A_CONNECTION, region="ireland")
-    assert seen["attribution"] == config.credit_html("ireland")
+    assert seen["attribution"] == licences.html(config.credit_parts("ireland"))
 
 
 # --- where the archive goes ---------------------------------------------------
@@ -930,7 +938,9 @@ def test_building_from_an_existing_export_needs_no_connection(
     src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3])
     out = publish.build(None, region="northern_ireland", from_export=src)
     assert out.exists()
-    assert _attribution(tippecanoe_calls[0]) == config.credit_html("northern_ireland")
+    assert _attribution(tippecanoe_calls[0]) == licences.html(
+        config.credit_parts("northern_ireland")
+    )
 
 
 def test_a_missing_export_is_named_rather_than_silently_exported(monkeypatch, tmp_path):
@@ -1080,14 +1090,14 @@ def test_a_bus_only_region_gets_no_segments_pass(tippecanoe_calls, tmp_path):
 def test_the_noun_is_not_bus_once_the_archive_holds_other_modes():
     """ "Bus routes" was accurate while a bus was all there was. An archive holding
     trams and ferries credited as bus routes misdescribes what it contains."""
-    assert "Bus routes" not in config.credit_html("wales")
-    assert "Routes and timetables" in config.credit_html("wales")
+    assert "Bus routes" not in licences.html(config.credit_parts("wales"))
+    assert "Routes and timetables" in licences.html(config.credit_parts("wales"))
 
 
 def test_operator_geometry_is_named_in_the_publishers_credit_not_a_third_line():
     """The trace arrives in the same bundle as the timetable and is covered by the
     same licence, so it needs naming rather than crediting separately."""
-    credit = config.credit_html("wales", operator=True)
+    credit = licences.html(config.credit_parts("wales", operator=True))
     assert "Routes, timetables and operator geometry" in credit
     # Still two parts, not three.
     assert len(config.credit_parts("wales", operator=True)) == 2
@@ -1097,7 +1107,7 @@ def test_an_archive_with_no_matched_edges_makes_no_odbl_claim():
     """Claiming ODbL over an operator's own survey is wrong in the opposite
     direction from omitting it: it asserts a share-alike condition on data whose
     publisher never imposed one. No OSM way was involved, so no OSM credit."""
-    credit = config.credit_html("ireland", road=False, operator=True)
+    credit = licences.html(config.credit_parts("ireland", road=False, operator=True))
     assert "OpenStreetMap" not in credit
     assert licences.URLS[licences.ODBL] not in credit
     # The publisher is still credited, and CC BY 4.0 makes that a condition.

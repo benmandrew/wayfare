@@ -91,6 +91,16 @@ jobs:
         name: lint
         run: nix develop --command ruff check .
 
+      # deploy/refresh.sh is the whole of the scheduled pipeline and the only
+      # part of it that is shell. It runs unattended, under `set -euo pipefail`,
+      # on a host that carries no checkout -- the file is vendored into Ansible
+      # -- so a quoting slip surfaces as a refresh that stopped a week ago.
+      # There is no test that runs it, and there cannot be one: it drives
+      # `docker compose` against a Valhalla graph.
+      - if: ${{ !cancelled() }}
+        name: lint (shell)
+        run: nix develop --command shellcheck deploy/refresh.sh
+
       - if: ${{ !cancelled() }}
         name: types
         run: nix develop --command mypy
