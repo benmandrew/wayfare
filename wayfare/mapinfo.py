@@ -96,8 +96,7 @@ def header(lines: Iterator[str]) -> Header:
         elif key == "coordsys":
             coordsys = rest
         elif key == "columns":
-            for _ in range(int(rest)):
-                columns.append(next(lines).split()[0])
+            columns.extend(next(lines).split()[0] for _ in range(int(rest)))
         elif key == "data":
             break
     else:

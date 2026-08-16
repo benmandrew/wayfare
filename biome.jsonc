@@ -1,0 +1,45 @@
+{
+  // Pinned to the version the flake supplies, so the editor's inline errors and CI's
+  // are the same errors.
+  "$schema": "https://biomejs.dev/schemas/2.5.6/schema.json",
+
+  // `web/` is around 4,100 lines, and roughly 3,000 of them are JavaScript inside
+  // `<script>` tags in `index.html` and `art.html`. Nothing checked any of it until
+  // this file existed. Biome reads the script tags, so the pages need no extraction.
+  //
+  // `web/vendor` is maplibre-gl and pmtiles as shipped, and is not ours to fix.
+  "files": {
+    "includes": ["web/**", "!web/vendor"]
+  },
+
+  // Lint only. `biome format` rewrites around 350 lines of the two pages, which is a
+  // diff nobody can review against a behaviour question, and the pages are already
+  // consistent with themselves. Turn this on in its own commit if it is ever wanted.
+  "formatter": { "enabled": false },
+  "assist": { "enabled": false },
+
+  // The recommended preset, which is the default. Named here so a future Biome that
+  // changes its default does not quietly change what this repo checks.
+  "linter": {
+    "enabled": true,
+    "rules": { "preset": "recommended" }
+  },
+
+  "overrides": [
+    {
+      // These three are classic `<script src>` files, not modules: they declare the
+      // globals the two pages call, and `bootTheme()` at `index.html:104` is a call
+      // Biome cannot see from inside `util.js`. Biome parses every `.js` as a module,
+      // so it reads a shared global as dead and an explicit `"use strict"` as
+      // redundant -- neither of which is true of a file loaded by a script tag.
+      // `javascript.globals` does not help; it governs uses, not declarations.
+      "includes": ["web/util.js", "web/credits.js", "web/palette.js"],
+      "linter": {
+        "rules": {
+          "correctness": { "noUnusedVariables": "off" },
+          "suspicious": { "noRedundantUseStrict": "off" }
+        }
+      }
+    }
+  ]
+}

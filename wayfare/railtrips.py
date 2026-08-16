@@ -34,6 +34,7 @@ and where two relations both cover it the shorter is the one it ran on.
 
 from __future__ import annotations
 
+import itertools
 import json
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -227,7 +228,7 @@ def attribute(
         spellings = _resolve_sequence(sequence, register, unresolved)
         if spellings is None:
             continue
-        for first, second in zip(spellings, spellings[1:], strict=False):
+        for first, second in itertools.pairwise(spellings):
             legs += 1
             total += weekly
             shared = {i for n in first for i in by_name.get(n, [])} & {

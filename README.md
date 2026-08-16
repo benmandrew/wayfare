@@ -35,7 +35,9 @@ puts `.venv/bin` on `PATH`, so `wayfare`, `pytest -q`, `ruff check .` and `mypy`
 Outside the shell none of them are on `PATH` at all.
 
 The flake supplies Python 3.12, uv, cairo and pkg-config, felt/tippecanoe (no other fork
-writes PMTiles), taplo for the TOML and the duckdb command-line interface (CLI) for
+writes PMTiles), taplo for the TOML, biome for the JavaScript the two viewer pages carry
+inside `<script>` tags, actionlint and hadolint for the workflows and the Dockerfile, and
+the duckdb command-line interface (CLI) for
 reading the database by hand; the Docker image builds tippecanoe 2.79.0 from source instead. Two things sit
 outside the flake: a Valhalla server reachable at `WAYFARE_VALHALLA`, which defaults to
 `http://localhost:8002`, and roughly 40 GB of free disk for a national run. All pipeline
@@ -123,7 +125,7 @@ Each stage reads what the last one wrote, and each re-runs on its own.
   Non-road geometry goes into `segments`, which is how a tram or a ferry gets drawn.
 - **publish** ([`publish.py`](wayfare/publish.py)). One GeoJSON feature per line, then
   tippecanoe. Three tile layers come out: the banded road layer, `segments` and `track`.
-- **art** ([`art.py`](wayfare/art.py)). A bounding box or named preset to PNG or SVG, in one
+- **art** ([`art/`](wayfare/art/)). A bounding box or named preset to PNG or SVG, in one
   of three styles: `density`, `spectrum` or `strands`. A PNG is drawn in horizontal bands,
   one process per core (`--workers`, or `WAYFARE_RENDER_WORKERS` for a deployment).
 

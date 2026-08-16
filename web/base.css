@@ -85,4 +85,8 @@ a.btn { text-decoration: none; }
 .meta { color: var(--muted); font-size: 11.5px; }
 .meta b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
 .note { color: var(--muted); font-size: 11px; margin-top: 8px; font-style: italic; }
+/* biome-ignore lint/complexity/noImportantStyles: `hidden` is set from script on
+   elements whose own rule already gives them a `display` -- the flex rows and the
+   grid panels -- and a class selector beats an attribute selector, so without this
+   the attribute is set and nothing goes away. */
 [hidden] { display: none !important; }

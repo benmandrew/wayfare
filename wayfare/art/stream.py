@@ -245,13 +245,17 @@ class Window:
         with_groups: bool = False,
         spec: QuerySpec = DEFAULT_SPEC,
         source: Source = DEFAULT_SOURCE,
+        weights: Weights | None = None,
     ) -> None:
         self.bounds = bounds
         self.con = con
         self.with_groups = with_groups
         self.spec = spec
         self.sql = _Sql(spec, source, bounds.as_predicate_params())
-        self._weights: Weights | None = None
+        # Given rather than computed by a banded render: a band covers a slice of
+        # the picture, so a scale worked out from its own rows is a different scale
+        # per band, and the seams show. See `band`.
+        self._weights: Weights | None = weights
 
     @property
     def alpha_compensation(self) -> float:

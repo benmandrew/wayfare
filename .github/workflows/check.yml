@@ -95,6 +95,15 @@ jobs:
         name: lint
         run: nix develop --command ruff check .
 
+      # The two viewer pages hold around 3,000 lines of JavaScript inside `<script>`
+      # tags, which no other step here reads. `--error-on-warnings` because Biome
+      # exits zero on warnings by default, and a warning nothing fails on is a
+      # warning nobody fixes -- the `info` findings stay advisory either way.
+      # Formatting is off in `biome.jsonc`; this checks behaviour only.
+      - if: ${{ !cancelled() }}
+        name: lint (web)
+        run: nix develop --command biome lint --error-on-warnings .
+
       # `wayfare/map.toml` against `wayfare/map.schema.json`, which is the same
       # check the editor shows inline through "Even Better TOML" -- both read
       # `.taplo.toml`. Nothing about a wrong shape in that file is an error at
@@ -116,6 +125,33 @@ jobs:
       - if: ${{ !cancelled() }}
         name: lint (shell)
         run: nix develop --command shellcheck deploy/refresh.sh
+
+      # This file and `image.yml` call each other, so the things that go wrong are
+      # a `needs` naming a job that moved and an `if:` expression that parses as a
+      # truthy string. Both leave a green check on a step that did not run.
+      - if: ${{ !cancelled() }}
+        name: lint (workflows)
+        run: nix develop --command actionlint
+
+      # The image build is 15 minutes and runs only on a push to main, so a shell
+      # slip in a `RUN` surfaces there rather than here. `.hadolint.yaml` turns off
+      # the version-pinning advisories and states why.
+      - if: ${{ !cancelled() }}
+        name: lint (dockerfile)
+        run: nix develop --command hadolint Dockerfile
+
+      # Relative paths in the markdown, which is all of what there is to check: no
+      # external URL in this repo is a link rather than a code span, so `--offline`
+      # costs nothing and keeps a green check from depending on a third party being
+      # up. Scoped to tracked files so it never walks `.venv` or `web/vendor`.
+      # `xargs -0` rather than an unquoted `$(git ls-files)`, which is a word split
+      # actionlint refuses through shellcheck's SC2046 -- it caught this step on the
+      # commit that added it.
+      - if: ${{ !cancelled() }}
+        name: lint (links)
+        run: >-
+          git ls-files -z '*.md' | xargs -0
+          nix develop --command lychee --offline --no-progress
 
       - if: ${{ !cancelled() }}
         name: types

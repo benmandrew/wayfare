@@ -40,6 +40,7 @@ something within 5 m of 99.5% of it.
 
 from __future__ import annotations
 
+import itertools
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -207,7 +208,7 @@ class Track:
         cell = config.SNAP_GRID_M
         for w in ways:
             pts = [(lon * self.scale, lat * _M_PER_DEG_LAT) for lat, lon in w.points]
-            for (x0, y0), (x1, y1) in zip(pts, pts[1:], strict=False):
+            for (x0, y0), (x1, y1) in itertools.pairwise(pts):
                 i = len(self.way_of)
                 self.ax.append(x0)
                 self.ay.append(y0)
@@ -287,7 +288,7 @@ def _snap_one(shape: Shaped, track: Track) -> Outcome:
 
     total = 0.0
     covered = 0.0
-    for i, ((x0, y0), (x1, y1)) in enumerate(zip(pts, pts[1:], strict=False)):
+    for i, ((x0, y0), (x1, y1)) in enumerate(itertools.pairwise(pts)):
         seg = sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2)
         total += seg
         if chosen[i] is not None and chosen[i + 1] is not None:

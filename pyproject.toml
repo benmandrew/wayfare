@@ -39,7 +39,84 @@ wayfare = ["map.toml"]
 line-length = 92
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM"]
+select = [
+    "E",
+    "F",
+    "I",
+    "UP",
+    "B",
+    "SIM",
+    "A",
+    "C4",
+    "DTZ",
+    "ERA",
+    "FURB",
+    "G",
+    "ISC",
+    "LOG",
+    "N",
+    "PERF",
+    "PIE",
+    "PLC",
+    "PLE",
+    "PLW",
+    "PT",
+    "PTH",
+    "RET",
+    "RUF",
+    "S",
+    "SLF",
+]
+# The rest of pylint is deliberately out: `PLR` is 285 magic-value comparisons and 48
+# arity complaints, both of which read as noise against a codebase whose functions take
+# a window and a spec. Of the rules inside the selected prefixes, these four are wrong
+# here rather than merely unwelcome.
+ignore = [
+    # `config.py` re-exports the feed definitions as `X as X`, which is what makes them
+    # public under mypy strict. The comment above that block says so.
+    "PLC0414",
+    # `pycairo`, `numpy` and `pyarrow` are the `art` extra, and the pipeline must import
+    # without them. The lazy imports are the mechanism, not an oversight.
+    "PLC0415",
+    # `NoRoute`, `Malformed`, `Unauthorized`. The suffix carries nothing that the
+    # `raise` site does not already say.
+    "N818",
+    # 82 sites, all audited, and the rule cannot see the distinction that matters.
+    # This pipeline builds SQL from f-strings everywhere -- table names, closed
+    # vocabularies of fragments, `db.pattern_id_sql` -- so the rule fires on the
+    # normal way this code is written. The audit traced every one of the 82: the
+    # `art.QuerySpec` closed-vocabulary claim in CLAUDE.md holds (every `/art`
+    # request value is either checked against a dict of permitted keys or bound as
+    # `?`), and the one site that spliced third-party text, `osmroutes.py`'s
+    # `feed_version` from `feed_info.txt`, is now bound.
+    #
+    # Keeping it on would mean 82 `noqa`s, which is a rule nobody reads. Worse, its
+    # heuristic skips `SET`, so it flagged none of the three sites that were
+    # actually unescaped -- leaving it on would have bought a false sense of cover.
+    # `db.sql_literal` is the answer for the statements that take no parameter.
+    "S608",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# SLF001: a test reaching into a private is a test doing its job, and 125 of the 128
+# sites are here. PT018: splitting a composite assertion gives a better failure message
+# and costs the reader the one line that states the property; 30 sites, no defect among
+# them.
+"tests/*" = [
+    "SLF001",
+    "PT018",
+    # A test asserts; that is the whole of what it does. 1,649 sites.
+    "S101",
+    # `/tmp/a.png` in `test_art.py` is a string handed to a format-detector, not a
+    # path anything opens.
+    "S108",
+    # `urlopen` against the harness's own `127.0.0.1` server.
+    "S310",
+    # XML the test wrote itself, two lines further up.
+    "S314",
+    # `subprocess` running this repo's own generator script.
+    "S603",
+]
 
 [tool.mypy]
 python_version = "3.12"

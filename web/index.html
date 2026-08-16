@@ -120,8 +120,8 @@ window.__heads = (async () => {
    hidden -- so a percentage height puts the bottom of the map, the info card and
    the credit underneath a toolbar that is still on screen. `position: relative` is
    what makes them resolve against this box at all; without it they measure the
-   viewport and the height above buys nothing. The plain `height` on the line
-   before stands wherever `dvh` is not understood. */
+   viewport and the height above buys nothing. The fallback wherever `dvh` is not
+   understood is `html, body { height: 100% }` in base.css. */
 body {
   position: relative;
   height: 100dvh;
@@ -192,11 +192,13 @@ body {
    switches the mode -- an 11.5px row is a small thing to ask a cursor to find. */
 .ramp-label { font-size: 11.5px; margin-bottom: 3px; display: flex; align-items: center; gap: 6px; cursor: pointer; }
 .ramp-label input { margin: 0; accent-color: var(--accent); }
+.ramp { height: 8px; border-radius: 2px; }
 /* A row switched off keeps its place and its colours, dimmed. Dropping it would
    move every row under it, so the second click of a pair lands on a mode the
-   reader did not aim at. */
+   reader did not aim at. After `.ramp` and not before it: this is the more
+   specific of the two, so putting it first leaves the cascade reading as though
+   the plain rule could take the dimming back. */
 .ramp-row.off .ramp-label, .ramp-row.off .ramp { opacity: .4; }
-.ramp { height: 8px; border-radius: 2px; }
 /* Absolute rather than a flex row, because a tick has to sit on the colour it
    names and the stops are not evenly spaced. `paintLegend` writes the `left` and
    the matching `translateX`. */
@@ -336,13 +338,13 @@ body {
         <div class="sub" id="sub">Services by road, and by route where there is no road</div>
       </div>
       <a class="btn" href="art.html" title="Draw the network as a picture">Art</a>
-      <button class="btn" id="theme" title="Toggle light/dark" aria-label="Toggle light or dark theme">Dark</button>
+      <button type="button" class="btn" id="theme" title="Toggle light/dark" aria-label="Toggle light or dark theme">Dark</button>
       <!-- The key is a row of colour per mode, which on a national archive is
            eight of them and most of a phone. So it folds, and the button is here
            rather than on the panel itself: folded, the panel is not on screen to
            carry it. `chrome` decides which state it opens in. -->
-      <button class="btn" id="keyBtn" title="Show or hide the key" aria-expanded="true" aria-controls="legend">Key</button>
-      <button class="btn" id="helpBtn" title="What am I looking at?" aria-label="What am I looking at?" aria-expanded="false" aria-controls="help">?</button>
+      <button type="button" class="btn" id="keyBtn" title="Show or hide the key" aria-expanded="true" aria-controls="legend">Key</button>
+      <button type="button" class="btn" id="helpBtn" title="What am I looking at?" aria-label="What am I looking at?" aria-expanded="false" aria-controls="help">?</button>
     </div>
     <div class="search">
       <label class="sr-only" for="q">Filter by service number</label>
@@ -889,7 +891,7 @@ class HeadSource {
     return this.url;
   }
 
-  async getBytes(offset, length, signal, etag) {
+  async getBytes(offset, length, signal, _etag) {
     const head = await this.head;
     // Only a range wholly inside the buffer. A partial hit would have to be
     // stitched to a second request, which is the round trip this is here to
@@ -1353,7 +1355,7 @@ function start(missing) {
 // geometry came from stop agreeing -- which is exactly when someone is trying
 // to work out why detail stopped arriving.
 function maxArchiveZoom() {
-  const zooms = REGIONS.map((r) => r.header && r.header.maxZoom).filter(
+  const zooms = REGIONS.map((r) => r.header?.maxZoom).filter(
     (z) => typeof z === "number",
   );
   return zooms.length ? Math.max(...zooms) : null;

@@ -139,8 +139,9 @@ and looks modest.
 `GET /art/meta` serves what the studio page builds its controls from — the styles and their
 blurbs, the presets, the three spec vocabularies, the defaults, the limits, the credit, and
 this database's own operator and road-class lists, bounded at 500 values each. Served rather
-than compiled into the page, so a style or preset added in [`art.py`](../wayfare/art.py)
-reaches the interface without touching any HTML.
+than compiled into the page, so a style added in [`styles.py`](../wayfare/art/styles.py),
+or a preset in [`geometry.py`](../wayfare/art/geometry.py), reaches the interface without
+touching any HTML.
 
 Renders are serialised one at a time, because a render is CPU-bound cairo over a full
 scan of `edges` and the same box is usually also matching. A request waits up to 90

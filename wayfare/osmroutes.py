@@ -38,6 +38,7 @@ Two things this deliberately does not do:
 
 from __future__ import annotations
 
+import itertools
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -192,7 +193,7 @@ def _span_m(points: list[tuple[float, float]]) -> float:
     terminals. Each segment is short enough that the plane costs nothing against
     `osm.haversine_m`.
     """
-    return sum(osm.planar_m(a, b) for a, b in zip(points, points[1:], strict=False))
+    return sum(osm.planar_m(a, b) for a, b in itertools.pairwise(points))
 
 
 @dataclass(frozen=True)
@@ -449,12 +450,16 @@ def write(con: duckdb.DuckDBPyConnection, found: list[Candidate]) -> int:
         )
 
         pid = db.pattern_id_sql("route_id", "NULL", "stop_key")
-        con.execute(f"""
+        # `feed` is bound rather than spliced: `acquire.feed_version` returns
+        # `feed_info.txt`'s own `feed_version` field verbatim whenever it is not a
+        # GUID, so its content is the publisher's and not ours.
+        con.execute(
+            f"""
             INSERT INTO patterns
                 (pattern_id, route_id, agency_id, short_name, direction, shape_id,
                  n_stops, n_trips, span_m, mode, first_seen, last_seen)
             SELECT {pid}, route_id, agency_id, short_name, NULL, NULL,
-                   n_stops, NULL, span_m, mode, '{feed}', '{feed}'
+                   n_stops, NULL, span_m, mode, ?, ?
             FROM osm_route_raw
             ON CONFLICT (pattern_id) DO UPDATE SET
                 agency_id = excluded.agency_id,
@@ -463,7 +468,9 @@ def write(con: duckdb.DuckDBPyConnection, found: list[Candidate]) -> int:
                 span_m = excluded.span_m,
                 mode = excluded.mode,
                 last_seen = excluded.last_seen
-        """)  # noqa: S608 - feed is a meta value this pipeline wrote
+        """,
+            [feed, feed],
+        )
         con.execute(f"""
             INSERT OR REPLACE INTO traces
                 (pattern_id, relation_id, way_ids, ways_cut, lon_e6, lat_e6)

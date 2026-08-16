@@ -139,7 +139,9 @@ def _open_window(
     """What the style will draw from: the database, or edges the caller holds."""
     if edges is not None:
         return Held(edges, spec=query)
-    assert con is not None  # _paint opens one before it asks for a window
+    # S101: narrowing for mypy, not a check. `_paint` opens the connection before it
+    # asks for a window, and `Window` would fail on a None one line later regardless.
+    assert con is not None  # noqa: S101
     return Window(bounds, con, with_groups=sty.needs_groups, spec=query)
 
 

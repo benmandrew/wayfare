@@ -700,7 +700,7 @@ def _script_stages() -> list[str]:
     stages = []
     for raw in REFRESH.read_text().splitlines():
         line = raw.strip()
-        if line.startswith("#") or line.startswith("wayfare()"):
+        if line.startswith(("#", "wayfare()")):
             continue
         found = re.search(r"\bwayfare ([a-z]+)", line)
         if found:
@@ -853,7 +853,8 @@ def test_every_subcommand_the_table_names_reaches_the_parser(capsys):
     place its keys and argparse's own list of choices meet."""
     with pytest.raises(SystemExit):
         cli.main(["--help"])
-    declared = set(re.findall(r"^\s{4}(\w[\w-]*)", capsys.readouterr().out, re.M))
+    out = capsys.readouterr().out
+    declared = set(re.findall(r"^\s{4}(\w[\w-]*)", out, re.MULTILINE))
     assert set(cli._SUBCOMMANDS) <= declared
     assert len(cli._SUBCOMMANDS) == 16
 

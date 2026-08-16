@@ -37,6 +37,7 @@ route relation in the region with its member geometry inline.
 
 from __future__ import annotations
 
+import itertools
 import json
 import re
 import time
@@ -457,14 +458,16 @@ _SUFFIXES = re.compile(
     r"metro station|light railway station|bus station|ferry terminal|"
     r"station|halt|stop|dlr|underground"
     r")\s*$",
-    re.I,
+    re.IGNORECASE,
 )
 # Apostrophes are deleted where the rest of the punctuation becomes a space, and the
 # difference is load-bearing: "King's Cross" spaced reads as "king s cross", which
 # matches nothing on the other side. Everything else is a separator in at least one
 # publisher's spelling -- "Shepherd's Bush (Central)" against "Shepherd's Bush
 # Central" -- and has to become one here.
-_APOSTROPHE = re.compile(r"['’]")
+# Both apostrophe spellings on purpose: publishers use either, and the class has to
+# match whichever one a name arrives with.
+_APOSTROPHE = re.compile(r"['’]")  # noqa: RUF001
 _PUNCT = re.compile(r"[.,()\-/]")
 _SPACE = re.compile(r"\s+")
 
@@ -560,7 +563,7 @@ def planar_m(a: tuple[float, float], b: tuple[float, float]) -> float:
 def cumulative(pts: list[tuple[float, float]]) -> list[float]:
     """Distance along a metre-space polyline at each vertex."""
     out = [0.0]
-    for a, b in zip(pts, pts[1:], strict=False):
+    for a, b in itertools.pairwise(pts):
         out.append(out[-1] + sqrt((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2))
     return out
 
@@ -574,14 +577,14 @@ def project(
     chain and the second to decide whether the match is real at all.
     """
     best_along, best_off = 0.0, float("inf")
-    for i, (a, b) in enumerate(zip(pts, pts[1:], strict=False)):
+    for i, (a, b) in enumerate(itertools.pairwise(pts)):
         dx, dy = b[0] - a[0], b[1] - a[1]
         seg = dx * dx + dy * dy
         if seg == 0.0:
             t = 0.0
         else:
             t = ((pt[0] - a[0]) * dx + (pt[1] - a[1]) * dy) / seg
-            t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t
+            t = 0.0 if t < 0.0 else min(t, 1.0)
         cx, cy = a[0] + t * dx, a[1] + t * dy
         off = sqrt((pt[0] - cx) ** 2 + (pt[1] - cy) ** 2)
         if off < best_off:

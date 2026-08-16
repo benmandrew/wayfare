@@ -732,7 +732,7 @@ def serve_at(tmp_path: Path, monkeypatch):
 
 def _get(url: str, **headers: str):
     request = urllib.request.Request(url, headers=headers)
-    return urllib.request.urlopen(request, timeout=30)  # noqa: S310 - a local test server
+    return urllib.request.urlopen(request, timeout=30)
 
 
 # --- Compression ------------------------------------------------------------
@@ -966,7 +966,9 @@ def test_a_kept_alive_connection_sends_without_waiting_for_nagle(serve_at):
     seen: list[int] = []
 
     class Recording(server.Handler):
-        def do_GET(self) -> None:
+        # `BaseHTTPRequestHandler` dispatches on the method name, so the case is the
+        # standard library's to choose.
+        def do_GET(self) -> None:  # noqa: N802
             seen.append(self.connection.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))
             super().do_GET()
 

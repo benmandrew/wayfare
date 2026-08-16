@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import itertools
 import math
 import re
 import struct
@@ -186,7 +187,7 @@ def test_a_format_comes_from_a_path_or_from_a_bare_suffix():
 
 def test_unknown_output_format_fails_before_querying(tmp_path):
     """Rejecting the suffix must not cost a full window query first."""
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=re.escape("unsupported output format '.tiff'")):
         art.render("cardiff", style="density", out_path=tmp_path / "x.tiff", edges=[])
 
 
@@ -412,9 +413,9 @@ def test_paths_agree_with_projecting_the_edge_stream(con):
     proj = art.Projection.fit(BOUNDS, 800, 600)
     w = art.Window(BOUNDS, con)
 
-    viaPaths = [(weight, line.points()) for weight, line in w.paths(proj)]
-    viaEdges = [(e.weight, [proj(lon, lat) for lon, lat in e.coords]) for e in w.edges()]
-    assert viaPaths == viaEdges
+    via_paths = [(weight, line.points()) for weight, line in w.paths(proj)]
+    via_edges = [(e.weight, [proj(lon, lat) for lon, lat in e.coords]) for e in w.edges()]
+    assert via_paths == via_edges
 
 
 def test_held_paths_match_the_streaming_ones(con):
@@ -1106,7 +1107,7 @@ def test_bands_hold_roughly_equal_numbers_of_edges(banded):
             for lat in range(51_420_000, 51_420_000 + 60 * 3_000, 3_000)
             if lo <= proj(BOUNDS.min_lon, lat / 1e6)[1] < hi
         )
-        for lo, hi in zip(cuts, cuts[1:], strict=False)
+        for lo, hi in itertools.pairwise(cuts)
     ]
     assert len(counts) == 4
     assert max(counts) - min(counts) <= 2

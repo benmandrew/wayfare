@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import itertools
 import json
 import re
 import shutil
@@ -79,8 +80,8 @@ MODES = {
 
 # The MapInfo members that matter. PtLinks is the stop-to-stop road geometry;
 # StoppingPoints is what carries the ATCO code that joins it to the timetable.
-LINKS_MEMBER = re.compile(r"PtLinks.*\.MIF$", re.I)
-STOPS_MEMBER = re.compile(r"StoppingPoints.*\.MIF$", re.I)
+LINKS_MEMBER = re.compile(r"PtLinks.*\.MIF$", re.IGNORECASE)
+STOPS_MEMBER = re.compile(r"StoppingPoints.*\.MIF$", re.IGNORECASE)
 
 
 # --- OpenDataNI --------------------------------------------------------------
@@ -215,8 +216,7 @@ def _length(points: tuple[tuple[float, float], ...]) -> float:
     the same two stops, so the projection error over a few hundred metres of
     Northern Ireland cannot change an ordering."""
     return sum(
-        (x2 - x1) ** 2 + (y2 - y1) ** 2
-        for (x1, y1), (x2, y2) in zip(points, points[1:], strict=False)
+        (x2 - x1) ** 2 + (y2 - y1) ** 2 for (x1, y1), (x2, y2) in itertools.pairwise(points)
     )
 
 
@@ -304,7 +304,7 @@ def _days(profile: ET.Element | None) -> tuple[int, ...]:
 
 def _clock(hhmmss: str) -> int:
     parts = (hhmmss or "0:0:0").split(":")
-    h, m, s = (int(p or 0) for p in (parts + ["0", "0", "0"])[:3])
+    h, m, s = (int(p or 0) for p in [*parts, "0", "0", "0"][:3])
     return (h * 60 + m) * 60 + s
 
 
@@ -448,7 +448,14 @@ def read_timetable(
         "Service": seen.service,
         "VehicleJourney": seen.journey,
     }
-    for _, el in ET.iterparse(str(path), events=("end",)):
+    # S314: this is third-party XML -- Translink's TransXChange, through OpenDataNI.
+    # Measured rather than assumed: ElementTree refuses an external entity outright
+    # ("undefined entity"), so a crafted file cannot read a path off this machine.
+    # It does expand *internal* entities, so the exposure is memory exhaustion from
+    # a `billion laughs` payload, against a pipeline that already spends 104 MB and
+    # a stage on trusting this publisher's contents. `defusedxml` is the fix if that
+    # trade ever stops being the right one.
+    for _, el in ET.iterparse(str(path), events=("end",)):  # noqa: S314
         tag = el.tag.split("}")[-1]
         handle = handlers.get(tag)
         if handle is not None:
@@ -483,7 +490,7 @@ def _stitch(
 ) -> tuple[tuple[float, float], ...] | None:
     """The road a journey takes, or None if any hop of it is unpublished."""
     out: list[tuple[float, float]] = []
-    for a, b in zip(stops, stops[1:], strict=False):
+    for a, b in itertools.pairwise(stops):
         line = hops.get((a, b))
         if line is None:
             return None
@@ -725,7 +732,7 @@ def _created(path: Path) -> str:
     ``CreationDateTime`` is on the root element, so this reads the first tag and
     stops rather than parsing 104 MB to fetch one attribute.
     """
-    for _, el in ET.iterparse(str(path), events=("start",)):
+    for _, el in ET.iterparse(str(path), events=("start",)):  # noqa: S314  (see `_scan`)
         stamp = el.get("CreationDateTime") or ""
         m = re.match(r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)", stamp)
         return "".join(m.groups()[:3]) + "_" + "".join(m.groups()[3:]) if m else ""

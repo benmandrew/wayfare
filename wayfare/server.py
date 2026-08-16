@@ -737,7 +737,7 @@ def _database_meta() -> dict[str, Any]:
     A hit opens nothing, which is the point: the connection is the cheap half and
     the lock it competes for is not.
     """
-    global _meta_cache
+    global _meta_cache  # noqa: PLW0603 - a process-wide cache, guarded by `_meta_lock`
     key = (str(config.DB_PATH), _stamp())
     with _meta_lock:
         if _meta_cache is not None and _meta_cache[0] == key:
@@ -803,7 +803,7 @@ def _gzipped(path: str) -> bytes | None:
     that gets discovered from a proxy rather than from a test.
     """
     try:
-        st = os.stat(path)
+        st = Path(path).stat()
     except OSError:
         return None
     key = (path, st.st_mtime_ns, st.st_size)
@@ -1051,14 +1051,14 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         unfileable, so the page went out with neither an ETag nor compression
         while the archive beside it got both.
         """
-        if not os.path.isdir(path):
+        if not Path(path).is_dir():
             return path
         if not urlparse(self.path).path.endswith("/"):
             return None  # base class issues the redirect to the trailing-slash form
         for index in ("index.html", "index.htm"):
-            candidate = os.path.join(path, index)
-            if os.path.isfile(candidate):
-                return candidate
+            candidate = Path(path) / index
+            if candidate.is_file():
+                return str(candidate)
         return None  # no index: base class lists the directory
 
     def _file_etag(self, path: str, gzipped: bool = False) -> str | None:
@@ -1070,7 +1070,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         `wayfare publish` rewrites it, which is the only way its contents move.
         """
         try:
-            st = os.stat(path)
+            st = Path(path).stat()
         except OSError:
             return None
         suffix = "-gzip" if gzipped else ""
@@ -1098,7 +1098,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if self.guess_type(path).split(";")[0] not in COMPRESSIBLE:
             return False
         try:
-            return 0 < os.stat(path).st_size <= COMPRESS_MAX
+            return 0 < Path(path).stat().st_size <= COMPRESS_MAX
         except OSError:
             return False
 
@@ -1126,7 +1126,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def _send_range(self, path: str):  # type: ignore[no-untyped-def]
         header = self.headers.get("Range", "")
         try:
-            f = open(path, "rb")  # noqa: SIM115 - closed by the caller, as in the base class
+            # Left open: the caller closes it, as in the base class.
+            f = Path(path).open("rb")  # noqa: SIM115
         except OSError:
             self.send_error(404)
             return None

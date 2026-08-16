@@ -140,7 +140,8 @@ def measure(pytest_args: list[str]) -> float:
         ]
         # A failing suite means the number is measured against code that does not
         # work, so refuse rather than stamp it onto the badge.
-        if subprocess.run(cmd, cwd=ROOT).returncode != 0:
+        # S603: `cmd` is this file's own pytest invocation, a fixed argv, no shell.
+        if subprocess.run(cmd, cwd=ROOT, check=False).returncode != 0:  # noqa: S603
             raise SystemExit("the test suite failed; badge not written")
         return read_report(report)
 

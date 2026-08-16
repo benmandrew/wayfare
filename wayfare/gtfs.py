@@ -219,8 +219,14 @@ def build_patterns(
     config.route_types(kept_modes)  # reject a bad name before any work is done
     feed = feed_version or acquire.feed_version(gtfs_dir)
     limit = memory_limit or os.environ.get("WAYFARE_MEM", "8GB")
-    con.execute(f"SET memory_limit = '{limit}'")
-    con.execute(f"SET temp_directory = '{gtfs_dir.parent / 'duckdb_tmp'}'")
+    # `SET` takes a literal, not a bound parameter, and neither of these is a
+    # constant: `limit` is `--memory` or $WAYFARE_MEM, and the directory hangs off
+    # $WAYFARE_DATA. `db.sql_literal` is what keeps a path with an apostrophe in it
+    # from ending the run with a parse error naming a path nobody typed.
+    con.execute(f"SET memory_limit = {db.sql_literal(limit)}")
+    con.execute(
+        f"SET temp_directory = {db.sql_literal(str(gtfs_dir.parent / 'duckdb_tmp'))}"
+    )
     con.execute("SET preserve_insertion_order = false")
 
     n_trips = _load_source_tables(gtfs_dir, con, kept_modes)

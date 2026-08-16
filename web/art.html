@@ -43,7 +43,15 @@ body {
    measured against the viewport with the toolbars hidden, so the bottom of this
    box -- the status line, and the button that draws the picture again -- sits
    under a toolbar that is still on screen. The `%` before it is the fallback. */
-.studio { display: flex; gap: 12px; height: 100%; height: 100dvh; padding: 12px; }
+.studio {
+  display: flex;
+  gap: 12px;
+  height: 100%;
+  /* biome-ignore lint/suspicious/noDuplicateProperties: the `%` above is the
+     fallback a browser that does not know `dvh` is left holding. */
+  height: 100dvh;
+  padding: 12px;
+}
 .controls {
   width: 296px;
   flex: none;
@@ -227,6 +235,8 @@ input[type=color] {
     flex-direction: column;
     height: auto;
     min-height: 100%;
+    /* biome-ignore lint/suspicious/noDuplicateProperties: the `%` above is the
+       fallback a browser that does not know `svh` is left holding. */
     min-height: 100svh;
     padding: calc(8px + env(safe-area-inset-top, 0px)) calc(8px + env(safe-area-inset-right, 0px))
              calc(8px + env(safe-area-inset-bottom, 0px)) calc(8px + env(safe-area-inset-left, 0px));
@@ -245,6 +255,8 @@ input[type=color] {
     top: calc(8px + env(safe-area-inset-top, 0px));
     z-index: 1;
     min-height: 52vh;
+    /* biome-ignore lint/suspicious/noDuplicateProperties: `vh` above is the
+       fallback a browser that does not know `svh` is left holding. */
     min-height: 52svh;
     /* Opaque, because the panels inside it are not: the gap between the picture
        and the status line is a window onto whatever is scrolling underneath. */
@@ -270,7 +282,7 @@ input[type=color] {
         <div class="sub" id="sub">Renders drawn where the data lives</div>
       </div>
       <a class="btn" href="index.html" title="Back to the map">Map</a>
-      <button class="btn" id="theme" title="Toggle light/dark" aria-label="Toggle light or dark theme">Dark</button>
+      <button type="button" class="btn" id="theme" title="Toggle light/dark" aria-label="Toggle light or dark theme">Dark</button>
     </div>
   </div>
 
@@ -289,7 +301,7 @@ input[type=color] {
             the shape that is drawn.</div>
         </div>
         <div class="row" style="margin-top:7px">
-          <button class="btn" id="pickToggle" aria-expanded="true" aria-controls="pickwrap">Hide the map</button>
+          <button type="button" class="btn" id="pickToggle" aria-expanded="true" aria-controls="pickwrap">Hide the map</button>
         </div>
       </div>
       <div class="field">
@@ -335,7 +347,7 @@ input[type=color] {
         <input class="inp" type="number" id="min_trips" min="0" step="10">
       </div>
       <div class="row" style="margin-top:7px">
-        <button class="btn" id="filterReset">Draw everything again</button>
+        <button type="button" class="btn" id="filterReset">Draw everything again</button>
       </div>
       <div class="note">Nothing selected means any. A filter drops the roads no
         surviving service uses rather than drawing them empty, so it is the one
@@ -351,7 +363,7 @@ input[type=color] {
       <div class="label">Ground</div>
       <div class="row">
         <input type="color" id="background" title="Background colour">
-        <button class="btn" id="groundReset">Use style colour</button>
+        <button type="button" class="btn" id="groundReset">Use style colour</button>
       </div>
     </div>
 
@@ -393,9 +405,17 @@ input[type=color] {
     <div class="field">
       <div class="label">Download</div>
       <div class="row">
-        <a class="btn" id="dlPng" href="#">PNG</a>
-        <a class="btn" id="dlSvg" href="#">SVG</a>
-        <button class="btn" id="copyLink" title="Copy this design's address">Copy link</button>
+        <!-- Links and not buttons, because the endpoint answers with
+             `Content-Disposition: attachment`: a middle click or a "save link as"
+             is then a download, which a button cannot offer. The address carries
+             the whole design, so `exports` writes it at boot and rewrites it on
+             every change; the endpoint on its own is what stands in the markup
+             until then. It was `#` before, which is a link back to the top of this
+             page -- a navigation nobody asked for, and one that would silently
+             discard the design if the render never got as far as `exports`. -->
+        <a class="btn" id="dlPng" href="/art">PNG</a>
+        <a class="btn" id="dlSvg" href="/art">SVG</a>
+        <button type="button" class="btn" id="copyLink" title="Copy this design's address">Copy link</button>
       </div>
       <div class="meta" id="exportSize" style="margin-top:7px"></div>
       <!-- The download is the moment the licence condition attaches to somebody,
@@ -426,7 +446,7 @@ input[type=color] {
   <div class="panel status">
     <div class="grow meta" id="stat" role="status" aria-live="polite"></div>
     <div class="meta" id="busy" hidden aria-live="polite"><span class="dot"></span>rendering…</div>
-    <button class="btn" id="again" title="Fetch it again, past the browser cache">Refresh</button>
+    <button type="button" class="btn" id="again" title="Fetch it again, past the browser cache">Refresh</button>
   </div>
 </main>
 
@@ -521,7 +541,7 @@ boot().catch((err) => {
   console.error(err);
   offline(
     "Cannot set up the studio",
-    `<p>${escapeHtml(String((err && err.message) || err))}</p>
+    `<p>${escapeHtml(String(err?.message || err))}</p>
      <p>The server answered <code>/art/meta</code>, but this page could not build
         its controls from what came back. Check that <code>wayfare serve</code>
         and this page are the same version.</p>`
@@ -565,7 +585,7 @@ function renderable() {
     );
     return false;
   }
-  if (!META.database || !META.database.present) {
+  if (!META.database?.present) {
     offline(
       "No database on this server",
       `<p>Renders read <code>edges</code> straight out of the pipeline's DuckDB
@@ -631,7 +651,7 @@ function fitWidth() {
 // the window resizing, and the *window* being reframed, since a differently
 // shaped one meets a different edge of the frame first.
 function refit() {
-  if (!S || !S.previewWidthAuto) return;
+  if (!S?.previewWidthAuto) return;
   const w = fitWidth();
   // Small changes are ignored on purpose. A scrollbar appearing, or a phone's
   // address bar sliding away, is a few per cent of width and a whole render.
@@ -661,6 +681,14 @@ function refit() {
 //         for a picture that would never have used it.
 //   fmt   how it is written into a request. `trim` is what keeps 0.30000000000004
 //         out of a shared URL.
+//
+// `trim` is declared here rather than among the helpers below because the table
+// holds the function itself, not a call of it, and the table is built as this
+// script is evaluated: a `const` further down is still in its temporal dead zone
+// at that point, so the whole page dies before a single control is wired.
+const trim = (v) => String(Number(Number(v).toFixed(4)));
+const fmtBbox = (b) => b.map((n) => trim(n)).join(",");
+
 const PARAMS = [
   { key: "style",       read: "text", send: "style" },
   { key: "weight",      read: "text", send: "weight" },
@@ -779,7 +807,7 @@ function fromHash(base) {
   return s;
 }
 
-const vocabulary = (name) => (META.query && META.query[name]) || [];
+const vocabulary = (name) => META.query?.[name] || [];
 const maxTrips = () => META.limits.max_min_trips || 1e6;
 // Sorted and deduplicated, which is what the endpoint does to a filter as well, so
 // two spellings of one choice are one URL and one cached render.
@@ -981,7 +1009,7 @@ function watchStage() {
     if (S.previewWidth !== before) render();
   }, 250);
   addEventListener("resize", () => {
-    if (!S || !S.previewWidthAuto) return;
+    if (!S?.previewWidthAuto) return;
     refitStage();
   });
 }
@@ -1100,7 +1128,7 @@ function query({ width, scale, format, download, sample }) {
 // never waits on a picture already out of date.
 async function render(force) {
   scheduleRender.cancel();
-  if (!META || !META.enabled) return;
+  if (!META?.enabled) return;
 
   // Supersede rather than queue: the server allows four waiting renders and a
   // dragged slider would fill that with pictures nobody will look at.
@@ -1496,9 +1524,6 @@ function setSelected(el, chosen) {
   for (const v of chosen) if (!have.has(v)) el.add(new Option(v, v));
   for (const o of el.options) o.selected = chosen.includes(o.value);
 }
-
-const trim = (v) => String(Number(Number(v).toFixed(4)));
-const fmtBbox = (b) => b.map((n) => trim(n)).join(",");
 
 function bytes(n) {
   if (n < 1024) return n + " B";

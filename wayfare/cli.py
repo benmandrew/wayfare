@@ -23,7 +23,7 @@ import sys
 import time
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import duckdb
@@ -49,7 +49,7 @@ log = logs.get("cli")
 
 # What `add_subparsers` hands back. Private in argparse and typed nowhere public,
 # so the name is spelled once here rather than in fifteen signatures.
-type _Sub = argparse._SubParsersAction[argparse.ArgumentParser]
+type _Sub = argparse._SubParsersAction[argparse.ArgumentParser]  # noqa: SLF001
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -87,18 +87,18 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _region_arg(p: argparse.ArgumentParser, help: str) -> None:
+def _region_arg(p: argparse.ArgumentParser, text: str) -> None:
     """Which feed. Ambient by default, out of WAYFARE_REGION, because a data root
     holds one region and the flag is only ever an override of that."""
-    p.add_argument("--region", default=None, help=help)
+    p.add_argument("--region", default=None, help=text)
 
 
 def _limit_arg(p: argparse.ArgumentParser) -> None:
     p.add_argument("--limit", type=int, default=None, help="stop after N patterns")
 
 
-def _workers_arg(p: argparse.ArgumentParser, help: str) -> None:
-    p.add_argument("--workers", type=int, default=None, help=help)
+def _workers_arg(p: argparse.ArgumentParser, text: str) -> None:
+    p.add_argument("--workers", type=int, default=None, help=text)
 
 
 def _retry_arg(p: argparse.ArgumentParser, literal: str) -> None:
@@ -652,11 +652,7 @@ def _cmd_routes(args: argparse.Namespace) -> int:
             built.skipped_no_stops,
         )
         if args.cif:
-            when = (
-                datetime.strptime(args.on, "%Y-%m-%d").date()
-                if args.on
-                else datetime.now(UTC).date()
-            )
+            when = date.fromisoformat(args.on) if args.on else datetime.now(UTC).date()
             got = railtrips.run_cached(
                 con,
                 args.cif,

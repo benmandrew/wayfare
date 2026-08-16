@@ -63,12 +63,12 @@ RUN mkdir -p wayfare && touch wayfare/__init__.py \
 # raised at `import numpy` and pointing nowhere near the build that caused it.
 RUN P=/opt/venv/lib/python3.12/site-packages/pyarrow \
     && N=/opt/venv/lib/python3.12/site-packages/numpy \
-    && rm -rf $P/tests $P/include $P/src $P/*.pxd $P/*.pxi \
-    && rm -f $P/libarrow_flight.so* $P/libarrow_python_flight.so* \
-             $P/_flight*.so $P/flight.py \
-    && rm -rf $N/f2py $N/_core/include $N/_core/lib $N/_pyinstaller \
-    && find $N -type d -name tests -prune -exec rm -rf {} + \
-    && find $P -name '*.so*' -type f -print0 | xargs -0 strip --strip-unneeded
+    && rm -rf "$P"/tests "$P"/include "$P"/src "$P"/*.pxd "$P"/*.pxi \
+    && rm -f "$P"/libarrow_flight.so* "$P"/libarrow_python_flight.so* \
+             "$P"/_flight*.so "$P"/flight.py \
+    && rm -rf "$N"/f2py "$N"/_core/include "$N"/_core/lib "$N"/_pyinstaller \
+    && find "$N" -type d -name tests -prune -exec rm -rf {} + \
+    && find "$P" -name '*.so*' -type f -exec strip --strip-unneeded {} +
 
 
 FROM python:3.12-slim-bookworm

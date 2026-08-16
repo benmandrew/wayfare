@@ -343,10 +343,10 @@ def _draw_band(job: _BandJob) -> tuple[int, int, int, bytes]:
             with_groups=sty.needs_groups,
             spec=job.query,
             source=source,
+            # The whole picture's scale, handed in rather than recomputed. See the
+            # section header: a band that scales itself draws a different picture.
+            weights=job.weights,
         )
-        # The window's scale, injected rather than recomputed. See the section
-        # header: a band that scales itself draws a different picture.
-        window._weights = job.weights
         sty.draw(ctx, window, proj, job.opts)
     finally:
         con.close()
