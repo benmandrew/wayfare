@@ -189,6 +189,20 @@ window, which is what keeps every BODS slug drawing what it always drew. Bounds 
 never meet the region's live stops raise, because an empty box reports that nothing was
 discovered.
 
+**`routes` is for a mode with no timetable behind it, and a region that publishes one
+draws every line twice.** Iarnród Éireann is in the National Transport Authority's feed
+with shapes, and `routes` drew the same lines again off OSM relations: at z10 and z11
+none of the relation track's ink fell outside the operator's own shapes, while the
+shapes carry the journey counts the relations have no way to know. `config.Feed.route_relations`
+is the gate — `None` takes `osmroutes.ROUTE_MODES`, `()` draws none, and the Republic
+sets `()`. Read it with `is None` at every hop, because a selection that refuses
+everything is falsy and `or` hands it back the default it just refused. A region that
+draws nothing keeps its `operators` anyway, since that claim is what makes *another*
+region refuse the same relations. `osmroutes.write` retires on an empty run for the same
+reason it exists at all: a region that has stopped drawing relations is exactly the case
+whose last run has to be retired, and returning early left 44 of them live and on the
+map.
+
 **`segments` and `track_services` partition on `traces.ways_cut`, and a pattern in both
 is drawn twice.** A trace cut to its own pattern is inverted per way; a trace holding
 the whole line's chain keeps its polyline, because inverting it would attribute a short

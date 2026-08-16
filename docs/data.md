@@ -282,12 +282,25 @@ the join is by normalised station name with a coordinate check.
 [`docs/pipeline.md`](pipeline.md) covers the stage and [`wayfare/osm.py`](../wayfare/osm.py)
 the parsing.
 
-### Two gates on what a region draws
+### Three gates on what a region draws
 
 `osmroutes` discovers route relations over a window and turns each into a pattern. It is
 how Great Britain's National Rail is drawn at all, since BODS does not carry it, and it
-is Northern Ireland's only source of rail. A window is a box and a border is not, so
-there are two gates.
+is Northern Ireland's only source of rail. A window is a box and a border is not, so two
+of the gates are about where a relation is, and the first is about whether the region
+wants relations at all.
+
+`config.Feed.route_relations` is the OSM `route` values a region draws, narrowing
+`osmroutes.ROUTE_MODES`. `None` takes that default and `()` draws none. The stage exists
+for a mode with no timetable behind it, and a region publishing its own gets the same
+line from both sources: the Republic's rail is in the National Transport Authority feed
+with shapes, and at z10 and z11 none of the relation track's ink fell outside those
+shapes. The shapes win, because they are the operator's own recording and because they
+carry the journey counts the relations have no way to know, so the Republic sets `()`.
+It keeps its `operators` regardless — that claim is what makes Great Britain refuse the
+same relations, and it outlives the Republic's own reason for naming them. An empty
+selection skips the Overpass fetch and still retires the previous run, since a region
+that has stopped drawing relations is the one whose last run most needs retiring.
 
 `config.Feed.bounds` is the per-region window, `(south, west, north, east)`, intersected
 with the box the region's own stops draw. Northern Ireland gets `(54.0, -8.35, 55.35,

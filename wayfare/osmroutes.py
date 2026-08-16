@@ -256,7 +256,10 @@ def candidates(
     border is not, and two archives are loaded onto one map -- so a relation kept by
     both regions is a line the viewer draws twice.
     """
-    routes = routes or ROUTE_MODES
+    # `is None` rather than falsy: an empty selection is a region that draws no
+    # relations at all, and `or` would hand it back the default it just refused.
+    if routes is None:
+        routes = ROUTE_MODES
     mine, others = claims(region)
     out: list[Candidate] = []
     considered = broken = no_stops = not_ours = no_ways = 0
@@ -334,14 +337,25 @@ def write(con: duckdb.DuckDBPyConnection, found: list[Candidate]) -> int:
     Python, so these ids are minted by the same expression as the timetable's and
     cannot drift from it.
     """
-    if not found:
-        return 0
     feed = db.get_meta(con, "feed_version")
     if not feed:
         raise RuntimeError("no feed_version in meta; run `wayfare patterns` first")
 
     con.execute("BEGIN")
     try:
+        # Retire first, and retire even with nothing found. A run that draws none of
+        # these is not a no-op: it is a region that has stopped drawing them, and
+        # returning early here left the last run's relations live and still on the
+        # map. That is how the Republic kept its second copy of every line for a
+        # `routes` run after the setting that stopped drawing it.
+        con.execute(
+            "UPDATE patterns SET last_seen = NULL "
+            "WHERE route_id LIKE 'osm:r%' AND last_seen = ?",
+            [feed],
+        )
+        if not found:
+            con.execute("COMMIT")
+            return 0
         con.execute("""
             CREATE OR REPLACE TEMP TABLE osm_route_raw (
                 relation_id BIGINT, route_id VARCHAR, agency_id VARCHAR,
@@ -387,13 +401,6 @@ def write(con: duckdb.DuckDBPyConnection, found: list[Candidate]) -> int:
         )
 
         pid = db.pattern_id_sql("route_id", "NULL", "stop_key")
-        # Retire first, so a relation that stopped chaining -- or stopped existing --
-        # leaves the current feed instead of being drawn for ever on a stale row.
-        con.execute(
-            "UPDATE patterns SET last_seen = NULL "
-            "WHERE route_id LIKE 'osm:r%' AND last_seen = ?",
-            [feed],
-        )
         con.execute(f"""
             INSERT INTO patterns
                 (pattern_id, route_id, agency_id, short_name, direction, shape_id,
@@ -526,8 +533,24 @@ def run(
     window = bbox(con, region)
     if window is None:
         raise RuntimeError("no live patterns to derive a window from")
-    relations = osm.fetch(window, cache or config.RAW / "osm_routes.json", refresh=refresh)
-    wanted = routes or ROUTE_MODES
+    # The argument wins, then the region's own selection, then the default. `is not
+    # None` twice over, because `()` means "draw none" and is the whole point of the
+    # setting -- `or` would read it as "unset" and draw everything.
+    configured = config.feed(region).route_relations
+    if routes is not None:
+        wanted = routes
+    elif configured is None:
+        wanted = ROUTE_MODES
+    else:
+        wanted = {k: v for k, v in ROUTE_MODES.items() if k in configured}
+    # Before the fetch, not after. A region that draws none still has to reach
+    # `write`, so last run's relations retire, but asking Overpass for a body every
+    # relation in it is about to be refused is a national query spent on nothing.
+    relations = (
+        osm.fetch(window, cache or config.RAW / "osm_routes.json", refresh=refresh)
+        if wanted
+        else []
+    )
     sifted = candidates(relations, wanted, region)
     n_patterns = write(con, sifted.kept)
     # Only the relations that became patterns. `ways` is joined to `track_services`

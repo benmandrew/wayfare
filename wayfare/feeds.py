@@ -124,6 +124,19 @@ class Feed:
     # here claims -- which is how Great Britain keeps drawing what it drew while
     # stopping at the Irish Sea.
     operators: tuple[str, ...] = ()
+    # The OSM `route` tag values `routes` draws here, narrowing
+    # `osmroutes.ROUTE_MODES`. `None` takes that default; `()` draws none.
+    #
+    # `routes` exists for a mode the timetable does not carry, and a region that
+    # publishes the mode itself gets the same line from both -- measured on the
+    # Republic at z10 and z11, the relation track lay on the operator's own shapes
+    # to within two pixels and covered nothing they did not. The operator's own
+    # recording wins there, exactly as it does in `aggregate.build_segments`, and it
+    # is the one of the two that knows how often a service runs.
+    #
+    # Narrowing this retires the relations it stops drawing, so it takes a `routes`
+    # run to take effect and not only an `aggregate`.
+    route_relations: tuple[str, ...] | None = None
 
 
 FEEDS = {
@@ -143,7 +156,14 @@ FEEDS = {
         # No bounds: a box cannot describe the Republic, because Donegal reaches
         # further north than any part of Northern Ireland. The operator gate is
         # the whole of the border here.
+        #
+        # The operators stay named even though nothing here draws them any more:
+        # the claim is what makes *Great Britain* refuse these relations, and
+        # dropping it puts the Republic's rail back into the national archive.
         operators=("Iarnród Éireann", "Irish Rail"),
+        # Iarnród Éireann is in the NTA feed, timetable and shapes both, so there is
+        # no mode here with no timetable behind it and nothing for `routes` to draw.
+        route_relations=(),
     ),
     "northern_ireland": Feed(
         # No URL: there is no Northern Irish GTFS to download. `acquire` fetches

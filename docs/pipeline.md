@@ -423,6 +423,13 @@ schedule and is optional, with `--stops` naming the NaPTAN CSV that turns a TIPL
 place and `--on` the date whose service to count. Without `--cif` the track draws and
 `trips` stays null.
 
+**Which relations.** `config.Feed.route_relations` narrows `osmroutes.ROUTE_MODES` per
+region: `None` takes the default, `()` draws none. A region that publishes the mode
+itself needs `()`, because the relation and the operator's own shape are the same line
+and only the shape knows how often a service runs — see the three gates in
+[docs/data.md](data.md). An empty selection skips the Overpass fetch and still runs
+`write`, which retires the previous run whether or not it found anything.
+
 **Cost.** 54m43s nationally when profiled on the server against a cached 121.5 MB Overpass
 body, of which 99.8% was two insert loops: `write_ways` took 2,733 seconds for 68,369 ways
 and `write` 543 seconds for 935 patterns. Fetching, parsing and chaining the whole body
