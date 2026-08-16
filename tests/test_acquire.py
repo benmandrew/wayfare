@@ -3,6 +3,7 @@ from __future__ import annotations
 import zipfile
 from pathlib import Path
 
+import builders
 import pytest
 
 from wayfare import acquire, config
@@ -138,23 +139,16 @@ def test_missing_members_are_named(tmp_path):
 # --- Resume -----------------------------------------------------------------
 
 
-class FakeResponse:
-    def __init__(self, status: int, body: bytes, headers: dict[str, str] | None = None):
-        self.status_code = status
-        self.headers = headers or {"Content-Length": str(len(body))}
-        self._body = body
+def response(status: int, body: bytes, headers: dict[str, str] | None = None):
+    """`builders.FakeResponse` with the Content-Length every host but BODS sends.
 
-    def raise_for_status(self) -> None:
-        pass
-
-    def iter_content(self, n):
-        yield self._body
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
+    Declaring it by default is what keeps the completeness check in `_stream` live
+    for the tests that are about something else, so a transfer cut short in one of
+    them fails there rather than being written out short and passing.
+    """
+    return builders.FakeResponse(
+        body, status, headers or {"Content-Length": str(len(body))}
+    )
 
 
 def test_resume_appends_on_206(tmp_path, monkeypatch):
@@ -164,7 +158,7 @@ def test_resume_appends_on_206(tmp_path, monkeypatch):
 
     def fake_get(url, headers=None, **k):
         seen.update(headers or {})
-        return FakeResponse(206, b"BBBB")
+        return response(206, b"BBBB")
 
     monkeypatch.setattr(acquire.requests, "get", fake_get)
     src = acquire.Source("osm", "http://x/y.pbf", "x.pbf", resumable=True)
@@ -179,7 +173,7 @@ def test_a_server_that_ignores_range_restarts_cleanly(tmp_path, monkeypatch):
     part = tmp_path / "x.pbf.part"
     part.write_bytes(b"AAAA")
     monkeypatch.setattr(
-        acquire.requests, "get", lambda url, headers=None, **k: FakeResponse(200, b"WHOLE")
+        acquire.requests, "get", lambda url, headers=None, **k: response(200, b"WHOLE")
     )
     src = acquire.Source("osm", "http://x/y.pbf", "x.pbf", resumable=True)
     acquire._stream(src, part)
@@ -196,7 +190,7 @@ def test_a_short_read_is_caught_where_the_host_declares_a_length(tmp_path, monke
     monkeypatch.setattr(
         acquire.requests,
         "get",
-        lambda url, headers=None, **k: FakeResponse(200, b"AB", {"Content-Length": "1000"}),
+        lambda url, headers=None, **k: response(200, b"AB", {"Content-Length": "1000"}),
     )
     src = acquire.Source("gtfs", "http://x/f.zip", "f.zip")
     with pytest.raises(OSError, match="cut short"):
@@ -211,7 +205,7 @@ def test_a_compressed_body_is_not_measured_against_the_declared_length(
     monkeypatch.setattr(
         acquire.requests,
         "get",
-        lambda url, headers=None, **k: FakeResponse(
+        lambda url, headers=None, **k: response(
             200, b"decoded and longer", {"Content-Length": "4", "Content-Encoding": "gzip"}
         ),
     )
@@ -227,7 +221,7 @@ def test_non_resumable_sources_send_no_range_header(tmp_path, monkeypatch):
 
     def fake_get(url, headers=None, **k):
         seen.update(headers or {})
-        return FakeResponse(200, b"WHOLE")
+        return response(200, b"WHOLE")
 
     monkeypatch.setattr(acquire.requests, "get", fake_get)
     acquire._stream(acquire.sources("wales")[0], part)
@@ -269,7 +263,7 @@ def test_a_source_with_credentials_sends_them(tmp_path, monkeypatch):
 
     def fake_get(url, headers=None, auth=None, **k):
         seen["auth"] = auth
-        return FakeResponse(200, b"DATA")
+        return response(200, b"DATA")
 
     monkeypatch.setattr(acquire.requests, "get", fake_get)
     src = acquire.Source("cif", "http://x/c.gz", "c.gz", credentials_from="NROD")
@@ -282,7 +276,7 @@ def test_a_source_without_credentials_sends_none(tmp_path, monkeypatch):
 
     def fake_get(url, headers=None, auth=None, **k):
         seen["auth"] = auth
-        return FakeResponse(200, b"DATA")
+        return response(200, b"DATA")
 
     monkeypatch.setattr(acquire.requests, "get", fake_get)
     src = acquire.Source("osm", "http://x/y.pbf", "y.pbf")
@@ -293,7 +287,7 @@ def test_a_source_without_credentials_sends_none(tmp_path, monkeypatch):
 def test_a_401_is_refused_rather_than_raised_as_a_transfer_fault(tmp_path, monkeypatch):
     monkeypatch.setenv("WAYFARE_NROD_USER", "u")
     monkeypatch.setenv("WAYFARE_NROD_PASS", "p")
-    monkeypatch.setattr(acquire.requests, "get", lambda *a, **k: FakeResponse(401, b"nope"))
+    monkeypatch.setattr(acquire.requests, "get", lambda *a, **k: response(401, b"nope"))
     src = acquire.Source("cif", "http://x/c.gz?type=x", "c.gz", credentials_from="NROD")
     with pytest.raises(acquire.Unauthorized, match="401"):
         acquire._stream(src, tmp_path / "c.gz.part")
@@ -308,7 +302,7 @@ def test_a_refusal_is_not_retried(tmp_path, monkeypatch):
 
     def fake_get(*a, **k):
         calls["n"] += 1
-        return FakeResponse(403, b"nope")
+        return response(403, b"nope")
 
     monkeypatch.setattr(acquire.requests, "get", fake_get)
     src = acquire.Source("cif", "http://x/c.gz", "c.gz", credentials_from="NROD")

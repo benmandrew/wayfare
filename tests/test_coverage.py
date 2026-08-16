@@ -226,8 +226,12 @@ def test_the_tilt_is_what_a_hole_shows_up_in(monkeypatch, tmp_path):
     assert bands[0].tilt == 45.0
 
 
-def _lit(path):
-    """The pixels a PNG has anything in, decoded back out of the IDAT."""
+def _grey(path):
+    """A PNG decoded back to (width, height, one byte per pixel).
+
+    Every claim about a drawn map is made on these bytes, because a shade nothing is
+    painted in and a road nothing is drawn along both leave the constants correct.
+    """
     import struct as _struct
     import zlib as _zlib
 
@@ -244,10 +248,17 @@ def _lit(path):
         i += 12 + length
     width, height = size
     data = _zlib.decompress(b"".join(chunks))
-    stride = width + 1
-    return sum(
-        1 for y in range(height) for x in range(width) if data[y * stride + 1 + x]
-    ), (width, height)
+    stride = width + 1  # each row is prefixed by its filter byte
+    pixels = bytes(
+        b"".join(data[y * stride + 1 : y * stride + 1 + width] for y in range(height))
+    )
+    return width, height, pixels
+
+
+def _lit(path):
+    """The pixels a PNG has anything in."""
+    width, height, pixels = _grey(path)
+    return sum(1 for p in pixels if p), (width, height)
 
 
 def test_a_drawn_line_reaches_the_pixels_between_its_ends(tmp_path):
@@ -270,7 +281,7 @@ def test_a_drawn_line_reaches_the_pixels_between_its_ends(tmp_path):
     assert fraction == lit / (w * h)
 
 
-def _line_tile(start, end, extent=4096):
+def _line_tile(start, end, extent=4096, name=b"bus"):
     """One layer, one two-point LineString from start to end, in tile units."""
     sx, sy = start
     ex, ey = end
@@ -286,13 +297,37 @@ def _line_tile(start, end, extent=4096):
         )
     )
     feature = blob(2, key(3, 0) + varint(1) + blob(4, geometry))
-    layer = blob(1, b"bus") + feature + key(5, 0) + varint(extent) + key(15, 0) + varint(2)
+    layer = blob(1, name) + feature + key(5, 0) + varint(extent) + key(15, 0) + varint(2)
     return blob(3, layer)
 
 
 def test_the_layers_are_drawn_in_different_shades(tmp_path):
-    """A tram line must not be mistaken for a road that survived a filter."""
-    assert coverage._SHADES["bus"] > coverage._SHADES["segments"]
+    """A tram line must not be mistaken for a road that survived a filter.
+
+    Read off the picture rather than off `_SHADES`, because the constants can differ
+    while the map does not: a layer whose name never reaches the shade lookup falls
+    back to `_OTHER_SHADE`, and every road and every tram then come out the one
+    colour with nothing to show for it.
+    """
+    path = archive(
+        tmp_path / "a.pmtiles",
+        {
+            0: gzip.compress(
+                _line_tile(at(-20.0, 20.0), at(20.0, 20.0))
+                + _line_tile(at(-20.0, -20.0), at(20.0, -20.0), name=b"segments")
+            )
+        },
+    )
+    out = tmp_path / "a.png"
+    coverage.draw(path, 0, (-40.0, -40.0, 40.0, 40.0), out, width=100)
+    width, height, pixels = _grey(out)
+
+    rows = [set(pixels[y * width : (y + 1) * width]) - {0} for y in range(height)]
+    road = {shade for row in rows[: height // 2] for shade in row}
+    track = {shade for row in rows[height // 2 :] for shade in row}
+    # One shade each, and the road brighter: two values that a viewer can tell apart.
+    assert len(road) == len(track) == 1
+    assert max(road) > max(track)
 
 
 def test_an_empty_window_is_refused_rather_than_drawn(tmp_path):

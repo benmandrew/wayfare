@@ -56,18 +56,25 @@ def test_the_continent_is_dropped(name: str, lat: float, lon: float):
     assert not config.in_british_isles(lat, lon), name
 
 
-@pytest.mark.parametrize(("name", "lat", "lon"), INSIDE + OUTSIDE)
-def test_sql_and_python_agree(con, name: str, lat: float, lon: float):
-    """Two implementations of one boundary, so they are checked against each other.
+@pytest.mark.parametrize(
+    ("name", "lat", "lon", "inside"),
+    [(n, la, lo, True) for n, la, lo in INSIDE]
+    + [(n, la, lo, False) for n, la, lo in OUTSIDE],
+)
+def test_sql_and_python_agree(con, name: str, lat: float, lon: float, inside: bool):
+    """Two implementations of one boundary, each checked against the answer first.
 
-    `patterns` drops routes in SQL and `art` and the CLI test points in Python. A
-    drift between them would show up as a bounding box that disagrees with the rows
-    inside it, which is not a shape any error message would describe.
+    `config.british_isles_sql` is the one the pipeline runs: `gtfs` drops the routes
+    with it, and `osmroutes.bbox` and `trace.bbox` clip their windows with it.
+    `config.in_british_isles` has no caller outside this file -- it is the same
+    boundary written out in Python, kept as the readable statement of it. So a
+    disagreement here is a drift in the SQL that nothing else would report, and
+    checking the two only against each other would pass just as happily if both had
+    drifted together.
     """
     sql = config.british_isles_sql("?::DOUBLE", "?::DOUBLE")
-    assert db.scalar(con, f"SELECT {sql}", [lat, lon, lat]) is config.in_british_isles(
-        lat, lon
-    ), name
+    assert db.scalar(con, f"SELECT {sql}", [lat, lon, lat]) is inside, name
+    assert config.in_british_isles(lat, lon) is inside, name
 
 
 def test_margins_are_wider_than_the_error_in_a_stop_position():

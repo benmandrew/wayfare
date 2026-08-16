@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import json
-
+import builders
 import pytest
 import requests
 
@@ -337,6 +336,25 @@ def test_confidence_score_is_requested():
     assert "confidence_score" in valhalla.EDGE_ATTRS
 
 
+def test_the_trace_request_never_asks_for_the_osrm_format():
+    """The one reason this project uses Valhalla is that `edge.way_id` comes back
+    without a custom graph build, and `format=osrm` drops the way ids silently: the
+    response still parses, still holds edges, and the whole dataset keys on an
+    identity that is no longer in it. So the request must carry no `format` at all,
+    which is what leaves Valhalla answering in its native shape."""
+    posted = {}
+
+    def record(path, payload):
+        posted[path] = payload
+        return {}
+
+    client = valhalla.Client("http://valhalla.test/")
+    client._post = record  # type: ignore[method-assign]
+    client.trace_attributes([(53.0, -2.0), (53.1, -2.0)])
+    assert "format" not in posted["trace_attributes"]
+    assert posted["trace_attributes"]["filters"]["attributes"] == valhalla.EDGE_ATTRS
+
+
 def test_missing_confidence_score_raises_rather_than_defaulting():
     stripped = {k: v for k, v in RESPONSE.items() if k != "confidence_score"}
     with pytest.raises(valhalla.ValhallaError, match="confidence_score"):
@@ -350,27 +368,6 @@ def test_edge_walk_needs_no_confidence_score():
 
 
 # -- what a failure means ---------------------------------------------------
-
-
-class _Session:
-    """A requests.Session that answers with a canned response, or raises."""
-
-    def __init__(self, response=None, raises=None):
-        self.response = response
-        self.raises = raises
-
-    def post(self, url, json=None, timeout=None):
-        if self.raises:
-            raise self.raises
-        return self.response
-
-
-def _response(http_status: int, body: dict | str) -> requests.Response:
-    r = requests.Response()
-    r.status_code = http_status
-    r._content = (json.dumps(body) if isinstance(body, dict) else body).encode()
-    r.headers["Content-Type"] = "application/json"
-    return r
 
 
 def _client(session) -> valhalla.Client:
@@ -400,7 +397,11 @@ def test_every_no_path_code_is_no_route(code):
     code and never on the message. Valhalla's "No path could be found for input" is
     a third party's English, free to change between releases, and a mismatch there
     would file every permanent no-path as a transient error instead."""
-    c = _client(_Session(_response(400, _valhalla_body(code, "prose that may change"))))
+    c = _client(
+        builders.FakeSession(
+            builders.FakeResponse(_valhalla_body(code, "prose that may change"), 400)
+        )
+    )
     with pytest.raises(valhalla.NoRoute):
         c.trace_attributes([(53.0, -2.0), (53.1, -2.0)])
 
@@ -408,7 +409,11 @@ def test_every_no_path_code_is_no_route(code):
 def test_a_malformed_request_stays_a_plain_error():
     """125 is "No costing method found" -- our bug, permanent, and nothing to do
     with whether a road exists."""
-    c = _client(_Session(_response(400, _valhalla_body(125, "No costing method found"))))
+    c = _client(
+        builders.FakeSession(
+            builders.FakeResponse(_valhalla_body(125, "No costing method found"), 400)
+        )
+    )
     with pytest.raises(valhalla.ValhallaError) as exc:
         c.trace_attributes([(53.0, -2.0), (53.1, -2.0)])
     assert not isinstance(exc.value, valhalla.NoRoute)
@@ -423,7 +428,7 @@ def test_a_malformed_request_stays_a_plain_error():
     ],
 )
 def test_transport_faults_are_their_own_exception(exc):
-    c = _client(_Session(raises=exc))
+    c = _client(builders.FakeSession(raises=exc))
     with pytest.raises(valhalla.TransportError) as raised:
         c.trace_attributes([(53.0, -2.0), (53.1, -2.0)])
     # The class name is kept, because "which fault" is the whole diagnosis later.
@@ -441,12 +446,14 @@ def test_valhalla_shutting_down_is_a_transport_fault():
     """Code 102/203/402, HTTP 503: the server is restarting. This is the case that
     put 227 connection failures into one national run."""
     body = {"error_code": 402, "error": "The service is shutting down", "status_code": 503}
-    c = _client(_Session(_response(503, body)))
+    c = _client(builders.FakeSession(builders.FakeResponse(body, 503)))
     with pytest.raises(valhalla.TransportError):
         c.trace_attributes([(53.0, -2.0), (53.1, -2.0)])
 
 
 def test_an_unparseable_body_still_yields_a_message():
-    c = _client(_Session(_response(400, "<html>gateway said no</html>")))
+    c = _client(
+        builders.FakeSession(builders.FakeResponse("<html>gateway said no</html>", 400))
+    )
     with pytest.raises(valhalla.ValhallaError, match="gateway said no"):
         c.trace_attributes([(53.0, -2.0), (53.1, -2.0)])

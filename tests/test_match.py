@@ -5,7 +5,7 @@ from pathlib import Path
 import duckdb
 import pytest
 import requests
-from conftest import FakeClient
+from builders import FakeClient
 
 from wayfare import aggregate, config, gtfs, match, valhalla
 
@@ -49,6 +49,41 @@ def test_interruption_keeps_completed_work(loaded):
     match.run(loaded, client_=client)
     assert match.pending_count(loaded) == 0
     assert len(client.calls) == 1  # only the leftover pattern
+
+
+def test_a_batch_is_committed_before_the_next_one_is_selected(loaded, monkeypatch):
+    """The rule that makes resumption sound, checked from the selection side.
+
+    Work is selected by the *absence* of a `match_status` row, so a batch still in
+    flight is still selectable: loading the next batch before committing the last
+    hands the same patterns out twice, and the second copy of every outcome is
+    written by `INSERT OR REPLACE` without a word. This watches `load_batch` and
+    fails on the first call that can still see an earlier batch's pattern as work.
+    """
+    monkeypatch.setattr(config, "CHECKPOINT_EVERY", 1)
+    select = match.load_batch
+    handed: list[int] = []
+
+    def watched(con, limit):
+        uncommitted = [
+            pid
+            for pid in handed
+            if con.execute(
+                "SELECT 1 FROM match_status WHERE pattern_id = ?", [pid]
+            ).fetchone()
+            is None
+        ]
+        assert uncommitted == [], f"patterns {uncommitted} are selectable while in flight"
+        batch = select(con, limit)
+        handed.extend(p.pattern_id for p in batch)
+        return batch
+
+    monkeypatch.setattr(match, "load_batch", watched)
+    match.run(loaded, client_=FakeClient())
+
+    # Two batches of one, and no pattern in both of them.
+    assert len(handed) == 2
+    assert len(set(handed)) == 2
 
 
 def test_absurd_detour_is_recorded_but_its_edges_are_dropped(loaded):

@@ -8,9 +8,10 @@ The last of those is the one the incremental machinery cares about.
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
-from wayfare import acquire, config, db, gtfs, licences
+from wayfare import acquire, config, db, gtfs, licences, publish
 
 # The real header and row, GUID and all, taken from the 2026-08-08 publication.
 NTA_FEED_INFO = (
@@ -184,3 +185,80 @@ def test_a_republication_moves_the_version_so_a_departure_is_seen(gtfs_dir: Path
         f"count(*) FILTER (WHERE NOT ({db.current_feed()})) FROM patterns p"
     ).fetchone()
     assert (live, departed) == (1, 1)
+
+
+# --- A second region in one data root ----------------------------------------
+#
+# One data root serves one region. Nothing refuses a second one, and the way it goes
+# wrong is quiet on both sides: the pipeline reports a healthy run and the map loses
+# a country.
+
+DUBLIN = {
+    "stops.txt": (
+        "stop_id,stop_name,stop_lat,stop_lon\n"
+        "D1,O'Connell Street,53.3500,-6.2600\n"
+        "D2,Parnell Square,53.3530,-6.2630\n"
+    ),
+    "routes.txt": (
+        "route_id,agency_id,route_short_name,route_long_name,route_type\n"
+        "D1R,OP1,16,Dublin city,3\n"
+    ),
+    "trips.txt": "route_id,service_id,trip_id,direction_id,shape_id\nD1R,WK,TD1,0,\n",
+    "stop_times.txt": (
+        "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+        "TD1,08:00:00,08:00:00,D1,1\n"
+        "TD1,08:06:00,08:06:00,D2,2\n"
+    ),
+}
+
+
+def _irish_feed(gtfs_dir: Path, into: Path) -> Path:
+    """The NTA's feed beside the BODS one: its own stops, its own GUID version."""
+    shutil.copytree(gtfs_dir, into)
+    for name, body in DUBLIN.items():
+        (into / name).write_text(body)
+    return _feed_info(into, NTA_FEED_INFO.format(guid=GUID))
+
+
+def test_a_second_region_retires_the_first_rather_than_joining_it(
+    gtfs_dir: Path, con, tmp_path: Path
+):
+    """`meta.feed_version` holds one value, so two regions cannot both be current.
+
+    Acquiring Ireland into a data root that already holds a British region makes the
+    Irish feed the current one, and every consumer of `patterns` filters on exactly
+    that. The British patterns are still in the table, still matched, and no longer
+    reachable -- they read as services withdrawn from a timetable they were never in.
+    """
+    gtfs.build_patterns(gtfs_dir, con, memory_limit="1GB")
+    assert db.get_meta(con, "feed_version") == "20260806_022608"
+    british = {r[0] for r in con.execute("SELECT pattern_id FROM patterns").fetchall()}
+    assert len(british) == 2
+
+    gtfs.build_patterns(_irish_feed(gtfs_dir, tmp_path / "nta"), con, memory_limit="1GB")
+
+    assert db.get_meta(con, "feed_version") == "20260808_b375dfac"
+    live = {
+        r[0]
+        for r in con.execute(
+            f"SELECT pattern_id FROM patterns p WHERE {db.current_feed()}"
+        ).fetchall()
+    }
+    # Nothing is deleted, so the loss is invisible to any count of the table itself.
+    assert db.scalar(con, "SELECT count(*) FROM patterns") == len(british) + 1
+    assert not (live & british)
+
+
+def test_the_second_regions_publish_writes_over_the_first_ones_archive(
+    tmp_path: Path, monkeypatch
+):
+    """The other half of the same fact, and the half that reaches a served map.
+
+    A publish given no `--out` writes `bus.pmtiles` whatever region it just built, so
+    the second region's archive lands on the first's. The refusal in `default_out`
+    only fires once an archive named after the region is there to be made stale, and
+    a data root that has only ever published the default has nothing of the kind.
+    """
+    monkeypatch.setattr(config, "OUT", tmp_path)
+    assert publish.default_out("wales") == publish.default_out("ireland")
+    assert publish.default_out("ireland").name == publish.DEFAULT_ARCHIVE

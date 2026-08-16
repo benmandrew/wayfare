@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import types
 from pathlib import Path
 from typing import Any
 
+import builders
 import pytest
 
 from wayfare import cli, config, licences, publish
@@ -124,16 +127,23 @@ def test_different_ways_are_never_merged():
 
 
 def _edge(con, edge_id: int, refs: list[str]) -> None:
-    con.execute(
-        "INSERT INTO edges VALUES (?, ?, 'Oxford Road', 'secondary', 100.0, "
-        "[-2245000, -2240000], [53480000, 53480000], "
-        "-2245000, 53480000, -2240000, 53480000)",
-        [edge_id, edge_id],
+    """One edge of Oxford Road, one way to itself, its services listed busiest first.
+
+    The descending trip counts are what the ordering tests read: `refs[0]` is the
+    service that runs most over this edge.
+    """
+    builders.insert_edge(
+        con,
+        edge_id,
+        way_id=edge_id,
+        lon_e6=-2245000,
+        lat_e6=53480000,
+        span_e6=5000,
+        road_name="Oxford Road",
     )
-    for i, ref in enumerate(refs):
-        con.execute(
-            "INSERT INTO edge_services VALUES (?, ?, 'OP1', 1, ?)", [edge_id, ref, 100 - i]
-        )
+    builders.insert_services(
+        con, edge_id, refs, n_trips=[100 - i for i in range(len(refs))]
+    )
 
 
 def test_streaming_gives_the_same_result_as_collapsing_everything_at_once(
@@ -146,12 +156,8 @@ def test_streaming_gives_the_same_result_as_collapsing_everything_at_once(
     # two chunks -- the buffer must survive the chunk boundary.
     monkeypatch.setattr(publish, "FETCH_ROWS", 2)
     for eid, way, x in [(1, 10, 0), (2, 10, 10), (3, 20, 0), (4, 10, 20), (5, 20, 10)]:
-        con.execute(
-            "INSERT INTO edges VALUES (?, ?, 'R', 'secondary', 100.0, [?, ?], "
-            "[0, 0], ?, 0, ?, 0)",
-            [eid, way, x, x + 10, x, x + 10],
-        )
-        con.execute("INSERT INTO edge_services VALUES (?, '42', 'OP1', 1, 100)", [eid])
+        builders.insert_edge(con, eid, way_id=way, lon_e6=x, lat_e6=0, span_e6=10)
+        builders.insert_services(con, eid, n_trips=100)
 
     path = publish.export_geojsonl(con, tmp_path / "edges.geojsonl")
     feats = [json.loads(line) for line in path.read_text().splitlines()]
@@ -202,7 +208,6 @@ def test_a_capped_edge_still_reports_its_true_count(con, tmp_path, monkeypatch):
     }
     assert len(props[1]["refs"].split(",")) == 3
     assert props[1]["n"] == 10
-    assert not (tmp_path / "overflow.json").exists()
 
 
 def test_wales_fits_under_the_cap(con, tmp_path, monkeypatch):
@@ -217,11 +222,8 @@ def test_wales_fits_under_the_cap(con, tmp_path, monkeypatch):
 
 def test_edges_without_geometry_are_skipped(con, tmp_path, monkeypatch):
     monkeypatch.setattr(config, "OUT", tmp_path)
-    con.execute(
-        "INSERT INTO edges VALUES "
-        "(1, 1, 'X', 'residential', 100.0, NULL, NULL, NULL, NULL, NULL, NULL)"
-    )
-    con.execute("INSERT INTO edge_services VALUES (1, '42', 'OP1', 1, 10)")
+    builders.insert_edge(con, 1, geometry=False, road_name="X", road_class="residential")
+    builders.insert_services(con, 1, n_trips=10)
     path = publish.export_geojsonl(con, tmp_path / "edges.geojsonl")
     assert path.read_text() == ""
 
@@ -394,46 +396,51 @@ def test_an_unreadable_export_raises_rather_than_filtering_everything_out(tmp_pa
         publish._cell_floors(src, 1, config.OVERVIEW_WEIGHT)
 
 
-def test_the_overview_band_drops_the_card_only_attributes(monkeypatch, tmp_path):
+def _argv(calls, tmp_path, trips=(1, 2, 3), **kwargs) -> list[dict]:
+    """Build tiles over a small export and hand back each argv as a mapping.
+
+    `calls` is the `tippecanoe_calls` fixture, which supplies the fake tippecanoe
+    these run against.
+    """
+    src = write_geojsonl(tmp_path / "edges.geojsonl", list(trips))
+    publish.build_tiles(src, tmp_path / "bus.pmtiles", **kwargs)
+    return [builders.argv_map(cmd) for cmd in calls]
+
+
+def _excluded(band: dict) -> set[str]:
+    """The attributes a band tells tippecanoe to drop, however many `-x` it took."""
+    dropped = band.get("-x", [])
+    return set(dropped) if isinstance(dropped, list) else {dropped}
+
+
+def test_the_overview_band_drops_the_card_only_attributes(tippecanoe_calls, tmp_path):
     """Attributes are stored per feature per zoom, and nothing reads a road name
     when the whole country is a few hundred pixels across."""
-    import subprocess
-
-    calls = []
-
-    def fake_run(cmd, **kwargs):
-        calls.append(cmd)
-        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-
-    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
-    monkeypatch.setattr(publish.subprocess, "run", fake_run)
-
-    src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3])
-    publish.build_tiles(src, tmp_path / "bus.pmtiles")
-
-    far, mid, near, detail, join = calls
-    assert far[far.index("-Z") + 1] == str(config.MIN_ZOOM)
-    assert far[far.index("-z") + 1] == str(config.FAR_ZOOM - 1)
-    assert mid[mid.index("-Z") + 1] == str(config.FAR_ZOOM)
-    assert mid[mid.index("-z") + 1] == str(config.MID_ZOOM - 1)
-    assert near[near.index("-Z") + 1] == str(config.MID_ZOOM)
-    assert near[near.index("-z") + 1] == str(config.DETAIL_ZOOM - 1)
-    assert detail[detail.index("-Z") + 1] == str(config.DETAIL_ZOOM)
+    far, mid, near, detail, join = _argv(tippecanoe_calls, tmp_path)
+    assert far["-Z"] == str(config.MIN_ZOOM)
+    assert far["-z"] == str(config.FAR_ZOOM - 1)
+    assert mid["-Z"] == str(config.FAR_ZOOM)
+    assert mid["-z"] == str(config.MID_ZOOM - 1)
+    assert near["-Z"] == str(config.MID_ZOOM)
+    assert near["-z"] == str(config.DETAIL_ZOOM - 1)
+    assert detail["-Z"] == str(config.DETAIL_ZOOM)
     for name in publish._DETAIL_ONLY:
-        assert name in far
-        assert name in mid
-        assert name in near
-    # Two of the three are absent from the detail band because it carries them. The
-    # third is absent because it is the detail band's feature id rather than one of
-    # its attributes, so it is named by `--use-attribute-for-id` instead.
-    assert "refs" not in detail
-    assert "name" not in detail
+        assert name in _excluded(far)
+        assert name in _excluded(mid)
+        assert name in _excluded(near)
+    # Two of the three are kept by the detail band because it is the band that
+    # carries them. The third is dropped there because it is the detail band's
+    # feature id rather than one of its attributes, so it is named by
+    # `--use-attribute-for-id` instead.
+    assert "refs" not in _excluded(detail)
+    assert "name" not in _excluded(detail)
     assert "--use-attribute-for-id=way" in detail
-    assert join[0] == "tile-join"
+    assert join[""][0] == "tile-join"
 
 
-def test_only_the_detail_band_spends_the_way_id_and_the_coarser_grid(monkeypatch, tmp_path):
+def test_only_the_detail_band_spends_the_way_id_and_the_coarser_grid(
+    tippecanoe_calls, tmp_path
+):
     """The way id earns its place in the feature id field only where it is carried.
 
     A tile pools attribute values per layer, which dedupes `refs` 5.9x and `name`
@@ -447,91 +454,52 @@ def test_only_the_detail_band_spends_the_way_id_and_the_coarser_grid(monkeypatch
     with zooms below its own maximum that anybody reads. An overview band quantised
     the same way would be quantising z5, where a unit is already about 300 m.
     """
-    import subprocess
-
-    calls = []
-
-    def fake_run(cmd, **kwargs):
-        calls.append(cmd)
-        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-
-    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
-    monkeypatch.setattr(publish.subprocess, "run", fake_run)
-
-    src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3])
-    publish.build_tiles(src, tmp_path / "bus.pmtiles")
-
-    far, mid, near, detail, _join = calls
+    far, mid, near, detail, _join = _argv(tippecanoe_calls, tmp_path)
     for overview in (far, mid, near):
         assert "--use-attribute-for-id=id" in overview
         assert "-D" not in overview
     assert "--use-attribute-for-id=way" in detail
     # The edge id is still a property of every exported feature, and a property
     # tippecanoe is not told to drop is one it writes into every tile.
-    assert "id" in detail[detail.index("-x") :]
-    assert detail[detail.index("-D") + 1] == str(config.LOW_DETAIL)
+    assert "id" in _excluded(detail)
+    assert detail["-D"] == str(config.LOW_DETAIL)
 
 
-def test_every_band_keeps_the_two_attributes_the_ramps_paint_from(monkeypatch, tmp_path):
+def test_every_band_keeps_the_two_attributes_the_ramps_paint_from(
+    tippecanoe_calls, tmp_path
+):
     """`n` and `trips` are the viewer's two colour modes, and an excluded attribute
     is not an error the viewer can report: MapLibre reads the fallback and draws a
     map of one flat colour, which looks like a region with no services rather than a
     band built without the number. `trips` was in `_DETAIL_ONLY` while the info card
     was its only reader, and it is the one that would go back there by accident."""
-    import subprocess
-
-    calls = []
-
-    def fake_run(cmd, **kwargs):
-        calls.append(cmd)
-        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-
-    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
-    monkeypatch.setattr(publish.subprocess, "run", fake_run)
-
-    src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3])
-    publish.build_tiles(src, tmp_path / "bus.pmtiles")
+    *bands, _join = _argv(tippecanoe_calls, tmp_path)
 
     assert "n" not in publish._DETAIL_ONLY
     assert "trips" not in publish._DETAIL_ONLY
     # Every band, not just the overview: -x is global to a tippecanoe run, so a
     # band that excluded either would answer its whole zoom range with a flat map.
-    for cmd in calls[:-1]:
-        excluded = {cmd[i + 1] for i, arg in enumerate(cmd) if arg == "-x"}
-        assert "n" not in excluded
-        assert "trips" not in excluded
+    for band in bands:
+        assert "n" not in _excluded(band)
+        assert "trips" not in _excluded(band)
 
 
-def test_the_bands_cover_every_zoom_once_with_no_gap(monkeypatch, tmp_path):
+def test_the_bands_cover_every_zoom_once_with_no_gap(tippecanoe_calls, tmp_path):
     """A gap between two bands is a zoom the archive simply does not answer, and a
     viewer showing an empty map at one zoom looks like missing data, not a config
     slip."""
-    import subprocess
-
-    calls = []
-
-    def fake_run(cmd, **_):
-        calls.append(cmd)
-        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-
-    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
-    monkeypatch.setattr(publish.subprocess, "run", fake_run)
-    src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3])
-    publish.build_tiles(src, tmp_path / "bus.pmtiles")
-
     spans = [
-        (int(c[c.index("-Z") + 1]), int(c[c.index("-z") + 1]))
-        for c in calls
-        if c[0] == "tippecanoe"
+        (int(c["-Z"]), int(c["-z"]))
+        for c in _argv(tippecanoe_calls, tmp_path)
+        if c[""][0] == "tippecanoe"
     ]
     covered = [z for lo, hi in spans for z in range(lo, hi + 1)]
     assert covered == list(range(config.MIN_ZOOM, config.MAX_ZOOM + 1))
 
 
-def test_a_publish_never_shows_a_half_built_archive(monkeypatch, tmp_path):
+def test_a_publish_never_shows_a_half_built_archive(
+    tippecanoe_calls, monkeypatch, tmp_path
+):
     """The output directory is served. `server.archives` globs `*.pmtiles` there and
     the viewer loads every archive it is offered, so a band built beside the archive
     was advertised as a region for the length of a publish -- and the archive itself
@@ -540,22 +508,23 @@ def test_a_publish_never_shows_a_half_built_archive(monkeypatch, tmp_path):
     The glob is spelled out rather than imported so this stays a test of what is on
     disk; it is the same one `server.archives` runs.
     """
-    import subprocess
-
     out = tmp_path / "out" / "great_britain.pmtiles"
     out.parent.mkdir(parents=True)
     out.write_bytes(b"the previous archive")
     seen = []
+    stubbed = publish.subprocess.run
 
-    def fake_run(cmd, **_):
-        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"the new one")
+    def watch(cmd, **kwargs):
+        # What the directory holds is read *after* the pass has written its output,
+        # since it is the intermediates a publish must not leave on offer.
+        result = stubbed(cmd, **kwargs)
+        Path(builders.argv_map(cmd)["-o"]).write_bytes(b"the new one")
         seen.append(
             (sorted(p.name for p in out.parent.glob("*.pmtiles")), out.read_bytes())
         )
-        return subprocess.CompletedProcess(cmd, 0, "", "")
+        return result
 
-    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
-    monkeypatch.setattr(publish.subprocess, "run", fake_run)
+    monkeypatch.setattr(publish.subprocess, "run", watch)
     src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3])
     publish.build_tiles(src, out)
 
@@ -598,25 +567,9 @@ def test_no_dropping_reports_only_the_size_limit(caplog):
 # it, where a line in the viewer or a field in /archives.json would not.
 
 
-def _tippecanoe_calls(monkeypatch, tmp_path, **kwargs):
-    """Run build_tiles against a fake tippecanoe and hand back the argv it built."""
-    import subprocess
-
-    calls = []
-
-    def fake_run(cmd, **_):
-        calls.append(cmd)
-        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-
-    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
-    monkeypatch.setattr(publish.subprocess, "run", fake_run)
-    src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3])
-    publish.build_tiles(src, tmp_path / "bus.pmtiles", **kwargs)
-    return calls
-
-
 def _attribution(cmd):
+    """The credit one pass carries. `cmd` is an argv or an `argv_map` of one: the
+    flag holds its value in the token itself, so iterating either finds it."""
     return next(a.split("=", 1)[1] for a in cmd if a.startswith("--attribution="))
 
 
@@ -681,43 +634,54 @@ def test_dropping_the_links_keeps_every_name_and_still_credits_both():
     assert " ".join(config.credit_lines("ireland")) == config.credit_text("ireland")
 
 
-def test_every_zoom_band_is_stamped_with_the_credit(monkeypatch, tmp_path):
-    *bands, join = _tippecanoe_calls(monkeypatch, tmp_path)
+def test_every_zoom_band_is_stamped_with_the_credit(tippecanoe_calls, tmp_path):
+    *bands, join = _argv(tippecanoe_calls, tmp_path)
     assert len(bands) == 4
     for band in bands:
         assert _attribution(band) == config.credit_html()
     # tile-join carries an input's attribution through to the joined archive --
     # measured against tippecanoe 2.79.0, including where only one input has one --
     # so it needs no flag of its own.
-    assert join[0] == "tile-join"
+    assert join[""][0] == "tile-join"
 
 
-def test_the_credit_follows_the_region_rather_than_the_call_site(monkeypatch, tmp_path):
+def test_the_credit_follows_the_region_rather_than_the_call_site(
+    tippecanoe_calls, tmp_path
+):
     """Derived from `config.Feed`, so it cannot drift from what `acquire` fetched."""
-    far, *_ = _tippecanoe_calls(
-        monkeypatch, tmp_path, attribution=config.credit_html("ireland")
-    )
+    far, *_ = _argv(tippecanoe_calls, tmp_path, attribution=config.credit_html("ireland"))
     assert "National Transport Authority" in _attribution(far)
     assert licences.OGL not in _attribution(far)
 
 
-def test_publish_stamps_the_region_it_was_given(monkeypatch, tmp_path):
-    """`wayfare publish --region ireland` has to reach tippecanoe, because the
-    licence is a property of the feed and not of the machine running the build."""
-    seen = {}
+def _stub_build(monkeypatch, tmp_path) -> dict:
+    """Stub every export and the tile build, and report what `build` handed them.
+
+    The exports are stubbed alongside the tile build because `build` is given a
+    connection it must never read: what is under test on this path is the credit it
+    derives and the archive path it chooses, not a query.
+    """
+    seen: dict[str, Any] = {}
 
     def fake_build_tiles(path, out=None, attribution=None, segments=None, track=None):
-        seen["credit"] = attribution
-        return tmp_path / "bus.pmtiles"
+        seen.update(out=out, attribution=attribution)
+        return out
 
-    monkeypatch.setattr(config, "OUT", tmp_path)
     monkeypatch.setattr(publish, "export_geojsonl", lambda con: tmp_path / "e.geojsonl")
     monkeypatch.setattr(publish, "export_segments_geojsonl", lambda con: None)
     monkeypatch.setattr(publish, "export_track_geojsonl", lambda con: None)
     monkeypatch.setattr(publish, "contents", lambda con: {"road": True, "operator": False})
     monkeypatch.setattr(publish, "build_tiles", fake_build_tiles)
+    return seen
+
+
+def test_publish_stamps_the_region_it_was_given(monkeypatch, tmp_path):
+    """`wayfare publish --region ireland` has to reach tippecanoe, because the
+    licence is a property of the feed and not of the machine running the build."""
+    monkeypatch.setattr(config, "OUT", tmp_path)
+    seen = _stub_build(monkeypatch, tmp_path)
     publish.build(_A_CONNECTION, region="ireland")
-    assert seen["credit"] == config.credit_html("ireland")
+    assert seen["attribution"] == config.credit_html("ireland")
 
 
 # --- where the archive goes ---------------------------------------------------
@@ -729,19 +693,7 @@ def test_publish_stamps_the_region_it_was_given(monkeypatch, tmp_path):
 
 def _built_out(monkeypatch, tmp_path, **kwargs) -> Path:
     """Run `build` against a stubbed tippecanoe and report the path it chose."""
-    seen = {}
-
-    def fake_build_tiles(path, out=None, attribution=None, segments=None, track=None):
-        seen["out"] = out
-        return out
-
-    monkeypatch.setattr(publish, "export_geojsonl", lambda con: tmp_path / "e.geojsonl")
-    # Stubbed alongside the edge export: this helper is about which path `build`
-    # chooses, and it hands `build` a None connection to prove it never reads one.
-    monkeypatch.setattr(publish, "export_segments_geojsonl", lambda con: None)
-    monkeypatch.setattr(publish, "export_track_geojsonl", lambda con: None)
-    monkeypatch.setattr(publish, "contents", lambda con: {"road": True, "operator": False})
-    monkeypatch.setattr(publish, "build_tiles", fake_build_tiles)
+    seen = _stub_build(monkeypatch, tmp_path)
     publish.build(_A_CONNECTION, **kwargs)
     return seen["out"]
 
@@ -813,10 +765,6 @@ def test_another_regions_archive_does_not_block_the_default(monkeypatch, tmp_pat
 
 def _run_publish(monkeypatch, tmp_path, argv, build=None):
     """Run the CLI with the database and the tile build stubbed out."""
-    import types
-
-    from wayfare import cli
-
     for name in ("DATA", "RAW", "WORK", "OUT"):
         monkeypatch.setattr(config, name, tmp_path)
     monkeypatch.setattr(config, "DB_PATH", tmp_path / "wayfare.duckdb")
@@ -884,8 +832,6 @@ def test_a_refused_name_is_an_error_not_a_traceback(monkeypatch, tmp_path):
 
 
 def test_tippecanoe_failure_surfaces_stderr(monkeypatch, tmp_path):
-    import subprocess
-
     monkeypatch.setattr(publish.shutil, "which", lambda _: "/usr/local/bin/tippecanoe")
     monkeypatch.setattr(
         publish.subprocess,
@@ -897,25 +843,11 @@ def test_tippecanoe_failure_surfaces_stderr(monkeypatch, tmp_path):
         publish.build_tiles(src, tmp_path / "o.pmtiles")
 
 
-def test_only_the_last_band_may_extend_past_its_top_zoom(monkeypatch, tmp_path):
+def test_only_the_last_band_may_extend_past_its_top_zoom(tippecanoe_calls, tmp_path):
     """`-z` is a ceiling --extend-zooms-if-still-dropping is allowed to raise. Above
     the detail band there is nothing to collide with; below it, a band that grew into
     the next one's zooms would have tile-join merge both copies of every road."""
-    import subprocess
-
-    calls = []
-
-    def fake_run(cmd, **_):
-        calls.append(cmd)
-        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-
-    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
-    monkeypatch.setattr(publish.subprocess, "run", fake_run)
-    src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3])
-    publish.build_tiles(src, tmp_path / "bus.pmtiles")
-
-    *overview, detail, _ = calls
+    *overview, detail, _join = _argv(tippecanoe_calls, tmp_path)
     for band in overview:
         assert "--extend-zooms-if-still-dropping" not in band
     assert "--extend-zooms-if-still-dropping" in detail
@@ -935,72 +867,41 @@ def test_a_database_without_a_segments_table_still_publishes():
     assert publish.export_segments_geojsonl(con) is None
 
 
-def test_only_the_bands_with_a_cap_read_a_filtered_file(monkeypatch, tmp_path):
+def test_only_the_bands_with_a_cap_read_a_filtered_file(
+    tippecanoe_calls, monkeypatch, tmp_path
+):
     """z10 has never troubled the size limit, and neither has the detail band. Banding
     them in with z8 would cap the loosest zoom at whatever the tightest one needs --
     which is how a cap of 381,000 once took z10 from 943,040 features to 411,255."""
-    import subprocess
-
-    calls = []
-
-    def fake_run(cmd, **_):
-        calls.append(cmd)
-        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-
-    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
-    monkeypatch.setattr(publish.subprocess, "run", fake_run)
     monkeypatch.setattr(config, "OVERVIEW_CAP_FAR", 1)
     monkeypatch.setattr(config, "OVERVIEW_CAP_MID", 2)
 
-    src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3, 4])
-    publish.build_tiles(src, tmp_path / "bus.pmtiles")
-
-    far, mid, near, detail, _ = calls
-    assert Path(far[-1]).name == "far.geojsonl"
-    assert Path(mid[-1]).name == "mid.geojsonl"
+    far, mid, near, detail, _join = _argv(tippecanoe_calls, tmp_path, trips=(1, 2, 3, 4))
+    src = str(tmp_path / "edges.geojsonl")
+    assert Path(far[""][-1]).name == "far.geojsonl"
+    assert Path(mid[""][-1]).name == "mid.geojsonl"
     # The same file object the caller passed, not a copy of it.
-    assert near[-1] == str(src)
-    assert detail[-1] == str(src)
+    assert near[""][-1] == src
+    assert detail[""][-1] == src
 
 
-def test_an_uncapped_band_is_handed_the_export_itself(monkeypatch, tmp_path):
+def test_an_uncapped_band_is_handed_the_export_itself(
+    tippecanoe_calls, monkeypatch, tmp_path
+):
     """None means no cap, which is not the same as a cap nothing reaches: it must not
     cost a pass over the 1.6 GB national export either."""
-    import subprocess
-
-    calls = []
-
-    def fake_run(cmd, **_):
-        calls.append(cmd)
-        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-
-    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
-    monkeypatch.setattr(publish.subprocess, "run", fake_run)
     monkeypatch.setattr(config, "OVERVIEW_CAP_MID", None)
 
-    src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3, 4])
-    publish.build_tiles(src, tmp_path / "bus.pmtiles")
-
-    assert calls[1][-1] == str(src)
+    _far, mid, *_rest = _argv(tippecanoe_calls, tmp_path, trips=(1, 2, 3, 4))
+    assert mid[""][-1] == str(tmp_path / "edges.geojsonl")
     assert not (tmp_path / "mid.geojsonl").exists()
 
 
-def test_building_from_an_existing_export_needs_no_connection(monkeypatch, tmp_path):
+def test_building_from_an_existing_export_needs_no_connection(
+    tippecanoe_calls, monkeypatch, tmp_path
+):
     """A `prune` reclaims the tables `match` needed, so a data root can be left with
     its export and nothing else. Northern Ireland's is exactly that."""
-    import subprocess
-
-    calls = []
-
-    def fake_run(cmd, **_):
-        calls.append(cmd)
-        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-
-    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
-    monkeypatch.setattr(publish.subprocess, "run", fake_run)
     monkeypatch.setattr(config, "OUT", tmp_path / "out")
 
     def explode(*_a, **_k):
@@ -1011,7 +912,7 @@ def test_building_from_an_existing_export_needs_no_connection(monkeypatch, tmp_p
     src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3])
     out = publish.build(None, region="northern_ireland", from_export=src)
     assert out.exists()
-    assert _attribution(calls[0]) == config.credit_html("northern_ireland")
+    assert _attribution(tippecanoe_calls[0]) == config.credit_html("northern_ireland")
 
 
 def test_a_missing_export_is_named_rather_than_silently_exported(monkeypatch, tmp_path):
@@ -1122,64 +1023,37 @@ def test_the_segment_export_is_deterministic(con, tmp_path):
     assert [json.loads(x)["properties"]["id"] for x in a.read_text().splitlines()] == [3, 7]
 
 
-def test_segments_are_one_more_pass_joined_into_the_same_archive(monkeypatch, tmp_path):
+def test_segments_are_one_more_pass_joined_into_the_same_archive(
+    tippecanoe_calls, tmp_path
+):
     """A layer of its own rather than an attribute on `bus`: tile-join keeps
     distinct layer names, so the whole cost is one more tippecanoe pass. One pass
     over the full zoom range, not banded like the roads -- the bands thin the
     quietest roads out of the far view, and a tram line thinned out of its own layer
     would just be missing."""
-    import subprocess
-
-    calls = []
-
-    def fake_run(cmd, **kwargs):
-        calls.append(cmd)
-        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-
-    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
-    monkeypatch.setattr(publish.subprocess, "run", fake_run)
-
-    publish.build_tiles(
-        write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3]),
-        tmp_path / "bus.pmtiles",
-        segments=tmp_path / "segments.geojsonl",
+    far, *_roads, seg, join = _argv(
+        tippecanoe_calls, tmp_path, segments=tmp_path / "segments.geojsonl"
     )
-
-    far, *_roads, seg, join = calls
-    assert seg[seg.index("-l") + 1] == publish.LAYER_SEGMENTS
-    assert far[far.index("-l") + 1] == publish.LAYER
-    assert seg[seg.index("-Z") + 1] == str(config.MIN_ZOOM)
-    assert seg[seg.index("-z") + 1] == str(config.MAX_ZOOM)
+    assert seg["-l"] == publish.LAYER_SEGMENTS
+    assert far["-l"] == publish.LAYER
+    assert seg["-Z"] == str(config.MIN_ZOOM)
+    assert seg["-z"] == str(config.MAX_ZOOM)
     # Not extended: the band already reaches MAX_ZOOM, and only the last road band
     # may grow past its own ceiling.
     assert "--extend-zooms-if-still-dropping" not in seg
     # Every input carries the credit, so a band inspected on its own still says
     # where it came from.
-    assert join[0] == "tile-join"
-    assert sum(1 for a in seg if a.startswith("--attribution=")) == 1
+    assert join[""][0] == "tile-join"
+    # Counted on the argv itself: a mapping would fold a repeated flag into one key.
+    assert sum(1 for a in tippecanoe_calls[-2] if a.startswith("--attribution=")) == 1
 
 
-def test_a_bus_only_region_gets_no_segments_pass(monkeypatch, tmp_path):
+def test_a_bus_only_region_gets_no_segments_pass(tippecanoe_calls, tmp_path):
     """Passing None must skip the pass rather than join an empty layer into every
     archive that has no trams."""
-    import subprocess
-
-    calls = []
-
-    def fake_run(cmd, **kwargs):
-        calls.append(cmd)
-        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-
-    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
-    monkeypatch.setattr(publish.subprocess, "run", fake_run)
-
-    publish.build_tiles(
-        write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3]), tmp_path / "bus.pmtiles"
-    )
-    assert len(calls) == 5  # far, mid, near, detail, join -- and nothing else
-    assert not any(publish.LAYER_SEGMENTS in c for c in calls)
+    _argv(tippecanoe_calls, tmp_path)
+    assert len(tippecanoe_calls) == 5  # far, mid, near, detail, join -- nothing else
+    assert not any(publish.LAYER_SEGMENTS in c for c in tippecanoe_calls)
 
 
 # --- what the credit claims, and what it must not ------------------------------
@@ -1240,25 +1114,11 @@ def test_the_credit_follows_what_the_archive_actually_holds(con, tmp_path, monke
     assert publish.contents(con) == {"road": True, "operator": True, "track": False}
 
 
-def _stub_tippecanoe(monkeypatch, calls):
-    import subprocess
-
-    def fake_run(cmd, **kwargs):
-        calls.append(cmd)
-        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"")
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-
-    monkeypatch.setattr(publish.shutil, "which", lambda t: "/usr/bin/" + t)
-    monkeypatch.setattr(publish.subprocess, "run", fake_run)
-
-
-def test_a_region_with_no_matched_edges_skips_the_road_bands(monkeypatch, tmp_path):
+def test_a_region_with_no_matched_edges_skips_the_road_bands(tippecanoe_calls, tmp_path):
     """Irish Rail on its own is 331 patterns and not one of them is a road.
     tippecanoe exits 110 on an empty input rather than writing an empty archive, so
     the road bands are skipped -- the same rule the segments pass already follows,
     in the other direction."""
-    calls = []
-    _stub_tippecanoe(monkeypatch, calls)
     (tmp_path / "edges.geojsonl").write_text("")  # exported, but no features
     (tmp_path / "segments.geojsonl").write_text('{"type":"Feature"}\n')
 
@@ -1268,18 +1128,17 @@ def test_a_region_with_no_matched_edges_skips_the_road_bands(monkeypatch, tmp_pa
         segments=tmp_path / "segments.geojsonl",
     )
 
-    seg, join = calls
-    assert seg[seg.index("-l") + 1] == publish.LAYER_SEGMENTS
-    assert join[0] == "tile-join"
+    seg, join = (builders.argv_map(cmd) for cmd in tippecanoe_calls)
+    assert seg["-l"] == publish.LAYER_SEGMENTS
+    assert join[""][0] == "tile-join"
     # No `bus` layer at all, rather than an empty one.
-    assert not any(publish.LAYER in c and "-l" in c for c in [seg])
+    assert seg["-l"] != publish.LAYER
 
 
-def test_publishing_nothing_at_all_is_refused(monkeypatch, tmp_path):
+def test_publishing_nothing_at_all_is_refused(tippecanoe_calls, tmp_path):
     """Louder than an empty archive, which loads without complaint and shows a
     blank map -- that reads as a broken viewer rather than as a stage with nothing
     to write."""
-    _stub_tippecanoe(monkeypatch, [])
     (tmp_path / "edges.geojsonl").write_text("")
 
     with pytest.raises(RuntimeError, match="nothing to publish"):

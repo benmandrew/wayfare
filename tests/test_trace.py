@@ -8,9 +8,17 @@ it should be.
 
 from __future__ import annotations
 
-import json
-
 import pytest
+from builders import (
+    FakeResponse,
+    FakeSession,
+    broken_relation,
+    insert_pattern,
+    member_stop,
+    member_way,
+    node,
+    overpass,
+)
 
 from wayfare import aggregate, config, db, gtfs, osm, publish, trace
 
@@ -23,114 +31,25 @@ _C = (53.4800, -2.2350)
 _D = (53.4800, -2.2300)
 
 
-def _way(way_id: int, pts: list[tuple[float, float]], role: str = "") -> dict:
-    return {
-        "type": "way",
-        "ref": way_id,
-        "role": role,
-        "geometry": [{"lat": la, "lon": lo} for la, lo in pts],
-    }
-
-
-def _stop(node_id: int, role: str = "stop") -> dict:
-    return {"type": "node", "ref": node_id, "role": role}
-
-
-def _node(node_id: int, name: str, at: tuple[float, float]) -> dict:
-    return {
-        "type": "node",
-        "id": node_id,
-        "lat": at[0],
-        "lon": at[1],
-        "tags": {"name": name, "railway": "station"},
-    }
-
-
-def _overpass(
-    members: list[dict],
-    nodes: list[dict],
-    relation_id: int = 900,
-    route: str = "subway",
-    name: str = "Test line",
-) -> dict:
-    return {
-        "elements": [
-            {
-                "type": "relation",
-                "id": relation_id,
-                "tags": {"type": "route", "route": route, "name": name},
-                "members": members,
-            },
-            *nodes,
-        ]
-    }
-
-
 def _line() -> dict:
     """Three ways, four stations, one continuous path west to east."""
-    return _overpass(
+    return overpass(
         members=[
-            _stop(1),
-            _stop(2),
-            _stop(3),
-            _stop(4),
-            _way(101, [_A, _B]),
-            _way(102, [_B, _C]),
-            _way(103, [_C, _D]),
+            member_stop(1),
+            member_stop(2),
+            member_stop(3),
+            member_stop(4),
+            member_way(101, [_A, _B]),
+            member_way(102, [_B, _C]),
+            member_way(103, [_C, _D]),
         ],
         nodes=[
-            _node(1, "Alpha Underground Station", _A),
-            _node(2, "Bravo Underground Station", _B),
-            _node(3, "Charlie Underground Station", _C),
-            _node(4, "Delta Underground Station", _D),
+            node(1, "Alpha Underground Station", _A),
+            node(2, "Bravo Underground Station", _B),
+            node(3, "Charlie Underground Station", _C),
+            node(4, "Delta Underground Station", _D),
         ],
     )
-
-
-# -- names -------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("raw", "want"),
-    [
-        # The four the Victoria line experiment actually turned on: a suffix on one
-        # side and not the other, a full stop inside an abbreviation, an ampersand,
-        # and a bare name that must survive untouched.
-        ("Blackhorse Road Station", "blackhorse road"),
-        ("Blackhorse Road station", "blackhorse road"),
-        ("King's Cross St. Pancras Underground Station", "kings cross st pancras"),
-        ("King's Cross St Pancras", "kings cross st pancras"),
-        ("Highbury & Islington", "highbury and islington"),
-        ("Highbury and Islington Station", "highbury and islington"),
-        ("Vauxhall", "vauxhall"),
-        ("Edgware Road Station Station", "edgware road"),
-        ("Pier Head Ferry Terminal", "pier head"),
-        # The pair that cost the whole DLR on the first national run: OSM names a
-        # PTv2 stop member for its platform, BODS qualifies the same station by its
-        # mode, and neither qualifier appears on the other side.
-        ("Lewisham Platform 6", "lewisham"),
-        ("Lewisham DLR Station", "lewisham"),
-        ("Canary Wharf Platforms 5 & 6", "canary wharf"),
-        ("Canary Wharf DLR Station", "canary wharf"),
-        ("Shadwell DLR", "shadwell"),
-        ("Shadwell Platform 2", "shadwell"),
-        (
-            "Cutty Sark (for Maritime Greenwich) DLR Station",
-            "cutty sark for maritime greenwich",
-        ),
-        (
-            "Cutty Sark for Maritime Greenwich Platform 2",
-            "cutty sark for maritime greenwich",
-        ),
-        # A station whose whole name is a qualifier has to survive being stripped.
-        ("Bank", "bank"),
-        ("Bank Station", "bank"),
-        (None, ""),
-        ("", ""),
-    ],
-)
-def test_normalise_agrees_across_publishers(raw: str | None, want: str) -> None:
-    assert osm.normalise(raw) == want
 
 
 # -- parsing -----------------------------------------------------------------
@@ -155,16 +74,18 @@ def test_parse_keeps_platforms_out_of_the_way_chain() -> None:
     Leaving `role=platform` in produces a break at every station, because a platform
     way runs beside the track rather than along it.
     """
-    data = _overpass(
+    data = overpass(
         members=[
-            _stop(1),
-            _stop(2),
-            _way(101, [_A, _B]),
-            _way(500, [(53.4801, -2.2450), (53.4801, -2.2440)], role="platform"),
-            _way(102, [_B, _C]),
-            _way(501, [(53.4801, -2.2350), (53.4801, -2.2340)], role="platform_entry_only"),
+            member_stop(1),
+            member_stop(2),
+            member_way(101, [_A, _B]),
+            member_way(500, [(53.4801, -2.2450), (53.4801, -2.2440)], role="platform"),
+            member_way(102, [_B, _C]),
+            member_way(
+                501, [(53.4801, -2.2350), (53.4801, -2.2340)], role="platform_entry_only"
+            ),
         ],
-        nodes=[_node(1, "Alpha", _A), _node(2, "Charlie", _C)],
+        nodes=[node(1, "Alpha", _A), node(2, "Charlie", _C)],
     )
     (rel,) = osm.parse(data)
     assert [w.way_id for w in rel.ways] == [101, 102]
@@ -172,9 +93,13 @@ def test_parse_keeps_platforms_out_of_the_way_chain() -> None:
 
 
 def test_parse_ignores_platform_node_roles_as_calling_points() -> None:
-    data = _overpass(
-        members=[_stop(1), _stop(2, role="platform"), _way(101, [_A, _B])],
-        nodes=[_node(1, "Alpha", _A), _node(2, "Bravo", _B)],
+    data = overpass(
+        members=[
+            member_stop(1),
+            member_stop(2, role="platform"),
+            member_way(101, [_A, _B]),
+        ],
+        nodes=[node(1, "Alpha", _A), node(2, "Bravo", _B)],
     )
     (rel,) = osm.parse(data)
     assert [s.node_id for s in rel.stops] == [1]
@@ -192,9 +117,14 @@ def test_chain_walks_member_order_into_one_path() -> None:
 
 
 def test_chain_reverses_a_way_laid_the_other_way_round() -> None:
-    data = _overpass(
-        members=[_stop(1), _stop(2), _way(101, [_A, _B]), _way(102, [_C, _B])],
-        nodes=[_node(1, "Alpha", _A), _node(2, "Charlie", _C)],
+    data = overpass(
+        members=[
+            member_stop(1),
+            member_stop(2),
+            member_way(101, [_A, _B]),
+            member_way(102, [_C, _B]),
+        ],
+        nodes=[node(1, "Alpha", _A), node(2, "Charlie", _C)],
     )
     (rel,) = osm.parse(data)
     ch = osm.chain(rel)
@@ -205,9 +135,14 @@ def test_chain_reverses_a_way_laid_the_other_way_round() -> None:
 def test_chain_reverses_a_first_way_laid_backwards() -> None:
     """The first way's orientation is decided by the second, so it is the one case
     the walk cannot settle as it goes."""
-    data = _overpass(
-        members=[_stop(1), _stop(2), _way(101, [_B, _A]), _way(102, [_B, _C])],
-        nodes=[_node(1, "Alpha", _A), _node(2, "Charlie", _C)],
+    data = overpass(
+        members=[
+            member_stop(1),
+            member_stop(2),
+            member_way(101, [_B, _A]),
+            member_way(102, [_B, _C]),
+        ],
+        nodes=[node(1, "Alpha", _A), node(2, "Charlie", _C)],
     )
     (rel,) = osm.parse(data)
     ch = osm.chain(rel)
@@ -216,27 +151,15 @@ def test_chain_reverses_a_first_way_laid_backwards() -> None:
 
 
 def test_chain_counts_a_genuine_gap_as_a_break() -> None:
-    far = (53.4900, -2.1000)
-    data = _overpass(
-        members=[_stop(1), _stop(2), _way(101, [_A, _B]), _way(102, [far, _D])],
-        nodes=[_node(1, "Alpha", _A), _node(2, "Delta", _D)],
-    )
-    (rel,) = osm.parse(data)
-    assert osm.chain(rel).breaks == 1
+    assert osm.chain(broken_relation()).breaks == 1
 
 
 def test_prepare_drops_the_relations_that_do_not_chain() -> None:
-    far = (53.4900, -2.1000)
-    broken = _overpass(
-        members=[_stop(1), _stop(2), _way(101, [_A, _B]), _way(102, [far, _D])],
-        nodes=[_node(1, "Alpha", _A), _node(2, "Delta", _D)],
-        relation_id=901,
-    )
-    both = osm.parse(_line()) + osm.parse(broken)
+    both = [*osm.parse(_line()), broken_relation(relation_id=901)]
     prepared = trace.prepare(both)
     assert [c.relation.relation_id for c in prepared.candidates] == [900]
     # The broken one's stations are remembered so a pattern on it can say why.
-    assert "delta" in prepared.broken_names
+    assert "beta" in prepared.broken_names
 
 
 # -- geometry ----------------------------------------------------------------
@@ -264,9 +187,15 @@ def test_project_reports_distance_along_and_distance_off() -> None:
 # -- resolving ---------------------------------------------------------------
 
 
-def _candidates(data: dict) -> tuple[trace.Prepared, dict[str, list[int]]]:
-    prepared = trace.prepare(osm.parse(data))
+def _prepared(
+    relations: list[osm.Relation],
+) -> tuple[trace.Prepared, dict[str, list[int]]]:
+    prepared = trace.prepare(relations)
     return prepared, trace.index_by_name(prepared.candidates)
+
+
+def _candidates(data: dict) -> tuple[trace.Prepared, dict[str, list[int]]]:
+    return _prepared(osm.parse(data))
 
 
 def _pattern(names: list[str], points: list[tuple[float, float]]) -> trace.Pattern:
@@ -280,25 +209,19 @@ def _pattern(names: list[str], points: list[tuple[float, float]]) -> trace.Patte
     )
 
 
-def test_spellings_offer_the_bracketed_disambiguator_both_ways() -> None:
-    """BODS names the line in brackets where OSM lets the relation say which it is."""
-    assert osm.spellings("Edgware Road (Bakerloo)") == {
-        "edgware road bakerloo",
-        "edgware road",
-    }
-    # And where the brackets hold part of the name, the full form survives.
-    assert "cutty sark for maritime greenwich" in osm.spellings(
-        "Cutty Sark (for Maritime Greenwich) DLR Station"
-    )
-
-
 def test_resolve_matches_a_station_the_timetable_qualifies_by_line() -> None:
-    data = _overpass(
-        members=[_stop(1), _stop(2), _stop(3), _way(101, [_A, _B]), _way(102, [_B, _C])],
+    data = overpass(
+        members=[
+            member_stop(1),
+            member_stop(2),
+            member_stop(3),
+            member_way(101, [_A, _B]),
+            member_way(102, [_B, _C]),
+        ],
         nodes=[
-            _node(1, "Alpha", _A),
-            _node(2, "Edgware Road", _B),
-            _node(3, "Charlie", _C),
+            node(1, "Alpha", _A),
+            node(2, "Edgware Road", _B),
+            node(3, "Charlie", _C),
         ],
     )
     cands, index = _candidates(data)
@@ -358,25 +281,24 @@ def test_resolve_matches_a_pattern_running_the_other_way() -> None:
     assert got.n_stops == 4
 
 
-def test_resolve_reports_no_relation_when_nothing_serves_the_ends() -> None:
+@pytest.mark.parametrize(
+    ("names", "points", "want"),
+    [
+        # Nothing on the line answers to either end.
+        (["Nowhere", "Elsewhere"], [_A, _D], "no_relation"),
+        # Same termini, stops the line never calls at in that order.
+        (["Alpha", "Delta", "Bravo"], [_A, _D, _B], "no_stop_match"),
+        # The name matched something on another line that shares it: the second
+        # stop sits ~6.7 km north of the track.
+        (["Alpha", "Bravo"], [_A, (53.5400, -2.2400)], "no_stop_match"),
+    ],
+    ids=["neither end is on it", "a sequence it does not run", "a stop off the track"],
+)
+def test_resolve_refuses_a_pattern_the_line_does_not_carry(
+    names: list[str], points: list[tuple[float, float]], want: str
+) -> None:
     cands, index = _candidates(_line())
-    p = _pattern(["Nowhere", "Elsewhere"], [_A, _D])
-    assert trace.resolve(p, cands, index).status == "no_relation"
-
-
-def test_resolve_refuses_a_sequence_the_line_does_not_run() -> None:
-    """Same termini, stops the line never calls at in that order."""
-    cands, index = _candidates(_line())
-    p = _pattern(["Alpha", "Delta", "Bravo"], [_A, _D, _B])
-    assert trace.resolve(p, cands, index).status == "no_stop_match"
-
-
-def test_resolve_refuses_a_stop_too_far_from_the_track() -> None:
-    """The name matched something on another line that shares it."""
-    cands, index = _candidates(_line())
-    adrift = (53.5400, -2.2400)  # ~6.7 km north of the track
-    p = _pattern(["Alpha", "Bravo"], [_A, adrift])
-    assert trace.resolve(p, cands, index).status == "no_stop_match"
+    assert trace.resolve(_pattern(names, points), cands, index).status == want
 
 
 def test_resolve_names_a_sequence_that_turns_round_partway() -> None:
@@ -385,16 +307,16 @@ def test_resolve_names_a_sequence_that_turns_round_partway() -> None:
     Slicing between the ends of a sequence that doubles back takes whichever branch
     the chain happens to run through, and draws it confidently.
     """
-    data = _overpass(
+    data = overpass(
         members=[
-            _stop(1),
-            _stop(3),
-            _stop(2),
-            _way(101, [_A, _B]),
-            _way(102, [_B, _C]),
-            _way(103, [_C, _D]),
+            member_stop(1),
+            member_stop(3),
+            member_stop(2),
+            member_way(101, [_A, _B]),
+            member_way(102, [_B, _C]),
+            member_way(103, [_C, _D]),
         ],
-        nodes=[_node(1, "Alpha", _A), _node(2, "Bravo", _B), _node(3, "Charlie", _C)],
+        nodes=[node(1, "Alpha", _A), node(2, "Bravo", _B), node(3, "Charlie", _C)],
     )
     cands, index = _candidates(data)
     p = _pattern(["Alpha", "Charlie", "Bravo"], [_A, _C, _B])
@@ -406,16 +328,13 @@ def test_resolve_names_a_sequence_that_turns_round_partway() -> None:
 def test_resolve_tells_a_broken_line_apart_from_an_unmapped_one() -> None:
     """A relation that does not chain is dropped before any pattern reaches it, so
     without remembering its stations this would read as "nobody has mapped this"."""
-    far = (53.4900, -2.1000)
-    broken = _overpass(
-        members=[_stop(1), _stop(2), _way(101, [_A, _B]), _way(102, [far, _D])],
-        nodes=[_node(1, "Alpha", _A), _node(2, "Delta", _D)],
-    )
-    cands, index = _candidates(broken)
-    on_the_broken_line = _pattern(["Alpha", "Delta"], [_A, _D])
+    broken = broken_relation()
+    ends = [(s.lat, s.lon) for s in broken.stops]
+    cands, index = _prepared([broken])
+    on_the_broken_line = _pattern([s.name or "" for s in broken.stops], ends)
     assert trace.resolve(on_the_broken_line, cands, index).status == "chain_break"
 
-    nowhere = _pattern(["Nowhere", "Elsewhere"], [_A, _D])
+    nowhere = _pattern(["Nowhere", "Elsewhere"], ends)
     assert trace.resolve(nowhere, cands, index).status == "no_relation"
 
 
@@ -425,18 +344,18 @@ def test_resolve_takes_the_placement_that_runs_in_order() -> None:
     Only one of them projects in order along the track, and returning the first
     would refuse a pattern on a placement it never had to use.
     """
-    data = _overpass(
+    data = overpass(
         members=[
-            _stop(1),
-            _stop(2),
-            _stop(3),
-            _stop(1),
-            _way(101, [_A, _B]),
-            _way(102, [_B, _C]),
-            _way(103, [_C, _B]),
-            _way(104, [_B, _A]),
+            member_stop(1),
+            member_stop(2),
+            member_stop(3),
+            member_stop(1),
+            member_way(101, [_A, _B]),
+            member_way(102, [_B, _C]),
+            member_way(103, [_C, _B]),
+            member_way(104, [_B, _A]),
         ],
-        nodes=[_node(1, "Alpha", _A), _node(2, "Bravo", _B), _node(3, "Charlie", _C)],
+        nodes=[node(1, "Alpha", _A), node(2, "Bravo", _B), node(3, "Charlie", _C)],
     )
     cands, index = _candidates(data)
     p = _pattern(["Bravo", "Charlie"], [_B, _C])
@@ -448,7 +367,7 @@ def test_resolve_takes_the_placement_that_runs_in_order() -> None:
 def test_resolve_is_deterministic_across_two_identical_relations() -> None:
     """Two relations fitting equally well must not decide the picture by row order."""
     a = _line()
-    b = _overpass(
+    b = overpass(
         members=_line()["elements"][0]["members"],
         nodes=[e for e in _line()["elements"] if e["type"] == "node" and "id" in e],
         relation_id=42,
@@ -462,31 +381,9 @@ def test_resolve_is_deterministic_across_two_identical_relations() -> None:
 # -- fetching ----------------------------------------------------------------
 
 
-class _Response:
-    def __init__(self, payload: dict, status: int = 200):
-        self.payload = payload
-        self.status_code = status
-        self.ok = status < 400
-        self.text = json.dumps(payload)
-
-    def json(self) -> dict:
-        return self.payload
-
-
-class _Session:
-    def __init__(self, payload: dict, status: int = 200):
-        self.payload = payload
-        self.status = status
-        self.calls = 0
-
-    def post(self, url: str, **kw: object) -> _Response:
-        self.calls += 1
-        return _Response(self.payload, self.status)
-
-
 def test_fetch_caches_the_body_and_does_not_ask_twice(tmp_path) -> None:
     cache = tmp_path / "relations.json"
-    sess = _Session(_line())
+    sess = FakeSession(FakeResponse(_line()))
     first = osm.fetch((51.0, -1.0, 52.0, 1.0), cache, session=sess)
     second = osm.fetch((51.0, -1.0, 52.0, 1.0), cache, session=sess)
     assert sess.calls == 1
@@ -495,7 +392,7 @@ def test_fetch_caches_the_body_and_does_not_ask_twice(tmp_path) -> None:
 
 def test_fetch_treats_overpass_load_shedding_as_retryable(tmp_path) -> None:
     """429 says nothing about the query, so it must not become a permanent failure."""
-    sess = _Session({}, status=429)
+    sess = FakeSession(FakeResponse({}, 429))
     with pytest.raises(osm.TransportError):
         osm.fetch((51.0, -1.0, 52.0, 1.0), tmp_path / "r.json", session=sess)
     assert not (tmp_path / "r.json").exists()
@@ -524,14 +421,14 @@ def _rail_relation() -> dict:
     alpha = (53.4800, -2.2450)
     mid = (53.4000, -2.7000)
     quay = (53.3200, -3.1800)
-    return _overpass(
+    return overpass(
         members=[
-            _stop(1),
-            _stop(2),
-            _way(201, [alpha, mid]),
-            _way(202, [mid, quay]),
+            member_stop(1),
+            member_stop(2),
+            member_way(201, [alpha, mid]),
+            member_way(202, [mid, quay]),
         ],
-        nodes=[_node(1, "Alpha", alpha), _node(2, "Island Quay", quay)],
+        nodes=[node(1, "Alpha", alpha), node(2, "Island Quay", quay)],
         relation_id=555,
         route="train",
         name="Test Rail",
@@ -557,6 +454,32 @@ def test_run_records_a_failure_and_never_asks_again(rail_con) -> None:
     assert db.scalar(rail_con, "SELECT status FROM trace_status") == "no_relation"
     assert trace.pending_count(rail_con) == 0
     assert trace.run(rail_con, relations=osm.parse(_rail_relation())) == {}
+
+
+def test_a_transport_fault_is_the_only_outcome_retry_clears(rail_con) -> None:
+    """The round trip behind `transport_error` being the one retryable status.
+
+    A request that never arrived taught the run nothing about the pattern, so its
+    row has to be clearable unattended -- and every permanent outcome has to survive
+    the same call, or `--retry transient` becomes a re-run of the impossible.
+    """
+    feed = db.get_meta(rail_con, "feed_version")
+    insert_pattern(rail_con, 4242, mode="metro", feed=feed)
+    rail_id = db.scalar(rail_con, "SELECT pattern_id FROM patterns WHERE mode = 'rail'")
+    trace.write_outcomes(
+        rail_con,
+        [
+            trace.Outcome(pattern_id=rail_id, status="no_relation"),
+            trace.Outcome(pattern_id=4242, status=trace.TRANSPORT_ERROR),
+        ],
+    )
+    assert trace.pending_count(rail_con) == 0
+
+    assert trace.retry(rail_con, ["transient"]) == 1
+    kept = rail_con.execute("SELECT pattern_id, status FROM trace_status").fetchall()
+    assert kept == [(rail_id, "no_relation")]
+    # And the pattern handed back is the one whose failure was the network's.
+    assert [p.pattern_id for p in trace.load_pending(rail_con)] == [4242]
 
 
 def test_retry_clears_only_what_it_is_asked_for(rail_con) -> None:

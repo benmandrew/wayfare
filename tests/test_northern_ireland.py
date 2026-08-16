@@ -16,6 +16,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
+from builders import FakeResponse
 
 from wayfare import acquire, config, db, gtfs, licences, mapinfo, translink
 
@@ -208,14 +209,15 @@ def _mif_mid(tmp_path: Path, mif: str, mid: str) -> tuple[Path, Path]:
 # --- The MIF/MID reader ------------------------------------------------------
 
 
-def test_the_header_names_the_columns_and_the_delimiter(tmp_path: Path):
+def test_the_header_names_the_columns_and_the_delimiter():
     lines = iter(STOPPING_MIF.splitlines())
     head = mapinfo.header(lines)
     assert head.columns[:4] == ("SubNetwork", "StopID", "StopAreaID", "StoppingPointID")
     assert head.delimiter == ","
     assert head.encoding == "cp1252"
-    # The iterator is left on the first object, not on the header's last line.
-    assert next(lines).strip() in ("", "POINT -5.9300 54.5900")
+    # `Data` is the last line the header consumes, so what is left is the object
+    # section: the blank line that follows it and then the first object.
+    assert [ln.strip() for ln in lines][:2] == ["", "POINT -5.9300 54.5900"]
 
 
 def test_attributes_join_to_geometry_by_position_alone(tmp_path: Path):
@@ -433,22 +435,16 @@ def test_patterns_build_from_the_assembled_feed(ni_gtfs: Path, con):
 
 
 class FakeCkan:
-    """CKAN's package_show, with the shape the real one has: several formats in
-    one dataset and several ZIPs of different vintages."""
+    """A session serving CKAN's package_show, with the shape the real one has:
+    several formats in one dataset and several ZIPs of different vintages."""
 
-    def __init__(self, body):
+    def __init__(self, body: dict):
         self.body = body
-        self.seen = []
+        self.seen: list[tuple[str, dict | None]] = []
 
-    def get(self, url, params=None, headers=None, timeout=None):
+    def get(self, url, params=None, headers=None, timeout=None) -> FakeResponse:
         self.seen.append((url, params))
-        return self
-
-    def raise_for_status(self):
-        return None
-
-    def json(self):
-        return self.body
+        return FakeResponse(self.body)
 
 
 PACKAGE = {
@@ -495,7 +491,7 @@ def test_a_refused_package_show_is_an_error():
         translink.resource("x", session=FakeCkan({"success": False}))
 
 
-def test_the_province_is_four_datasets_and_no_naptan(monkeypatch):
+def test_the_province_is_four_datasets_and_no_naptan():
     feed = config.feed("northern_ireland")
     assert feed.url == ""
     assert [p.kind for p in feed.parts] == [

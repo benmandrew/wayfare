@@ -10,7 +10,7 @@ the country's timetable by how thoroughly its corridors happen to be mapped.
 
 from __future__ import annotations
 
-from test_osmroutes import stop, way
+from builders import broken_relation, stop, way
 
 from wayfare import db, naptan, osm, railtrips
 
@@ -57,15 +57,7 @@ def test_a_chaining_relation_becomes_a_line_with_its_stops_projected():
 
 
 def test_a_relation_that_does_not_chain_is_not_a_line():
-    broken = osm.Relation(
-        relation_id=2,
-        route="train",
-        name="Broken",
-        ways=(way(10, [A, B]), way(11, [(52.0, -1.0), (52.1, -1.0)])),
-        stops=(stop(1, "Alpha", *A), stop(2, "Beta", *B)),
-        tags={"route": "train"},
-    )
-    assert railtrips.lines([broken]) == []
+    assert railtrips.lines([broken_relation(relation_id=2)]) == []
 
 
 # --- attribution -------------------------------------------------------------

@@ -9,52 +9,11 @@ already exists, and that a relation which stops qualifying stops being drawn.
 from __future__ import annotations
 
 import pytest
+from builders import broken_relation, relation, stop, way
 
-from wayfare import db, osm, osmroutes
+from wayfare import db, osmroutes
 
 FEED = "20260812_test"
-
-
-def way(way_id: int, points: list[tuple[float, float]]) -> osm.Way:
-    return osm.Way(way_id, tuple(points))
-
-
-def stop(node_id: int, name: str, lat: float, lon: float) -> osm.Stop:
-    return osm.Stop(node_id, name, lat, lon)
-
-
-def relation(
-    relation_id: int = 1,
-    route: str = "train",
-    name: str = "Test Line",
-    ways: list[osm.Way] | None = None,
-    stops: list[osm.Stop] | None = None,
-    tags: dict[str, str] | None = None,
-) -> osm.Relation:
-    ways = (
-        ways
-        if ways is not None
-        else [
-            way(10, [(51.0, -1.0), (51.1, -1.0)]),
-            way(11, [(51.1, -1.0), (51.2, -1.0)]),
-        ]
-    )
-    stops = (
-        stops
-        if stops is not None
-        else [
-            stop(100, "Alpha Rail Station", 51.0, -1.0),
-            stop(101, "Beta Rail Station", 51.2, -1.0),
-        ]
-    )
-    return osm.Relation(
-        relation_id=relation_id,
-        route=route,
-        name=name,
-        ways=tuple(ways),
-        stops=tuple(stops),
-        tags={"route": route, "name": name, **(tags or {})},
-    )
 
 
 # --- the gate ----------------------------------------------------------------
@@ -72,11 +31,7 @@ def test_a_chaining_relation_becomes_a_candidate():
 
 def test_a_relation_that_does_not_chain_is_refused():
     """A break draws confident track across a gap no service crosses."""
-    broken_ways = [
-        way(10, [(51.0, -1.0), (51.1, -1.0)]),
-        way(11, [(52.0, -1.0), (52.1, -1.0)]),  # joins at neither end
-    ]
-    found, broken, *_ = osmroutes.candidates([relation(ways=broken_ways)])
+    found, broken, *_ = osmroutes.candidates([broken_relation()])
     assert found == []
     assert broken == 1
 
@@ -215,6 +170,21 @@ def test_the_pattern_id_is_stable_across_runs(seeded):
     osmroutes.write(seeded, found)
     assert db.scalar(seeded, "SELECT count(*) FROM patterns") == 1
     assert db.scalar(seeded, "SELECT pattern_id FROM patterns") == first
+
+
+def test_the_pattern_id_is_the_relation_id_and_its_normalised_stops(seeded):
+    """A literal, because two runs of one build agree however the id is minted.
+
+    `pattern_id` hashes `route_id | direction | stop key`, and here the stop key is
+    the relation's stop names put through `osm.normalise`. So the suffix, the
+    punctuation and the apostrophe tables in `osm` are all inside a permanent cache
+    key: widening one of them re-mints every `osm:r` pattern in the country and
+    leaves its `traces` and `trace_status` rows behind under ids nothing selects.
+    """
+    osmroutes.write(seeded, osmroutes.candidates([relation()])[0])
+    # hash('osm:r1' || '|' || '' || '|' || 'alpha\x1fbeta') >> 1, where the two
+    # names are "Alpha Rail Station" and "Beta Rail Station" normalised.
+    assert db.scalar(seeded, "SELECT pattern_id FROM patterns") == 5764178481033107580
 
 
 def test_a_relation_that_stops_qualifying_stops_being_drawn(seeded):

@@ -1799,6 +1799,16 @@ def _stroke_path(ctx: cairo.Context[cairo.Surface], line: Polyline) -> None:
         ctx.line_to(xs[i], ys[i])
 
 
+def density_halo_width(t: float) -> float:
+    """The halo pass's width, in units of DENSITY_REF_PX of canvas.
+
+    It is the widest thing `density` draws, so `STYLES["density"].max_line_px` is its
+    value at t=1 and the band collar is sized off that. Named rather than inlined
+    among the ramps below so the two cannot drift apart unnoticed.
+    """
+    return 1.5 + 8.0 * t
+
+
 def draw_density(
     ctx: cairo.Context[cairo.Surface],
     window: Window,
@@ -1830,7 +1840,7 @@ def draw_density(
     # broad dim halo, then the narrow bright core over it. Widths are in units of
     # DENSITY_REF_PX of canvas, not in pixels -- see below.
     passes: tuple[tuple[Ramp, Ramp, Ramp], ...] = (
-        (lambda t: 1.5 + 8.0 * t, lambda t: 0.012 + 0.075 * t, lambda t: 0.95),
+        (density_halo_width, lambda t: 0.012 + 0.075 * t, lambda t: 0.95),
         (
             lambda t: 0.25 + 1.8 * t**0.8,
             lambda t: 0.10 + 0.80 * t,
@@ -2030,7 +2040,7 @@ STYLES: dict[str, Style] = {
         draw=draw_density,
         background=(0.015, 0.018, 0.03),
         blurb="weekly trip volume as light",
-        # The halo pass, 1.5 + 8.0, quoted at DENSITY_REF_PX like the ramps are.
+        # `density_halo_width` at full traffic, quoted at DENSITY_REF_PX as it is.
         max_line_px=9.5,
         ref_px=DENSITY_REF_PX,
         coalesces=True,
