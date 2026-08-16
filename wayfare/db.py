@@ -371,6 +371,19 @@ INDICES = [
 ]
 
 
+def sql_literal(value: str) -> str:
+    """``value`` as a quoted SQL string literal, apostrophes doubled.
+
+    For the handful of statements DuckDB will not take a bound parameter for --
+    ``ATTACH``, ``SET memory_limit``, ``SET temp_directory``. Everywhere a ``?``
+    works, use one; this is the exception, and having one exception spelled one way
+    is the point. The realistic failure it prevents is not an attack but a data root
+    under a directory with an apostrophe in its name, which otherwise ends the run
+    with a parse error naming a path nobody typed.
+    """
+    return "'" + value.replace("'", "''") + "'"
+
+
 def pattern_id_sql(route_id: str, direction: str, stop_key: str) -> str:
     """SQL for a pattern's identity hash, from expressions for its three parts.
 
@@ -791,7 +804,7 @@ def _migrate_pattern_ids(con: duckdb.DuckDBPyConnection) -> None:
     con.execute("ALTER TABLE patterns ADD PRIMARY KEY (pattern_id)")
 
     for table, one_per_pattern in _KEYED_ON_PATTERN.items():
-        if not scalar(con, f"SELECT count(*) FROM {table}"):  # noqa: S608
+        if not scalar(con, f"SELECT count(*) FROM {table}"):
             # Nothing to remap, and rebuilding would trade the key `SCHEMA` has just
             # declared on an empty table for an index, to no end.
             continue
@@ -799,7 +812,7 @@ def _migrate_pattern_ids(con: duckdb.DuckDBPyConnection) -> None:
             CREATE OR REPLACE TABLE {table}_new AS
             SELECT r.new_id AS pattern_id, t.* EXCLUDE (pattern_id)
             FROM {table} t JOIN pattern_remap r ON r.old_id = t.pattern_id
-        """)  # noqa: S608
+        """)
         con.execute(f"DROP TABLE {table}")
         con.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
         if one_per_pattern:
@@ -968,8 +981,7 @@ def insert_via_file(
             else f"read_csv('{quoted}', header=false, columns={{{spec}}})"
         )
         con.execute(
-            f"{_CONFLICT[on_conflict]} INTO {table} ({named}) "  # noqa: S608
-            f"SELECT {named} FROM {read}"
+            f"{_CONFLICT[on_conflict]} INTO {table} ({named}) SELECT {named} FROM {read}"
         )
     return n
 
@@ -1060,14 +1072,14 @@ def retry_statuses(
     ids = [
         r[0]
         for r in con.execute(
-            f"SELECT {key} FROM {status_table} WHERE status IN (SELECT unnest(?))",  # noqa: S608
+            f"SELECT {key} FROM {status_table} WHERE status IN (SELECT unnest(?))",
             [wanted],
         ).fetchall()
     ]
     if not ids:
         return 0
     for table in (*dependents, status_table):
-        con.execute(f"DELETE FROM {table} WHERE {key} IN (SELECT unnest(?))", [ids])  # noqa: S608
+        con.execute(f"DELETE FROM {table} WHERE {key} IN (SELECT unnest(?))", [ids])
     logs.get("db").info("cleared %d outcomes with status in %s", len(ids), wanted)
     return len(ids)
 
