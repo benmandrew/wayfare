@@ -201,8 +201,10 @@ def test_reclassifying_an_old_database_moves_only_the_transport_rows(loaded):
     ids = [r[0] for r in loaded.execute("SELECT pattern_id FROM match_status").fetchall()]
     details = [
         '400: {"error_code": 442, "error": "No path could be found for input"}',
-        "ConnectionError: HTTPConnectionPool(host='valhalla', port=8002): "
-        "Max retries exceeded (Caused by NewConnectionError: Connection refused)",
+        (
+            "ConnectionError: HTTPConnectionPool(host='valhalla', port=8002): "
+            "Max retries exceeded (Caused by NewConnectionError: Connection refused)"
+        ),
     ]
     for pattern_id, detail in zip(ids, details, strict=True):
         loaded.execute(

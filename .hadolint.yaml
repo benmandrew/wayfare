@@ -1,0 +1,11 @@
+# hadolint on the Dockerfile, which builds Valhalla and tippecanoe from source and is
+# otherwise checked only by running it.
+#
+# The version-pinning advisories are off. DL3008 wants `apt-get install pkg=version`
+# and DL3013 wants `pip install pkg==version` -- against a base image that is itself a
+# moving tag, pinning the leaves and not the root buys nothing, and every pin would go
+# stale on the next Debian point release with no test to notice. The image is
+# reproducible through its digest, which is where reproducibility belongs here.
+ignored:
+  - DL3008
+  - DL3013

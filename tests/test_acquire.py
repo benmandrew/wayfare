@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import zipfile
 from pathlib import Path
 
@@ -113,7 +114,7 @@ def test_partials_are_kept_only_when_the_host_can_resume(tmp_path, monkeypatch):
     assert not (tmp_path / "bods_gtfs_wales.zip.part").exists()
 
     # Geofabrik answers 206, so the bytes already paid for are kept.
-    osm = [s for s in acquire.sources("wales", with_osm=True) if s.name == "osm"][0]
+    osm = next(s for s in acquire.sources("wales", with_osm=True) if s.name == "osm")
     with pytest.raises(RuntimeError):
         acquire.download(osm, tmp_path)
     assert (tmp_path / f"{osm.filename}.part").read_bytes() == b"partial"
@@ -132,7 +133,7 @@ def test_truncated_zip_is_rejected(tmp_path):
 
 def test_missing_members_are_named(tmp_path):
     z = _zip(tmp_path / "f.zip", ["stops.txt", "routes.txt"])
-    with pytest.raises(OSError, match="stop_times.txt"):
+    with pytest.raises(OSError, match=re.escape("stop_times.txt")):
         acquire.check_gtfs(z)
 
 

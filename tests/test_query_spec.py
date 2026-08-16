@@ -274,7 +274,7 @@ def test_a_filter_value_is_bound_rather_than_written_into_the_sql(net, field):
         # of its groups survived. Fixed by that join; keep it parametrised here.
         {"min_trips": 100},
     ],
-    ids=lambda k: "+".join(k),
+    ids="+".join,
 )
 def test_a_filter_removes_the_same_edges_from_both_query_shapes(net, kwargs):
     """One spec, one set of edges, whichever query shape a style happens to use.

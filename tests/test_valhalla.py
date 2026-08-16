@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import itertools
+
 import builders
 import pytest
 import requests
@@ -71,14 +73,14 @@ def test_chunking_covers_long_services(n, expected_chunks):
     chunks = valhalla._chunks(points, valhalla.MAX_LOCATIONS, valhalla.CHUNK_OVERLAP)
     assert len(chunks) == expected_chunks
     # Consecutive chunks must share an endpoint, or the stitched route has a gap.
-    for a, b in zip(chunks, chunks[1:], strict=False):
+    for a, b in itertools.pairwise(chunks):
         assert a[-1] == b[0]
     # Every point must appear somewhere.
     assert {p for c in chunks for p in c} == set(points)
 
 
 def _chain_m(points):
-    return sum(osm.haversine_m(a, b) for a, b in zip(points, points[1:], strict=False))
+    return sum(osm.haversine_m(a, b) for a, b in itertools.pairwise(points))
 
 
 @pytest.mark.parametrize(("n", "expected_chunks"), [(40, 1), (41, 2), (80, 3)])
@@ -106,7 +108,7 @@ def test_a_chunk_inside_the_location_count_still_splits_on_distance():
     chunks = valhalla._chunks(points, valhalla.MAX_LOCATIONS, 1, valhalla.MAX_CHUNK_M)
     assert len(chunks) > 1
     assert all(_chain_m(c) <= valhalla.MAX_CHUNK_M for c in chunks)
-    for a, b in zip(chunks, chunks[1:], strict=False):
+    for a, b in itertools.pairwise(chunks):
         assert a[-1] == b[0]
     assert chunks[0] + [p for c in chunks[1:] for p in c[1:]] == points
 

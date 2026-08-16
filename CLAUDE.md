@@ -299,6 +299,22 @@ path, no version, or the byte-identical tests are a fiction.
   [`.taplo.toml`](.taplo.toml). The same association drives the "Even Better TOML" VS Code
   extension, so the editor shows inline what CI fails on. What JSON Schema cannot say —
   a relation between one value and another — is refused by `palette.load` instead.
+- **`biome` is the linter for `web/`, and most of what it reads is inside `<script>`
+  tags.** The two viewer pages hold around 3,000 lines of JavaScript that ruff and mypy
+  never see, so Biome is what checks it, configured in [`biome.jsonc`](biome.jsonc). It
+  parses every `.js` as a module, which is wrong for `util.js`, `credits.js` and
+  `palette.js` — those are classic `<script src>` files whose top-level names *are* the
+  pages' globals, so a shared function reads as dead and an explicit `"use strict"` reads
+  as redundant. Both rules are off for those three and must stay off. `web/vendor` is
+  excluded, formatting is off, and CI passes `--error-on-warnings` because Biome exits
+  zero on warnings and a warning nothing fails on is a warning nobody fixes.
+- `actionlint` reads the workflows as workflows rather than as YAML, which matters
+  because [`image.yml`](.github/workflows/image.yml) calls
+  [`check.yml`](.github/workflows/check.yml): a `needs` naming a job that moved and an
+  `if:` that parses as a truthy string both leave a green check on a step that never ran.
+  `hadolint` covers the Dockerfile, whose only other check is a 15-minute image build on a
+  push to main. [`.hadolint.yaml`](.hadolint.yaml) turns off the version-pinning
+  advisories and says why.
 - The dev environment is the nix flake and nothing else. direnv enters it (`.envrc` is
   `use flake` plus `dotenv_if_exists .env`, the same file Compose reads); `nix develop`
   is the same shell without direnv. It supplies Python 3.12, uv, cairo, pkg-config,

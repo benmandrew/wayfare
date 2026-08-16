@@ -23,6 +23,7 @@ is coarser than that -- the Firth of Clyde closes up and Strangford Lough goes.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import urllib.request
 from pathlib import Path
@@ -53,7 +54,7 @@ def fetch(force: bool = False) -> Path:
         print(f"already have {dest} ({dest.stat().st_size / 1e6:.1f} MB)")
         return dest
     print(f"fetching {SOURCE}")
-    with urllib.request.urlopen(SOURCE, timeout=120) as response:  # noqa: S310
+    with urllib.request.urlopen(SOURCE, timeout=120) as response:
         dest.write_bytes(response.read())
     print(f"wrote {dest} ({dest.stat().st_size / 1e6:.1f} MB)")
     return dest
@@ -83,7 +84,7 @@ def clip(source: Path, box: tuple[float, float, float, float]) -> list[list[list
         )
         for line in lines:
             run: list[list[float]] = []
-            for a, b in zip(line, line[1:], strict=False):
+            for a, b in itertools.pairwise(line):
                 if inside(a) or inside(b):
                     if not run:
                         run.append(a)

@@ -43,6 +43,21 @@
             # `wayfare/map.toml`, whose shape nothing reports at run time: a
             # mistyped layer name draws an empty layer and says nothing.
             pkgs.taplo
+            # The two viewer pages carry around 3,000 lines of JavaScript inside
+            # `<script>` tags, and ruff and mypy see none of it. Biome reads the
+            # script tags, so the pages need no extraction and the repo needs no
+            # node_modules. `biome.jsonc` is the configuration.
+            pkgs.biome
+            # `check.yml` and `image.yml` call each other, and a wrong `needs` or a
+            # malformed `if:` expression is a workflow that silently does not run
+            # the check it is named for. actionlint is the only thing that reads
+            # those files as anything but YAML.
+            pkgs.actionlint
+            # The Dockerfile builds Valhalla and tippecanoe from source and is
+            # otherwise checked only by running it, which takes long enough that a
+            # shell slip in a `RUN` is expensive to find. `.hadolint.yaml` is the
+            # configuration.
+            pkgs.hadolint
           ];
 
           # buildInputs rather than nativeBuildInputs so the linker wrapper adds

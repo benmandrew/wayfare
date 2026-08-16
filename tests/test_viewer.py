@@ -208,7 +208,7 @@ def test_the_shared_files_are_reachable_and_typed():
                 "palette.js": "javascript",
             }
             for name, kind in wanted.items():
-                with urllib.request.urlopen(f"{base}/{name}", timeout=30) as res:  # noqa: S310
+                with urllib.request.urlopen(f"{base}/{name}", timeout=30) as res:
                     assert res.status == 200, name
                     assert kind in res.headers["Content-Type"], (name, res.headers)
                     assert res.read() == (WEB / name).read_bytes(), name

@@ -38,6 +38,7 @@ no Markov model, nothing to disambiguate. `docs/pipeline.md` has the reasoning.
 
 from __future__ import annotations
 
+import itertools
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -408,7 +409,7 @@ def _cut(
     # between the two ends takes the wrong branch and draws confident track the
     # service never runs on.
     slack = config.TRACE_MONOTONIC_SLACK_M
-    steps = list(zip(along, along[1:], strict=False))
+    steps = list(itertools.pairwise(along))
     forward = all(b >= a - slack for a, b in steps)
     backward = all(a >= b - slack for a, b in steps)
     if not (forward or backward):

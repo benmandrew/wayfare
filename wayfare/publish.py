@@ -15,7 +15,6 @@ rather than the other way round.
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -773,12 +772,12 @@ def build_tiles(
         joined = tmp / out.name
         _tile_join(joined, parts)
         size = joined.stat().st_size
-        # os.replace, not shutil.move: a rename within one filesystem is atomic, so
+        # Path.replace, not shutil.move: a rename within one filesystem is atomic, so
         # a reader either gets the whole old archive or the whole new one. Writing
-        # the final path directly left a window -- a republish is minutes of a file
+        # the final path directly leaves a window -- a republish is minutes of a file
         # that PMTiles clients are reading in byte ranges, and a range served across
         # the rewrite spans two different archives.
-        os.replace(joined, out)
+        joined.replace(out)
 
     log.info("tiles built: %.1f MB", size / 1e6)
     log.info("attribution: %s", attribution)
@@ -924,7 +923,9 @@ def _tippecanoe(band: _Band, geojsonl: Path, out: Path, *, attribution: str) -> 
     # tippecanoe writes a per-tile progress bar to stderr -- hundreds of kilobytes
     # of it for a national build. On a server run that buries everything else in
     # the log, so it is captured and reduced to what actually matters.
-    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    # S603: a fixed argv, no shell. Every element is a literal flag or a path this
+    # module built under `config.OUT`.
+    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)  # noqa: S603
     if proc.returncode != 0:
         log.error("tippecanoe failed:\n%s", _tail(proc.stderr))
         raise subprocess.CalledProcessError(proc.returncode, cmd, proc.stdout, proc.stderr)
@@ -933,7 +934,8 @@ def _tippecanoe(band: _Band, geojsonl: Path, out: Path, *, attribution: str) -> 
 
 def _tile_join(out: Path, parts: list[Path]) -> None:
     cmd = ["tile-join", "-o", str(out), "--force", "-pk", *[str(p) for p in parts]]
-    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    # S603: as above -- a fixed argv of flags and paths this module built.
+    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)  # noqa: S603
     if proc.returncode != 0:
         log.error("tile-join failed:\n%s", _tail(proc.stderr))
         raise subprocess.CalledProcessError(proc.returncode, cmd, proc.stdout, proc.stderr)
@@ -1067,7 +1069,7 @@ def _has_rows(con: duckdb.DuckDBPyConnection, table: str) -> bool:
     """
     if not db.table_exists(con, table):
         return False
-    return bool(db.scalar(con, f"SELECT count(*) FROM {table}"))  # noqa: S608
+    return bool(db.scalar(con, f"SELECT count(*) FROM {table}"))
 
 
 def build(

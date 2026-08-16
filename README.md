@@ -35,7 +35,9 @@ puts `.venv/bin` on `PATH`, so `wayfare`, `pytest -q`, `ruff check .` and `mypy`
 Outside the shell none of them are on `PATH` at all.
 
 The flake supplies Python 3.12, uv, cairo and pkg-config, felt/tippecanoe (no other fork
-writes PMTiles), taplo for the TOML and the duckdb command-line interface (CLI) for
+writes PMTiles), taplo for the TOML, biome for the JavaScript the two viewer pages carry
+inside `<script>` tags, actionlint and hadolint for the workflows and the Dockerfile, and
+the duckdb command-line interface (CLI) for
 reading the database by hand; the Docker image builds tippecanoe 2.79.0 from source instead. Two things sit
 outside the flake: a Valhalla server reachable at `WAYFARE_VALHALLA`, which defaults to
 `http://localhost:8002`, and roughly 40 GB of free disk for a national run. All pipeline

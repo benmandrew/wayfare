@@ -335,6 +335,12 @@ class Polyline:
             return NotImplemented
         return self.points() == other.points()
 
+    # Unhashable on purpose, and spelled out rather than left to the default that a
+    # custom `__eq__` implies. A hash agreeing with that equality would have to
+    # materialise the points, which is the allocation this class exists to avoid,
+    # and nothing keys a set or a dict on a path.
+    __hash__ = None  # type: ignore[assignment]
+
     def points(self) -> list[tuple[float, float]]:
         """The polyline as (x, y) tuples. Materialises; the draw path avoids it."""
         xs, ys = self.xs, self.ys

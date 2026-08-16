@@ -13,6 +13,7 @@ what that code produced -- `tests/test_palette.py` pins all thirty-six of them.
 
 from __future__ import annotations
 
+import itertools
 import math
 import tomllib
 from dataclasses import dataclass
@@ -268,7 +269,7 @@ def load(path: Path = MAP_TOML) -> Palette:
     # and an editor shows it while the file is typed; these are the relations
     # between one value and another, which JSON Schema has no way to say.
     at = raw["road_ramp"]["at"]
-    if any(b <= a for a, b in zip(at, at[1:], strict=False)):
+    if any(b <= a for a, b in itertools.pairwise(at)):
         raise ValueError(
             f"road_ramp.at {at} is not strictly ascending, so a stop sits at or "
             "below the one before it and the ramp reverses between them"

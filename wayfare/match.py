@@ -465,7 +465,7 @@ def _match_batch(
             # produces hundreds of these and they are all the same fault.
             log.warning("pattern %d: %s", p.pattern_id, exc)
             return Outcome(p.pattern_id, TRANSPORT_ERROR, p.source, detail=str(exc)[:400])
-        except Exception as exc:  # noqa: BLE001 - one bad pattern must not stop a run of days
+        except Exception as exc:
             # The genuine last resort: a bug in this code. Permanent on purpose --
             # a defect that retries forever is worse than one that records the
             # traceback and moves on.

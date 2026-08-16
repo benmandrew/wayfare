@@ -47,7 +47,9 @@ def retarget(data: Path) -> None:
     silently did nothing. A constant added above belongs in this function in the
     same edit, and `tests/test_cli.py` walks the module to check that it is.
     """
-    global DATA, RAW, WORK, OUT, DB_PATH
+    # The rebinding is the point: every stage reads these names off the module, so
+    # a per-process root is one assignment rather than a parameter on every call.
+    global DATA, RAW, WORK, OUT, DB_PATH  # noqa: PLW0603
     DATA = data.resolve()
     RAW = DATA / "raw"
     WORK = DATA / "work"

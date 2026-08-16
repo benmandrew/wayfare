@@ -20,6 +20,7 @@ reach for it before believing any number this module reports.
 from __future__ import annotations
 
 import gzip
+import itertools
 import math
 import struct
 import zlib
@@ -841,7 +842,7 @@ def draw(
                 )
                 for mx, my in (_mercator(lon, lat) for lon, lat in line)
             ]
-            for (ax, ay), (bx, by) in zip(points, points[1:], strict=False):
+            for (ax, ay), (bx, by) in itertools.pairwise(points):
                 _stroke(pixels, width, height, ax, ay, bx, by, ink, _UNDERLAY_WEIGHT)
 
     for archive in archives:
@@ -882,7 +883,7 @@ def draw(
                             ]
                             # Deliberately not strict: this is a sliding pair over
                             # one list, so the shorter tail is the point.
-                            for (ax, ay), (bx, by) in zip(points, points[1:], strict=False):
+                            for (ax, ay), (bx, by) in itertools.pairwise(points):
                                 _stroke(pixels, width, height, ax, ay, bx, by, rgb, weight)
 
     background = _BACKGROUND[theme] if theme else (0, 0, 0)

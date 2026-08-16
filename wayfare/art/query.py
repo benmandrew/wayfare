@@ -427,7 +427,7 @@ SELECT max(weight) FILTER (WHERE rn = least(n - 1, floor(? * n)::BIGINT)),
 FROM ranked
 """
         # Textual order again -- the two CTEs first, then the quantiles in the SELECT.
-        return sql, params + [lo_q, hi_q]
+        return sql, [*params, lo_q, hi_q]
 
     def _grouped_base(self) -> tuple[str, list[Any]]:
         """The shared part of the two grouped queries.
@@ -511,12 +511,12 @@ FROM ranked
             if self.spec.sample > 1
             else ""
         )
-        return (
+        sql = (
             f"{base}\nSELECT p.grp, win.lon_e6, win.lat_e6\n"
             "FROM pair p JOIN win USING (edge_id) JOIN gstat USING (grp)\n"
-            f"{thin}ORDER BY {order}\n",
-            params,
+            f"{thin}ORDER BY {order}\n"
         )
+        return sql, params
 
     def chain_query(self) -> tuple[str, list[Any]]:
         """Each edge in the window, and the one edge that continues it, if any.

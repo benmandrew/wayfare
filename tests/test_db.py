@@ -10,8 +10,10 @@ from wayfare import aggregate, db, maintenance
 
 # `routes` as it stood before the mode filter: no route_type at all.
 _OLD_ROUTES = (
-    "CREATE TABLE routes (route_id VARCHAR PRIMARY KEY, agency_id VARCHAR, "
-    "short_name VARCHAR, long_name VARCHAR)",
+    (
+        "CREATE TABLE routes (route_id VARCHAR PRIMARY KEY, agency_id VARCHAR, "
+        "short_name VARCHAR, long_name VARCHAR)"
+    ),
     "INSERT INTO routes VALUES ('R1', 'OP1', '42', 'Alpha to Delta')",
 )
 
@@ -251,7 +253,7 @@ def test_edges_migrate_from_wkt_text_to_micro_degree_lists(legacy_db):
             None,
         )
         # CTAS does not carry a PRIMARY KEY over, so the rewrite reinstates it.
-        with pytest.raises(Exception, match="onstraint|nique"):
+        with pytest.raises(Exception, match=r"onstraint|nique"):
             builders.insert_edge(con, 1)
     finally:
         con.close()
@@ -320,7 +322,7 @@ def test_the_renumbering_carries_a_column_it_was_never_told_about(legacy_db):
     try:
         assert db.row(con, "SELECT operator_notes, mode FROM patterns") == ("kept", "bus")
         # ...and the key it is rebuilt with is a key, not merely an index.
-        with pytest.raises(Exception, match="onstraint|nique"):
+        with pytest.raises(Exception, match=r"onstraint|nique"):
             con.execute(
                 "INSERT INTO patterns (pattern_id, route_id) "
                 "SELECT pattern_id, 'R2' FROM patterns"
@@ -483,7 +485,7 @@ def test_clustering_reinstates_the_unique_edge_id(con):
     or the next `match` could double-insert an edge in silence."""
     builders.insert_edge(con, 1, lon_e6=-3200000, lat_e6=51480000)
     maintenance.cluster_edges(con)
-    with pytest.raises(Exception, match="onstraint|nique"):
+    with pytest.raises(Exception, match=r"onstraint|nique"):
         builders.insert_edge(con, 1, lon_e6=-3200000, lat_e6=51480000)
 
 

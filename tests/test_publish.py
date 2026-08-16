@@ -720,7 +720,7 @@ def test_an_archive_is_named_after_its_region():
 def test_a_region_that_would_escape_the_output_directory_names_no_archive():
     """The only place a region slug reaches the filesystem."""
     for bad in ("../served", "out/wales", ".", ".."):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="does not name an archive"):
             config.archive_name(bad)
 
 

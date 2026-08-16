@@ -33,7 +33,9 @@ REQUIRED_GTFS = ("stop_times.txt", "trips.txt", "routes.txt", "stops.txt")
 
 # A feed_version shaped like this identifies a publication and describes nothing
 # about it -- see `feed_version`.
-_GUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+_GUID = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
+)
 
 
 class Unauthorized(Exception):
@@ -175,7 +177,7 @@ def download(src: Source, dest_dir: Path | None = None, force: bool = False) -> 
             part.unlink(missing_ok=True)
             raise
 
-        except Exception as exc:  # noqa: BLE001 - retried, then re-raised below
+        except Exception as exc:
             last_error = exc
             # A partial file is only worth keeping if the host will let us
             # continue from where it stopped. Otherwise it is dead weight that

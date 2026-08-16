@@ -422,7 +422,9 @@ def bbox(b: art.Bounds) -> list[int]:
 
 def queries(bounds: art.Bounds) -> dict[str, tuple[str, list[Any], str | None]]:
     """(counted form, params, streamable form) for each per-render scan."""
-    sql = art._Sql(art.DEFAULT_SPEC, art.DEFAULT_SOURCE, bbox(bounds))
+    # The query builder is what is being timed, and it is private with no public
+    # stand-in: `Window` runs the queries as well as building them.
+    sql = art._Sql(art.DEFAULT_SPEC, art.DEFAULT_SOURCE, bbox(bounds))  # noqa: SLF001
     window, win_params = sql.window()
     weights, weight_params = sql.weights_query()
     return {

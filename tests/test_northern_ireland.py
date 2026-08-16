@@ -272,7 +272,9 @@ def test_a_polyline_the_file_ends_in_the_middle_of_is_an_error(tmp_path: Path):
     PEP 479 turns the StopIteration into `RuntimeError`, out of the one module whose
     whole thesis is that a misalignment must name itself."""
     mif, mid = _mif_mid(
-        tmp_path, LINKS_MIF.split("PLINE 4")[0] + "PLINE 4\n-5.9300 54.5900\n", LINKS_MID
+        tmp_path,
+        LINKS_MIF.split("PLINE 4", maxsplit=1)[0] + "PLINE 4\n-5.9300 54.5900\n",
+        LINKS_MID,
     )
     with pytest.raises(mapinfo.Malformed, match="coordinate pairs"):
         list(mapinfo.read(mif, mid))

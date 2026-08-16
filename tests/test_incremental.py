@@ -54,12 +54,11 @@ def _drop_the_short_working(gtfs_dir: Path) -> None:
 
 
 def _ids_by_stop_count(con: duckdb.DuckDBPyConnection) -> dict[int, int]:
-    return {
-        n: pid
-        for n, pid in con.execute(
+    return dict(
+        con.execute(
             f"SELECT n_stops, pattern_id FROM patterns p WHERE {db.current_feed()}"
         ).fetchall()
-    }
+    )
 
 
 def _build(gtfs_dir: Path, con: duckdb.DuckDBPyConnection, **kw) -> None:
