@@ -13,7 +13,7 @@ from wayfare import cli, config, licences, publish
 
 
 def _row(edge_id, pts, refs, way_id=1, name="Oxford Road", trips=100):
-    """One row in the shape export_geojsonl's query returns."""
+    """One row in the shape export_edges_geojsonl's query returns."""
     return (
         edge_id,
         way_id,
@@ -159,7 +159,7 @@ def test_streaming_gives_the_same_result_as_collapsing_everything_at_once(
         builders.insert_edge(con, eid, way_id=way, lon_e6=x, lat_e6=0, span_e6=10)
         builders.insert_services(con, eid, n_trips=100)
 
-    path = publish.export_geojsonl(con, tmp_path / "edges.geojsonl")
+    path = publish.export_edges_geojsonl(con, tmp_path / "edges.geojsonl")
     feats = [json.loads(line) for line in path.read_text().splitlines()]
 
     # Way 10 chains into one 4-point line, way 20 into one 3-point line. Never one
@@ -173,7 +173,7 @@ def test_export_writes_one_feature_per_line(con, tmp_path, monkeypatch):
     _edge(con, 1, ["42", "43"])
     _edge(con, 2, ["X57"])
 
-    path = publish.export_geojsonl(con, tmp_path / "edges.geojsonl")
+    path = publish.export_edges_geojsonl(con, tmp_path / "edges.geojsonl")
     features = [json.loads(line) for line in path.read_text().splitlines()]
 
     assert len(features) == 2
@@ -188,7 +188,7 @@ def test_refs_are_ordered_by_service_frequency(con, tmp_path, monkeypatch):
     """The capped list should keep the buses that run most, not an arbitrary set."""
     monkeypatch.setattr(config, "OUT", tmp_path)
     _edge(con, 1, ["busiest", "quieter", "quietest"])
-    path = publish.export_geojsonl(con, tmp_path / "edges.geojsonl")
+    path = publish.export_edges_geojsonl(con, tmp_path / "edges.geojsonl")
     props = json.loads(path.read_text().splitlines()[0])["properties"]
     assert props["refs"].split(",") == ["busiest", "quieter", "quietest"]
 
@@ -201,7 +201,7 @@ def test_a_capped_edge_still_reports_its_true_count(con, tmp_path, monkeypatch):
     _edge(con, 1, [str(i) for i in range(10)])
     _edge(con, 2, ["42"])
 
-    path = publish.export_geojsonl(con, tmp_path / "edges.geojsonl")
+    path = publish.export_edges_geojsonl(con, tmp_path / "edges.geojsonl")
     props = {
         json.loads(line)["properties"]["id"]: json.loads(line)["properties"]
         for line in path.read_text().splitlines()
@@ -215,7 +215,7 @@ def test_wales_fits_under_the_cap(con, tmp_path, monkeypatch):
     so the common case carries a complete list."""
     monkeypatch.setattr(config, "OUT", tmp_path)
     _edge(con, 1, [str(i) for i in range(53)])
-    path = publish.export_geojsonl(con, tmp_path / "edges.geojsonl")
+    path = publish.export_edges_geojsonl(con, tmp_path / "edges.geojsonl")
     props = json.loads(path.read_text().splitlines()[0])["properties"]
     assert len(props["refs"].split(",")) == 53
 
@@ -224,12 +224,12 @@ def test_edges_without_geometry_are_skipped(con, tmp_path, monkeypatch):
     monkeypatch.setattr(config, "OUT", tmp_path)
     builders.insert_edge(con, 1, geometry=False, road_name="X", road_class="residential")
     builders.insert_services(con, 1, n_trips=10)
-    path = publish.export_geojsonl(con, tmp_path / "edges.geojsonl")
+    path = publish.export_edges_geojsonl(con, tmp_path / "edges.geojsonl")
     assert path.read_text() == ""
 
 
 def write_geojsonl(path, trips, at=(0.0, 0.0)):
-    """A GeoJSONL file in the shape `export_geojsonl` writes, one feature per count.
+    """A GeoJSONL file in the shape `export_edges_geojsonl` writes, one feature per count.
 
     `trips` may be a flat list, which puts every feature at `at`, or a mapping of
     position to counts, which is how a test says two places rather than one.
@@ -667,7 +667,9 @@ def _stub_build(monkeypatch, tmp_path) -> dict:
         seen.update(out=out, attribution=attribution)
         return out
 
-    monkeypatch.setattr(publish, "export_geojsonl", lambda con: tmp_path / "e.geojsonl")
+    monkeypatch.setattr(
+        publish, "export_edges_geojsonl", lambda con: tmp_path / "e.geojsonl"
+    )
     monkeypatch.setattr(publish, "export_segments_geojsonl", lambda con: None)
     monkeypatch.setattr(publish, "export_track_geojsonl", lambda con: None)
     monkeypatch.setattr(publish, "contents", lambda con: {"road": True, "operator": False})
@@ -758,6 +760,22 @@ def test_another_regions_archive_does_not_block_the_default(monkeypatch, tmp_pat
     monkeypatch.setattr(config, "OUT", tmp_path)
     (tmp_path / "great_britain.pmtiles").write_bytes(b"")
     assert _built_out(monkeypatch, tmp_path, region="ireland") == tmp_path / "bus.pmtiles"
+
+
+def test_a_tile_build_given_no_path_asks_the_same_question_build_asks(
+    tippecanoe_calls, monkeypatch, tmp_path
+):
+    """One question, one answer. `build_tiles` named the default archive itself,
+    which skipped the guard `build` goes through -- so the path that took no `--out`
+    was the one that would write bus.pmtiles beside the archive it left stale."""
+    monkeypatch.setattr(config, "OUT", tmp_path)
+    monkeypatch.setattr(config, "BODS_REGION", "ireland")
+    src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3])
+    assert publish.build_tiles(src) == tmp_path / publish.DEFAULT_ARCHIVE
+
+    (tmp_path / "ireland.pmtiles").write_bytes(b"the archive being served")
+    with pytest.raises(RuntimeError, match="--name-by-region"):
+        publish.build_tiles(src)
 
 
 # --- the publish subcommand ----------------------------------------------------
@@ -905,9 +923,9 @@ def test_building_from_an_existing_export_needs_no_connection(
     monkeypatch.setattr(config, "OUT", tmp_path / "out")
 
     def explode(*_a, **_k):
-        raise AssertionError("export_geojsonl was called with no connection to use")
+        raise AssertionError("export_edges_geojsonl was called with no connection to use")
 
-    monkeypatch.setattr(publish, "export_geojsonl", explode)
+    monkeypatch.setattr(publish, "export_edges_geojsonl", explode)
 
     src = write_geojsonl(tmp_path / "edges.geojsonl", [1, 2, 3])
     out = publish.build(None, region="northern_ireland", from_export=src)
@@ -1112,6 +1130,14 @@ def test_the_credit_follows_what_the_archive_actually_holds(con, tmp_path, monke
 
     _edge(con, 5, ["42"])
     assert publish.contents(con) == {"road": True, "operator": True, "track": False}
+
+
+def test_the_no_database_credit_answers_for_everything_an_archive_can_hold(con):
+    """`--from-export` has no database to read, so it assumes a road-only archive.
+    A fourth kind of geometry added to `contents` and not here would leave that path
+    crediting an archive it no longer describes, and nothing in the picture says so."""
+    assert publish.ROAD_ONLY.keys() == publish.contents(con).keys()
+    assert publish.ROAD_ONLY == {"road": True, "operator": False, "track": False}
 
 
 def test_a_region_with_no_matched_edges_skips_the_road_bands(tippecanoe_calls, tmp_path):

@@ -182,7 +182,7 @@ def test_refs_is_a_string_rather_than_an_array(built, tmp_path):
     It stores the array's JSON *text* instead, so a two-service way reached the
     viewer as the literal `["Northern line","Jubilee line"]` and the split on commas
     came back holding `["Northern line` and `Jubilee line"]`. Every name mangled and
-    the service search matching nothing, with no error anywhere. `export_geojsonl`
+    the service search matching nothing, with no error anywhere. `export_edges_geojsonl`
     has always joined; this is the same contract, checked rather than assumed.
     """
     both = [

@@ -540,7 +540,7 @@ would update nothing anyone serves. `--from-export` builds from a GeoJSONL a pre
 publish wrote and needs no database, for a data root whose database has been pruned away;
 it rebuilds the same tiles and does not refresh the region.
 
-**Cost.** Tens of minutes nationally, dominated by tippecanoe. `export_geojsonl` streams by
+**Cost.** Tens of minutes nationally, dominated by tippecanoe. `export_edges_geojsonl` streams by
 `way_id` rather than materialising, measured at 617 MB down to 372 MB peak resident set
 size on Wales. `tippecanoe` and `tile-join` must be on `PATH`, from felt/tippecanoe; the
 mapbox fork cannot write PMTiles.
@@ -614,7 +614,7 @@ at z8 it is 8.2% against 5.0%, where the capped render hollowed the city into a 
 the point of being served before anyone noticed.
 
 - *`tippecanoe` or `tile-join` not on `PATH`.* `build_tiles` names the missing tool and
-  where to get it. The check runs after `export_geojsonl`, so the export has already been
+  where to get it. The check runs after `export_edges_geojsonl`, so the export has already been
   paid for and `--from-export` is what skips repeating it.
 - *An empty input.* Tippecanoe exits 110 rather than writing an empty archive, so a pass
   with no features is skipped instead of joined in: a region with no matched edges gets no

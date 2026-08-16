@@ -21,7 +21,7 @@ import shutil
 import subprocess
 import tempfile
 from collections import defaultdict
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -52,79 +52,57 @@ Point = tuple[int, int]  # (lon_e6, lat_e6)
 
 
 # How many rows to pull from DuckDB at a time. Only ever this many rows plus one
-# way's worth are resident; the previous fetchall() held the entire edge table as
-# Python objects, which at national scale is several million rows of tuples and
-# integer lists.
+# way's worth are resident, which is what keeps the national edge table -- several
+# million rows of tuples and integer lists -- out of the Python heap.
 FETCH_ROWS = 50_000
 
 
-def export_segments_geojsonl(
-    con: duckdb.DuckDBPyConnection, path: Path | None = None
-) -> Path | None:
-    """Write the non-road patterns as one GeoJSON feature per line, or None.
+def _degrees(points: Iterable[Point]) -> list[list[float]]:
+    """Micro-degree integer points as the degrees GeoJSON is written in."""
+    return [[x / 1e6, y / 1e6] for x, y in points]
 
-    None rather than an empty file when there is nothing to draw, so a bus-only
-    region skips the extra tippecanoe pass entirely instead of joining an empty
-    layer into every archive.
 
-    No coalescing and no streaming, and neither is an oversight. A segment is a
-    whole pattern's trace rather than a fragment of one, so there is nothing to
-    merge with anything -- and Great Britain has 630 of them against 2.7M edges, so
-    the table fits in memory many times over. `ORDER BY pattern_id` is here for the
-    same reason the edge export sorts: a rebuild has to be byte-identical.
+def _polyline(lon_e6: Sequence[int], lat_e6: Sequence[int]) -> list[list[float]]:
+    """One polyline held as two parallel arrays, as GeoJSON coordinates.
+
+    strict: the two lists are one polyline, so a length mismatch is corrupt geometry
+    rather than a short line. Truncating to the shorter of them would draw a
+    confident line that stops halfway.
     """
-    if not _has_rows(con, "segments"):
-        return None
+    return _degrees(zip(lon_e6, lat_e6, strict=True))
 
-    path = path or (config.WORK / "segments.geojsonl")
+
+def _write_features(
+    path: Path, features: Iterable[tuple[dict[str, Any], list[list[float]]]]
+) -> int:
+    """Write the features one GeoJSON object per line, which is what tippecanoe wants.
+
+    All three exports write through here, so the shape of a line is one decision
+    rather than three. `separators` is what `_features` reads back out with a regular
+    expression, and each export's properties go out in the order it built them, which
+    is what makes a rebuild byte-identical.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-
-    rows = con.execute(
-        """
-        SELECT s.pattern_id, s.mode, s.lon_e6, s.lat_e6,
-               COALESCE(NULLIF(trim(p.short_name), ''), p.route_id) AS ref,
-               p.n_trips
-        FROM segments s
-        JOIN patterns p USING (pattern_id)
-        ORDER BY s.pattern_id
-        """
-    ).fetchall()
-
+    written = 0
     with path.open("w") as fh:
-        for pattern_id, mode, lon_e6, lat_e6, ref, trips in rows:
+        for props, coords in features:
             fh.write(
                 json.dumps(
                     {
                         "type": "Feature",
-                        "properties": {
-                            "id": pattern_id,
-                            "mode": mode,
-                            "ref": ref,
-                            "trips": trips,
-                        },
-                        "geometry": {
-                            "type": "LineString",
-                            "coordinates": [
-                                # strict: the two lists are one polyline stored as
-                                # parallel arrays, so a length mismatch is corrupt
-                                # geometry. Truncating to the shorter would draw a
-                                # confident line that stops halfway.
-                                [x / 1e6, y / 1e6]
-                                for x, y in zip(lon_e6, lat_e6, strict=True)
-                            ],
-                        },
+                        "properties": props,
+                        "geometry": {"type": "LineString", "coordinates": coords},
                     },
                     separators=(",", ":"),
                 )
             )
             fh.write("\n")
+            written += 1
+    return written
 
-    log.info("%d non-road segments written to %s", len(rows), path)
-    return path
 
-
-def export_geojsonl(con: duckdb.DuckDBPyConnection, path: Path | None = None) -> Path:
-    """Write one GeoJSON feature per line, which is what tippecanoe wants.
+def export_edges_geojsonl(con: duckdb.DuckDBPyConnection, path: Path | None = None) -> Path:
+    """Write the matched road network, one GeoJSON feature per line.
 
     Streamed rather than materialised. The query is ordered by way_id and coalescing
     never merges across ways, so a way's edges can be collapsed and released as soon
@@ -133,7 +111,6 @@ def export_geojsonl(con: duckdb.DuckDBPyConnection, path: Path | None = None) ->
     which is exactly the part it is better at than the Python heap.
     """
     path = path or (config.WORK / "edges.geojsonl")
-    path.parent.mkdir(parents=True, exist_ok=True)
 
     cur = con.execute(
         """
@@ -156,35 +133,165 @@ def export_geojsonl(con: duckdb.DuckDBPyConnection, path: Path | None = None) ->
         """
     )
 
-    n_written = 0
-    n_capped = 0
-    stats = {"edges": 0}
-
-    with path.open("w") as fh:
-        for props, coords in _coalesce_by_way(cur, stats):
-            n_capped += props["n"] > config.MAX_REFS_IN_TILE
-            fh.write(
-                json.dumps(
-                    {
-                        "type": "Feature",
-                        "properties": props,
-                        "geometry": {"type": "LineString", "coordinates": coords},
-                    },
-                    separators=(",", ":"),
-                )
-            )
-            fh.write("\n")
-            n_written += 1
+    stats = {"edges": 0, "capped": 0}
+    written = _write_features(path, _edge_features(cur, stats))
 
     log.info(
         "%d edges coalesced to %d features in %s (%d over the %d-service cap)",
         stats["edges"],
-        n_written,
+        written,
         path,
-        n_capped,
+        stats["capped"],
         config.MAX_REFS_IN_TILE,
     )
     return path
+
+
+def export_segments_geojsonl(
+    con: duckdb.DuckDBPyConnection, path: Path | None = None
+) -> Path | None:
+    """Write the non-road patterns as one GeoJSON feature per line, or None.
+
+    None rather than an empty file when there is nothing to draw, so a bus-only
+    region skips the extra tippecanoe pass entirely instead of joining an empty
+    layer into every archive.
+
+    No coalescing and no streaming, and neither is an oversight. A segment is a
+    whole pattern's trace rather than a fragment of one, so there is nothing to
+    merge with anything -- and Great Britain has 630 of them against 2.7M edges, so
+    the table fits in memory many times over. `ORDER BY pattern_id` is here for the
+    same reason the edge export sorts: a rebuild has to be byte-identical.
+    """
+    if not _has_rows(con, "segments"):
+        return None
+
+    path = path or (config.WORK / "segments.geojsonl")
+    rows = con.execute(
+        """
+        SELECT s.pattern_id, s.mode, s.lon_e6, s.lat_e6,
+               COALESCE(NULLIF(trim(p.short_name), ''), p.route_id) AS ref,
+               p.n_trips
+        FROM segments s
+        JOIN patterns p USING (pattern_id)
+        ORDER BY s.pattern_id
+        """
+    ).fetchall()
+
+    written = _write_features(
+        path,
+        (
+            (
+                {"id": pattern_id, "mode": mode, "ref": ref, "trips": trips},
+                _polyline(lon_e6, lat_e6),
+            )
+            for pattern_id, mode, lon_e6, lat_e6, ref, trips in rows
+        ),
+    )
+    log.info("%d non-road segments written to %s", written, path)
+    return path
+
+
+def export_track_geojsonl(
+    con: duckdb.DuckDBPyConnection, path: Path | None = None
+) -> Path | None:
+    """One feature per way of relation track, with the services that use it.
+
+    The counterpart of the edge export for the modes nothing routed. Where that one
+    coalesces edges into ways as it streams, this is already per way: the inversion
+    happened in `aggregate.build_track_services`, so a way is one row here and one
+    feature out.
+
+    Drawing per way rather than per pattern is the whole point. Great Britain's 911
+    chaining `route=train` relations are 1,569,495 vertices drawn one polyline per
+    relation and 443,126 drawn once per way, because 75.8% of ways carry two or more
+    relations. Nothing is lost in the reduction -- the service list is what the
+    overlap was carrying, and it is right here on the feature.
+
+    One feature per way *and mode*, because the layer carries the traced modes too
+    now and a way is painted by its mode. Two networks over one alignment are two
+    features and are drawn twice, which is deliberate: an Underground line and the
+    National Rail service beside it are not the same railway.
+
+    `trips` comes from `way_trips` where a timetable was attributed per leg, and
+    from the services on the way where the timetable supplied the patterns
+    themselves. Summing the service column is only wrong for the first: there a
+    relation count multiplies a figure that belongs to the track, which is what
+    `way_trips` exists to keep separate. It stays null rather than becoming zero
+    where neither knows. A viewer can style "unknown" and cannot style a lie.
+
+    `ORDER BY way_id` for the reason every other export sorts: a rebuild has to be
+    byte-identical, and DuckDB's parallel hash join returns rows in a varying order
+    otherwise. `mode` joins the sort because a way is now more than one row.
+    """
+    if not _has_rows(con, "track_services"):
+        return None
+    if not db.table_exists(con, "way_trips"):
+        return None
+    path = path or (config.WORK / "track.geojsonl")
+
+    rows = con.execute(
+        """
+        SELECT w.way_id, ts.mode, w.lon_e6, w.lat_e6,
+               count(*)                                   AS n,
+               list(ts.short_name ORDER BY ts.short_name)  AS refs,
+               -- `way_trips` first, and it is the only source for the rail this
+               -- pipeline built out of relations: a leg's trips are a property of
+               -- the track, and summing a per-service column there would multiply
+               -- them by however many relations happen to cover it. Where the
+               -- timetable supplied the pattern and OSM only supplied its shape,
+               -- the services carry the count and summing them is what
+               -- `edge_services` does with the same numbers.
+               COALESCE(
+                   any_value(wt.n_trips),
+                   CASE WHEN count(ts.n_trips) = 0 THEN NULL
+                        ELSE sum(ts.n_trips) END
+               )                                          AS trips
+        FROM track_services ts
+        JOIN ways w USING (way_id)
+        LEFT JOIN way_trips wt USING (way_id)
+        GROUP BY w.way_id, ts.mode, w.lon_e6, w.lat_e6
+        ORDER BY w.way_id, ts.mode
+        """
+    ).fetchall()
+
+    written = _write_features(
+        path,
+        (
+            (
+                {
+                    "way_id": way_id,
+                    "mode": mode,
+                    "n": n,
+                    # Comma-joined, exactly as the edge export writes it, because a
+                    # JSON array is not a thing a vector tile can hold. Tippecanoe
+                    # does not drop one and does not warn: it stores the array's
+                    # *JSON text* as a string, so the viewer's `refs.split(",")` came
+                    # back holding `["Northern line` and `Jubilee line"]`. Every name
+                    # mangled, and the service search silently matching nothing on
+                    # this layer.
+                    "refs": ",".join(refs[: config.MAX_REFS_IN_TILE]),
+                    "trips": trips,
+                },
+                _polyline(lon_e6, lat_e6),
+            )
+            for way_id, mode, lon_e6, lat_e6, n, refs, trips in rows
+        ),
+    )
+    log.info("%d features of relation track written to %s", written, path)
+    return path
+
+
+def _edge_features(
+    cur: duckdb.DuckDBPyConnection, stats: dict[str, int]
+) -> Iterator[tuple[dict[str, Any], list[list[float]]]]:
+    """The coalesced road features, counting the ones whose service list was capped.
+
+    Counted on the way past rather than afterwards, because nothing holds the whole
+    export and there is nothing left to count once it is written.
+    """
+    for props, coords in _coalesce_by_way(cur, stats):
+        stats["capped"] += props["n"] > config.MAX_REFS_IN_TILE
+        yield props, coords
 
 
 def _coalesce_by_way(
@@ -286,7 +393,7 @@ def coalesce(rows: list[Any]) -> list[tuple[dict[str, Any], list[list[float]]]]:
             }
             if name:
                 props["name"] = name
-            out.append((props, [[x / 1e6, y / 1e6] for x, y in pts]))
+            out.append((props, _degrees(pts)))
     return out
 
 
@@ -404,10 +511,18 @@ Cell = tuple[int, int]
 
 
 class _Band(NamedTuple):
-    """One tippecanoe pass over the road export, covering a range of zooms.
+    """One tippecanoe pass: the zooms it covers and what it carries through them.
 
-    The defaults are the overview bands: the Valhalla edge id in the feature id
-    field and tippecanoe's own tile grid. Only `detail` departs from either.
+    The defaults are the road overview bands -- the `bus` layer, the Valhalla edge id
+    in the feature id field, tippecanoe's own tile grid, and a top zoom the pass may
+    not grow past. `detail` departs from the last three, and the segments and track
+    passes only from the first two.
+
+    `extend` defaults off because `-z` is a ceiling
+    `--extend-zooms-if-still-dropping` is allowed to raise, which is silently wrong
+    for every band with another band above it: a far band that grew from z7 to z9 --
+    measured, on Great Britain -- overlaps the near band, and tile-join merges the
+    two into tiles holding both copies of every road.
     """
 
     name: str
@@ -415,6 +530,7 @@ class _Band(NamedTuple):
     max_zoom: int
     floors: Mapping[Cell, int]
     exclude: Sequence[str]
+    layer: str = LAYER
     extend: bool = False
     id_attribute: str = "id"
     low_detail: int | None = None
@@ -558,37 +674,19 @@ def build_tiles(
     segments: Path | None = None,
     track: Path | None = None,
 ) -> Path:
-    """Build the archive in four zoom bands and join them.
+    """Build the road bands and a pass per extra layer, and join them into one archive.
 
     tippecanoe stores attributes per feature per zoom, and -x is global to a run --
     there is no way to say "keep the road name only where someone might read it" in
-    a single pass. So the three overview bands are built without the four attributes
-    that exist purely for the info card, the detail band is built with everything,
-    and tile-join concatenates the four into one PMTiles file. The join is cheap.
+    a single pass. So the road export is built in bands, the segments and track
+    layers get a pass each, and tile-join concatenates whatever exists into one
+    PMTiles file. The join is cheap.
 
-    The overview is three bands because the three parts of it are under different
-    amounts of pressure, and a band is the only place a cap can be applied. z5-z7 is
-    cut to `OVERVIEW_CAP_FAR`, z8-z9 to `OVERVIEW_CAP_MID`, and z10 -- which has
-    never troubled the size limit -- is handed the export whole. Banding them
-    together means capping the loosest at whatever the tightest needs. See the caps
-    in `config` for what they are measured against and why the choice is not left to
-    tippecanoe's `--drop-densest-as-needed`.
-
-    The holding back is done to the *input* and not with tippecanoe's own `-j`.
-    That is not a style preference: `-x` runs first, so a `-j` filter naming an
-    attribute the same command excludes matches nothing and writes an empty band.
-    Measured on London -- `-x trips` with `-j` on `trips` built a 2.4 KB archive
-    holding no tiles at all, and said nothing about it.
-
-    `attribution` goes into both passes. tile-join carries an input's attribution
-    through to the joined archive -- measured, including where only one of the two
+    `attribution` goes into every pass. tile-join carries an input's attribution
+    through to the joined archive -- measured, including where only one of the
     inputs has one -- but a band that can be inspected on its own should say where
-    it came from, and passing it twice costs nothing.
+    it came from, and passing it each time costs nothing.
     """
-    out = out or (config.OUT / DEFAULT_ARCHIVE)
-    attribution = attribution or config.credit_html()
-    out.parent.mkdir(parents=True, exist_ok=True)
-
     for tool in ("tippecanoe", "tile-join"):
         if not shutil.which(tool):
             raise RuntimeError(
@@ -597,6 +695,13 @@ def build_tiles(
                 "docker-compose.yml). The mapbox/tippecanoe fork is unmaintained and "
                 "cannot write PMTiles."
             )
+
+    # `default_out` and not the archive name directly, so a build given no path
+    # answers the question the same way `build` does -- including its refusal to
+    # write the default beside an archive this data root already publishes by name.
+    out = out or default_out()
+    attribution = attribution or config.credit_html()
+    out.parent.mkdir(parents=True, exist_ok=True)
 
     # Every intermediate goes in a scratch directory, and only the finished archive
     # is moved into place. The output directory is served: `wayfare serve` offers
@@ -612,111 +717,43 @@ def build_tiles(
     # which is the whole reason it is atomic.
     with tempfile.TemporaryDirectory(dir=out.parent, prefix=".publish-") as scratch:
         tmp = Path(scratch)
-        joined = tmp / out.name
-        parts = []
-        # A region can have no matched edges at all -- Irish Rail on its own is 331
-        # patterns and not one of them is a road -- and tippecanoe exits 110 on an
-        # empty input rather than writing an empty archive. Skipping the road bands
-        # is the same rule the segments pass already follows, in the other direction.
-        if _has_features(geojsonl):
-            far_floors = (
-                _cell_floors(geojsonl, config.OVERVIEW_CAP_FAR, config.OVERVIEW_WEIGHT)
-                if config.OVERVIEW_CAP_FAR
-                else {}
-            )
-            mid_floors = (
-                _cell_floors(geojsonl, config.OVERVIEW_CAP_MID, config.OVERVIEW_WEIGHT)
-                if config.OVERVIEW_CAP_MID
-                else {}
-            )
-            # Only the last band may extend past its own top zoom. `-z` is a ceiling
-            # that --extend-zooms-if-still-dropping is allowed to raise, which is
-            # harmless when there is nothing above it and silently wrong when there
-            # is: a far band that grew from z7 to z9 -- measured, on Great Britain --
-            # overlaps the near band, and tile-join merges the two into tiles holding
-            # both copies of every road.
-            bands = [
-                _Band(
-                    "far", config.MIN_ZOOM, config.FAR_ZOOM - 1, far_floors, _DETAIL_ONLY
-                ),
-                _Band(
-                    "mid", config.FAR_ZOOM, config.MID_ZOOM - 1, mid_floors, _DETAIL_ONLY
-                ),
-                _Band("near", config.MID_ZOOM, config.DETAIL_ZOOM - 1, {}, _DETAIL_ONLY),
-                # The one band that carries `way`, and so the one band that can spend
-                # it on the feature id instead of an attribute. `id` is excluded by
-                # hand here because `--use-attribute-for-id` consumes `way` instead,
-                # and a property tippecanoe is not told to drop is a property it
-                # writes into every feature.
-                _Band(
-                    "detail",
-                    config.DETAIL_ZOOM,
-                    config.MAX_ZOOM,
-                    {},
-                    ("id",),
-                    extend=True,
-                    id_attribute="way",
-                    low_detail=config.LOW_DETAIL,
-                ),
-            ]
-            for band in bands:
-                src = _hold_back(geojsonl, tmp / f"{band.name}.geojsonl", band.floors)
-                part = tmp / f"{band.name}.pmtiles"
-                _tippecanoe(
-                    src,
-                    part,
-                    band.min_zoom,
-                    band.max_zoom,
-                    band.exclude,
-                    attribution,
-                    band.extend,
-                    id_attribute=band.id_attribute,
-                    low_detail=band.low_detail,
-                )
-                parts.append(part)
+        passes = [(band, geojsonl) for band in _road_bands(geojsonl)]
         # One pass over the whole zoom range rather than banded like the roads. The
         # bands exist to stop millions of edges paying for info-card attributes at
         # zooms nobody reads them at, and to thin the quietest roads out of the far
         # view; there are hundreds of segments, not millions, and a tram line thinned
-        # out of its own layer would just be missing. `extend` is off because the
-        # band already reaches MAX_ZOOM and there is nothing above it to grow into.
+        # out of its own layer would just be missing.
         if segments:
-            tiles = tmp / "segments.pmtiles"
-            _tippecanoe(
-                segments,
-                tiles,
+            band = _Band(
+                "segments",
                 config.MIN_ZOOM,
                 config.MAX_ZOOM,
+                {},
                 (),
-                attribution,
-                False,
                 layer=LAYER_SEGMENTS,
             )
-            parts.append(tiles)
+            passes.append((band, segments))
         # Same single pass, same reasoning: 55,114 ways is not millions, and a
         # rail line thinned out of the only layer that draws it is just absent.
         #
         # The way id goes in the MVT feature id field, as it does for the detail
         # band and for the same two reasons: it is what `setFeatureState` addresses,
         # so a hover can light the track under the cursor, and a near-unique value is
-        # the one thing a tile's attribute pool cannot dedupe. It was in neither
-        # place before -- this pass took the default `id`, which the track export
-        # does not write, so every feature reached the viewer with no id at all.
+        # the one thing a tile's attribute pool cannot dedupe. The default `id` is
+        # not a property this export writes, so taking it would leave every feature
+        # reaching the viewer with no id at all.
         if track:
-            tiles = tmp / "track.pmtiles"
-            _tippecanoe(
-                track,
-                tiles,
+            band = _Band(
+                "track",
                 config.MIN_ZOOM,
                 config.MAX_ZOOM,
+                {},
                 (),
-                attribution,
-                False,
                 layer=LAYER_TRACK,
                 id_attribute="way_id",
             )
-            parts.append(tiles)
-        if not parts:
+            passes.append((band, track))
+        if not passes:
             # Louder than an empty archive. A published file with no features in it
             # loads without complaint and shows a blank map, which reads as a broken
             # viewer rather than as a stage that had nothing to write.
@@ -724,6 +761,8 @@ def build_tiles(
                 f"nothing to publish: {geojsonl} has no matched edges and there are "
                 "no segments. Run `wayfare match` and `wayfare aggregate` first."
             )
+        parts = [_run(band, src, tmp, attribution) for band, src in passes]
+        joined = tmp / out.name
         _tile_join(joined, parts)
         size = joined.stat().st_size
         # os.replace, not shutil.move: a rename within one filesystem is atomic, so
@@ -738,6 +777,70 @@ def build_tiles(
     return out
 
 
+def _road_bands(geojsonl: Path) -> list[_Band]:
+    """The passes over the road export, or none at all where it holds nothing.
+
+    A region can have no matched edges -- Irish Rail on its own is 331 patterns and
+    not one of them is a road -- and tippecanoe exits 110 on an empty input rather
+    than writing an empty archive, so the road bands are skipped outright. That is
+    the same rule the segments pass follows, in the other direction.
+
+    The overview is three bands rather than one because a band is the only place a
+    cap can be applied and the three parts of it are under different amounts of
+    pressure. Both caps are `None` today and the quota machinery under them is
+    dormant: what a low zoom holds is left to tippecanoe, and every cap tried thinned
+    the whole country to spare the handful of tiles that would not fit. Read the
+    block in `config` before reviving any of it.
+
+    A cap, where one is set, is applied to the *input* and not with tippecanoe's own
+    `-j`. That is not a style preference: `-x` runs first, so a `-j` filter naming an
+    attribute the same command excludes matches nothing and writes an empty band.
+    Measured on London -- `-x trips` with `-j` on `trips` built a 2.4 KB archive
+    holding no tiles at all, and said nothing about it.
+    """
+    if not _has_features(geojsonl):
+        return []
+    far_floors, mid_floors = (
+        _cell_floors(geojsonl, cap, config.OVERVIEW_WEIGHT) if cap else {}
+        for cap in (config.OVERVIEW_CAP_FAR, config.OVERVIEW_CAP_MID)
+    )
+    return [
+        _Band("far", config.MIN_ZOOM, config.FAR_ZOOM - 1, far_floors, _DETAIL_ONLY),
+        _Band("mid", config.FAR_ZOOM, config.MID_ZOOM - 1, mid_floors, _DETAIL_ONLY),
+        _Band("near", config.MID_ZOOM, config.DETAIL_ZOOM - 1, {}, _DETAIL_ONLY),
+        # The one band that carries `way`, and so the one band that can spend it on
+        # the feature id instead of an attribute. `id` is excluded by hand here
+        # because `--use-attribute-for-id` consumes `way` instead, and a property
+        # tippecanoe is not told to drop is a property it writes into every feature.
+        #
+        # It is also the only band that may extend past its own top zoom, because it
+        # is the only one with nothing above it to overlap.
+        _Band(
+            "detail",
+            config.DETAIL_ZOOM,
+            config.MAX_ZOOM,
+            {},
+            ("id",),
+            extend=True,
+            id_attribute="way",
+            low_detail=config.LOW_DETAIL,
+        ),
+    ]
+
+
+def _run(band: _Band, geojsonl: Path, tmp: Path, attribution: str) -> Path:
+    """Build one band into the scratch directory, and say what it wrote.
+
+    A band with no floors is handed the file it was given rather than a copy of it,
+    so a region under its cap -- which is every region today -- pays for no extra
+    pass over a 1.6 GB export.
+    """
+    src = _hold_back(geojsonl, tmp / f"{band.name}.geojsonl", band.floors)
+    part = tmp / f"{band.name}.pmtiles"
+    _tippecanoe(band, src, part, attribution=attribution)
+    return part
+
+
 def _has_features(geojsonl: Path) -> bool:
     """Whether a GeoJSONL file holds anything worth handing to tippecanoe.
 
@@ -748,29 +851,18 @@ def _has_features(geojsonl: Path) -> bool:
     return geojsonl.exists() and geojsonl.stat().st_size > 0
 
 
-def _tippecanoe(
-    geojsonl: Path,
-    out: Path,
-    min_zoom: int,
-    max_zoom: int,
-    exclude: Sequence[str],
-    attribution: str,
-    extend: bool = True,
-    layer: str = LAYER,
-    id_attribute: str = "id",
-    low_detail: int | None = None,
-) -> None:
+def _tippecanoe(band: _Band, geojsonl: Path, out: Path, *, attribution: str) -> None:
     cmd = [
         "tippecanoe",
         "-o",
         str(out),
         "--force",
         "-l",
-        layer,
+        band.layer,
         "-Z",
-        str(min_zoom),
+        str(band.min_zoom),
         "-z",
-        str(max_zoom),
+        str(band.max_zoom),
         # One id belongs in the MVT feature id field rather than in the attributes.
         # It is two varints and a pool entry per feature cheaper there, and it is
         # where setFeatureState looks -- so the viewer needs no promoteId either.
@@ -787,9 +879,9 @@ def _tippecanoe(
         # changes along it, and they now share an id -- which the MVT spec asks for
         # and does not require, MapLibre does not mind, and the viewer turns into
         # hovering a whole way rather than one segment of it.
-        f"--use-attribute-for-id={id_attribute}",
+        f"--use-attribute-for-id={band.id_attribute}",
         "-x",
-        id_attribute,
+        band.id_attribute,
         # Where the credit is kept. It lands in the tileset metadata, PMTiles carries
         # that verbatim, and MapLibre reads a source's own attribution into the
         # control without the page saying anything -- so both the viewer and the art
@@ -810,17 +902,17 @@ def _tippecanoe(
         # a box over range requests, so it is ours to set.
         f"--maximum-tile-bytes={config.MAX_TILE_BYTES}",
     ]
-    if low_detail is not None:
-        cmd += ["-D", str(low_detail)]
+    if band.low_detail is not None:
+        cmd += ["-D", str(band.low_detail)]
     if config.SIMPLIFY_SHARED_NODES:
         cmd.append("--no-simplification-of-shared-nodes")
-    if extend:
+    if band.extend:
         cmd.append("--extend-zooms-if-still-dropping")
-    for name in exclude:
+    for name in band.exclude:
         cmd += ["-x", name]
     cmd.append(str(geojsonl))
 
-    log.info("tippecanoe z%d-z%d -> %s", min_zoom, max_zoom, out.name)
+    log.info("tippecanoe z%d-z%d -> %s", band.min_zoom, band.max_zoom, out.name)
     # tippecanoe writes a per-tile progress bar to stderr -- hundreds of kilobytes
     # of it for a national build. On a server run that buries everything else in
     # the log, so it is captured and reduced to what actually matters.
@@ -922,6 +1014,12 @@ def contents(con: duckdb.DuckDBPyConnection) -> dict[str, bool]:
     }
 
 
+# What a publish with no database to read assumes it is publishing. It names every
+# key `contents` answers, so a fourth kind of geometry added there fails here as a
+# missing key rather than passing silently as a credit that omits it.
+ROAD_ONLY: dict[str, bool] = {"road": True, "operator": False, "track": False}
+
+
 def _has_traced_segments(con: duckdb.DuckDBPyConnection) -> bool:
     """Whether anything actually drawn came from an OSM route relation.
 
@@ -937,19 +1035,17 @@ def _has_traced_segments(con: duckdb.DuckDBPyConnection) -> bool:
     every `aggregate`, so the intersection is the honest answer -- and a credit has
     to describe the bytes being published, not the database they came out of.
 
-    Asking only the segments arm was correct exactly as long as a relation pattern
-    was drawn there too. It stopped being correct when that double draw was
-    removed, and the failure would have been an archive of nothing but relation
-    track crediting OpenStreetMap for none of it.
+    Both arms have to be asked, because a pattern reaches exactly one of them: an
+    archive of nothing but relation track has an empty `segments` while being wholly
+    derived from OpenStreetMap, and asking that arm alone would credit none of it.
     """
     if _has_rows(con, "track_services"):
         return True
     if not (db.table_exists(con, "traces") and db.table_exists(con, "segments")):
         return False
-    row = con.execute(
-        "SELECT count(*) FROM segments s JOIN traces t USING (pattern_id)"
-    ).fetchone()
-    return bool(row and row[0])
+    return bool(
+        db.scalar(con, "SELECT count(*) FROM segments s JOIN traces t USING (pattern_id)")
+    )
 
 
 def _has_rows(con: duckdb.DuckDBPyConnection, table: str) -> bool:
@@ -963,8 +1059,7 @@ def _has_rows(con: duckdb.DuckDBPyConnection, table: str) -> bool:
     """
     if not db.table_exists(con, table):
         return False
-    row = con.execute(f"SELECT count(*) FROM {table}").fetchone()  # noqa: S608
-    return bool(row and row[0])
+    return bool(db.scalar(con, f"SELECT count(*) FROM {table}"))  # noqa: S608
 
 
 def build(
@@ -987,7 +1082,7 @@ def build(
     if from_export is None:
         if con is None:
             raise ValueError("publish needs a connection unless it is given an export")
-        from_export = export_geojsonl(con)
+        from_export = export_edges_geojsonl(con)
     elif not from_export.exists():
         raise RuntimeError(
             f"{from_export} is not there. --from-export names the GeoJSONL a previous "
@@ -999,7 +1094,7 @@ def build(
     # deliberately not rebuilt from the export instead: the export *is* the road
     # network, and a rebuild that quietly dropped a region's trams would look like a
     # successful publish.
-    held = contents(con) if con is not None else {"road": True, "operator": False}
+    held = contents(con) if con is not None else ROAD_ONLY
     return build_tiles(
         from_export,
         out or default_out(region),
@@ -1007,105 +1102,3 @@ def build(
         segments=export_segments_geojsonl(con) if con is not None else None,
         track=export_track_geojsonl(con) if con is not None else None,
     )
-
-
-def export_track_geojsonl(
-    con: duckdb.DuckDBPyConnection, path: Path | None = None
-) -> Path | None:
-    """One feature per way of relation track, with the services that use it.
-
-    The counterpart of `export_geojsonl` for the modes nothing routed. Where that
-    one coalesces edges into ways as it streams, this is already per way: the
-    inversion happened in `aggregate.build_track_services`, so a way is one row here
-    and one feature out.
-
-    Drawing per way rather than per pattern is the whole point. Great Britain's 911
-    chaining `route=train` relations are 1,569,495 vertices drawn one polyline per
-    relation and 443,126 drawn once per way, because 75.8% of ways carry two or more
-    relations. Nothing is lost in the reduction -- the service list is what the
-    overlap was carrying, and it is right here on the feature.
-
-    One feature per way *and mode*, because the layer carries the traced modes too
-    now and a way is painted by its mode. Two networks over one alignment are two
-    features and are drawn twice, which is deliberate: an Underground line and the
-    National Rail service beside it are not the same railway.
-
-    `trips` comes from `way_trips` where a timetable was attributed per leg, and
-    from the services on the way where the timetable supplied the patterns
-    themselves. Summing the service column is only wrong for the first: there a
-    relation count multiplies a figure that belongs to the track, which is what
-    `way_trips` exists to keep separate. It stays null rather than becoming zero
-    where neither knows. A viewer can style "unknown" and cannot style a lie.
-
-    `ORDER BY way_id` for the reason every other export sorts: a rebuild has to be
-    byte-identical, and DuckDB's parallel hash join returns rows in a varying order
-    otherwise. `mode` joins the sort because a way is now more than one row.
-    """
-    if not (db.table_exists(con, "track_services") and _has_rows(con, "track_services")):
-        return None
-    if not db.table_exists(con, "way_trips"):
-        return None
-    path = path or (config.WORK / "track.geojsonl")
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    rows = con.execute(
-        """
-        SELECT w.way_id, ts.mode, w.lon_e6, w.lat_e6,
-               count(*)                                   AS n,
-               list(ts.short_name ORDER BY ts.short_name)  AS refs,
-               -- `way_trips` first, and it is the only source for the rail this
-               -- pipeline built out of relations: a leg's trips are a property of
-               -- the track, and summing a per-service column there would multiply
-               -- them by however many relations happen to cover it. Where the
-               -- timetable supplied the pattern and OSM only supplied its shape,
-               -- the services carry the count and summing them is what
-               -- `edge_services` does with the same numbers.
-               COALESCE(
-                   any_value(wt.n_trips),
-                   CASE WHEN count(ts.n_trips) = 0 THEN NULL
-                        ELSE sum(ts.n_trips) END
-               )                                          AS trips
-        FROM track_services ts
-        JOIN ways w USING (way_id)
-        LEFT JOIN way_trips wt USING (way_id)
-        GROUP BY w.way_id, ts.mode, w.lon_e6, w.lat_e6
-        ORDER BY w.way_id, ts.mode
-        """
-    ).fetchall()
-
-    with path.open("w") as fh:
-        for way_id, mode, lon_e6, lat_e6, n, refs, trips in rows:
-            fh.write(
-                json.dumps(
-                    {
-                        "type": "Feature",
-                        "properties": {
-                            "way_id": way_id,
-                            "mode": mode,
-                            "n": n,
-                            # Comma-joined, exactly as `export_geojsonl` writes it,
-                            # because a JSON array is not a thing a vector tile can
-                            # hold. Tippecanoe does not drop one and does not warn:
-                            # it stores the array's *JSON text* as a string, so the
-                            # viewer's `refs.split(",")` came back holding
-                            # `["Northern line` and `Jubilee line"]`. Every name
-                            # mangled, and the service search silently matching
-                            # nothing on this layer.
-                            "refs": ",".join(refs[: config.MAX_REFS_IN_TILE]),
-                            "trips": trips,
-                        },
-                        "geometry": {
-                            "type": "LineString",
-                            "coordinates": [
-                                [x / 1e6, y / 1e6]
-                                for x, y in zip(lon_e6, lat_e6, strict=True)
-                            ],
-                        },
-                    },
-                    separators=(",", ":"),
-                )
-            )
-            fh.write("\n")
-
-    log.info("%d features of relation track written to %s", len(rows), path)
-    return path

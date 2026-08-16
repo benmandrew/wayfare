@@ -558,6 +558,53 @@ def test_meta_reports_the_operators_and_road_classes_the_database_holds(art_db):
     assert database["road_classes"] == ["secondary"]
 
 
+def test_the_facets_are_read_once_per_database_rewrite(art_db, monkeypatch):
+    """The operator list is a DISTINCT over `edge_services` -- 10.25M rows with
+    nothing to prune -- and /art/meta is a page load. A hit opens nothing at all,
+    which is the point: the connection is the cheap half and the write lock it
+    competes for is not. Invalidated on the same size and mtime the render cache
+    uses, so a rebuilt database is never described by the previous one's dropdowns."""
+    opens = _Opens(monkeypatch)
+    first = server.art_meta(True)["database"]
+    assert first["operators"] == ["OP1"]
+    assert opens.calls == 1
+
+    assert server.art_meta(True)["database"] == first
+    assert opens.calls == 1
+
+    st = art_db.stat()
+    os.utime(art_db, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    assert server.art_meta(True)["database"] == first
+    assert opens.calls == 2
+
+
+def test_the_dimension_cap_covers_the_height_and_keeps_the_name_the_page_reads(art_db):
+    """One cap over both axes: a tall window at a legal width is as much work as a
+    wide one. The studio page asks for `max_width`, so the name it knows has to keep
+    working alongside the one that says what the cap is."""
+    limits = server.art_meta(True)["limits"]
+    assert limits["max_dimension"] == limits["max_width"] == server.MAX_DIMENSION
+    with pytest.raises(server.BadRequest, match="height=99999 is out of range"):
+        server.parse_art("area=cardiff&height=99999")
+    assert server.parse_art("area=cardiff&width=200&height=300").opts.height_px == 300
+    assert server.parse_art("area=cardiff&width=200").opts.height_px is None
+
+
+class _Opens:
+    """Counts read-only opens of the database, so a memo hit is visible as a
+    connection that was never made -- and therefore as a lock never competed for."""
+
+    def __init__(self, monkeypatch) -> None:
+        self.calls = 0
+        real = db.connect
+
+        def counted(*a, **kw):
+            self.calls += 1
+            return real(*a, **kw)
+
+        monkeypatch.setattr(server.db, "connect", counted)
+
+
 def test_the_facet_lists_are_bounded(art_db, monkeypatch):
     monkeypatch.setattr(server, "MAX_FACET_VALUES", 1)
     con = db.connect(art_db)
@@ -972,6 +1019,31 @@ def test_an_unsatisfiable_range_frames_its_empty_body(serve_at):
         # rather than being read as the tail of this one.
         conn.request("GET", "/archives.json")
         assert json.loads(conn.getresponse().read()) == ["wales.pmtiles"]
+    finally:
+        conn.close()
+
+
+def test_every_response_carries_one_set_of_cors_headers(serve_at):
+    """The viewer reads an archive cross-origin, and a header sent twice is as broken
+    as one never sent -- a browser refuses a duplicated
+    Access-Control-Allow-Origin. `end_headers` is the one hook every response passes
+    through, so it is the only place they may be added: a response adding its own
+    could only be de-duplicated by reading back the buffer the stdlib is still
+    building, and that guard matched the 416's `Content-Range` too, which left the
+    one response in the set without them."""
+    conn = _connect(serve_at())
+    try:
+        for headers, status in (
+            ({}, 200),
+            ({"Range": "bytes=0-3"}, 206),
+            ({"Range": "bytes=99999-"}, 416),
+        ):
+            conn.request("GET", "/wales.pmtiles", headers=headers)
+            response = conn.getresponse()
+            assert response.status == status
+            assert response.headers.get_all("Access-Control-Allow-Origin") == ["*"]
+            assert len(response.headers.get_all("Access-Control-Expose-Headers")) == 1
+            response.read()
     finally:
         conn.close()
 

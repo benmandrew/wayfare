@@ -155,7 +155,7 @@ a hover selects the whole way. Carrying this to a served archive is a `publish` 
 no migration, because `way` was already a column on `edges` and already in the export.
 
 **Nothing holds a whole window or a whole table.** `art` streams its window and
-`publish.export_geojsonl` streams by `way_id`. Anything statistical — weight
+`publish.export_edges_geojsonl` streams by `way_id`. Anything statistical — weight
 percentiles, group stats — must read the *unsampled*, *unbanded* window, and only
 drawn geometry may be thinned.
 

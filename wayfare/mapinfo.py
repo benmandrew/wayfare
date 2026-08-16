@@ -49,7 +49,6 @@ class Header:
     columns: tuple[str, ...]
     encoding: str
     delimiter: str
-    coordsys: str
 
 
 @dataclass(frozen=True)
@@ -108,7 +107,7 @@ def header(lines: Iterator[str]) -> Header:
     # without raising -- the numbers are still numbers.
     if coordsys and not re.match(r"Earth\s+Projection\s+1\b", coordsys):
         raise Malformed(f"expected a longitude/latitude CoordSys, got {coordsys!r}")
-    return Header(tuple(columns), encoding, delimiter, coordsys)
+    return Header(tuple(columns), encoding, delimiter)
 
 
 def _points(lines: Iterator[str], n: int) -> tuple[tuple[float, float], ...]:
