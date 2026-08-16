@@ -460,6 +460,26 @@ def pad_and_clip(
     return (south, west, north, east)
 
 
+# The share of a region's live relation patterns a `routes` run must rediscover
+# before it is allowed to retire the rest.
+#
+# The stage rewrites everything on every invocation, so the retire is what keeps a
+# withdrawn line from being drawn for ever -- and the same statement thins a region's
+# rail to a handful of lines when a run comes back nearly empty for a reason that has
+# nothing to do with OpenStreetMap. Nothing downstream can see the difference: a few
+# relations is what a truncated Overpass body looks like, and also what a country with
+# two railways looks like.
+#
+# 0.5 is deliberately loose. This is a floor under a catastrophe, not a churn budget:
+# real withdrawal is one line at a time, while a window that missed and an operator
+# gate tightened too far both take out most of the region at once.
+#
+# A run that finds *nothing* is exempt, and the exemption is the point rather than a
+# corner: `Feed.route_relations = ()` makes a region draw none on purpose, and the
+# retire it causes is what removes the second copy of every line. Only the partial
+# collapse is ambiguous, so only the partial collapse is refused.
+ROUTES_COLLAPSE_FLOOR = 0.5
+
 # --- Snapping an operator shape onto OSM track ------------------------------
 
 # `railway` values worth fetching as bare ways. `trace` reaches ways through a route
