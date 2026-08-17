@@ -40,9 +40,16 @@
 html, body { height: 100%; margin: 0; }
 
 /* --- panel chrome --- */
+/* No `backdrop-filter` here, and the alpha above is why. At 94% the blurred
+   backdrop is six percent of each pixel, which nobody has ever seen -- but the
+   compositor still has to copy each panel's region out of the framebuffer, run a
+   two-pass Gaussian over it and re-composite, holding a scratch surface per panel
+   while it does. Over a WebGL canvas that repaints through every pan, zoom and
+   inertia glide, that is per panel per frame: three panels on the map and seven
+   in the studio. On a software rasteriser it was the most expensive declaration
+   in this file, and it bought six percent of a blur. */
 .panel {
   background: var(--panel);
-  backdrop-filter: blur(8px);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   box-shadow: var(--shadow);
