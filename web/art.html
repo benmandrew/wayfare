@@ -1376,7 +1376,22 @@ let syncing = false;    // a camera move of our own, which must not be read back
 function initPicker() {
   if (typeof maplibregl === "undefined") return; // no vendor bundle; no picker
   $("pickField").hidden = false;
+  $("pickToggle").addEventListener("click", () => showPicker(!!$("pickwrap").hidden));
+  // Which does the building, if it is opening. See `showPicker`.
+  showPicker(localStorage.getItem("wayfare-pickmap") !== "closed");
+}
 
+// Everything a picker costs, and none of it paid until someone opens one. This
+// used to run from `boot()` unconditionally, so a reader who closed the picker
+// last visit still paid for a second WebGL context, the raster basemap,
+// `archives.json`, a `getHeader()` per archive and the whole road network drawn
+// into a box roughly 272 by 200 pixels -- held for the session, and never once on
+// screen. Two live WebGL contexts on one page is at the edge of what a
+// two-gigabyte Android will keep alive, and this was the invisible one.
+//
+// Called only with the container already visible, which is also what lets the map
+// measure itself: constructed under `display: none` it comes up zero by zero.
+function buildPicker() {
   const b = bounds() || ISLES;
   pickMap = new maplibregl.Map({
     container: "pickmap",
@@ -1436,10 +1451,16 @@ function initPicker() {
     addNetwork(pickMap);
   });
 
-  addEventListener("resize", debounce(() => quietly(() => pickMap.resize()), 100));
-
-  $("pickToggle").addEventListener("click", () => showPicker(!!$("pickwrap").hidden));
-  showPicker(localStorage.getItem("wayfare-pickmap") !== "closed");
+  // Skipped while the picker is folded away, because a resize of a hidden
+  // container reallocates the drawing buffer to nothing and back -- and Android
+  // fires `resize` every time the address bar slides. `showPicker` does the
+  // resize on the way back open, which is the moment it is needed.
+  addEventListener(
+    "resize",
+    debounce(() => {
+      if (!$("pickwrap").hidden) quietly(() => pickMap.resize());
+    }, 100)
+  );
 }
 
 // fitBounds({animate:false}) and resize() both jump rather than ease, and a jump
@@ -1461,9 +1482,14 @@ function showPicker(open) {
   $("pickToggle").textContent = open ? "Hide the map" : "Pick on a map";
   $("pickToggle").setAttribute("aria-expanded", String(open));
   localStorage.setItem("wayfare-pickmap", open ? "open" : "closed");
-  // A map whose container was display:none while the window changed size comes
-  // back with a stale canvas.
-  if (open && pickMap) quietly(() => pickMap.resize());
+  if (!open) return;
+  // The container is on screen by now, which is what `buildPicker` needs and what
+  // makes the freshly built map measure itself correctly rather than need the
+  // resize below. Everything after the first open is the resize alone: a map whose
+  // container was display:none while the window changed size comes back with a
+  // stale canvas.
+  if (pickMap) quietly(() => pickMap.resize());
+  else buildPicker();
 }
 
 function repaintPicker() {

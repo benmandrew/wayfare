@@ -773,3 +773,31 @@ def test_the_studio_revokes_a_render_it_never_got_to_show():
     # The revoke of the pending URL comes before the <img> is pointed anywhere else,
     # because after that assignment nothing can reach it.
     assert text.index("URL.revokeObjectURL(pendingURL)") < text.index("img.src = next;")
+
+
+def test_the_studio_builds_the_picker_only_when_it_is_opened():
+    """`initPicker` ran from `boot()` unconditionally and only decided at the end
+    whether anyone wanted a picker. A reader who closed it last visit still paid for
+    a second WebGL context, the raster basemap, `archives.json`, a `getHeader()` per
+    archive and the whole road network drawn into a box roughly 272 by 200 pixels --
+    held for the session, and never on screen.
+
+    The order is what this pins. `buildPicker` has to run with the container already
+    visible, because a MapLibre map constructed under `display: none` comes up zero
+    by zero -- so the build sits after the line that unhides the wrapper, not before
+    it."""
+    text = _source("art.html")
+    build = _between(text, "function showPicker(open) {", "\n}\n")
+    assert "else buildPicker();" in build
+    assert build.index('$("pickwrap").hidden = !open;') < build.index("buildPicker()")
+    # And nothing constructs a map before that.
+    init = _between(text, "function initPicker()", "\n}\n")
+    assert "new maplibregl.Map" not in init
+    assert "showPicker(" in init
+
+
+def test_the_studio_does_not_resize_a_picker_nobody_is_looking_at():
+    """Android fires `resize` whenever the address bar slides, and resizing a hidden
+    container reallocates the drawing buffer to nothing and back. `showPicker` does
+    the resize on the way open, which is the moment it is needed."""
+    assert _holds("art.html", 'if (!$("pickwrap").hidden) quietly(() => pickMap.resize());')
