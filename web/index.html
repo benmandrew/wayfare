@@ -86,7 +86,19 @@ window.__heads = (async () => {
   return heads;
 })();
 </script>
-<link rel="stylesheet" href="vendor/maplibre-gl.css">
+<!-- `media="print"` so this does not block, flipped to `all` beside the library it
+     belongs to. 65 KB of CSS whose every `.maplibregl-*` selector matches nothing
+     until `start()` builds the map, and it was gating two things that come before
+     the map exists: the first paint of the boot overlay, and -- because a classic
+     script cannot run until every stylesheet above it has loaded -- the
+     `bootTheme()` call whose whole purpose is running before that paint. A reader
+     who chose dark got the white screen it was written to prevent, on exactly the
+     device where the wait is longest.
+
+     Still in this position, and it has to be: the flip does not move the sheet in
+     the cascade, and the nine `.maplibregl-ctrl-*` overrides in the page's own
+     <style> below win on document order rather than on specificity. -->
+<link id="mapcss" rel="stylesheet" href="vendor/maplibre-gl.css" media="print">
 <!-- The palette and the panel chrome, shared with art.html. Linked before the
      page's own rules, so those still win. -->
 <link rel="stylesheet" href="base.css">
@@ -398,6 +410,11 @@ body {
      private network, where a public CDN is both a hard dependency the rest of
      the deployment does not have and the one thing that would take the map down
      while every byte it actually renders sat on disk. See web/vendor/README.md. -->
+<!-- The other half of the `media="print"` in <head>. Here rather than up there
+     because here is where it stops costing anything: the boot overlay has painted,
+     so making the sheet render-blocking again blocks nothing that has not already
+     been drawn, and it has had the whole of the head and the body to arrive. -->
+<script>document.getElementById("mapcss").media = "all";</script>
 <script src="vendor/maplibre-gl.js"></script>
 <script src="vendor/pmtiles.js"></script>
 <!-- The basemap credit, shared with art.html so the two cannot drift. -->

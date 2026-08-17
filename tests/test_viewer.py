@@ -547,6 +547,30 @@ def test_the_cursor_asks_once_a_frame_and_never_mid_drag():
     assert _holds("index.html", 'map.on("moveend", () => {')
 
 
+def test_neither_page_lets_the_map_stylesheet_block_the_theme():
+    """A classic script cannot run until every stylesheet above it has loaded, so
+    65 KB of MapLibre CSS in `<head>` gated the `bootTheme()` call whose whole
+    purpose is running before the first paint -- and the first paint with it. Every
+    `.maplibregl-*` selector in that file matches nothing until a map is built.
+
+    Both halves are asserted per page. The `media="print"` alone leaves the sheet
+    never applying, and the flip alone leaves it blocking. Its position is asserted
+    too: it stays above each page's own `<style>`, because the flip does not move it
+    in the cascade and the `.maplibregl-ctrl-*` overrides below win on document
+    order rather than on specificity."""
+    for page in PAGES:
+        text = _source(page)
+        assert _holds(page, 'id="mapcss" rel="stylesheet"'), page
+        assert _holds(page, 'href="vendor/maplibre-gl.css" media="print"'), page
+        assert _holds(page, 'document.getElementById("mapcss").media = "all";'), page
+        # The opening tag at the start of its own line, because the prose above the
+        # link names `<style>` and would otherwise be what this found.
+        own = re.search(r"^<style>$", text, re.MULTILINE)
+        assert own, page
+        assert text.index('id="mapcss"') < own.start(), page
+        assert own.start() < text.index('getElementById("mapcss")'), page
+
+
 def test_the_map_is_constructed_with_the_settings_a_weak_device_needs():
     """Every one of these is a MapLibre default that was never chosen. They are
     asserted here because a default is invisible: nothing reports that the map is
