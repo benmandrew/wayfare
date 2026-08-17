@@ -729,7 +729,9 @@ all made the map worse.** `config.OVERVIEW_CAP_FAR` and `config.OVERVIEW_CAP_MID
 thinner than Ireland. Read the block in `config` before reviving any of it.
 `--drop-densest-as-needed` picks by density rather than service level, which is a real
 fault, but it thins only the tiles that will not fit: 18 at z5-z7 and 4 at z8-z9, where
-every cap tried thinned the whole country to spare those.
+every cap tried thinned the whole country to spare those. A fifth attempt is recorded
+below, whose lossless half ships and whose cap failed for a reason none of the first four
+ran into.
 
 **Judge a low zoom by lit pixels, never by feature counts.** A cap keeps many short
 features spread over many cells and no cap keeps fewer, longer ones. Features per zoom,
@@ -739,6 +741,106 @@ got worse. `wayfare coverage` counts the same way and inherits the same blind sp
 the geometry and look at it. Rasterised around London, the uncapped archive lights 3.8% of
 the window at z5, 7.0% at z6 and 9.3% at z7 against the capped build's 2.7%, 3.7% and 3.7%;
 at z8 it is 8.2% against 5.0%, where the capped render hollowed the city into a skeleton.
+
+**The fifth attempt changed the unit of removal from a feature to a contiguous run.**
+[`wayfare/corridors.py`](../wayfare/corridors.py) links export features end to end by
+*good continuation*. At a junction two feature ends join only where each is the other's
+straightest onward choice, the turn is at most 60 degrees, and the onward direction is
+measured over 50 m rather than over the adjacent vertex. The cartographic literature calls
+a run built that way a *stroke* (Thomson and Richardson, 1999), and the module renames it a
+corridor because the viewer already calls a drawn line's width its stroke. Half of that
+work ships. The lossless merge under it is `publish.merge_overview` in
+[`wayfare/publish.py`](../wayfare/publish.py), and the cap on top of it is a bench no
+publish calls.
+
+**Every publish now builds the merged file.** `config.MERGE_OVERVIEW` is `True`, so the
+three bands below z11 read it while the detail band goes on reading the road export, which
+spends `way` on the feature id and carries `refs` and `name` for the info card. The merged
+file lands in the publish scratch directory rather than beside the export, deliberately,
+because it carries none of the info card's attributes and a later `--from-export` that
+picked it up would publish a region with no road names and no service lists. Setting
+`config.MERGE_OVERVIEW` false builds an archive the way it was built before, which is what
+a comparison against the old build needs.
+
+**The cap is still a bench.** `wayfare corridors EXPORT OUT [--merge] [--cap N]` runs the
+corridor builder over a GeoJSONL a publish wrote, where `--merge` writes out the same
+merged file a publish builds, for inspection or for capping on top of, and `--cap N` drops
+whole corridors. That is the idea under test, because a cap that removes contiguous runs
+rather than scattered features cannot leave a road drawn as dashes.
+`publish --overview-export GEOJSONL` hands the three overview bands a source file of one's
+own choosing, which is how a thinned overview is measured against the merged default.
+
+**`coalesce` will not join two edges on different ways, because `way_id` is in its key.**
+The overview bands carry neither `way` nor `refs` nor `name`, so every way boundary along a
+corridor with the same services throughout is a feature break those bands pay for and
+cannot show. The merge joins runs across it where `n` and `trips` are both equal, through a
+point where exactly two of the group's lines meet, which is `publish._chain`'s rule. Great
+Britain goes from 868,984 features to 244,679, or 28.2% of the count, and Ireland from
+87,691 to 17,571, or 20.0%. On Great Britain that costs 15 seconds and 275 MB peak resident
+set size.
+
+**Fewer features means smaller tiles at every overview zoom.** Built over z5-z10 in
+`benmandrew/wayfare:latest` on Linux with the flags a publish uses, the overview goes from
+34 MB to 19 MB on Great Britain and from 4.3 MB to 1.6 MB on Ireland. The published Great
+Britain archive is 127.5 MB, and the detail band is the rest of it and is untouched. Worst
+tile against the 977 KB limit, by zoom, before and after: z5 952 KB to 862 KB, z6 893 to
+838, z7 786 to 732, z8 903 to 346, z9 627 to 224, z10 422 to 135. So z8-z10 stop being
+under any size pressure at all, and z5-z7 gain headroom while drawing more. End to end on
+Ireland the whole archive goes from 13.60 MB to 10.75 MB, with the detail band unchanged
+inside it.
+
+**Lit pixels rise wherever the tiles were being thinned to fit.** Around London, z5 goes
+5.771% to 8.062%, z6 7.413% to 8.625% and z7 7.670% to 8.598%. Around Manchester, z5 goes
+3.321% to 4.934%, z6 4.529% to 5.654% and z7 4.810% to 5.829%. Over Wales at z5 it is
+2.361% to 2.929%. The whole-country window loses between 0.07 and 0.17 percentage points at
+z6-z10, and drawn and looked at that is simplification working on longer lines rather than
+a network going missing. At 600 m a pixel the two renders are indistinguishable.
+
+The merge changes one thing below z11. A merged run is one feature sharing one id, so a
+hover lights the whole run rather than one way's worth of it.
+
+**On the merged Great Britain file, 244,679 features form 117,445 corridors, the longest
+115.0 km and the median one feature.** The median is one feature because the merge has
+already joined what could be joined, and the junctions left over rarely pass mutual best
+fit. Corridor building adds little on top of the merge. A cap of 120,000 keeps 55.0% of the
+features and 81.9% of the drawn kilometres, and takes the overview from 18.75 MB to 12.75
+MB.
+
+**The cap costs ink everywhere.** Around London it loses 0.4 percentage points at z5 and
+0.97 at z8-z10, around Manchester 0.40 at z5 and 1.0 at z7, and over Wales 0.09 at z5 and
+0.24 at z10. Nothing comes out dashed. The network stays continuous and the towns simply
+draw thinner, which is what the corridor unit was for, and it is a real improvement on the
+four earlier attempts, whose capped renders hollowed London into a radial skeleton.
+
+**It still is not worth it, and the reason is new.** At z5, the zoom the cap exists for,
+the worst tile went from 862 KB to 899 KB, and tippecanoe's own thinning report over the
+far band says which way round that is. Against the merged file with no cap, two z5 tiles
+exceeded the 977 KB ceiling and `--drop-densest-as-needed` cut them to 58.40% and 43.20% of
+their features, leaving 105,117 features standing at z5. Against the capped file no z5 tile
+reaches the ceiling, nothing is dropped, and 112,357 features stand. So 862 KB is a thinned
+tile and 899 KB is a complete one. The cap adds no bytes to any tile. It removes the
+thinning that was taking bytes off two of them, and does its own thinning across the whole
+country instead.
+
+**That is the paragraph above happening again, on the fifth attempt.** The capped build
+leaves more features standing at z5 than the uncapped one, 112,357 against 105,117, and
+lights fewer pixels in every window measured. Judged on features per zoom the cap wins at
+the only zoom it was built for, and the render it wins with is the thinner one, which is
+what "judge a low zoom by lit pixels, never by feature counts" is there to catch. It caught
+it in tippecanoe's drop report, where none of the first four attempts looked.
+
+After the merge, z8-z10 have no size pressure left for a cap to relieve. A cap also filters
+the input to all three overview bands at once, so it thins z10, where there was never a
+problem. Applying it to the `far` band alone was not measured.
+
+**Every figure here is from the Great Britain and Ireland exports of 2026-08-16.** The
+lit-pixel comparisons were built on macOS with `config.SIMPLIFY_SHARED_NODES` off, which is
+the documented SIGTRAP workaround, both arms identical. The byte figures were rebuilt on
+Linux in the published image with the flag on and came out the same, 34 MB to 19 MB.
+
+The merge is the corridor work's one shipped outcome. The cap does draw the continuous
+network the four earlier caps destroyed, and it arrives at a zoom where the thinning it
+replaces was already cutting deeper than the ceiling asked for.
 
 **What goes wrong.** Three of these are silent, and each of the three took an archive to
 the point of being served before anyone noticed.

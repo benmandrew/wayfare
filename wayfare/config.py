@@ -616,6 +616,32 @@ MAX_ZOOM = 14
 # appears on hover, and hovering a road is not a thing anyone does at that scale.
 # `n` stays everywhere because it drives the colour and width ramps.
 DETAIL_ZOOM = 11
+# Whether the three overview bands are built from the road export re-joined across the
+# way boundaries it was split at. On, and it is the largest saving the overview has had.
+#
+# `coalesce` keeps `way_id` in its key because the detail band spends the way id on its
+# feature id. The overview bands carry no `way`, no `refs` and no `name`, so a way
+# boundary along a road whose services do not change is a feature break they pay for and
+# cannot show. `publish.merge_overview` joins across it wherever `n` and `trips` both
+# match, which moves no point and averages no attribute.
+#
+# Measured on the exports of 2026-08-16, over z5-z10, in the published image:
+#
+#   region            features            overview       worst z5   worst z8
+#   Great Britain     868,984 -> 244,679   34 -> 19 MB   952 -> 862 KB   903 -> 346 KB
+#   Ireland            87,691 ->  17,571  4.3 -> 1.6 MB
+#
+# z8-z10 stop being under any size pressure at all, and z5-z7 stay full while holding
+# more of the network: `--drop-densest-as-needed` has less to throw away, so the lit
+# fraction *rises* where the tiles were being thinned -- around London, 5.771% to 8.062%
+# at z5 and 7.670% to 8.598% at z7. The whole-country window loses 0.07 to 0.17
+# percentage points at z6-z10, which is simplification working on longer lines and is
+# not visible at 600 m a pixel.
+#
+# It costs 15 seconds and 275 MB resident on Great Britain, and one intermediate file
+# in the publish scratch directory. It changes one thing a reader can see: a merged run
+# is one feature sharing one id, so a hover below DETAIL_ZOOM lights the whole run.
+MERGE_OVERVIEW = True
 # How many features each overview band may carry, and **both are None: the overview
 # is not capped, and everything below is switched off.**
 #

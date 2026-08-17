@@ -164,6 +164,19 @@ every feature as detail-band. A way whose service set changes along it is severa
 a hover selects the whole way. Carrying this to a served archive is a `publish` run and
 no migration, because `way` was already a column on `edges` and already in the export.
 
+**The overview bands are built from a second export, and it can build nothing else.**
+`coalesce` keeps `way_id` in its key because the detail band spends the way id on its
+feature id, so a road whose services never change is still one feature per way — a break
+the bands below `DETAIL_ZOOM` pay for and cannot show, since they carry no `way`, `refs` or
+`name`. `publish.merge_overview` joins across it wherever `n` and `trips` both match, which
+moves no point and averages nothing, and took Great Britain's overview from 34 MB to 19 MB
+while *raising* the lit fraction at z5–z7 — the numbers and the switch are on
+`config.MERGE_OVERVIEW`. What fails silently is the other direction: that file has none of
+the info card's attributes, so handing it to the detail band publishes a region with no road
+names, no service lists and no feature ids at all. `build_tiles` keeps the two apart and
+writes the merged file into the publish scratch directory, never beside the export, so no
+later `--from-export` can pick it up by mistake.
+
 **Anything both the pipeline and a viewer must agree on is in `wayfare/map.toml`, and the
 browser cannot read it.** The three layer names, every colour, the archive name a page
 falls back to on a static host, the detail-band pair above, and the box the viewer will not

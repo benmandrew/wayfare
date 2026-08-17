@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from array import array
 from collections import defaultdict
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
@@ -282,6 +283,104 @@ def export_track_geojsonl(
     )
     log.info("%d features of relation track written to %s", written, path)
     return path
+
+
+# --- The overview export ----------------------------------------------------
+#
+# `export_edges_geojsonl` writes with separators=(",", ":") and geometry last, so these
+# are the shape of every line it produces, and the properties go out in the order
+# `coalesce` builds them -- id, way, n, refs, trips, name. That order is what makes the
+# leftmost match of each pattern the property itself rather than something inside a road
+# name or a service list further along the line.
+#
+# A line none of them reads is raised on rather than skipped, for the reason `_features`
+# raises: a filter that quietly matches nothing writes an empty band, and an empty band
+# reads as a region that lost its buses.
+_COORDS = re.compile(rb'"coordinates":(\[\[.*\]\])\}\}$')
+_ID = re.compile(rb'"id":(\d+)')
+_N = re.compile(rb'"n":(\d+)')
+
+
+def _read_full(path: Path) -> Iterator[tuple[list[list[float]], int, int, int]]:
+    """Every feature as its geometry and the three properties an overview band keeps."""
+    with path.open("rb") as src:
+        for raw in src:
+            line = raw.rstrip()
+            geometry = _COORDS.search(line)
+            fid = _ID.search(line)
+            n = _N.search(line)
+            trips = _TRIPS.search(line)
+            if geometry is None or fid is None or n is None or trips is None:
+                raise RuntimeError(
+                    f"{path} has a feature this filter cannot read: {line[:120]!r}. "
+                    "The export format and this filter have diverged."
+                )
+            yield json.loads(geometry[1]), int(fid[1]), int(n[1]), int(trips[1])
+
+
+def merge_overview(geojsonl: Path, out: Path) -> Path:
+    """Rewrite the road export for the bands that cannot see a way boundary.
+
+    `coalesce` will not merge two edges that sit on different ways, because `way_id` is
+    in its key -- and it has to be, since the detail band puts the way id in the feature
+    id field. The overview bands do not carry `way`, or `refs`, or `name`: below
+    `DETAIL_ZOOM` an archive holds geometry, `n` and `trips` and nothing else. So every
+    way boundary along a road that carries the same services throughout is a feature
+    break those bands are paying for and cannot show.
+
+    Joining across it costs no ink at all. Two features with the same `n` and the same
+    `trips`, meeting end to end, are one line to every reader of an overview tile, and
+    what the merge saves is per-feature overhead: a geometry header, an absolute moveto
+    and a key/value pair per attribute. It also gives `--simplification` something to
+    work with, which a four-point line does not. Measured, this is the largest saving in
+    the overview there has ever been -- see `config.MERGE_OVERVIEW`.
+
+    **The output has no `way`, no `refs` and no `name`, so it can only build the
+    overview.** Handing it to the detail band would take the road names and the service
+    lists off the info card and leave every feature there with no id at all, since that
+    band spends `way` on the id field. `build_tiles` keeps the two files apart, and it
+    is the one thing about this that fails silently rather than loudly.
+
+    The merge is through a point where exactly two of the group's lines meet, which is
+    `_chain`'s rule and is the reason it is `_chain` doing it: at a junction of three
+    the continuation is ambiguous and picking one draws a line that doubles back.
+    """
+    coords = array("i")
+    starts = array("q")
+    ids = array("q")
+    groups: defaultdict[tuple[int, int], list[int]] = defaultdict(list)
+
+    for i, (points, fid, n, trips) in enumerate(_read_full(geojsonl)):
+        starts.append(len(coords) // 2)
+        for lon, lat in points:
+            coords.append(round(lon * 1e6))
+            coords.append(round(lat * 1e6))
+        ids.append(fid)
+        groups[(n, trips)].append(i)
+    starts.append(len(coords) // 2)
+    read = len(ids)
+
+    def points_of(i: int) -> list[Point]:
+        return [(coords[2 * j], coords[2 * j + 1]) for j in range(starts[i], starts[i + 1])]
+
+    def merged() -> Iterator[tuple[dict[str, Any], list[list[float]]]]:
+        # A group at a time, so only the largest one's geometry is ever materialised as
+        # Python tuples. The flat array above is what the whole network costs, and it is
+        # eight bytes a coordinate against the eighty a tuple of two floats takes. Great
+        # Britain's 868,984 features peak at 275 MB here.
+        for (n, trips), members in groups.items():
+            for fid, pts in _chain([(ids[i], points_of(i)) for i in members]):
+                yield {"id": fid, "n": n, "trips": trips}, _degrees(pts)
+
+    written = _write_features(out, merged())
+    log.info(
+        "overview export: %d features merged to %d (%.1f%%) across %d distinct (n, trips)",
+        read,
+        written,
+        100 * written / read if read else 100.0,
+        len(groups),
+    )
+    return out
 
 
 def _edge_features(
@@ -680,6 +779,7 @@ def build_tiles(
     attribution: str | None = None,
     segments: Path | None = None,
     track: Path | None = None,
+    overview: Path | None = None,
 ) -> Path:
     """Build the road bands and a pass per extra layer, and join them into one archive.
 
@@ -693,6 +793,13 @@ def build_tiles(
     through to the joined archive -- measured, including where only one of the
     inputs has one -- but a band that can be inspected on its own should say where
     it came from, and passing it each time costs nothing.
+
+    `overview` is a second road export for the three bands below `DETAIL_ZOOM`, which
+    carry neither `way` nor `refs` nor `name` and so can be built from a file that
+    joins the runs a way boundary split. It is a bench input rather than something a
+    publish makes for itself -- `wayfare corridors --merge` writes one -- and it is
+    kept off the detail band on purpose: that band spends `way` on the feature id, so
+    building it from a merged file would leave every feature in it with no id at all.
     """
     for tool in ("tippecanoe", "tile-join"):
         if not shutil.which(tool):
@@ -724,7 +831,16 @@ def build_tiles(
     # which is the whole reason it is atomic.
     with tempfile.TemporaryDirectory(dir=out.parent, prefix=".publish-") as scratch:
         tmp = Path(scratch)
-        passes = [(band, geojsonl) for band in _road_bands(geojsonl)]
+        # Built into the scratch directory rather than beside the export, because it is
+        # an intermediate of this build and not a second thing a data root holds: it
+        # carries none of the info card's attributes, so a later `--from-export` that
+        # picked it up would publish a region with no road names and no service lists.
+        if overview is None and config.MERGE_OVERVIEW and _has_features(geojsonl):
+            overview = merge_overview(geojsonl, tmp / "overview.geojsonl")
+        passes = [
+            (band, geojsonl if band.name == "detail" else (overview or geojsonl))
+            for band in _road_bands(geojsonl, overview)
+        ]
         # One pass over the whole zoom range rather than banded like the roads. The
         # bands exist to stop millions of edges paying for info-card attributes at
         # zooms nobody reads them at, and to thin the quietest roads out of the far
@@ -784,7 +900,7 @@ def build_tiles(
     return out
 
 
-def _road_bands(geojsonl: Path) -> list[_Band]:
+def _road_bands(geojsonl: Path, overview: Path | None = None) -> list[_Band]:
     """The passes over the road export, or none at all where it holds nothing.
 
     A region can have no matched edges -- Irish Rail on its own is 331 patterns and
@@ -807,8 +923,11 @@ def _road_bands(geojsonl: Path) -> list[_Band]:
     """
     if not _has_features(geojsonl):
         return []
+    # The floors are read off whatever the overview bands are actually built from, so
+    # a cap over a merged file counts the features that file holds rather than the
+    # ones it merged away.
     far_floors, mid_floors = (
-        _cell_floors(geojsonl, cap, config.OVERVIEW_WEIGHT) if cap else {}
+        _cell_floors(overview or geojsonl, cap, config.OVERVIEW_WEIGHT) if cap else {}
         for cap in (config.OVERVIEW_CAP_FAR, config.OVERVIEW_CAP_MID)
     )
     return [
@@ -1077,6 +1196,7 @@ def build(
     region: str | None = None,
     out: Path | None = None,
     from_export: Path | None = None,
+    overview: Path | None = None,
 ) -> Path:
     """Export the matched network and build the archive from it.
 
@@ -1111,4 +1231,5 @@ def build(
         attribution=licences.html(config.credit_parts(region, **held)),
         segments=export_segments_geojsonl(con) if con is not None else None,
         track=export_track_geojsonl(con) if con is not None else None,
+        overview=overview,
     )

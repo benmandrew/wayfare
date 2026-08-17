@@ -32,6 +32,7 @@ from . import (
     acquire,
     aggregate,
     config,
+    corridors,
     coverage,
     db,
     gtfs,
@@ -356,6 +357,17 @@ def _add_publish_parser(sub: _Sub) -> None:
         "work/edges.geojsonl. This rebuilds the same tiles; it does not refresh "
         "the region",
     )
+    p.add_argument(
+        "--overview-export",
+        type=Path,
+        default=None,
+        metavar="GEOJSONL",
+        help=f"build the three bands below z{config.DETAIL_ZOOM} from this file "
+        "instead of merging one, which is what a publish does for itself. For trying "
+        "a thinned overview from `wayfare corridors`. The detail band is built from "
+        "the road export either way, because it is the band that carries the way id "
+        "and the info card",
+    )
     _archive_args(p)
 
 
@@ -424,6 +436,49 @@ def _add_draw_parser(sub: _Sub) -> None:
         "of the antialiasing. 1 is the diagnostic default and every line is a hard "
         "pixel; 2 or 3 is what a picture somebody looks at wants, at the square of "
         "itself in memory and roughly that in time",
+    )
+
+
+def _add_corridors_parser(sub: _Sub) -> None:
+    p = sub.add_parser(
+        "corridors",
+        help="thin a road export by whole corridors -- a bench for the low-zoom cap, "
+        "not part of a publish",
+    )
+    p.add_argument(
+        "export",
+        type=Path,
+        help="the GeoJSONL a publish wrote, normally work/edges.geojsonl",
+    )
+    p.add_argument("out", type=Path, help="the GeoJSONL to write")
+    p.add_argument(
+        "--merge",
+        action="store_true",
+        help="write out the merged overview export a publish now builds for itself, "
+        "for inspecting it or for capping on top of it. The output carries none of "
+        "the info card's attributes and can only build the overview",
+    )
+    p.add_argument(
+        "--cap",
+        type=int,
+        default=None,
+        metavar="FEATURES",
+        help="how many features the thinned export may carry. Soft: a corridor kept "
+        "for one cell spends the allowance of every other cell it crosses",
+    )
+    p.add_argument(
+        "--weight",
+        type=float,
+        default=config.OVERVIEW_WEIGHT,
+        help=f"how the cap is shared out -- a cell's share goes as its feature count "
+        f"to this power (default: {config.OVERVIEW_WEIGHT})",
+    )
+    p.add_argument(
+        "--cell",
+        type=float,
+        default=config.OVERVIEW_CELL,
+        metavar="DEGREES",
+        help=f"the cell the cap is shared out over (default: {config.OVERVIEW_CELL})",
     )
 
 
@@ -717,7 +772,11 @@ def _cmd_publish(args: argparse.Namespace) -> int:
 
     with opened as con:
         out = publish.build(
-            con, region=args.region, out=_archive_out(args), from_export=export
+            con,
+            region=args.region,
+            out=_archive_out(args),
+            from_export=export,
+            overview=args.overview_export,
         )
     log.info("done: %s", out)
     return 0
@@ -746,6 +805,38 @@ def _cmd_draw(args: argparse.Namespace) -> int:
         supersample=args.supersample,
     )
     return 0
+
+
+def _cmd_corridors(args: argparse.Namespace) -> int:
+    if not args.export.exists():
+        log.error("%s is not there", args.export)
+        return 1
+    if not args.merge and args.cap is None:
+        log.error("nothing asked for: pass --merge, or --cap, or both")
+        return 1
+
+    src = args.export
+    if args.merge:
+        # Merged first and thinned second, because merging joins the runs a way
+        # boundary split and a corridor over the joined file is the same road in
+        # fewer, longer pieces -- which is what the cap is then spent on.
+        src = publish.merge_overview(
+            src, args.out if args.cap is None else _beside(args.out)
+        )
+    if args.cap is not None:
+        src = corridors.thin(src, args.out, args.cap, args.weight, args.cell)
+
+    if src != args.out:
+        # Said rather than left to the log line above, because the command still exits
+        # zero and a caller about to build tiles from `args.out` would find nothing
+        # there.
+        log.info("nothing written: the export is already under the cap")
+    return 0
+
+
+def _beside(out: Path) -> Path:
+    """Where the merge lands when a thin is going to read it and write `out`."""
+    return out.with_name(f"{out.stem}.merged{out.suffix}")
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
@@ -963,6 +1054,7 @@ _SUBCOMMANDS = {
     "publish": (_add_publish_parser, _cmd_publish),
     "coverage": (_add_coverage_parser, _cmd_coverage),
     "draw": (_add_draw_parser, _cmd_draw),
+    "corridors": (_add_corridors_parser, _cmd_corridors),
     "status": (_add_status_parser, _cmd_status),
     "prune": (_add_prune_parser, _cmd_prune),
     "cluster": (_add_cluster_parser, _cmd_cluster),
