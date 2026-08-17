@@ -449,11 +449,17 @@ def test_the_basemap_gives_up_resolution_when_the_link_says_it_is_slow():
     beside it, with nothing to see either way."""
     text = (WEB / "util.js").read_text()
     assert re.search(r"function\s+thriftyConnection\s*\(\s*\)", text)
-    assert "devicePixelRatio > 1.4 && !thriftyConnection()" in text
-    assert "thriftyConnection() ? 512 : 256" in text
+    assert "devicePixelRatio > 1.4 && !thriftyBasemap()" in text
+    assert "thriftyBasemap() ? 512 : 256" in text
     # Save-Data is the user asking; effectiveType is the browser guessing. Both.
     assert "c.saveData" in text
     assert "effectiveType" in text
+    # And the machine as well as the link. A slow processor and a fast radio are
+    # common together, and that phone was taking the full-price backdrop.
+    assert "thriftyConnection() || weakDevice()" in text
+    assert re.search(r"function\s+weakDevice\s*\(\s*\)", text)
+    assert "navigator.deviceMemory" in text
+    assert "navigator.hardwareConcurrency" in text
     # A tile URL in a page is a second basemap; the preconnect in the viewer's head
     # names the host and asks for nothing, so it is the template that is checked.
     for page in PAGES:

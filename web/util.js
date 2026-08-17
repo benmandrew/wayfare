@@ -113,21 +113,31 @@ function thriftyConnection() {
   return Boolean(c.saveData) || ["slow-2g", "2g", "3g"].includes(c.effectiveType);
 }
 
+// A slow radio and a slow processor are two reasons to draw a cheaper backdrop,
+// and they are common on the same phone rather than on different ones. The
+// connection alone was the trigger, so a low-end Android reporting
+// `effectiveType: "4g"` took the full-price basemap: a `@2x` tile is a
+// 512-pixel PNG decoded and uploaded as a megabyte of texture instead of 256 KB,
+// and with `tileSize: 256` the grid is the same size, so there is nothing saved
+// to pay for it.
+const thriftyBasemap = () => thriftyConnection() || weakDevice();
+
 // Cold profiling put the basemap at 447,036 bytes over 30 requests, 40.9% of
 // everything transferred, and blocking it took a throttled load from 19.4 s to
 // 12.1 s. It competes with the archive for the same pipe while being the context
-// rather than the subject, so on a connection that says it is slow it is drawn at
-// half resolution: `tileSize: 512` against 256-pixel tiles makes MapLibre ask for
-// one zoom level lower and scale it up, which is a quarter of the tiles for a
-// blurrier backdrop. The roads on top are unaffected -- they are vector.
-const basemapTileSize = () => (thriftyConnection() ? 512 : 256);
+// rather than the subject, so where the device says it cannot afford it, it is
+// drawn at half resolution: `tileSize: 512` against 256-pixel tiles makes
+// MapLibre ask for one zoom level lower and scale it up, which is a quarter of
+// the tiles for a blurrier backdrop. The roads on top are unaffected -- they are
+// vector.
+const basemapTileSize = () => (thriftyBasemap() ? 512 : 256);
 
 function basemapTiles(t) {
   // MapLibre has no {s} or {r} placeholder: expand the subdomains here and pick
-  // the retina variant up front. A thrifty connection takes the plain tile
-  // whatever the screen is: a retina backdrop is the first thing to give up when
-  // the network underneath it is still arriving.
-  const r = devicePixelRatio > 1.4 && !thriftyConnection() ? "@2x" : "";
+  // the retina variant up front. A thrifty device takes the plain tile whatever
+  // the screen is: a retina backdrop is the first thing to give up, whether what
+  // is short is the pipe underneath it or the memory it is decoded into.
+  const r = devicePixelRatio > 1.4 && !thriftyBasemap() ? "@2x" : "";
   return ["a", "b", "c", "d"].map(
     (s) => `https://${s}.basemaps.cartocdn.com/${BASEMAP[t]}/{z}/{x}/{y}${r}.png`
   );
