@@ -517,12 +517,28 @@ def test_the_viewer_answers_a_tap_and_gives_it_room_to_land():
     a box rather than a point, because a road is two pixels wide and a fingertip
     covers forty. A mouse click keeps the point: a slop box under an arrow answers
     for the road beside the one being pointed at."""
-    assert _holds("index.html", 'map.on("mousemove", (e) => selectAt(e.point, 0));')
+    assert _holds("index.html", "if (point) selectAt(point, 0);")
     assert _holds("index.html", 'map.on("click", (e) => {')
     assert _holds("index.html", 'e.originalEvent.pointerType === "mouse"')
     assert _holds("index.html", "selectAt(e.point, mouse ? 0 : SLOP)")
     # The box is built from the slop, and a slop of zero stays the point itself.
     assert _holds("index.html", "const box = slop")
+
+
+def test_the_cursor_asks_once_a_frame_and_never_mid_drag():
+    """`mousemove` arrives at the pointer's rate rather than the map's, and each one
+    ran up to three `queryRenderedFeatures` whose hits carry the road's whole
+    coordinate array. A pointer has one position per frame, so the rest were built
+    and discarded.
+
+    The drag guard and the `moveend` flush are asserted together, because either
+    one alone is a bug rather than half a fix: without the guard the hot path runs
+    over a viewport whose tiles the pan is still re-parsing, and without the flush
+    the highlight is left on whatever the pointer was over before the pan moved the
+    map out from under it."""
+    assert _holds("index.html", "frame = requestAnimationFrame(ask);")
+    assert _holds("index.html", "if (e.originalEvent.buttons || frame) return;")
+    assert _holds("index.html", 'map.on("moveend", () => {')
 
 
 def test_both_pages_give_a_coarse_pointer_a_field_it_will_not_zoom_into():

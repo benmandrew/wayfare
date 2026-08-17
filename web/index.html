@@ -1373,6 +1373,17 @@ class ZoomLevelControl {
     this._el.className = "maplibregl-ctrl zoomlevel";
     this._el.title = "Camera zoom, and the zoom the tiles being drawn came from";
     this._el.setAttribute("aria-live", "off");
+    // Two nodes written with `textContent`, rather than the one `innerHTML` this
+    // used to be. `zoom` fires once per rendered frame through a pinch or a wheel
+    // gesture, so that was an HTML parse and a subtree replacement sixty times a
+    // second for a number that moves one decimal place. `_shown` skips even the
+    // two writes on the frames where neither half has changed, which through a
+    // slow pinch is most of them.
+    this._camera = document.createTextNode("");
+    this._tiles = document.createElement("span");
+    this._tiles.className = "tiles";
+    this._el.append(this._camera, this._tiles);
+    this._shown = null;
     this._update = () => {
       const z = map.getZoom();
       // MapLibre asks a vector source for floor(zoom), and stops at the
@@ -1381,12 +1392,12 @@ class ZoomLevelControl {
         this._maxZoom === null
           ? Math.floor(z)
           : Math.min(Math.floor(z), this._maxZoom);
-      this._el.innerHTML =
-        "z" +
-        z.toFixed(1) +
-        (tiles === Math.floor(z)
-          ? ""
-          : ' <span class="tiles">tiles z' + tiles + "</span>");
+      const camera = "z" + z.toFixed(1);
+      const behind = tiles === Math.floor(z) ? "" : " tiles z" + tiles;
+      if (this._shown === camera + behind) return;
+      this._shown = camera + behind;
+      this._camera.nodeValue = camera;
+      this._tiles.textContent = behind;
     };
     map.on("zoom", this._update);
     this._update();
@@ -1441,6 +1452,7 @@ function wireSelection(map, ids, card) {
   // The source-layer rides along because there are now two of them in one archive
   // and setFeatureState addresses a feature by all three.
   let hovered = null; // { src, sourceLayer, id }
+  let shownCursor = "";
   const setHover = (h, on) =>
     map.setFeatureState(
       { source: h.src, sourceLayer: h.sourceLayer, id: h.id },
@@ -1469,7 +1481,14 @@ function wireSelection(map, ids, card) {
     const trackHits = segHits.length ? [] : at(track);
     const hits = segHits.length ? segHits : trackHits.length ? trackHits : at(bus);
     const f = hits[0];
-    map.getCanvas().style.cursor = f ? "pointer" : "";
+    // Written only when it changes. Assigning an inline style is a style
+    // invalidation on the canvas whether or not the value moved, and the value
+    // does not move for the whole time a cursor is crossing one road.
+    const cursor = f ? "pointer" : "";
+    if (cursor !== shownCursor) {
+      shownCursor = cursor;
+      map.getCanvas().style.cursor = cursor;
+    }
     if (hovered && (!f || hovered.id !== f.id || hovered.src !== f.source)) {
       setHover(hovered, false);
       hovered = null;
@@ -1484,7 +1503,37 @@ function wireSelection(map, ids, card) {
 
   // A cursor is exact and asks continuously, so it asks about the point it is on:
   // a slop box there would answer for the road beside the one under the arrow.
-  map.on("mousemove", (e) => selectAt(e.point, 0));
+  //
+  // Coalesced onto an animation frame, because `mousemove` arrives at the pointer's
+  // rate and not the map's -- which on a weak device is several events per drawn
+  // frame -- and each one ran up to three `queryRenderedFeatures`, every hit of
+  // which is materialised as GeoJSON carrying the road's whole coordinate array.
+  // A pointer has one position per frame, so the answers in between were built and
+  // thrown away. Nothing is lost: the frame reads the latest point, which is the
+  // only one that was ever going to be on screen.
+  let asking = null;
+  let frame = 0;
+  const ask = () => {
+    frame = 0;
+    const point = asking;
+    asking = null;
+    if (point) selectAt(point, 0);
+  };
+  map.on("mousemove", (e) => {
+    asking = e.point;
+    // A drag-pan does not stop `mousemove`, so this used to run at pointer rate
+    // over a viewport whose tiles were being re-parsed by the pan that uncovered
+    // them -- and every answer was stale a frame later, because the camera moved
+    // out from under the point it was about. The point is kept rather than
+    // dropped, and `moveend` below asks it once the map has settled.
+    if (e.originalEvent.buttons || frame) return;
+    frame = requestAnimationFrame(ask);
+  });
+  // What the pointer is over after a pan is a different road from what it was over
+  // before one, and the pointer need not have moved for that to be true.
+  map.on("moveend", () => {
+    if (asking && !frame) frame = requestAnimationFrame(ask);
+  });
   // A tap is the other half, and on a touchscreen it is the only half -- there is
   // no cursor to move and MapLibre reports a tap as a click. It fires after a tap
   // and not after a pan, which is the distinction the map needs and the one a
@@ -1887,8 +1936,21 @@ function mergeRegions(hits) {
 // one bad paint expression is enough -- and the handler that reads it runs on
 // every mouse move, so the one real error arrives buried under thousands of
 // identical ones naming the layer rather than the fault.
+//
+// Which of them are missing is settled once the style has loaded: nothing adds or
+// removes a layer after `start`, and the theme switch reassigns paint properties
+// on the ones already there. So the answer is worked out once and kept, rather
+// than a fresh array and one `getLayer` per id per mouse move. Keyed on the id
+// arrays themselves, which `layerIds` builds once and the page then holds for its
+// whole life, and cached only once the style is loaded -- asked before that,
+// every layer is missing and the answer would be an empty list forever.
+const liveLayerCache = new WeakMap();
 function liveLayers(map, ids) {
-  return ids.filter((id) => map.getLayer(id));
+  const known = liveLayerCache.get(ids);
+  if (known) return known;
+  const live = ids.filter((id) => map.getLayer(id));
+  if (map.isStyleLoaded()) liveLayerCache.set(ids, live);
+  return live;
 }
 
 // Which modes have been drawn, so the legend carries a row for each. `absent` is
