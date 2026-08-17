@@ -420,7 +420,7 @@ def test_the_archive_head_is_prefetched_under_the_key_that_reads_it():
     assert re.search(r'Range:\s*"bytes=0-16383"', prefetch)
     assert _holds(
         "index.html",
-        "new pmtiles.PMTiles(new HeadSource(url, heads.get(url) || null))",
+        "new pmtiles.PMTiles(new HeadSource(url, heads.get(url) || null), DIR_CACHE)",
     )
 
 
@@ -539,6 +539,29 @@ def test_the_cursor_asks_once_a_frame_and_never_mid_drag():
     assert _holds("index.html", "frame = requestAnimationFrame(ask);")
     assert _holds("index.html", "if (e.originalEvent.buttons || frame) return;")
     assert _holds("index.html", 'map.on("moveend", () => {')
+
+
+def test_the_map_is_constructed_with_the_settings_a_weak_device_needs():
+    """Every one of these is a MapLibre default that was never chosen. They are
+    asserted here because a default is invisible: nothing reports that the map is
+    rasterising nine times the fragments it needs, holding four uncapped tile
+    caches, or re-fetching tiles it already has.
+
+    `maxPitch: 0` and `disableRotation` are asserted together. Bearing is not pitch
+    and the pitch cap does not reach it, so with only one of the two a pinch on a
+    phone still carries a rotation nobody asked for."""
+    text = _source("index.html")
+    assert _holds(
+        "index.html", "pixelRatio: weakDevice() ? Math.min(devicePixelRatio, 1.5)"
+    )
+    assert _holds("index.html", "maxTileCacheSize: 15,")
+    assert _holds("index.html", "maxPitch: 0,")
+    assert _holds("index.html", "map.touchZoomRotate.disableRotation();")
+    for off in ("dragRotate", "touchPitch", "refreshExpiredTiles", "renderWorldCopies"):
+        assert re.search(rf"{off}:\s*false", text), off
+    # The map option `fadeDuration` is a different setting and inert with no symbol
+    # layers, so the basemap's own paint is the one that had to be written.
+    assert _holds("index.html", '"raster-fade-duration": 0')
 
 
 def test_the_legend_scan_waits_for_a_tile_to_arrive():

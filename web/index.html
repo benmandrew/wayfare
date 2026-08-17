@@ -867,6 +867,18 @@ paintLegend();
 const protocol = new pmtiles.Protocol({ metadata: true });
 maplibregl.addProtocol("pmtiles", protocol.tile);
 
+// One directory cache across every archive, rather than the one each `PMTiles`
+// allocates for itself. Left to itself each takes a `SharedPromiseCache` of 100
+// entries, so three regions is 300 leaf directories held as small objects on top
+// of the parsed library and MapLibre's own caches -- and no archive on this page
+// has anywhere near 100 leaves to put in one.
+//
+// Up here beside the protocol, and above the `boot()` call rather than below it.
+// `openArchive` is only reached after an await, so a declaration further down does
+// initialise in time -- but that is a fact about where the first await happens to
+// be, and 3b6c734 is what a const read before its declaration costs on this page.
+const DIR_CACHE = new pmtiles.SharedPromiseCache(64);
+
 // A PMTiles source that answers out of the head prefetched in <head>, and goes to
 // the network for everything past it. `PMTiles` takes either a URL string, which
 // it wraps in the plugin's own FetchSource, or any object with `getKey` and
@@ -1003,7 +1015,7 @@ async function openArchive(name, i) {
     // A miss is a null head, and a null head is a source that reads the network for
     // everything, so the prefetch is an optimisation and never a requirement.
     const heads = await window.__heads.catch(() => new Map());
-    const archive = new pmtiles.PMTiles(new HeadSource(url, heads.get(url) || null));
+    const archive = new pmtiles.PMTiles(new HeadSource(url, heads.get(url) || null), DIR_CACHE);
     protocol.add(archive); // share the instance so the header is fetched once
     return {
       name,
@@ -1263,7 +1275,16 @@ function buildStyle() {
   // no road is ever moved by. The segment shadow falls across the track below it
   // on purpose -- a tram over a railway is the pair this most needs to separate,
   // and which one is on top is the answer the layer order already gives.
-  const layers = [{ id: "basemap", type: "raster", source: "basemap" }];
+  //
+  // The fade is off because its default is 300 ms and what it costs is paid at
+  // the worst moment: for about eighteen frames of full-screen compositing it
+  // holds the old texture and the new one live together, which is precisely while
+  // the vector tiles over the top are still arriving and being parsed. The map
+  // option `fadeDuration` is a different setting and inert here, since the style
+  // has no symbol layers -- this is the one that was running.
+  const layers = [
+    { id: "basemap", type: "raster", source: "basemap", paint: { "raster-fade-duration": 0 } },
+  ];
   for (const r of REGIONS) layers.push(busLayer(r));
   for (const r of REGIONS) layers.push(trackShadowLayer(r));
   for (const r of REGIONS) layers.push(trackLayer(r));
@@ -1321,11 +1342,46 @@ function start(missing) {
     // a smaller area and harder to spot.
     minZoom: Math.max(...REGIONS.map((r) => r.header.minZoom)),
     maxZoom: 18,
+    // Left unset, MapLibre rasterises at `devicePixelRatio`, and a cheap Android
+    // reports 2.6 to 3 -- seven to nine times the fragments of a one-to-one
+    // surface. Fragments are this map's dominant graphics cost: every line layer
+    // is translucent, so the whole road mesh is alpha-blended overdraw with no
+    // early-depth rejection, drawn over a raster basemap. The cap costs sharpness
+    // on exactly the devices that cannot afford the sharpness, and nothing
+    // anywhere else.
+    pixelRatio: weakDevice() ? Math.min(devicePixelRatio, 1.5) : devicePixelRatio,
+    // The cache is per source and holds tiles that have left the screen, so the
+    // default -- a viewport's worth times five zoom levels -- is four caches on
+    // this page: three archives and the basemap. A phone was holding around
+    // ninety parsed vector tiles and seventy-five decoded basemap textures to
+    // make a pan back instant. The cap trades that for a re-fetch.
+    maxTileCacheSize: 15,
+    // This is a north-up thematic map. A pitch covers several times more tiles
+    // toward the horizon, and both of the gestures that reach one are accidents
+    // here -- a right-drag or a two-finger twist while trying to pan. Rotation
+    // goes with them below, since it comes in on the same pinch as the zoom.
+    maxPitch: 0,
+    dragRotate: false,
+    touchPitch: false,
+    // The archives are immutable between publishes, so there is nothing to
+    // refresh: this only schedules a silent re-fetch and re-parse of tiles
+    // already on screen wherever the host sends a short `max-age`, and
+    // `HeadSource.getBytes` deliberately forwards `cacheControl` and `expires`.
+    refreshExpiredTiles: false,
+    // `maxBounds` is the whole of the British Isles, so the map cannot be panned
+    // to a copy of the world and the bookkeeping for one is never paid off.
+    renderWorldCopies: false,
     // Off here so it can be positioned; added below. The two are exclusive --
     // configuring it in the constructor and adding a second one gives two.
     attributionControl: false,
     style: buildStyle(),
   });
+
+  // The other half of `maxPitch: 0`. Bearing is not pitch and is not covered by
+  // it, and a two-finger pinch is how a phone zooms -- so without this the zoom
+  // gesture carries a rotation nobody asked for, on a map whose north is the only
+  // orientation its labels and its bounds were drawn for.
+  map.touchZoomRotate.disableRotation();
 
   // A resize changes the aspect, and with it how wide the box has to be for the
   // country to still fit top to bottom.

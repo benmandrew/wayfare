@@ -76,6 +76,25 @@ function toggleTheme(btn) {
   return theme;
 }
 
+/* ---------- what the machine will admit to ---------- */
+
+// Whether the device is one of the ones this page has to be careful with. Both
+// readings are Chromium-only, so like `thriftyConnection` below this is an
+// improvement where it exists and never a requirement -- absent, it reads false
+// and every browser gets exactly what it got before.
+//
+// `deviceMemory` is the half worth trusting: it is reported in whole gigabytes,
+// capped at 8, and a desktop reports the cap. `hardwareConcurrency` on its own is
+// a poor signal, because a four-core laptop is not a weak device in any sense
+// this page cares about -- so it is only read where there is no memory figure at
+// all, which is Safari and Firefox, and only at a count low enough that nothing
+// current reaches it.
+function weakDevice() {
+  const mem = navigator.deviceMemory;
+  if (mem) return mem <= 4;
+  return navigator.hardwareConcurrency ? navigator.hardwareConcurrency <= 4 : false;
+}
+
 /* ---------- the basemap ---------- */
 
 const BASEMAP = {
