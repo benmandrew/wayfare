@@ -4,7 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Wayfare studio — generative renders</title>
-<link rel="stylesheet" href="vendor/maplibre-gl.css">
+<!-- `media="print"` so this does not block, flipped to `all` beside the library it
+     belongs to. 65 KB of CSS for a picker map that may never be opened, and it was
+     gating the first paint and -- because a classic script cannot run until every
+     stylesheet above it has loaded -- the `bootTheme()` call below, which exists to
+     run before that paint. Still in this position because the flip does not move
+     the sheet in the cascade, and the page's own rules below win on document
+     order. -->
+<link id="mapcss" rel="stylesheet" href="vendor/maplibre-gl.css?v=4.7.1" media="print">
 <!-- The palette and the panel chrome, shared with index.html. Linked before the
      page's own rules, so those still win. -->
 <link rel="stylesheet" href="base.css">
@@ -456,8 +463,12 @@ input[type=color] {
      gives: this page is usually served on a private network. Only the window
      picker needs them, and it stands down if they are missing, so a bundle
      without web/vendor/ loses the map and keeps the studio. -->
-<script src="vendor/maplibre-gl.js"></script>
-<script src="vendor/pmtiles.js"></script>
+<!-- The other half of the `media="print"` in <head>, here because here is where it
+     stops costing anything: the studio has painted, so making the sheet
+     render-blocking again blocks nothing that is not already on screen. -->
+<script>document.getElementById("mapcss").media = "all";</script>
+<script src="vendor/maplibre-gl.js?v=4.7.1"></script>
+<script src="vendor/pmtiles.js?v=4.4.1"></script>
 <!-- The basemap credit, shared with index.html so the two cannot drift. -->
 <script src="credits.js"></script>
 <script>
@@ -509,6 +520,7 @@ let META = null;
 let S = null;            // the whole parameter set; the hash is its serialisation
 let controller = null;   // in-flight preview request
 let objectURL = null;    // currently displayed blob URL
+let pendingURL = null;   // handed to the <img>, not yet decoded; see `show`
 let lastHash = null;     // what we wrote, so our own writes are not read back
 
 // A knob comes to rest before it is drawn. 300 ms is long enough to swallow a
@@ -854,6 +866,7 @@ const picked = (el, e) => e.target.value;
 const chosen = (el) => [...el.selectedOptions].map((o) => o.value).sort();
 
 function build() {
+  writeExportCredit();
   $("styles").innerHTML = META.styles.map((st) => `
     <label class="pick" data-style="${escapeHtml(st.name)}">
       <input type="radio" name="style" value="${escapeHtml(st.name)}">
@@ -944,7 +957,7 @@ function build() {
     $("out-" + key).textContent = trim(S[key]);
     // `scale` never changes the preview, so moving it only refreshes the
     // export figures.
-    if (key === "scale") { writeHash(); exports(); } else changed();
+    if (key === "scale") scheduleCommit(); else changed();
   });
 
   $("formats").innerHTML = (META.limits.formats || [".png"]).map((f) => {
@@ -980,7 +993,7 @@ function build() {
       if (!Number.isFinite(v) || v < 64) return; // mid-typing; wait for a usable number
       S[id] = Math.round(v);
       $(id + "Out").textContent = S[id] + " px";
-      if (id === "width") { writeHash(); exports(); }
+      if (id === "width") scheduleCommit();
       else { S.previewWidthAuto = false; changed(); }
     });
   }
@@ -1079,10 +1092,28 @@ function applyQuery() {
   $("filterReset").hidden = !filtersActive();
 }
 
-function changed() {
+// What a change costs once the knob has come to rest. `scheduleRender` used to be
+// the only debounced part of this, so all three of these ran per `input` event: a
+// 300-pixel slider drag is about 300 calls to `history.replaceState`, which Safari
+// throttles past roughly a hundred in thirty seconds and Firefox warns about.
+//
+// The count is not the worst of it. `exports` writes DOM and the next event's
+// `refit` reads `getComputedStyle` and `clientWidth`, so every event forced a
+// synchronous style and layout flush of a document holding selects of up to 500
+// options -- one per pixel of the drag.
+//
+// Shorter than the render's own debounce, so the width `refit` settles on is the
+// width the render that follows asks for.
+const COMMIT_MS = 150;
+function commit() {
   refit(); // the area may have changed shape, which changes what fits
   writeHash();
   exports();
+}
+const scheduleCommit = debounce(commit, COMMIT_MS);
+
+function changed() {
+  scheduleCommit();
   $("busy").hidden = false;
   scheduleRender();
 }
@@ -1128,6 +1159,11 @@ function query({ width, scale, format, download, sample }) {
 // never waits on a picture already out of date.
 async function render(force) {
   scheduleRender.cancel();
+  // The hash, the export links and the fitted width are all part of what a render
+  // is of, so a render overtaking a pending commit -- the Refresh button, a design
+  // pasted into the address bar -- runs it rather than leaving it to land after.
+  scheduleCommit.cancel();
+  commit();
   if (!META?.enabled) return;
 
   // Supersede rather than queue: the server allows four waiting renders and a
@@ -1146,7 +1182,13 @@ async function render(force) {
       const url = query({
         width: S.previewWidth,
         scale: 1, // see KNOBS: scale is resolution only, so the preview never pays for it
-        format: S.format,
+        // Always a raster, whatever the download will be. `exports` caps a download
+        // against `max_pixels` and nothing caps the preview, so choosing SVG used
+        // to hand the browser a full-detail vector of a national window -- hundreds
+        // of thousands of paths to parse and rasterise into a few hundred pixels of
+        // frame. Both formats come off the same spec through the same renderer, so
+        // what is on screen is the same picture either way.
+        format: "png",
         download: false,
         sample,
       });
@@ -1194,20 +1236,48 @@ async function reason(res) {
 function show(blob, res, sample) {
   const next = URL.createObjectURL(blob);
   const img = $("shot");
-  // The previous URL is revoked only once the new image has decoded; revoking
-  // it earlier can blank the picture we are trying to keep on screen.
+  // A URL that was handed to the <img> and never got to `onload` is revoked here,
+  // synchronously, because after this line nothing can reach it: assigning
+  // `img.src` below drops the load in flight and assigning `img.onload` drops the
+  // handler that would have taken ownership of it. Left alone it held its blob and
+  // its decoded bitmap for the life of the page.
+  //
+  // This is the ordinary path rather than a corner: a preview is drawn twice, at
+  // `sample=8` and then at `sample=1`, and the leak is what happens when the
+  // second response arrives before the first has decoded -- which is the slow
+  // device this matters on.
+  if (pendingURL) URL.revokeObjectURL(pendingURL);
+  pendingURL = next;
+  // The previous *displayed* URL is revoked only once the new image has decoded;
+  // revoking it earlier can blank the picture we are trying to keep on screen.
   img.onload = () => {
     if (objectURL) URL.revokeObjectURL(objectURL);
     objectURL = next;
+    pendingURL = null;
     // Say so when the picture is a sampled one: it is dimmer and sparser than
     // the export will be, and an unlabelled approximation is a design decision
     // made against the wrong image.
     const partial = sample > 1
       ? ` · <span style="color:var(--accent)">1 edge in ${sample}</span>, refining`
       : "";
+    // The preview is a raster whatever the download will be, so the size and the
+    // time here are a PNG's. Said rather than left to be inferred: they are the
+    // figures somebody sizing an export reads.
+    const raster = S.format === "png" ? "" : " · previewed as PNG";
     $("stat").innerHTML =
       `<b>${img.naturalWidth}</b> × <b>${img.naturalHeight}</b> px · ` +
-      `<b>${bytes(blob.size)}</b> · drawn in <b>${serverMs(res)}</b>${partial}`;
+      `<b>${bytes(blob.size)}</b> · drawn in <b>${serverMs(res)}</b>${partial}${raster}`;
+  };
+  // A blob that will not decode is the other way out of `onload`, and without
+  // this it leaks the same way and leaves the status line describing the render
+  // before it. The picture already on screen stays, as it does for a failed
+  // request.
+  img.onerror = () => {
+    if (pendingURL === next) {
+      URL.revokeObjectURL(next);
+      pendingURL = null;
+    }
+    showError("the render could not be decoded", null);
   };
   img.src = next;
   img.hidden = false;
@@ -1256,17 +1326,23 @@ const refuse = (el, over) => {
 
 // The server rejects anything over its pixel budget, and a rejected download is
 // a wasted wait, so the same arithmetic runs here first.
-function exports() {
-  const b = bounds();
-  // Said at the download rather than buried in a note beside the toggle. Every file
-  // that leaves here already carries this in its PNG or SVG metadata, which is the
-  // half nobody has to remember; the half that needs saying is that metadata does
-  // not survive most places a picture gets posted.
+// Said at the download rather than buried in a note beside the toggle. Every file
+// that leaves here already carries this in its PNG or SVG metadata, which is the
+// half nobody has to remember; the half that needs saying is that metadata does
+// not survive most places a picture gets posted.
+//
+// Written once from `build`, because `META.credit` is fixed for the session and
+// this used to be re-parsed as HTML on every call of `exports`.
+function writeExportCredit() {
   $("exportCredit").innerHTML = META.credit
     ? `Every download carries its credit in the file's metadata &mdash; ${META.credit}. ` +
       `Metadata rarely survives a repost, so tick <b>Draw the credit</b> under Caption ` +
       `for anything going somewhere public.`
     : "";
+}
+
+function exports() {
+  const b = bounds();
   const png = query({ width: S.width, scale: S.scale, format: "png", download: true });
   const svg = query({ width: S.width, scale: 1, format: "svg", download: true });
   $("dlPng").href = png;
@@ -1340,7 +1416,22 @@ let syncing = false;    // a camera move of our own, which must not be read back
 function initPicker() {
   if (typeof maplibregl === "undefined") return; // no vendor bundle; no picker
   $("pickField").hidden = false;
+  $("pickToggle").addEventListener("click", () => showPicker(!!$("pickwrap").hidden));
+  // Which does the building, if it is opening. See `showPicker`.
+  showPicker(localStorage.getItem("wayfare-pickmap") !== "closed");
+}
 
+// Everything a picker costs, and none of it paid until someone opens one. This
+// used to run from `boot()` unconditionally, so a reader who closed the picker
+// last visit still paid for a second WebGL context, the raster basemap,
+// `archives.json`, a `getHeader()` per archive and the whole road network drawn
+// into a box roughly 272 by 200 pixels -- held for the session, and never once on
+// screen. Two live WebGL contexts on one page is at the edge of what a
+// two-gigabyte Android will keep alive, and this was the invisible one.
+//
+// Called only with the container already visible, which is also what lets the map
+// measure itself: constructed under `display: none` it comes up zero by zero.
+function buildPicker() {
   const b = bounds() || ISLES;
   pickMap = new maplibregl.Map({
     container: "pickmap",
@@ -1400,10 +1491,16 @@ function initPicker() {
     addNetwork(pickMap);
   });
 
-  addEventListener("resize", debounce(() => quietly(() => pickMap.resize()), 100));
-
-  $("pickToggle").addEventListener("click", () => showPicker(!!$("pickwrap").hidden));
-  showPicker(localStorage.getItem("wayfare-pickmap") !== "closed");
+  // Skipped while the picker is folded away, because a resize of a hidden
+  // container reallocates the drawing buffer to nothing and back -- and Android
+  // fires `resize` every time the address bar slides. `showPicker` does the
+  // resize on the way back open, which is the moment it is needed.
+  addEventListener(
+    "resize",
+    debounce(() => {
+      if (!$("pickwrap").hidden) quietly(() => pickMap.resize());
+    }, 100)
+  );
 }
 
 // fitBounds({animate:false}) and resize() both jump rather than ease, and a jump
@@ -1414,8 +1511,17 @@ function quietly(fn) {
   try { fn(); } finally { syncing = false; }
 }
 
+// What the picker was last pointed at, so it is not pointed there again. `apply`
+// calls `showOnMap` on every discrete change -- picking a style, a weight, a group
+// or a format -- and none of those moves the window, while `fitBounds` is a full
+// repaint and a tile-coverage check whether or not the camera has anywhere to go.
+let shownWindow = null;
+
 function showOnMap(b) {
   if (!pickMap || !b) return;
+  const where = b.join(",");
+  if (where === shownWindow) return;
+  shownWindow = where;
   quietly(() => pickMap.fitBounds([[b[0], b[1]], [b[2], b[3]]],
                                   { padding: 0, animate: false }));
 }
@@ -1425,9 +1531,14 @@ function showPicker(open) {
   $("pickToggle").textContent = open ? "Hide the map" : "Pick on a map";
   $("pickToggle").setAttribute("aria-expanded", String(open));
   localStorage.setItem("wayfare-pickmap", open ? "open" : "closed");
-  // A map whose container was display:none while the window changed size comes
-  // back with a stale canvas.
-  if (open && pickMap) quietly(() => pickMap.resize());
+  if (!open) return;
+  // The container is on screen by now, which is what `buildPicker` needs and what
+  // makes the freshly built map measure itself correctly rather than need the
+  // resize below. Everything after the first open is the resize alone: a map whose
+  // container was display:none while the window changed size comes back with a
+  // stale canvas.
+  if (pickMap) quietly(() => pickMap.resize());
+  else buildPicker();
 }
 
 function repaintPicker() {

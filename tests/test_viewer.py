@@ -335,7 +335,24 @@ def test_every_legend_row_is_a_switch():
     # The road network and the relation track are a layer each; the modes share one
     # layer per region, so a mode goes off by filter and not by visibility.
     assert "withoutModes" in text
-    assert _holds("index.html", "map.setFilter(id, off.length ? withoutModes(off) : null)")
+    assert _holds("index.html", "const filter = off.length ? withoutModes(off) : null;")
+
+
+def test_a_selection_that_has_not_moved_is_not_reapplied():
+    """`setFilter` marks the layer's source for reload, and MapLibre's guard against
+    a redundant call cannot fire on these layers: they are built with no `filter`, so
+    the stored value is `undefined` and the guard's `undefined === null` is false.
+    Every keystroke therefore re-parsed every tile of every archive, indefinitely.
+
+    Both keys are asserted, because the guard has to be on the mode rows and the
+    track rows alike -- one of the two left open is still a reload of one source per
+    archive per keystroke. Sorting is asserted with them: unsorted, the key names the
+    order the rows were clicked in rather than the selection, and two rows switched
+    off in the other order read as a change that is not one."""
+    text = _source("index.html")
+    assert _holds("index.html", "if (nextMode !== modeKey) {")
+    assert _holds("index.html", "if (nextTrack !== trackKey) {")
+    assert len(re.findall(r"\[\.\.\.off\w*\]\.sort\(\)\.join\(\",\"\)", text)) == 2
 
 
 def test_the_viewer_tells_the_two_id_spaces_apart_by_refs():
@@ -403,7 +420,7 @@ def test_the_archive_head_is_prefetched_under_the_key_that_reads_it():
     assert re.search(r'Range:\s*"bytes=0-16383"', prefetch)
     assert _holds(
         "index.html",
-        "new pmtiles.PMTiles(new HeadSource(url, heads.get(url) || null))",
+        "new pmtiles.PMTiles(new HeadSource(url, heads.get(url) || null), DIR_CACHE)",
     )
 
 
@@ -432,11 +449,17 @@ def test_the_basemap_gives_up_resolution_when_the_link_says_it_is_slow():
     beside it, with nothing to see either way."""
     text = (WEB / "util.js").read_text()
     assert re.search(r"function\s+thriftyConnection\s*\(\s*\)", text)
-    assert "devicePixelRatio > 1.4 && !thriftyConnection()" in text
-    assert "thriftyConnection() ? 512 : 256" in text
+    assert "devicePixelRatio > 1.4 && !thriftyBasemap()" in text
+    assert "thriftyBasemap() ? 512 : 256" in text
     # Save-Data is the user asking; effectiveType is the browser guessing. Both.
     assert "c.saveData" in text
     assert "effectiveType" in text
+    # And the machine as well as the link. A slow processor and a fast radio are
+    # common together, and that phone was taking the full-price backdrop.
+    assert "thriftyConnection() || weakDevice()" in text
+    assert re.search(r"function\s+weakDevice\s*\(\s*\)", text)
+    assert "navigator.deviceMemory" in text
+    assert "navigator.hardwareConcurrency" in text
     # A tile URL in a page is a second basemap; the preconnect in the viewer's head
     # names the host and asks for nothing, so it is the template that is checked.
     for page in PAGES:
@@ -500,12 +523,118 @@ def test_the_viewer_answers_a_tap_and_gives_it_room_to_land():
     a box rather than a point, because a road is two pixels wide and a fingertip
     covers forty. A mouse click keeps the point: a slop box under an arrow answers
     for the road beside the one being pointed at."""
-    assert _holds("index.html", 'map.on("mousemove", (e) => selectAt(e.point, 0));')
+    assert _holds("index.html", "if (point) selectAt(point, 0);")
     assert _holds("index.html", 'map.on("click", (e) => {')
     assert _holds("index.html", 'e.originalEvent.pointerType === "mouse"')
     assert _holds("index.html", "selectAt(e.point, mouse ? 0 : SLOP)")
     # The box is built from the slop, and a slop of zero stays the point itself.
     assert _holds("index.html", "const box = slop")
+
+
+def test_the_cursor_asks_once_a_frame_and_never_mid_drag():
+    """`mousemove` arrives at the pointer's rate rather than the map's, and each one
+    ran up to three `queryRenderedFeatures` whose hits carry the road's whole
+    coordinate array. A pointer has one position per frame, so the rest were built
+    and discarded.
+
+    The drag guard and the `moveend` flush are asserted together, because either
+    one alone is a bug rather than half a fix: without the guard the hot path runs
+    over a viewport whose tiles the pan is still re-parsing, and without the flush
+    the highlight is left on whatever the pointer was over before the pan moved the
+    map out from under it."""
+    assert _holds("index.html", "frame = requestAnimationFrame(ask);")
+    assert _holds("index.html", "if (e.originalEvent.buttons || frame) return;")
+    assert _holds("index.html", 'map.on("moveend", () => {')
+
+
+def test_every_vendored_url_carries_the_version_the_readme_names():
+    """`wayfare serve` sends `web/vendor/*` as `immutable` for a year, and what makes
+    that safe is the query: the URL a page asks for changes when the bytes behind it
+    do. Bump a library without bumping the pages and every returning visitor holds
+    the old one until the year is out, with nothing to see and no way to tell.
+
+    The versions are read out of `web/vendor/README.md`, which is the table the
+    update instructions there tell you to edit, so this fails on either half of the
+    bump being forgotten rather than on a number written twice."""
+    table = (WEB / "vendor" / "README.md").read_text()
+    versions = dict(re.findall(r"\|\s*\[`([\w.-]+)`\][^|]*\|\s*([\d.]+)\s*\|", table))
+    assert set(versions) == {"maplibre-gl.js", "maplibre-gl.css", "pmtiles.js"}
+    for page in PAGES:
+        text = _source(page)
+        asked = dict(re.findall(r'"vendor/([\w.-]+)\?v=([\d.]+)"', text))
+        assert asked, page
+        for name, version in asked.items():
+            assert versions[name] == version, (page, name)
+        # And no unversioned one alongside them, which would be the copy that goes
+        # on being served out of a year-old cache.
+        assert not re.search(r'"vendor/[\w.-]+"', text), page
+
+
+def test_neither_page_lets_the_map_stylesheet_block_the_theme():
+    """A classic script cannot run until every stylesheet above it has loaded, so
+    65 KB of MapLibre CSS in `<head>` gated the `bootTheme()` call whose whole
+    purpose is running before the first paint -- and the first paint with it. Every
+    `.maplibregl-*` selector in that file matches nothing until a map is built.
+
+    Both halves are asserted per page. The `media="print"` alone leaves the sheet
+    never applying, and the flip alone leaves it blocking. Its position is asserted
+    too: it stays above each page's own `<style>`, because the flip does not move it
+    in the cascade and the `.maplibregl-ctrl-*` overrides below win on document
+    order rather than on specificity."""
+    for page in PAGES:
+        text = _source(page)
+        assert _holds(page, 'id="mapcss" rel="stylesheet"'), page
+        assert re.search(r'href="vendor/maplibre-gl\.css\?v=[\d.]+" media="print"', text), (
+            page
+        )
+        assert _holds(page, 'document.getElementById("mapcss").media = "all";'), page
+        # The opening tag at the start of its own line, because the prose above the
+        # link names `<style>` and would otherwise be what this found.
+        own = re.search(r"^<style>$", text, re.MULTILINE)
+        assert own, page
+        assert text.index('id="mapcss"') < own.start(), page
+        assert own.start() < text.index('getElementById("mapcss")'), page
+
+
+def test_the_map_is_constructed_with_the_settings_a_weak_device_needs():
+    """Every one of these is a MapLibre default that was never chosen. They are
+    asserted here because a default is invisible: nothing reports that the map is
+    rasterising nine times the fragments it needs, holding four uncapped tile
+    caches, or re-fetching tiles it already has.
+
+    `maxPitch: 0` and `disableRotation` are asserted together. Bearing is not pitch
+    and the pitch cap does not reach it, so with only one of the two a pinch on a
+    phone still carries a rotation nobody asked for."""
+    text = _source("index.html")
+    assert _holds(
+        "index.html", "pixelRatio: weakDevice() ? Math.min(devicePixelRatio, 1.5)"
+    )
+    assert _holds("index.html", "maxTileCacheSize: 15,")
+    assert _holds("index.html", "maxPitch: 0,")
+    assert _holds("index.html", "map.touchZoomRotate.disableRotation();")
+    for off in ("dragRotate", "touchPitch", "refreshExpiredTiles", "renderWorldCopies"):
+        assert re.search(rf"{off}:\s*false", text), off
+    # The map option `fadeDuration` is a different setting and inert with no symbol
+    # layers, so the basemap's own paint is the one that had to be written.
+    assert _holds("index.html", '"raster-fade-duration": 0')
+
+
+def test_the_legend_scan_waits_for_a_tile_to_arrive():
+    """Both `noteRendered` calls are a `queryRenderedFeatures` over the whole
+    viewport with no bounding box, and every hit is materialised as a LineString
+    carrying its full geometry so that one property can be read off it. `seenModes`
+    and `seenTrackModes` only ever grow, so once they have stopped growing the whole
+    allocation is discarded -- and `idle` fires on every camera settle for the life
+    of the page.
+
+    A mode can only be seen for the first time in a tile drawn for the first time,
+    so the gate is a tile having loaded. It has to start true, or the opening view
+    is scanned only if a tile happens to finish after the first idle."""
+    assert _holds("index.html", "let tileArrived = true;")
+    assert _holds(
+        "index.html", 'if (e.dataType === "source" && e.tile) tileArrived = true;'
+    )
+    assert _holds("index.html", "if (!tileArrived) return;")
 
 
 def test_both_pages_give_a_coarse_pointer_a_field_it_will_not_zoom_into():
@@ -625,3 +754,96 @@ def test_the_studio_picker_draws_every_archive_the_server_lists():
     # A theme change has to reach every layer drawn, not the one named `bus`.
     assert _holds("art.html", "for (const id of pickLayers) {")
     assert '"bus"' not in _tight(_between(text, "function repaintPicker", "\n}\n"))
+
+
+def test_the_studio_revokes_a_render_it_never_got_to_show():
+    """`show` took ownership of an object URL inside `img.onload`. A second `show`
+    overwrites `img.onload` and `img.src`, so when the second response arrives
+    before the first has decoded the first URL is never revoked and never again
+    reachable -- it holds its blob and its decoded bitmap for the life of the page.
+
+    That is the ordinary path rather than a corner: a preview is drawn at
+    `sample=8` and then at `sample=1`, and the overtaking happens exactly on the
+    slow device this matters on. `onerror` is asserted with it, because a blob that
+    will not decode is the other way out of `onload` and leaks the same way."""
+    text = _source("art.html")
+    assert _holds("art.html", "if (pendingURL) URL.revokeObjectURL(pendingURL);")
+    assert _holds("art.html", "pendingURL = next;")
+    assert _holds("art.html", "img.onerror = () => {")
+    # The revoke of the pending URL comes before the <img> is pointed anywhere else,
+    # because after that assignment nothing can reach it.
+    assert text.index("URL.revokeObjectURL(pendingURL)") < text.index("img.src = next;")
+
+
+def test_the_studio_builds_the_picker_only_when_it_is_opened():
+    """`initPicker` ran from `boot()` unconditionally and only decided at the end
+    whether anyone wanted a picker. A reader who closed it last visit still paid for
+    a second WebGL context, the raster basemap, `archives.json`, a `getHeader()` per
+    archive and the whole road network drawn into a box roughly 272 by 200 pixels --
+    held for the session, and never on screen.
+
+    The order is what this pins. `buildPicker` has to run with the container already
+    visible, because a MapLibre map constructed under `display: none` comes up zero
+    by zero -- so the build sits after the line that unhides the wrapper, not before
+    it."""
+    text = _source("art.html")
+    build = _between(text, "function showPicker(open) {", "\n}\n")
+    assert "else buildPicker();" in build
+    assert build.index('$("pickwrap").hidden = !open;') < build.index("buildPicker()")
+    # And nothing constructs a map before that.
+    init = _between(text, "function initPicker()", "\n}\n")
+    assert "new maplibregl.Map" not in init
+    assert "showPicker(" in init
+
+
+def test_the_studio_does_not_resize_a_picker_nobody_is_looking_at():
+    """Android fires `resize` whenever the address bar slides, and resizing a hidden
+    container reallocates the drawing buffer to nothing and back. `showPicker` does
+    the resize on the way open, which is the moment it is needed."""
+    assert _holds("art.html", 'if (!$("pickwrap").hidden) quietly(() => pickMap.resize());')
+
+
+def test_the_studio_debounces_every_side_effect_of_a_knob_moving():
+    """`scheduleRender` was the only debounced part of `changed`, so `refit`,
+    `writeHash` and `exports` ran per `input` event -- a 300-pixel slider drag being
+    about 300 calls to `history.replaceState`, which Safari throttles past roughly a
+    hundred in thirty seconds.
+
+    The count is not the worst of it: `exports` writes DOM and the next event's
+    `refit` reads `getComputedStyle` and `clientWidth`, so every event forced a
+    synchronous style and layout flush of a document holding selects of up to 500
+    options. The commit delay is asserted to be under the render's, because the
+    width `refit` settles on has to be the width the render then asks for."""
+    text = _source("art.html")
+    assert _holds("art.html", "const scheduleCommit = debounce(commit, COMMIT_MS);")
+    commit_ms = int(re.search(r"const COMMIT_MS = (\d+);", text).group(1))
+    debounce_ms = int(re.search(r"const DEBOUNCE_MS = (\d+);", text).group(1))
+    assert commit_ms < debounce_ms
+    # A render overtaking a pending commit runs it rather than leaving it to land
+    # after the picture it was part of.
+    assert _holds("art.html", "scheduleCommit.cancel();")
+    changed = _between(text, "function changed() {", "\n}\n")
+    for direct in ("refit()", "writeHash()", "exports()"):
+        assert direct not in changed, direct
+
+
+def test_the_studio_previews_as_a_raster_whatever_it_will_export():
+    """`exports` caps a download against `max_pixels` and nothing caps the preview,
+    so choosing SVG handed the browser a full-detail vector of a national window --
+    hundreds of thousands of paths to parse and rasterise into a few hundred pixels
+    of frame. Both formats come off the same spec through the same renderer.
+
+    The status line has to say so, because the size and the time it reports are then
+    a PNG's and they are what somebody sizing an export reads."""
+    request = _between(_source("art.html"), "for (const sample of stages)", "const res =")
+    assert 'format: "png"' in _tight(request).replace("format:", "format: ")
+    assert "S.format" not in request
+    assert _holds("art.html", 'S.format === "png" ? "" : " · previewed as PNG"')
+
+
+def test_the_studio_does_not_refit_the_picker_onto_the_window_it_is_already_on():
+    """`apply` calls `showOnMap` on every discrete change -- a style, a weight, a
+    group, a format -- and none of those moves the window, while `fitBounds` is a
+    full repaint and a tile-coverage check whether or not the camera has anywhere to
+    go."""
+    assert _holds("art.html", "if (where === shownWindow) return;")

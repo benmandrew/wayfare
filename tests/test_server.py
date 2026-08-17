@@ -1078,3 +1078,67 @@ def test_a_compressible_file_goes_out_gzipped_and_stays_identical(
     assert len(bodies) == 1
     assert gzip.decompress(bodies.pop()) == (tmp_path / "web" / "app.js").read_bytes()
     assert len(gzip_cache) == 1
+
+
+# --- Freshness ---------------------------------------------------------------
+
+
+def test_a_vendored_library_is_cached_outright_and_the_page_is_not(tmp_path, serve_at):
+    """The libraries were on `no-cache` with the page, on the argument that the
+    conditional requests multiplex into roughly one round trip. That holds behind an
+    HTTP/2 front end and `wayfare serve` is not one -- it is HTTP/1.1 over a
+    threading TCP server, so a repeat visit spends two round trips across six
+    connections to transfer nothing.
+
+    What makes `immutable` safe is that the pages ask under a versioned URL, so this
+    is asserted with the query on: the request changes when the bytes do. The page
+    itself must not be caught by the same rule, because a stale index.html is a bug
+    that outlives its own fix.
+    """
+    base = serve_at()
+    web = tmp_path / "web"
+    (web / "vendor").mkdir()
+    (web / "vendor" / "maplibre-gl.js").write_text("// library\n")
+    (web / "index.html").write_text("<!DOCTYPE html>")
+    with _get(f"{base}/vendor/maplibre-gl.js?v=4.7.1") as response:
+        assert response.headers["Cache-Control"] == (
+            f"public, max-age={server.VENDOR_MAX_AGE}, immutable"
+        )
+    with _get(f"{base}/index.html") as response:
+        assert response.headers["Cache-Control"] == server.REVALIDATE
+
+
+def test_the_archive_index_is_revalidated_rather_than_re_sent(serve_at):
+    """The viewer asks for this in `<head>`, on the critical path of every load, and
+    the answer is the same bytes between publishes. Under `no-store` that round trip
+    carried the whole body back every time."""
+    base = serve_at()
+    with _get(f"{base}/archives.json") as response:
+        assert response.headers["Cache-Control"] == server.REVALIDATE
+        etag = response.headers["ETag"]
+        assert etag
+        body = response.read()
+    # urllib raises on a 304 rather than returning it, so the second visit is read
+    # off the exception. A 200 here is the regression, and pytest.raises is what
+    # fails on one.
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        _get(f"{base}/archives.json", **{"If-None-Match": etag})
+    # Closed explicitly: an HTTPError holds the connection open, and an unclosed
+    # socket surfaces as a ResourceWarning under whichever later test happens to
+    # trigger the collection.
+    with caught.value as again:
+        assert again.code == 304
+        assert again.headers["ETag"] == etag
+        assert again.read() == b""
+    assert json.loads(body) == ["wales.pmtiles"]
+
+
+def test_a_fault_is_still_not_stored(serve_at):
+    """A 503 is about the moment it was asked, so there is nothing in it worth a
+    client keeping -- and an ETag on one would invite exactly that."""
+    base = serve_at(art_enabled=False)
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        _get(f"{base}/art?bbox=0,0,1,1")
+    with caught.value as refused:
+        assert refused.headers["Cache-Control"] == "no-store"
+        assert refused.headers["ETag"] is None

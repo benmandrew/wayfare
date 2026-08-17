@@ -86,7 +86,19 @@ window.__heads = (async () => {
   return heads;
 })();
 </script>
-<link rel="stylesheet" href="vendor/maplibre-gl.css">
+<!-- `media="print"` so this does not block, flipped to `all` beside the library it
+     belongs to. 65 KB of CSS whose every `.maplibregl-*` selector matches nothing
+     until `start()` builds the map, and it was gating two things that come before
+     the map exists: the first paint of the boot overlay, and -- because a classic
+     script cannot run until every stylesheet above it has loaded -- the
+     `bootTheme()` call whose whole purpose is running before that paint. A reader
+     who chose dark got the white screen it was written to prevent, on exactly the
+     device where the wait is longest.
+
+     Still in this position, and it has to be: the flip does not move the sheet in
+     the cascade, and the nine `.maplibregl-ctrl-*` overrides in the page's own
+     <style> below win on document order rather than on specificity. -->
+<link id="mapcss" rel="stylesheet" href="vendor/maplibre-gl.css?v=4.7.1" media="print">
 <!-- The palette and the panel chrome, shared with art.html. Linked before the
      page's own rules, so those still win. -->
 <link rel="stylesheet" href="base.css">
@@ -398,8 +410,13 @@ body {
      private network, where a public CDN is both a hard dependency the rest of
      the deployment does not have and the one thing that would take the map down
      while every byte it actually renders sat on disk. See web/vendor/README.md. -->
-<script src="vendor/maplibre-gl.js"></script>
-<script src="vendor/pmtiles.js"></script>
+<!-- The other half of the `media="print"` in <head>. Here rather than up there
+     because here is where it stops costing anything: the boot overlay has painted,
+     so making the sheet render-blocking again blocks nothing that has not already
+     been drawn, and it has had the whole of the head and the body to arrive. -->
+<script>document.getElementById("mapcss").media = "all";</script>
+<script src="vendor/maplibre-gl.js?v=4.7.1"></script>
+<script src="vendor/pmtiles.js?v=4.4.1"></script>
 <!-- The basemap credit, shared with art.html so the two cannot drift. -->
 <script src="credits.js"></script>
 <script>
@@ -867,6 +884,18 @@ paintLegend();
 const protocol = new pmtiles.Protocol({ metadata: true });
 maplibregl.addProtocol("pmtiles", protocol.tile);
 
+// One directory cache across every archive, rather than the one each `PMTiles`
+// allocates for itself. Left to itself each takes a `SharedPromiseCache` of 100
+// entries, so three regions is 300 leaf directories held as small objects on top
+// of the parsed library and MapLibre's own caches -- and no archive on this page
+// has anywhere near 100 leaves to put in one.
+//
+// Up here beside the protocol, and above the `boot()` call rather than below it.
+// `openArchive` is only reached after an await, so a declaration further down does
+// initialise in time -- but that is a fact about where the first await happens to
+// be, and 3b6c734 is what a const read before its declaration costs on this page.
+const DIR_CACHE = new pmtiles.SharedPromiseCache(64);
+
 // A PMTiles source that answers out of the head prefetched in <head>, and goes to
 // the network for everything past it. `PMTiles` takes either a URL string, which
 // it wraps in the plugin's own FetchSource, or any object with `getKey` and
@@ -1003,7 +1032,7 @@ async function openArchive(name, i) {
     // A miss is a null head, and a null head is a source that reads the network for
     // everything, so the prefetch is an optimisation and never a requirement.
     const heads = await window.__heads.catch(() => new Map());
-    const archive = new pmtiles.PMTiles(new HeadSource(url, heads.get(url) || null));
+    const archive = new pmtiles.PMTiles(new HeadSource(url, heads.get(url) || null), DIR_CACHE);
     protocol.add(archive); // share the instance so the header is fetched once
     return {
       name,
@@ -1263,7 +1292,16 @@ function buildStyle() {
   // no road is ever moved by. The segment shadow falls across the track below it
   // on purpose -- a tram over a railway is the pair this most needs to separate,
   // and which one is on top is the answer the layer order already gives.
-  const layers = [{ id: "basemap", type: "raster", source: "basemap" }];
+  //
+  // The fade is off because its default is 300 ms and what it costs is paid at
+  // the worst moment: for about eighteen frames of full-screen compositing it
+  // holds the old texture and the new one live together, which is precisely while
+  // the vector tiles over the top are still arriving and being parsed. The map
+  // option `fadeDuration` is a different setting and inert here, since the style
+  // has no symbol layers -- this is the one that was running.
+  const layers = [
+    { id: "basemap", type: "raster", source: "basemap", paint: { "raster-fade-duration": 0 } },
+  ];
   for (const r of REGIONS) layers.push(busLayer(r));
   for (const r of REGIONS) layers.push(trackShadowLayer(r));
   for (const r of REGIONS) layers.push(trackLayer(r));
@@ -1321,11 +1359,46 @@ function start(missing) {
     // a smaller area and harder to spot.
     minZoom: Math.max(...REGIONS.map((r) => r.header.minZoom)),
     maxZoom: 18,
+    // Left unset, MapLibre rasterises at `devicePixelRatio`, and a cheap Android
+    // reports 2.6 to 3 -- seven to nine times the fragments of a one-to-one
+    // surface. Fragments are this map's dominant graphics cost: every line layer
+    // is translucent, so the whole road mesh is alpha-blended overdraw with no
+    // early-depth rejection, drawn over a raster basemap. The cap costs sharpness
+    // on exactly the devices that cannot afford the sharpness, and nothing
+    // anywhere else.
+    pixelRatio: weakDevice() ? Math.min(devicePixelRatio, 1.5) : devicePixelRatio,
+    // The cache is per source and holds tiles that have left the screen, so the
+    // default -- a viewport's worth times five zoom levels -- is four caches on
+    // this page: three archives and the basemap. A phone was holding around
+    // ninety parsed vector tiles and seventy-five decoded basemap textures to
+    // make a pan back instant. The cap trades that for a re-fetch.
+    maxTileCacheSize: 15,
+    // This is a north-up thematic map. A pitch covers several times more tiles
+    // toward the horizon, and both of the gestures that reach one are accidents
+    // here -- a right-drag or a two-finger twist while trying to pan. Rotation
+    // goes with them below, since it comes in on the same pinch as the zoom.
+    maxPitch: 0,
+    dragRotate: false,
+    touchPitch: false,
+    // The archives are immutable between publishes, so there is nothing to
+    // refresh: this only schedules a silent re-fetch and re-parse of tiles
+    // already on screen wherever the host sends a short `max-age`, and
+    // `HeadSource.getBytes` deliberately forwards `cacheControl` and `expires`.
+    refreshExpiredTiles: false,
+    // `maxBounds` is the whole of the British Isles, so the map cannot be panned
+    // to a copy of the world and the bookkeeping for one is never paid off.
+    renderWorldCopies: false,
     // Off here so it can be positioned; added below. The two are exclusive --
     // configuring it in the constructor and adding a second one gives two.
     attributionControl: false,
     style: buildStyle(),
   });
+
+  // The other half of `maxPitch: 0`. Bearing is not pitch and is not covered by
+  // it, and a two-finger pinch is how a phone zooms -- so without this the zoom
+  // gesture carries a rotation nobody asked for, on a map whose north is the only
+  // orientation its labels and its bounds were drawn for.
+  map.touchZoomRotate.disableRotation();
 
   // A resize changes the aspect, and with it how wide the box has to be for the
   // country to still fit top to bottom.
@@ -1373,6 +1446,17 @@ class ZoomLevelControl {
     this._el.className = "maplibregl-ctrl zoomlevel";
     this._el.title = "Camera zoom, and the zoom the tiles being drawn came from";
     this._el.setAttribute("aria-live", "off");
+    // Two nodes written with `textContent`, rather than the one `innerHTML` this
+    // used to be. `zoom` fires once per rendered frame through a pinch or a wheel
+    // gesture, so that was an HTML parse and a subtree replacement sixty times a
+    // second for a number that moves one decimal place. `_shown` skips even the
+    // two writes on the frames where neither half has changed, which through a
+    // slow pinch is most of them.
+    this._camera = document.createTextNode("");
+    this._tiles = document.createElement("span");
+    this._tiles.className = "tiles";
+    this._el.append(this._camera, this._tiles);
+    this._shown = null;
     this._update = () => {
       const z = map.getZoom();
       // MapLibre asks a vector source for floor(zoom), and stops at the
@@ -1381,12 +1465,12 @@ class ZoomLevelControl {
         this._maxZoom === null
           ? Math.floor(z)
           : Math.min(Math.floor(z), this._maxZoom);
-      this._el.innerHTML =
-        "z" +
-        z.toFixed(1) +
-        (tiles === Math.floor(z)
-          ? ""
-          : ' <span class="tiles">tiles z' + tiles + "</span>");
+      const camera = "z" + z.toFixed(1);
+      const behind = tiles === Math.floor(z) ? "" : " tiles z" + tiles;
+      if (this._shown === camera + behind) return;
+      this._shown = camera + behind;
+      this._camera.nodeValue = camera;
+      this._tiles.textContent = behind;
     };
     map.on("zoom", this._update);
     this._update();
@@ -1441,6 +1525,7 @@ function wireSelection(map, ids, card) {
   // The source-layer rides along because there are now two of them in one archive
   // and setFeatureState addresses a feature by all three.
   let hovered = null; // { src, sourceLayer, id }
+  let shownCursor = "";
   const setHover = (h, on) =>
     map.setFeatureState(
       { source: h.src, sourceLayer: h.sourceLayer, id: h.id },
@@ -1469,7 +1554,14 @@ function wireSelection(map, ids, card) {
     const trackHits = segHits.length ? [] : at(track);
     const hits = segHits.length ? segHits : trackHits.length ? trackHits : at(bus);
     const f = hits[0];
-    map.getCanvas().style.cursor = f ? "pointer" : "";
+    // Written only when it changes. Assigning an inline style is a style
+    // invalidation on the canvas whether or not the value moved, and the value
+    // does not move for the whole time a cursor is crossing one road.
+    const cursor = f ? "pointer" : "";
+    if (cursor !== shownCursor) {
+      shownCursor = cursor;
+      map.getCanvas().style.cursor = cursor;
+    }
     if (hovered && (!f || hovered.id !== f.id || hovered.src !== f.source)) {
       setHover(hovered, false);
       hovered = null;
@@ -1484,7 +1576,37 @@ function wireSelection(map, ids, card) {
 
   // A cursor is exact and asks continuously, so it asks about the point it is on:
   // a slop box there would answer for the road beside the one under the arrow.
-  map.on("mousemove", (e) => selectAt(e.point, 0));
+  //
+  // Coalesced onto an animation frame, because `mousemove` arrives at the pointer's
+  // rate and not the map's -- which on a weak device is several events per drawn
+  // frame -- and each one ran up to three `queryRenderedFeatures`, every hit of
+  // which is materialised as GeoJSON carrying the road's whole coordinate array.
+  // A pointer has one position per frame, so the answers in between were built and
+  // thrown away. Nothing is lost: the frame reads the latest point, which is the
+  // only one that was ever going to be on screen.
+  let asking = null;
+  let frame = 0;
+  const ask = () => {
+    frame = 0;
+    const point = asking;
+    asking = null;
+    if (point) selectAt(point, 0);
+  };
+  map.on("mousemove", (e) => {
+    asking = e.point;
+    // A drag-pan does not stop `mousemove`, so this used to run at pointer rate
+    // over a viewport whose tiles were being re-parsed by the pan that uncovered
+    // them -- and every answer was stale a frame later, because the camera moved
+    // out from under the point it was about. The point is kept rather than
+    // dropped, and `moveend` below asks it once the map has settled.
+    if (e.originalEvent.buttons || frame) return;
+    frame = requestAnimationFrame(ask);
+  });
+  // What the pointer is over after a pan is a different road from what it was over
+  // before one, and the pointer need not have moved for that to be true.
+  map.on("moveend", () => {
+    if (asking && !frame) frame = requestAnimationFrame(ask);
+  });
   // A tap is the other half, and on a touchscreen it is the only half -- there is
   // no cursor to move and MapLibre reports a tap as a click. It fires after a tap
   // and not after a pan, which is the distinction the map needs and the one a
@@ -1554,6 +1676,20 @@ function wireFilter(map, ids, card) {
   // visibility; the modes share one layer per region -- one for segments and one
   // for track -- and go off by filter. Every region moves together, the same as the
   // search does: a mode is a mode wherever the cursor is.
+  //
+  // What each mode selection was last handed to `setFilter`, because MapLibre's own
+  // guard against a redundant one does not catch the state nearly every visitor is
+  // in. These layers are built with no `filter` key, so their stored filter is
+  // `undefined`; the guard deep-equals that against the argument and ends in `===`,
+  // and `undefined === null` is false. So `setFilter(id, null)` -- what an empty
+  // selection asks for -- passes the guard into `_updateLayer`, which marks the
+  // layer's source for reload and re-parses every tile it holds, in every archive.
+  // It never settles either, because the call writes `undefined` straight back, so
+  // every keystroke in the search box paid for it again. Both start empty because
+  // that is what the built style holds.
+  let modeKey = "";
+  let trackKey = "";
+
   function applyRows() {
     const show = (id, on) => map.setLayoutProperty(id, "visibility", on ? "visible" : "none");
     const busOn = !hiddenRows.has("bus");
@@ -1566,16 +1702,25 @@ function wireFilter(map, ids, card) {
       [...hiddenRows].filter((k) => k.startsWith(prefix)).map((k) => k.slice(prefix.length));
     // The shadows take every filter their lines take. A shadow the switch missed
     // is the outline of a mode the legend says is off.
+    // Sorted, so the key names the selection rather than the order it was clicked
+    // in: two rows switched off in either order are one filter and must not read
+    // as two.
     const off = offRows("mode:");
-    for (const id of [...seg, ...segShadow]) {
-      map.setFilter(id, off.length ? withoutModes(off) : null);
+    const nextMode = [...off].sort().join(",");
+    if (nextMode !== modeKey) {
+      modeKey = nextMode;
+      const filter = off.length ? withoutModes(off) : null;
+      for (const id of [...seg, ...segShadow]) map.setFilter(id, filter);
     }
     // Track reads its mode through the same rail fallback the paint does, so a row
     // switched off clears the archives that name the mode and the older ones that
     // only imply it.
     const offTrack = offRows("track:");
-    for (const id of [...track, ...trackShadow]) {
-      map.setFilter(id, offTrack.length ? withoutTrackModes(offTrack) : null);
+    const nextTrack = [...offTrack].sort().join(",");
+    if (nextTrack !== trackKey) {
+      trackKey = nextTrack;
+      const filter = offTrack.length ? withoutTrackModes(offTrack) : null;
+      for (const id of [...track, ...trackShadow]) map.setFilter(id, filter);
     }
   }
 
@@ -1632,8 +1777,30 @@ function wireFilter(map, ids, card) {
   // A segment files under "other" where it names no mode; a way of track files
   // under heavy rail, which is what an archive built before this layer carried a
   // mode at all is holding.
-  map.on("idle", () => noteRendered(map, seg, seenModes, "other"));
-  map.on("idle", () => noteRendered(map, track, seenTrackModes, TRACK_MODE));
+  //
+  // Gated on a tile having arrived, because a mode can only be seen for the first
+  // time in a tile that is being drawn for the first time. `idle` fires on every
+  // camera settle, and both of these scans are a `queryRenderedFeatures` over the
+  // whole viewport with no bounding box, every hit of which is materialised as a
+  // LineString carrying its full geometry -- to read one property off it. The sets
+  // only ever grow, so after the first pass or two the entire allocation was
+  // discarded, and it went on being made for the life of the page.
+  //
+  // Nothing is missed by the gate. `idle` means every tile in view has loaded and
+  // rendered, so a scan at one covers the whole screen; a tile answered from the
+  // cache was in the viewport when it loaded, and was scanned at the idle after
+  // that. It starts true so the opening view is scanned whatever order the events
+  // arrive in.
+  let tileArrived = true;
+  map.on("data", (e) => {
+    if (e.dataType === "source" && e.tile) tileArrived = true;
+  });
+  map.on("idle", () => {
+    if (!tileArrived) return;
+    tileArrived = false;
+    noteRendered(map, seg, seenModes, "other");
+    noteRendered(map, track, seenTrackModes, TRACK_MODE);
+  });
   addEventListener("keydown", (e) => {
     if (e.key === "/" && document.activeElement !== input) {
       e.preventDefault();
@@ -1864,8 +2031,21 @@ function mergeRegions(hits) {
 // one bad paint expression is enough -- and the handler that reads it runs on
 // every mouse move, so the one real error arrives buried under thousands of
 // identical ones naming the layer rather than the fault.
+//
+// Which of them are missing is settled once the style has loaded: nothing adds or
+// removes a layer after `start`, and the theme switch reassigns paint properties
+// on the ones already there. So the answer is worked out once and kept, rather
+// than a fresh array and one `getLayer` per id per mouse move. Keyed on the id
+// arrays themselves, which `layerIds` builds once and the page then holds for its
+// whole life, and cached only once the style is loaded -- asked before that,
+// every layer is missing and the answer would be an empty list forever.
+const liveLayerCache = new WeakMap();
 function liveLayers(map, ids) {
-  return ids.filter((id) => map.getLayer(id));
+  const known = liveLayerCache.get(ids);
+  if (known) return known;
+  const live = ids.filter((id) => map.getLayer(id));
+  if (map.isStyleLoaded()) liveLayerCache.set(ids, live);
+  return live;
 }
 
 // Which modes have been drawn, so the legend carries a row for each. `absent` is

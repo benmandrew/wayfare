@@ -112,12 +112,25 @@ GZIP_CACHE_ENTRIES = 16
 # way out. --max-age moves it; 0 goes back to revalidating every time.
 ARCHIVE_MAX_AGE = 24 * 60 * 60
 
-# Everything else -- the page and the vendored libraries -- keeps revalidating.
-# Those change whenever the image is rebuilt rather than on the pipeline's
-# schedule, they are served from one HTTP/2 connection so the checks multiplex
-# into roughly a single round trip, and a stale index.html is a bug that outlives
+# The page keeps revalidating. It changes whenever the image is rebuilt rather
+# than on the pipeline's schedule, and a stale index.html is a bug that outlives
 # its own fix.
 REVALIDATE = "no-cache"
+
+# The vendored libraries are the exception, and the reason is their URLs. Each
+# carries the version out of web/vendor/README.md as a query, so the URL a page
+# asks for changes when the bytes behind it do -- which is what `immutable`
+# promises and what the page alone could not.
+#
+# They were on REVALIDATE with the page, on the argument that the checks multiplex
+# into roughly one round trip. That holds behind an HTTP/2 front end; a direct
+# `wayfare serve` is not one. `protocol_version` is HTTP/1.1 over a threading TCP
+# server, so a repeat visit spends two round trips across six connections asking
+# seven conditional questions and transferring nothing. 803 KB of MapLibre, 65 KB
+# of its CSS and 20 KB of pmtiles.js are the bulk of that, and none of them has
+# ever changed without its version changing.
+VENDOR_MAX_AGE = 365 * 24 * 60 * 60
+VENDOR_PREFIX = "vendor"
 
 # Render limits. Width alone is not the thing to cap: the window's aspect ratio
 # decides the height, and `scale` multiplies both, so a modest-looking
@@ -842,9 +855,9 @@ class ArtEndpoint:
 
     def serve(self, url: ParseResult) -> None:
         if url.path == "/archives.json":
-            self.json(archives(self.handler.out_dir))
+            self.json(archives(self.handler.out_dir), validated=True)
         elif url.path == "/art/meta":
-            self.json(art_meta(self.handler.renderer is not None))
+            self.json(art_meta(self.handler.renderer is not None), validated=True)
         else:
             self.render(url.query)
 
@@ -910,14 +923,44 @@ class ArtEndpoint:
         handler.wfile.write(body)
 
     def json(
-        self, payload: object, status: int = 200, retry_after: int | None = None
+        self,
+        payload: object,
+        status: int = 200,
+        retry_after: int | None = None,
+        *,
+        validated: bool = False,
     ) -> None:
+        """A JSON body, optionally under an ETag the client may revalidate against.
+
+        `validated` is for the two answers that describe the server rather than
+        report on a request. The viewer asks for `/archives.json` in `<head>`, on
+        the critical path of every load, and the answer is the same bytes between
+        publishes -- under `no-store` that round trip carried the whole body back
+        every time. Under `no-cache` with a validator it is a 304 with none.
+
+        A fault keeps `no-store`. A 503 is about the moment it was asked, and there
+        is nothing there worth a client keeping.
+        """
         handler = self.handler
         body = json.dumps(payload).encode()
+        # A digest of the body, which is small and already in hand. The static
+        # half's `_file_etag` is an mtime and a size for the opposite reason: an
+        # archive is ~130 MB and hashing it would cost more than the transfer.
+        etag = _etag(body.decode()) if validated else None
+        if etag is not None and _matches(handler.headers.get("If-None-Match"), etag):
+            handler.send_response(304)
+            handler.send_header("ETag", etag)
+            handler.send_header("Cache-Control", REVALIDATE)
+            handler.end_headers()
+            return
         handler.send_response(status)
         handler.send_header("Content-Type", "application/json")
         handler.send_header("Content-Length", str(len(body)))
-        handler.send_header("Cache-Control", "no-store")
+        if etag is not None:
+            handler.send_header("ETag", etag)
+            handler.send_header("Cache-Control", REVALIDATE)
+        else:
+            handler.send_header("Cache-Control", "no-store")
         if retry_after is not None:
             handler.send_header("Retry-After", str(retry_after))
         handler.end_headers()
@@ -1081,13 +1124,20 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
         Split by what republishes the file rather than by content type. An archive
         comes from the pipeline on a monthly cadence and is the expensive thing to
-        re-fetch, so it gets a real freshness lifetime. The page and its libraries
-        come from an image rebuild and are cheap, so they keep revalidating --
-        caching those would mean shipping a fix that returning visitors could not
-        see.
+        re-fetch, so it gets a real freshness lifetime. The page comes from an image
+        rebuild and is cheap, so it keeps revalidating -- caching it would mean
+        shipping a fix that returning visitors could not see.
+
+        A vendored library is the one file that is cheap to re-fetch and still worth
+        caching outright, because the pages ask for it under a versioned URL: the
+        request changes when the bytes do, so `immutable` is a promise that holds.
+        Matched on the directory rather than on the suffix, so nothing outside
+        `web/vendor/` can claim it by being named `.js`.
         """
         if path.endswith(ARTEFACT_SUFFIXES) and self.max_age > 0:
             return f"public, max-age={self.max_age}"
+        if Path(path).parent.name == VENDOR_PREFIX:
+            return f"public, max-age={VENDOR_MAX_AGE}, immutable"
         return REVALIDATE
 
     def _gzip_wanted(self, path: str) -> bool:
