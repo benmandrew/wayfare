@@ -541,6 +541,24 @@ def test_the_cursor_asks_once_a_frame_and_never_mid_drag():
     assert _holds("index.html", 'map.on("moveend", () => {')
 
 
+def test_the_legend_scan_waits_for_a_tile_to_arrive():
+    """Both `noteRendered` calls are a `queryRenderedFeatures` over the whole
+    viewport with no bounding box, and every hit is materialised as a LineString
+    carrying its full geometry so that one property can be read off it. `seenModes`
+    and `seenTrackModes` only ever grow, so once they have stopped growing the whole
+    allocation is discarded -- and `idle` fires on every camera settle for the life
+    of the page.
+
+    A mode can only be seen for the first time in a tile drawn for the first time,
+    so the gate is a tile having loaded. It has to start true, or the opening view
+    is scanned only if a tile happens to finish after the first idle."""
+    assert _holds("index.html", "let tileArrived = true;")
+    assert _holds(
+        "index.html", 'if (e.dataType === "source" && e.tile) tileArrived = true;'
+    )
+    assert _holds("index.html", "if (!tileArrived) return;")
+
+
 def test_both_pages_give_a_coarse_pointer_a_field_it_will_not_zoom_into():
     """Safari zooms the page in on a focused input drawn under 16px, and what it
     zooms to is the panel -- leaving a map, or a column of knobs, that has to be

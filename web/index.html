@@ -1704,8 +1704,30 @@ function wireFilter(map, ids, card) {
   // A segment files under "other" where it names no mode; a way of track files
   // under heavy rail, which is what an archive built before this layer carried a
   // mode at all is holding.
-  map.on("idle", () => noteRendered(map, seg, seenModes, "other"));
-  map.on("idle", () => noteRendered(map, track, seenTrackModes, TRACK_MODE));
+  //
+  // Gated on a tile having arrived, because a mode can only be seen for the first
+  // time in a tile that is being drawn for the first time. `idle` fires on every
+  // camera settle, and both of these scans are a `queryRenderedFeatures` over the
+  // whole viewport with no bounding box, every hit of which is materialised as a
+  // LineString carrying its full geometry -- to read one property off it. The sets
+  // only ever grow, so after the first pass or two the entire allocation was
+  // discarded, and it went on being made for the life of the page.
+  //
+  // Nothing is missed by the gate. `idle` means every tile in view has loaded and
+  // rendered, so a scan at one covers the whole screen; a tile answered from the
+  // cache was in the viewport when it loaded, and was scanned at the idle after
+  // that. It starts true so the opening view is scanned whatever order the events
+  // arrive in.
+  let tileArrived = true;
+  map.on("data", (e) => {
+    if (e.dataType === "source" && e.tile) tileArrived = true;
+  });
+  map.on("idle", () => {
+    if (!tileArrived) return;
+    tileArrived = false;
+    noteRendered(map, seg, seenModes, "other");
+    noteRendered(map, track, seenTrackModes, TRACK_MODE);
+  });
   addEventListener("keydown", (e) => {
     if (e.key === "/" && document.activeElement !== input) {
       e.preventDefault();
