@@ -1554,6 +1554,20 @@ function wireFilter(map, ids, card) {
   // visibility; the modes share one layer per region -- one for segments and one
   // for track -- and go off by filter. Every region moves together, the same as the
   // search does: a mode is a mode wherever the cursor is.
+  //
+  // What each mode selection was last handed to `setFilter`, because MapLibre's own
+  // guard against a redundant one does not catch the state nearly every visitor is
+  // in. These layers are built with no `filter` key, so their stored filter is
+  // `undefined`; the guard deep-equals that against the argument and ends in `===`,
+  // and `undefined === null` is false. So `setFilter(id, null)` -- what an empty
+  // selection asks for -- passes the guard into `_updateLayer`, which marks the
+  // layer's source for reload and re-parses every tile it holds, in every archive.
+  // It never settles either, because the call writes `undefined` straight back, so
+  // every keystroke in the search box paid for it again. Both start empty because
+  // that is what the built style holds.
+  let modeKey = "";
+  let trackKey = "";
+
   function applyRows() {
     const show = (id, on) => map.setLayoutProperty(id, "visibility", on ? "visible" : "none");
     const busOn = !hiddenRows.has("bus");
@@ -1566,16 +1580,25 @@ function wireFilter(map, ids, card) {
       [...hiddenRows].filter((k) => k.startsWith(prefix)).map((k) => k.slice(prefix.length));
     // The shadows take every filter their lines take. A shadow the switch missed
     // is the outline of a mode the legend says is off.
+    // Sorted, so the key names the selection rather than the order it was clicked
+    // in: two rows switched off in either order are one filter and must not read
+    // as two.
     const off = offRows("mode:");
-    for (const id of [...seg, ...segShadow]) {
-      map.setFilter(id, off.length ? withoutModes(off) : null);
+    const nextMode = [...off].sort().join(",");
+    if (nextMode !== modeKey) {
+      modeKey = nextMode;
+      const filter = off.length ? withoutModes(off) : null;
+      for (const id of [...seg, ...segShadow]) map.setFilter(id, filter);
     }
     // Track reads its mode through the same rail fallback the paint does, so a row
     // switched off clears the archives that name the mode and the older ones that
     // only imply it.
     const offTrack = offRows("track:");
-    for (const id of [...track, ...trackShadow]) {
-      map.setFilter(id, offTrack.length ? withoutTrackModes(offTrack) : null);
+    const nextTrack = [...offTrack].sort().join(",");
+    if (nextTrack !== trackKey) {
+      trackKey = nextTrack;
+      const filter = offTrack.length ? withoutTrackModes(offTrack) : null;
+      for (const id of [...track, ...trackShadow]) map.setFilter(id, filter);
     }
   }
 

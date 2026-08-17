@@ -335,7 +335,24 @@ def test_every_legend_row_is_a_switch():
     # The road network and the relation track are a layer each; the modes share one
     # layer per region, so a mode goes off by filter and not by visibility.
     assert "withoutModes" in text
-    assert _holds("index.html", "map.setFilter(id, off.length ? withoutModes(off) : null)")
+    assert _holds("index.html", "const filter = off.length ? withoutModes(off) : null;")
+
+
+def test_a_selection_that_has_not_moved_is_not_reapplied():
+    """`setFilter` marks the layer's source for reload, and MapLibre's guard against
+    a redundant call cannot fire on these layers: they are built with no `filter`, so
+    the stored value is `undefined` and the guard's `undefined === null` is false.
+    Every keystroke therefore re-parsed every tile of every archive, indefinitely.
+
+    Both keys are asserted, because the guard has to be on the mode rows and the
+    track rows alike -- one of the two left open is still a reload of one source per
+    archive per keystroke. Sorting is asserted with them: unsorted, the key names the
+    order the rows were clicked in rather than the selection, and two rows switched
+    off in the other order read as a change that is not one."""
+    text = _source("index.html")
+    assert _holds("index.html", "if (nextMode !== modeKey) {")
+    assert _holds("index.html", "if (nextTrack !== trackKey) {")
+    assert len(re.findall(r"\[\.\.\.off\w*\]\.sort\(\)\.join\(\",\"\)", text)) == 2
 
 
 def test_the_viewer_tells_the_two_id_spaces_apart_by_refs():
