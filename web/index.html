@@ -98,7 +98,7 @@ window.__heads = (async () => {
      Still in this position, and it has to be: the flip does not move the sheet in
      the cascade, and the nine `.maplibregl-ctrl-*` overrides in the page's own
      <style> below win on document order rather than on specificity. -->
-<link id="mapcss" rel="stylesheet" href="vendor/maplibre-gl.css" media="print">
+<link id="mapcss" rel="stylesheet" href="vendor/maplibre-gl.css?v=4.7.1" media="print">
 <!-- The palette and the panel chrome, shared with art.html. Linked before the
      page's own rules, so those still win. -->
 <link rel="stylesheet" href="base.css">
@@ -415,8 +415,8 @@ body {
      so making the sheet render-blocking again blocks nothing that has not already
      been drawn, and it has had the whole of the head and the body to arrive. -->
 <script>document.getElementById("mapcss").media = "all";</script>
-<script src="vendor/maplibre-gl.js"></script>
-<script src="vendor/pmtiles.js"></script>
+<script src="vendor/maplibre-gl.js?v=4.7.1"></script>
+<script src="vendor/pmtiles.js?v=4.4.1"></script>
 <!-- The basemap credit, shared with art.html so the two cannot drift. -->
 <script src="credits.js"></script>
 <script>

@@ -547,6 +547,29 @@ def test_the_cursor_asks_once_a_frame_and_never_mid_drag():
     assert _holds("index.html", 'map.on("moveend", () => {')
 
 
+def test_every_vendored_url_carries_the_version_the_readme_names():
+    """`wayfare serve` sends `web/vendor/*` as `immutable` for a year, and what makes
+    that safe is the query: the URL a page asks for changes when the bytes behind it
+    do. Bump a library without bumping the pages and every returning visitor holds
+    the old one until the year is out, with nothing to see and no way to tell.
+
+    The versions are read out of `web/vendor/README.md`, which is the table the
+    update instructions there tell you to edit, so this fails on either half of the
+    bump being forgotten rather than on a number written twice."""
+    table = (WEB / "vendor" / "README.md").read_text()
+    versions = dict(re.findall(r"\|\s*\[`([\w.-]+)`\][^|]*\|\s*([\d.]+)\s*\|", table))
+    assert set(versions) == {"maplibre-gl.js", "maplibre-gl.css", "pmtiles.js"}
+    for page in PAGES:
+        text = _source(page)
+        asked = dict(re.findall(r'"vendor/([\w.-]+)\?v=([\d.]+)"', text))
+        assert asked, page
+        for name, version in asked.items():
+            assert versions[name] == version, (page, name)
+        # And no unversioned one alongside them, which would be the copy that goes
+        # on being served out of a year-old cache.
+        assert not re.search(r'"vendor/[\w.-]+"', text), page
+
+
 def test_neither_page_lets_the_map_stylesheet_block_the_theme():
     """A classic script cannot run until every stylesheet above it has loaded, so
     65 KB of MapLibre CSS in `<head>` gated the `bootTheme()` call whose whole
@@ -561,7 +584,9 @@ def test_neither_page_lets_the_map_stylesheet_block_the_theme():
     for page in PAGES:
         text = _source(page)
         assert _holds(page, 'id="mapcss" rel="stylesheet"'), page
-        assert _holds(page, 'href="vendor/maplibre-gl.css" media="print"'), page
+        assert re.search(r'href="vendor/maplibre-gl\.css\?v=[\d.]+" media="print"', text), (
+            page
+        )
         assert _holds(page, 'document.getElementById("mapcss").media = "all";'), page
         # The opening tag at the start of its own line, because the prose above the
         # link names `<style>` and would otherwise be what this found.

@@ -20,9 +20,11 @@ fetched per view from `basemaps.cartocdn.com`, so it cannot be bundled, and it
 still means panning the map is visible to a third party. Point `BASEMAP` at a
 local tile source if that matters for your deployment.
 
+`wayfare serve` sends everything in this directory as `immutable` for a year, which is the one place it caches outright rather than revalidating. What makes that safe is the query on the URL: both pages ask for `vendor/maplibre-gl.js?v=4.7.1` and not for the bare name, so the request a browser makes changes when the bytes behind it do. Drop the query and a returning visitor holds the old library until the year is out, with nothing on screen to say so.
+
 ## Updating
 
-Fetch the same two packages at the new version and update the table above:
+Fetch the same two packages at the new version, update the table above, and update the `?v=` on the six `vendor/` URLs in [`index.html`](../index.html) and [`art.html`](../art.html) to match. `tests/test_viewer.py` reads the table above and fails on either half of that being forgotten.
 
 ```sh
 V=4.7.1  # maplibre-gl

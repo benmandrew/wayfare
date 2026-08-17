@@ -11,7 +11,7 @@
      run before that paint. Still in this position because the flip does not move
      the sheet in the cascade, and the page's own rules below win on document
      order. -->
-<link id="mapcss" rel="stylesheet" href="vendor/maplibre-gl.css" media="print">
+<link id="mapcss" rel="stylesheet" href="vendor/maplibre-gl.css?v=4.7.1" media="print">
 <!-- The palette and the panel chrome, shared with index.html. Linked before the
      page's own rules, so those still win. -->
 <link rel="stylesheet" href="base.css">
@@ -467,8 +467,8 @@ input[type=color] {
      stops costing anything: the studio has painted, so making the sheet
      render-blocking again blocks nothing that is not already on screen. -->
 <script>document.getElementById("mapcss").media = "all";</script>
-<script src="vendor/maplibre-gl.js"></script>
-<script src="vendor/pmtiles.js"></script>
+<script src="vendor/maplibre-gl.js?v=4.7.1"></script>
+<script src="vendor/pmtiles.js?v=4.4.1"></script>
 <!-- The basemap credit, shared with index.html so the two cannot drift. -->
 <script src="credits.js"></script>
 <script>
