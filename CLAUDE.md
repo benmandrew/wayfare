@@ -18,8 +18,6 @@ the area they cover — most of them record something that was a bug first.
   coverage gaps, attribution.
 - [`docs/pipeline.md`](docs/pipeline.md) — the stages, storage, DuckDB lessons, clustering,
   tiles.
-- [`docs/rendering.md`](docs/rendering.md) — `art`: the style/spec split, streaming,
-  banding, coalescing, where a render's time goes, the `/art` endpoint and the studio page.
 - [`docs/results.md`](docs/results.md) — measured runs: Wales, Greater London, Great
   Britain, feed churn.
 - [`docs/deploy.md`](docs/deploy.md) — the scheduled refresh over Compose, vendored into

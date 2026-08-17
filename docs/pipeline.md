@@ -15,8 +15,7 @@ The stages run in this order, each reading what the last one wrote:
     aggregate-> invert pattern->edges into edge->services
     publish  -> GeoJSONL -> tippecanoe -> PMTiles
 
-What the feeds themselves hold is [docs/data.md](data.md), and `art` is
-[docs/rendering.md](rendering.md). `wayfare all` chains acquire, patterns, match, the
+What the feeds themselves hold is [docs/data.md](data.md). `wayfare all` chains acquire, patterns, match, the
 publish gate, trace, snap, routes, aggregate, prune, cluster and publish — the same stages in
 the same order as [`deploy/refresh.sh`](../deploy/refresh.sh), and a test parses that script
 to keep the two from drifting. `trace`, `snap` and `routes` are tolerated failures, because
@@ -1094,7 +1093,7 @@ column and DuckDB pushes no min/max filter through the join, so the weights pass
 Cardiff 10,250,638 rows down to 614,400 and London to 2,457,600, and buys 40.9 ms to 31.1 ms
 on Cardiff, 356.1 ms to 357.6 ms on London and nothing nationally. That is four INTEGER
 columns on the largest table in the database for 10 ms on the smallest window; the scan was
-never what cost anything, and [docs/rendering.md](rendering.md) has where the time goes.
+never what cost anything.
 
 Most of what is written above began as a bug, and the entries that read as arbitrary
 constants are usually the second answer to a question the first answer got wrong. The

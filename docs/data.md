@@ -423,7 +423,7 @@ crediting only its basemap rather than like an error.
 A render is the case tileset metadata cannot reach, since a PNG is passed around on its own.
 Every render stamps `licences.text(config.credit_parts())` into its own file, and
 `licences.lines(config.credit_parts(region), links=False)` is the same credit shortened for a caption drawn
-on the canvas; [`docs/rendering.md`](rendering.md) covers how. The studio page states the
+on the canvas. The studio page states the
 credit at the download control, served from `/art/meta`, because the download is the moment
 the obligation attaches to somebody.
 

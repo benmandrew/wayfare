@@ -161,7 +161,7 @@ DEFAULT_SPEC = QuerySpec()
 # dozen sites that scan them. Substituting either for a materialised or extracted
 # window was tried and is not worth having: a density render is 75% cairo and the
 # whole database scan is a quarter of the rest, and a Parquet extract of the window
-# measured *slower* on a filtered spec. See docs/rendering.md.
+# measured *slower* on a filtered spec.
 EDGES = "edges"
 SERVICES = "edge_services"
 

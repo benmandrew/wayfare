@@ -404,11 +404,11 @@ previously fell in whatever order the scan returned, and two runs of the old `sp
 differed by 426 bytes. Verified by rendering Cardiff before and after the streaming rewrite:
 `density` byte-identical, `strands` differing by 7 bytes out of 5.8M at delta 1, `spectrum`
 differing more because its ties now resolve differently. That claim was PNG-only until the
-`strands`-to-SVG ordering bug was found; see [docs/rendering.md](rendering.md).
+`strands`-to-SVG ordering bug was found.
 
 ## What the render numbers were measured against
 
-The banding, coalescing and cairo figures in [docs/rendering.md](rendering.md) are the first
+The banding, coalescing and cairo figures are the first
 `art` measurements taken against real national data — 2,746,261 edges and 8,301,705
 edge-service rows, on the four-core, eight-thread box that serves it.
 
