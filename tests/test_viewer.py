@@ -754,3 +754,22 @@ def test_the_studio_picker_draws_every_archive_the_server_lists():
     # A theme change has to reach every layer drawn, not the one named `bus`.
     assert _holds("art.html", "for (const id of pickLayers) {")
     assert '"bus"' not in _tight(_between(text, "function repaintPicker", "\n}\n"))
+
+
+def test_the_studio_revokes_a_render_it_never_got_to_show():
+    """`show` took ownership of an object URL inside `img.onload`. A second `show`
+    overwrites `img.onload` and `img.src`, so when the second response arrives
+    before the first has decoded the first URL is never revoked and never again
+    reachable -- it holds its blob and its decoded bitmap for the life of the page.
+
+    That is the ordinary path rather than a corner: a preview is drawn at
+    `sample=8` and then at `sample=1`, and the overtaking happens exactly on the
+    slow device this matters on. `onerror` is asserted with it, because a blob that
+    will not decode is the other way out of `onload` and leaks the same way."""
+    text = _source("art.html")
+    assert _holds("art.html", "if (pendingURL) URL.revokeObjectURL(pendingURL);")
+    assert _holds("art.html", "pendingURL = next;")
+    assert _holds("art.html", "img.onerror = () => {")
+    # The revoke of the pending URL comes before the <img> is pointed anywhere else,
+    # because after that assignment nothing can reach it.
+    assert text.index("URL.revokeObjectURL(pendingURL)") < text.index("img.src = next;")

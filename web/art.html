@@ -520,6 +520,7 @@ let META = null;
 let S = null;            // the whole parameter set; the hash is its serialisation
 let controller = null;   // in-flight preview request
 let objectURL = null;    // currently displayed blob URL
+let pendingURL = null;   // handed to the <img>, not yet decoded; see `show`
 let lastHash = null;     // what we wrote, so our own writes are not read back
 
 // A knob comes to rest before it is drawn. 300 ms is long enough to swallow a
@@ -1205,11 +1206,24 @@ async function reason(res) {
 function show(blob, res, sample) {
   const next = URL.createObjectURL(blob);
   const img = $("shot");
-  // The previous URL is revoked only once the new image has decoded; revoking
-  // it earlier can blank the picture we are trying to keep on screen.
+  // A URL that was handed to the <img> and never got to `onload` is revoked here,
+  // synchronously, because after this line nothing can reach it: assigning
+  // `img.src` below drops the load in flight and assigning `img.onload` drops the
+  // handler that would have taken ownership of it. Left alone it held its blob and
+  // its decoded bitmap for the life of the page.
+  //
+  // This is the ordinary path rather than a corner: a preview is drawn twice, at
+  // `sample=8` and then at `sample=1`, and the leak is what happens when the
+  // second response arrives before the first has decoded -- which is the slow
+  // device this matters on.
+  if (pendingURL) URL.revokeObjectURL(pendingURL);
+  pendingURL = next;
+  // The previous *displayed* URL is revoked only once the new image has decoded;
+  // revoking it earlier can blank the picture we are trying to keep on screen.
   img.onload = () => {
     if (objectURL) URL.revokeObjectURL(objectURL);
     objectURL = next;
+    pendingURL = null;
     // Say so when the picture is a sampled one: it is dimmer and sparser than
     // the export will be, and an unlabelled approximation is a design decision
     // made against the wrong image.
@@ -1219,6 +1233,17 @@ function show(blob, res, sample) {
     $("stat").innerHTML =
       `<b>${img.naturalWidth}</b> × <b>${img.naturalHeight}</b> px · ` +
       `<b>${bytes(blob.size)}</b> · drawn in <b>${serverMs(res)}</b>${partial}`;
+  };
+  // A blob that will not decode is the other way out of `onload`, and without
+  // this it leaks the same way and leaves the status line describing the render
+  // before it. The picture already on screen stays, as it does for a failed
+  // request.
+  img.onerror = () => {
+    if (pendingURL === next) {
+      URL.revokeObjectURL(next);
+      pendingURL = null;
+    }
+    showError("the render could not be decoded", null);
   };
   img.src = next;
   img.hidden = false;
