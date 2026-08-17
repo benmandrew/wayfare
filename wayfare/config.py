@@ -625,18 +625,27 @@ DETAIL_ZOOM = 11
 # cannot show. `publish.merge_overview` joins across it wherever `n` and `trips` both
 # match, which moves no point and averages no attribute.
 #
-# Measured on the exports of 2026-08-16, over z5-z10, in the published image:
+# Confirmed on the production host against the real Great Britain data root, in the
+# published image, with the flags a publish uses: the whole archive goes from 127.49 MB
+# to 112.43 MB, 11.8%, and builds in 3.6 minutes against 4.2 -- faster despite the extra
+# pass, because tippecanoe has fewer features to place. The control is what makes that
+# number the merge's and nothing else's: the same build with this set to False came out
+# byte-identical to the archive being served, at every zoom. Both arms and the feature
+# counts below are the exports of 2026-08-16.
 #
-#   region            features            overview       worst z5   worst z8
-#   Great Britain     868,984 -> 244,679   34 -> 19 MB   952 -> 862 KB   903 -> 346 KB
-#   Ireland            87,691 ->  17,571  4.3 -> 1.6 MB
+#   region          features             overview z5-z10
+#   Great Britain   868,984 -> 244,679   39.3 -> 24.3 MB
+#   Ireland          87,691 ->  17,571    4.3 ->  1.6 MB
 #
-# z8-z10 stop being under any size pressure at all, and z5-z7 stay full while holding
-# more of the network: `--drop-densest-as-needed` has less to throw away, so the lit
-# fraction *rises* where the tiles were being thinned -- around London, 5.771% to 8.062%
-# at z5 and 7.670% to 8.598% at z7. The whole-country window loses 0.07 to 0.17
-# percentage points at z6-z10, which is simplification working on longer lines and is
-# not visible at 600 m a pixel.
+# Where the saving lands depends on whether a zoom was up against the tile ceiling. z8
+# to z10 were not, and roughly halve: 8.9 to 4.5 MB, 10.3 to 5.2, 11.5 to 6.1. z5 to z7
+# were, so there the same bytes buy more network instead -- z6 even grows, 2.8 to 3.1 MB,
+# because `--drop-densest-as-needed` now has less to throw away. That is the lit fraction
+# *rising* where the tiles were being thinned: around London, 5.771% to 8.062% at z5 and
+# 7.670% to 8.598% at z7. z11-z14 do not move at all, since the detail band is built from
+# the road export either way. The whole-country window loses 0.07 to 0.17 percentage
+# points at z6-z10, which is simplification working on longer lines and is not visible at
+# 600 m a pixel.
 #
 # It costs 15 seconds and 275 MB resident on Great Britain, and one intermediate file
 # in the publish scratch directory. It changes one thing a reader can see: a merged run
