@@ -1111,12 +1111,24 @@ function coveredBounds() {
 
 /* ---------- one pair of layers per region ---------- */
 
+// `bevel` on this layer alone, and `round` everywhere else. A round join makes the
+// line bucket emit a triangle fan per join, which is paid three times over: worker
+// time at tile parse, bytes in the vertex buffer, and vertices rasterised on every
+// frame. This is where that costs most and shows least -- the road mesh is the
+// feature count of the whole map, and its stroke is 0.38 px at z6, where a join is
+// under a pixel wide and the two are the same picture. The traced modes keep
+// `round`: there are few of them, they are drawn wide enough for the difference to
+// be visible, and the shadow under each one would show a mitred corner.
+//
+// `line-cap` stays `round` on both, because a cap is an end rather than a corner,
+// and a butt end is what makes a dashed-looking road out of a network drawn as
+// separate features per way.
 const busLayer = (r) => ({
   id: r.layer,
   type: "line",
   source: r.src,
   "source-layer": LAYER_SRC,
-  layout: { "line-cap": "round", "line-join": "round" },
+  layout: { "line-cap": "round", "line-join": "bevel" },
   paint: {
     "line-color": hoverOr(colourExpr(theme)),
     "line-width": width(HOVER_BUMP),
