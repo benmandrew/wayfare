@@ -801,3 +801,49 @@ def test_the_studio_does_not_resize_a_picker_nobody_is_looking_at():
     container reallocates the drawing buffer to nothing and back. `showPicker` does
     the resize on the way open, which is the moment it is needed."""
     assert _holds("art.html", 'if (!$("pickwrap").hidden) quietly(() => pickMap.resize());')
+
+
+def test_the_studio_debounces_every_side_effect_of_a_knob_moving():
+    """`scheduleRender` was the only debounced part of `changed`, so `refit`,
+    `writeHash` and `exports` ran per `input` event -- a 300-pixel slider drag being
+    about 300 calls to `history.replaceState`, which Safari throttles past roughly a
+    hundred in thirty seconds.
+
+    The count is not the worst of it: `exports` writes DOM and the next event's
+    `refit` reads `getComputedStyle` and `clientWidth`, so every event forced a
+    synchronous style and layout flush of a document holding selects of up to 500
+    options. The commit delay is asserted to be under the render's, because the
+    width `refit` settles on has to be the width the render then asks for."""
+    text = _source("art.html")
+    assert _holds("art.html", "const scheduleCommit = debounce(commit, COMMIT_MS);")
+    commit_ms = int(re.search(r"const COMMIT_MS = (\d+);", text).group(1))
+    debounce_ms = int(re.search(r"const DEBOUNCE_MS = (\d+);", text).group(1))
+    assert commit_ms < debounce_ms
+    # A render overtaking a pending commit runs it rather than leaving it to land
+    # after the picture it was part of.
+    assert _holds("art.html", "scheduleCommit.cancel();")
+    changed = _between(text, "function changed() {", "\n}\n")
+    for direct in ("refit()", "writeHash()", "exports()"):
+        assert direct not in changed, direct
+
+
+def test_the_studio_previews_as_a_raster_whatever_it_will_export():
+    """`exports` caps a download against `max_pixels` and nothing caps the preview,
+    so choosing SVG handed the browser a full-detail vector of a national window --
+    hundreds of thousands of paths to parse and rasterise into a few hundred pixels
+    of frame. Both formats come off the same spec through the same renderer.
+
+    The status line has to say so, because the size and the time it reports are then
+    a PNG's and they are what somebody sizing an export reads."""
+    request = _between(_source("art.html"), "for (const sample of stages)", "const res =")
+    assert 'format: "png"' in _tight(request).replace("format:", "format: ")
+    assert "S.format" not in request
+    assert _holds("art.html", 'S.format === "png" ? "" : " · previewed as PNG"')
+
+
+def test_the_studio_does_not_refit_the_picker_onto_the_window_it_is_already_on():
+    """`apply` calls `showOnMap` on every discrete change -- a style, a weight, a
+    group, a format -- and none of those moves the window, while `fitBounds` is a
+    full repaint and a tile-coverage check whether or not the camera has anywhere to
+    go."""
+    assert _holds("art.html", "if (where === shownWindow) return;")
