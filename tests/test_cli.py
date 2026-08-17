@@ -24,6 +24,7 @@ from wayfare import (
     aggregate,
     cli,
     config,
+    corridors,
     coverage,
     db,
     gtfs,
@@ -536,6 +537,35 @@ def test_draw_takes_several_archives_and_a_theme(monkeypatch, root, tmp_path):
     assert got.args[5] == "dark"
 
 
+# --- corridors -----------------------------------------------------------------
+
+
+def test_corridors_refuses_a_run_that_would_do_nothing(monkeypatch, root, tmp_path):
+    """Neither flag is not "the defaults": it is a command that would write no file
+    and still exit zero, leaving whatever was about to build tiles from `out` with
+    nothing to read."""
+    src = tmp_path / "edges.geojsonl"
+    src.write_text("")
+    assert cli.main(["corridors", str(src), str(tmp_path / "o.geojsonl")]) == 1
+
+
+def test_corridors_merges_before_it_caps(monkeypatch, root, tmp_path):
+    """In that order, because merging joins the runs a way boundary split and a
+    corridor over the joined file is the same road in fewer, longer pieces -- which is
+    what the cap is then spent on. The merge lands beside the output rather than on
+    it, so the cap has something to read and something else to write."""
+    src = tmp_path / "edges.geojsonl"
+    src.write_text("")
+    out = tmp_path / "o.geojsonl"
+    merged = spy(monkeypatch, publish, "merge_overview", tmp_path / "o.merged.geojsonl")
+    thinned = spy(monkeypatch, corridors, "thin", out)
+    assert cli.main(["corridors", str(src), str(out), "--merge", "--cap", "50"]) == 0
+    assert merged.args[0] == src
+    assert merged.args[1] != out
+    assert thinned.args[0] == merged.args[1]
+    assert thinned.args[1] == out
+
+
 # --- status, prune, cluster ----------------------------------------------------
 
 
@@ -856,7 +886,7 @@ def test_every_subcommand_the_table_names_reaches_the_parser(capsys):
     out = capsys.readouterr().out
     declared = set(re.findall(r"^\s{4}(\w[\w-]*)", out, re.MULTILINE))
     assert set(cli._SUBCOMMANDS) <= declared
-    assert len(cli._SUBCOMMANDS) == 16
+    assert len(cli._SUBCOMMANDS) == 17
 
 
 def test_data_retargets_every_path_config_computed_at_import(monkeypatch, tmp_path):

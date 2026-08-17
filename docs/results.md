@@ -342,6 +342,61 @@ The 24.8% more ways are the ones the run was driving past. The 32 patterns still
 band each hold at least one vertex genuinely that far from any mapped track, which is what
 the band is for.
 
+## The overview merge against the served archive, 2026-08-17
+
+The confirmation run of `publish.merge_overview`, now on by default through
+`config.MERGE_OVERVIEW`. It ran on the production host against the real Great Britain
+data root, in `benmandrew/wayfare:latest` on Linux x86_64, which is the image and the
+flags a real publish uses. Unlike the earlier bench figures, no simplification
+workaround is in play.
+
+Both arms were built by `publish.build_tiles` from the same three exports of 2026-08-16
+already on disk: `edges.geojsonl` at 308 MB, `segments.geojsonl` and `track.geojsonl`.
+Nothing was re-exported and the database was never opened. The two arms differ in
+`config.MERGE_OVERVIEW` and in nothing else, and everything was mounted read-only except
+a scratch output directory, so the served archive was never a write target.
+
+The control is what makes the comparison airtight. The merge-off arm came out
+byte-identical to the archive currently served, at every zoom, with the same tile counts,
+the same totals and the same maxima, and 127.49 MB against the served 127,486,895 bytes.
+So the difference in the other arm is the merge and nothing else.
+
+The merged arm comes to 112.43 MB, a saving of 15.06 MB or 11.8%. It also builds faster,
+3.6 minutes against 4.2, because tippecanoe has fewer features to place and that outweighs
+the extra pass.
+
+| zoom | served and unmerged | merged |
+|---|---|---|
+| z5 | 1.8 MB, max 1251 KB | 1.7 MB, max 1159 KB |
+| z6 | 2.8 MB, max 1011 KB | 3.1 MB, max 1113 KB |
+| z7 | 4.0 MB, max 1041 KB | 3.7 MB, max 998 KB |
+| z8 | 8.9 MB, max 1046 KB | 4.5 MB, max 506 KB |
+| z9 | 10.3 MB, max 743 KB | 5.2 MB, max 351 KB |
+| z10 | 11.5 MB, max 516 KB | 6.1 MB, max 234 KB |
+| z11-z14 | 14.5 / 17.1 / 21.6 / 34.6 MB | identical |
+
+z11-z14 are identical because the detail band is built from the road export in both arms.
+That is the design working. The merge reaches the three bands below z11 and nothing else,
+and the numbers say so.
+
+**z6 goes up**, 2.8 MB to 3.1 MB, and its worst tile with it, 1011 KB to 1113 KB. Those
+tiles were already against the size ceiling and being thinned by
+`--drop-densest-as-needed`, so the merge bought them more of the network for about the
+same money. The lit fraction rises at z5-z7 for the same reason, measured earlier around
+London at 5.771% to 8.062% at z5. At the zooms under pressure the saving arrives as
+content, and at the zooms with headroom, z8-z10, it arrives as bytes, roughly halving
+each.
+
+The per-zoom maxima above exceed the 977 KB figure this report measures against, in both
+arms, because `--maximum-tile-bytes` binds each tippecanoe pass and `tile-join` then
+concatenates the three layers into one tile. It is not new and it is the same on both
+sides.
+
+An arm that reproduces the served archive byte for byte was worth the 4.2 minutes it
+cost, since it leaves every other number here with one cause. What the merge is worth
+still differs by zoom, bytes where there is headroom and drawn network where there is
+none.
+
 ## Determinism
 
 All three `art` styles are byte-identical run to run, which none of them were. Ties

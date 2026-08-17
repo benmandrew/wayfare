@@ -438,6 +438,20 @@ def test_the_overview_band_drops_the_card_only_attributes(tippecanoe_calls, tmp_
     assert join[""][0] == "tile-join"
 
 
+def test_an_overview_export_reaches_the_low_bands_and_never_the_detail_one(
+    tippecanoe_calls, tmp_path
+):
+    """A merged file joins the runs a way boundary split, which the overview bands
+    cannot see and the detail band is built on: that band puts the way id in the
+    feature id field, so building it from a file with no `way` would leave every
+    feature in it with no id at all."""
+    overview = write_geojsonl(tmp_path / "overview.geojsonl", [5, 6])
+    far, mid, near, detail, _join = _argv(tippecanoe_calls, tmp_path, overview=overview)
+    for band in (far, mid, near):
+        assert band[""][1:] == [str(overview)]
+    assert detail[""][1:] == [str(tmp_path / "edges.geojsonl")]
+
+
 def test_only_the_detail_band_spends_the_way_id_and_the_coarser_grid(
     tippecanoe_calls, tmp_path
 ):
@@ -671,7 +685,9 @@ def _stub_build(monkeypatch, tmp_path) -> dict:
     """
     seen: dict[str, Any] = {}
 
-    def fake_build_tiles(path, out=None, attribution=None, segments=None, track=None):
+    def fake_build_tiles(
+        path, out=None, attribution=None, segments=None, track=None, overview=None
+    ):
         seen.update(out=out, attribution=attribution)
         return out
 
@@ -801,7 +817,7 @@ def _run_publish(monkeypatch, tmp_path, argv, build=None):
 
     seen = {}
 
-    def fake_build(con, region=None, out=None, from_export=None):
+    def fake_build(con, region=None, out=None, from_export=None, overview=None):
         seen.update(region=region, out=out, from_export=from_export)
         if build is not None:
             return build(con, region=region, out=out)
@@ -901,6 +917,9 @@ def test_only_the_bands_with_a_cap_read_a_filtered_file(
     which is how a cap of 381,000 once took z10 from 943,040 features to 411,255."""
     monkeypatch.setattr(config, "OVERVIEW_CAP_FAR", 1)
     monkeypatch.setattr(config, "OVERVIEW_CAP_MID", 2)
+    # The cap's plumbing, not the merge's: with the merge on, every overview band reads
+    # a file the build made, and which of them read a *filtered* one is the question.
+    monkeypatch.setattr(config, "MERGE_OVERVIEW", False)
 
     far, mid, near, detail, _join = _argv(tippecanoe_calls, tmp_path, trips=(1, 2, 3, 4))
     src = str(tmp_path / "edges.geojsonl")
@@ -917,6 +936,7 @@ def test_an_uncapped_band_is_handed_the_export_itself(
     """None means no cap, which is not the same as a cap nothing reaches: it must not
     cost a pass over the 1.6 GB national export either."""
     monkeypatch.setattr(config, "OVERVIEW_CAP_MID", None)
+    monkeypatch.setattr(config, "MERGE_OVERVIEW", False)
 
     _far, mid, *_rest = _argv(tippecanoe_calls, tmp_path, trips=(1, 2, 3, 4))
     assert mid[""][-1] == str(tmp_path / "edges.geojsonl")
@@ -971,7 +991,7 @@ def test_from_export_publishes_without_touching_the_database(monkeypatch, tmp_pa
     )
     seen = {}
 
-    def fake_build(con, region=None, out=None, from_export=None):
+    def fake_build(con, region=None, out=None, from_export=None, overview=None):
         seen.update(con=con, from_export=from_export)
         return tmp_path / "bus.pmtiles"
 
@@ -1179,3 +1199,168 @@ def test_publishing_nothing_at_all_is_refused(tippecanoe_calls, tmp_path):
 
     with pytest.raises(RuntimeError, match="nothing to publish"):
         publish.build_tiles(tmp_path / "edges.geojsonl", tmp_path / "o.pmtiles")
+
+
+# --- the overview export ---------------------------------------------------------
+#
+# Synthetic geometry laid out on the equator, where a degree of longitude and a degree
+# of latitude are the same distance, so a bearing written here is the one the code sees.
+
+STEP = 0.004
+
+
+def write_lines(path, features):
+    """A GeoJSONL in the shape `export_edges_geojsonl` writes, with real geometry.
+
+    `features` is a list of `(trips, [(lon, lat), ...])`, optionally with an `n` and a
+    way id after it. Every property the export carries is here, in the order it writes
+    them, because the reader picks each one out by pattern and the order is what makes
+    the leftmost match the right one.
+    """
+    lines = []
+    for i, feature in enumerate(features):
+        trips, points = feature[0], feature[1]
+        n = feature[2] if len(feature) > 2 else 1
+        way = feature[3] if len(feature) > 3 else i
+        lines.append(
+            json.dumps(
+                {
+                    "type": "Feature",
+                    "properties": {
+                        "id": i,
+                        "way": way,
+                        "n": n,
+                        "refs": ",".join(str(k) for k in range(n)),
+                        "trips": trips,
+                        "name": "Cross Street",
+                    },
+                    "geometry": {
+                        "type": "LineString",
+                        "coordinates": [[lon, lat] for lon, lat in points],
+                    },
+                },
+                separators=(",", ":"),
+            )
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def straight(pieces, trips=10, step=STEP):
+    """One road east along the equator, cut into `pieces` separate features."""
+    return [(trips, [(i * step, 0.0), ((i + 1) * step, 0.0)]) for i in range(pieces)]
+
+
+def props_of(path):
+    return [json.loads(line)["properties"] for line in path.read_text().splitlines()]
+
+
+def test_one_road_across_two_ways_is_one_overview_feature(tmp_path):
+    """`coalesce` cannot join these, because `way_id` is in its key and the detail band
+    spends the way id on its feature id. An overview band does not carry `way` at all,
+    so the boundary is a feature break it pays for and cannot show."""
+    src = write_lines(
+        tmp_path / "edges.geojsonl",
+        [
+            (10, [(0.0, 0.0), (STEP, 0.0)], 2, 111),
+            (10, [(STEP, 0.0), (2 * STEP, 0.0)], 2, 222),
+        ],
+    )
+    out = publish.merge_overview(src, tmp_path / "overview.geojsonl")
+    props = props_of(out)
+    assert len(props) == 1
+    assert props[0] == {"id": 0, "n": 2, "trips": 10}
+
+
+def test_a_service_change_still_breaks_the_line(tmp_path):
+    """`n` and `trips` are the two weights the viewer paints an overview zoom with, so
+    joining across a change in either would be averaging colour, not saving bytes."""
+    src = write_lines(
+        tmp_path / "edges.geojsonl",
+        [
+            (10, [(0.0, 0.0), (STEP, 0.0)], 2),
+            (11, [(STEP, 0.0), (2 * STEP, 0.0)], 2),
+            (11, [(2 * STEP, 0.0), (3 * STEP, 0.0)], 3),
+        ],
+    )
+    assert len(props_of(publish.merge_overview(src, tmp_path / "o.geojsonl"))) == 3
+
+
+def test_the_merge_stops_at_a_junction_of_three(tmp_path):
+    """`_chain`'s rule, and the reason it is `_chain` doing the joining: at a junction
+    of three the continuation is ambiguous, and picking one draws a line that doubles
+    back on itself."""
+    src = write_lines(
+        tmp_path / "edges.geojsonl",
+        [
+            (10, [(0.0, 0.0), (STEP, 0.0)], 2),
+            (10, [(STEP, 0.0), (2 * STEP, 0.0)], 2),
+            (10, [(STEP, 0.0), (STEP, STEP)], 2),
+        ],
+    )
+    assert len(props_of(publish.merge_overview(src, tmp_path / "o.geojsonl"))) == 3
+
+
+def test_the_merged_file_carries_nothing_the_info_card_reads(tmp_path):
+    """It can only build the overview. Handing it to the detail band would take the
+    names and the service lists off the card, and leave every feature there with no id
+    at all -- that band spends `way` on the feature id."""
+    src = write_lines(tmp_path / "edges.geojsonl", straight(3))
+    out = publish.merge_overview(src, tmp_path / "overview.geojsonl")
+    assert all(set(p) == {"id", "n", "trips"} for p in props_of(out))
+
+
+def test_the_merge_moves_no_point(tmp_path):
+    """Lossless means lossless: it joins lines end to end and that is all it does."""
+    src = write_lines(tmp_path / "edges.geojsonl", straight(4))
+    out = publish.merge_overview(src, tmp_path / "overview.geojsonl")
+    joined = json.loads(out.read_text())["geometry"]["coordinates"]
+    assert joined == [[i * STEP, 0.0] for i in range(5)]
+
+
+def test_the_same_export_merges_to_the_same_bytes(tmp_path):
+    """A rebuild has to be byte-identical, and a chain is a thing that comes out
+    forwards or backwards depending on which end the scan reached first."""
+    crossing = [
+        (11, [(0.0, 0.01 + i * STEP), (0.0, 0.01 + (i + 1) * STEP)]) for i in range(5)
+    ]
+    src = write_lines(tmp_path / "edges.geojsonl", straight(5) + crossing)
+    first = publish.merge_overview(src, tmp_path / "a.geojsonl").read_bytes()
+    second = publish.merge_overview(src, tmp_path / "b.geojsonl").read_bytes()
+    assert first == second
+
+
+def test_an_unreadable_export_raises_rather_than_merging_it_away(tmp_path):
+    """A filter that quietly matches nothing writes an empty band, and an empty band
+    reads as a region that lost its buses."""
+    src = tmp_path / "edges.geojsonl"
+    src.write_text('{"type":"Feature","properties":{"n":1}}\n')
+    with pytest.raises(RuntimeError, match="diverged"):
+        publish.merge_overview(src, tmp_path / "o.geojsonl")
+
+
+def test_a_publish_merges_the_overview_for_itself(tippecanoe_calls, tmp_path):
+    """The default since it was measured. The three overview bands read the merged file
+    and the detail band reads the export, and the merge lands in the scratch directory
+    rather than beside the export -- a later `--from-export` that picked it up would
+    publish a region with no road names and no service lists."""
+    src = write_lines(tmp_path / "edges.geojsonl", straight(4))
+    publish.build_tiles(src, tmp_path / "bus.pmtiles")
+    far, mid, near, detail, _join = (builders.argv_map(c) for c in tippecanoe_calls)
+    assert detail[""][1:] == [str(src)]
+    for band in (far, mid, near):
+        assert band[""][1:] != [str(src)]
+        assert Path(band[""][1]).name == "overview.geojsonl"
+    # Gone with the scratch directory, so nothing in the data root can pick it up.
+    assert not (tmp_path / "overview.geojsonl").exists()
+
+
+def test_the_merge_can_be_switched_off(tippecanoe_calls, tmp_path, monkeypatch):
+    """One setting rather than a rebuild, for comparing an archive against the way it
+    was built before."""
+    monkeypatch.setattr(config, "MERGE_OVERVIEW", False)
+    src = write_lines(tmp_path / "edges.geojsonl", straight(4))
+    publish.build_tiles(src, tmp_path / "bus.pmtiles")
+    for cmd in list(tippecanoe_calls)[:4]:
+        assert builders.argv_map(cmd)[""][1:] == [str(src)]
