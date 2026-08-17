@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Draw the map the README embeds, from the published archives.
+"""Draw the banner the README embeds, from the published archives.
 
-    python scripts/readme_map.py                      # docs/map.png
+    python scripts/readme_map.py                      # docs/banner.png
     python scripts/readme_map.py --zoom 12 --width 2400
     python scripts/readme_map.py --archives a.pmtiles b.pmtiles
 
@@ -20,13 +20,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
 from wayfare import config, coverage, palette
 
 ROOT = Path(__file__).resolve().parent.parent
-OUT = ROOT / "docs" / "map.png"
+OUT = ROOT / "docs" / "banner.png"
 
 # Clipped from Natural Earth by `scripts/coastline.py` and committed, so a redraw
 # needs no network and works in an offline clone. Drawn under everything: without
@@ -35,19 +36,28 @@ OUT = ROOT / "docs" / "map.png"
 # all. Optional, because the map is still a map without it.
 COASTLINE = ROOT / "docs" / "coastline.json"
 
-# Mainland Great Britain and Ireland. Narrower than `art.ISLES`, which is the box
-# the archives actually cover: north stops at 58.8, above Dunnet Head at 58.67 and
-# below Orkney at 58.7, so the picture keeps every mile of mainland road and drops
-# the two archipelagos.
+# A letterbox across the three archives: Kerry to Lowestoft, so both islands are in
+# it, and only as tall as that width over `BANNER_ASPECT`.
 #
-# What that buys is not the islands themselves but the sea around them. Shetland
-# sits 2.2 degrees north of the Scottish mainland with nothing but two ferry lines
-# in between, so a window reaching it spent a fifth of its height drawing water.
+# It drops Scotland and the north of England, and there is no arrangement in which
+# it does not. The whole islands are 13 degrees of longitude over 9 of latitude,
+# which is nowhere near 2.5:1 in Mercator, so a letterbox of them is a crop either
+# way -- the only choice is which end.
 #
-# The Outer Hebrides stay, and cannot be dropped without dropping Ireland: they
-# reach -7.7 and Dunmore Head reaches -10.5, so the western edge is set by Kerry
-# and the Hebrides are inside it either way.
-WINDOW = (-11.0, 49.8, 2.0, 58.8)
+# Its north and south edges are derived rather than chosen, because what fixes them
+# is where London falls. London is the brightest thing on this map by a wide margin
+# and a banner is looked at once, so it sits on the lower third rather than in the
+# middle, and the frame is built outwards from that. Stating the latitudes instead
+# would be four numbers that silently stop meaning it the moment the aspect moves.
+#
+# 2.5 is as tall as a banner can be cropped before the crop takes something: at 3
+# Dublin goes over the top edge and at 3.5 Wales loses Snowdonia and the south coast
+# is cut through, both of which are visible and neither of which any measurement
+# reports.
+BANNER_SPAN = (-10.6, 1.8)
+BANNER_ASPECT = 2.5
+BANNER_FOCUS = 51.5074  # London
+BANNER_THIRD = 1 / 3  # of the height, measured up from the bottom edge
 
 # One archive per region, in the order they are drawn. Great Britain first because
 # it is the largest and the other two sit clear of it.
@@ -75,15 +85,53 @@ DEFAULT_ZOOM = 11
 # pixel is an edge somewhere.
 SUPERSAMPLE = 6
 
-# Wide enough for the two device pixels a retina screen draws each of the roughly 600
-# CSS pixels the README gives it, and no wider. GitHub's readme column is about 900
-# wide beside the About sidebar, the picture is set to two thirds of it, and the 1800
-# this was drawn at was paying for a third size nothing displays.
-WIDTH = 1200
+# Wide enough for the two device pixels a retina screen draws each of the roughly 900
+# CSS pixels GitHub's readme column gives a full-width picture, and no wider. Set
+# across the column rather than to two thirds of it, so there is no third size being
+# paid for.
+#
+# The archives have far more than this to give: 12.4 degrees over 1800 pixels is
+# about 6.9e-3 degrees each, against a z11 tile's coordinate grid at about 4.3e-5.
+# The raster runs out long before the tiles do, so a wider draw is a real picture
+# rather than an upscale, and `--width` is what asks for one.
+WIDTH = 1800
+
+
+def _mercator_y(lat: float) -> float:
+    """Latitude to the 0..1 vertical the tiles live on. Not from `coverage`.
+
+    That one is private, takes a longitude it does not need here, and has no
+    inverse, which the frame below is built out of.
+    """
+    s = math.sin(math.radians(lat))
+    return 0.5 - math.log((1 + s) / (1 - s)) / (4 * math.pi)
+
+
+def _latitude(y: float) -> float:
+    """The inverse of `_mercator_y`."""
+    return math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y))))
+
+
+def _window() -> tuple[float, float, float, float]:
+    """The letterbox that puts `BANNER_FOCUS` on the lower third line.
+
+    Built in Mercator rather than in degrees, because a third of the *picture* is a
+    third of the projected height and the two diverge by about 0.1 degrees over this
+    frame -- enough to move London off the line it is being placed on.
+    """
+    west, east = BANNER_SPAN
+    height = (east - west) / 360.0 / BANNER_ASPECT
+    top = _mercator_y(BANNER_FOCUS) - (1 - BANNER_THIRD) * height
+    return west, _latitude(top + height), east, _latitude(top)
+
+
+WINDOW = _window()
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument(
         "--archives",
         type=Path,

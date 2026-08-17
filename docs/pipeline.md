@@ -916,37 +916,66 @@ square of the factor in memory and much less in time, the whole-islands z11 rend
 from 15s to 42s at 6, since about 8s of either is spent before any of it is drawn: `draw`
 walks one zoom, so these three archives are 16.5 MB of z11 tiles rather than the 147.7 MB
 they hold, and 0.7s of that is the read and the gunzip against 7.2s of parsing 1.14M
-features out of the wire format. The committed PNG goes from 288 KB to 796 KB, because an
-antialiased edge is what does not compress. `scripts/readme_map.py` passes 6, and it is the
+features out of the wire format. An antialiased edge is what does not compress, and the
+committed `docs/banner.png` is 0.84 MB. `scripts/readme_map.py` passes 6, and it is the
 only caller that asks for more than 1.
 
-**`scripts/readme_map.py` draws `docs/map.png`, which the README embeds.** It has no
-`--check` and CI cannot run it, since every data root is gitignored and a national build
-is a match run of a day or two, so the picture is committed and the script is run by hand
-when the archives move. It defaults to z11 for its geometry rather than its attributes: a
-current archive carries `trips` at every zoom, so the ramp draws at any of them, and z11 is
-the finest band whose whole-country pass is seconds. The check under it is not dead, since
-an archive built before `trips` reached the overview bands has it in the detail band alone
-and comes out every road in the "no answer" grey below z11.
-`coverage.layer_attributes` is what lets it warn about the band it was given rather than
-write that map.
+**`scripts/readme_map.py` draws the picture the README embeds.** `python
+scripts/readme_map.py` writes `docs/banner.png`, and `--zoom`, `--width`, `--supersample`,
+`--theme` and `--out` are what vary it. It has no `--check` and CI cannot run it, since
+every data root is gitignored and a national build is a match run of a day or two, so the
+picture is committed and the script is run by hand when the archives move. The three
+regions are named rather than globbed, because `$WAYFARE_DATA/out` accumulates whatever has
+been published into it, and `wales.pmtiles` beside `great_britain.pmtiles` is the same
+roads twice. It defaults to z11 for its geometry rather than its attributes: a current
+archive carries `trips` at every zoom, so the ramp draws at any of them, and z11 is the
+finest band whose whole-country pass is seconds. The check under it is not dead, since an
+archive built before `trips` reached the overview bands has it in the detail band alone and
+comes out every road in the "no answer" grey below z11. `coverage.layer_attributes` is what
+lets it warn about the band it was given rather than write that map.
 
-It draws 1200 wide, which is what the page it is embedded in displays rather than what
-the archives could fill. GitHub's readme column is around 900 CSS pixels beside the About
-sidebar and the picture is set to two thirds of it, so 1200 is the two device pixels a
-retina screen draws each of them and the 1800 this began at was paying for a third size
-nothing shows. The width is where the supersampling is paid for twice over: fewer output
-pixels is a cheaper render and a smaller file, and every one of them is carrying more of
-the network, which is the case for antialiasing them well.
+It draws 1800 wide, which is the two device pixels a retina screen draws each of the
+roughly 900 CSS pixels GitHub's readme column gives a full-width picture. The archives have
+far more than that to give. This window's 12.4 degrees over 1800 pixels is about 6.9e-3
+degrees each, against the 360 / (2048 * 4096) degrees of a z11 tile's coordinate grid,
+about 4.3e-5, so the raster runs out long before the tile geometry does and a wider draw is
+a real picture rather than an upscale. `--width` is what asks for one.
 
-Its window is mainland Great Britain and Ireland, north to 58.8 — above Dunnet Head at
-58.67 and below Orkney at 58.7. What the crop buys is the sea rather than the islands:
-Shetland sits 2.2 degrees north of the Scottish mainland with two ferry lines and nothing
-else in between, so reaching it spent a fifth of the height on water. The Outer Hebrides
-stay and cannot be dropped without dropping Ireland, since they reach -7.7 and Dunmore Head
-reaches -10.5, so Kerry sets the western edge and the Hebrides fall inside it. The ferries
-that leave the window are drawn up to its edge, because `draw` clips per pixel rather than
-per line.
+**The frame is a letterbox across the three archives**, Kerry at -10.6 east to Lowestoft at
+1.8, at 2.5:1 and 1800 by 720 pixels, drawn at z11 and supersample 6 in the dark theme over
+the coastline underlay. It comes out 0.84 MB, reads 22.5% lit and takes 36s to draw. It
+drops Scotland and the north of England, and no arrangement of it does otherwise. The whole
+islands are 13 degrees of longitude over 9 of latitude, nowhere near 2.5:1 in Mercator, so
+a letterbox of them is a crop either way and the only choice is which end. The ferries that
+leave the window are drawn up to its edge, because `draw` clips per pixel rather than per
+line.
+
+Its north and south edges are derived rather than written down, because what fixes them is
+where London falls. London is the brightest thing on this map by a wide margin, so it is
+placed on the lower third line rather than in the middle, and the frame is built outwards
+from that latitude, the longitude span and the aspect. Four hard-coded latitudes would stop
+meaning that the moment the aspect moved. The derivation runs in *Mercator* rather than in
+degrees, since a third of the picture is a third of the projected height and the two differ
+by about 0.1 degrees over this frame, which is enough to move London off the line it is
+being placed on. `_mercator_y` is the script's own rather than `coverage._mercator`, which
+is private, takes a longitude it does not need and has no inverse, and that inverse is what
+the frame is built out of.
+
+**The lit fraction is comparable at one width and at no other.** A drawn road stays about
+one pixel wide whatever the width, so quadrupling the pixels roughly halves the fraction of
+them a fixed network lights. The 22.5% above and the 1200-wide figures below were drawn at
+different widths, and neither says anything about the other. `coverage`'s argument that the
+lit fraction is the statistic worth comparing holds across archives and across builds drawn
+at one width. Across two widths it says nothing.
+
+**2.5:1 is as tall as the crop goes before it takes something.** At 3:1 Dublin goes over
+the top edge, and at 3.5:1 Wales loses Snowdonia and the south coast is cut through. Both
+are visible in the picture and neither is reported by any number. The lit fraction rises as
+the crop tightens, 17.6% at 2.5:1 against 18.0% at 3:1 and 18.7% at 3.5:1, because a
+tighter crop keeps proportionally more of England. All three were measured unsupersampled
+at 1200 wide, which is what makes them a comparison with each other and with nothing else.
+That is the blind spot the low zoom bands have, and it has the same answer. Draw the frame
+and look.
 
 **The coastline under it is a committed file, not a basemap.** `draw` takes an `underlay`
 of longitude/latitude polylines and paints them below every feature, at a weight of 1
@@ -955,16 +984,16 @@ where the buses are, so a coast with no service on it — most of Sutherland, mo
 is not drawn at all. `scripts/coastline.py` clips Natural Earth's 1:10m coastline to
 `map.toml`'s roam box and writes `docs/coastline.json`: 69 runs, 9,339 points, 144 KB at
 three decimal places, which is about 70 m against a pixel that is about 480 m. Clipped to
-the roam box rather than to the picture's frame, so the frame moves without the coastline
+the roam box rather than to the banner's frame, so the frame moves without the coastline
 being rebuilt. The 10 MB source is cached in `RAW` like every other download and the
 clipped file is committed, so a redraw makes no request.
 
 The alternative was the viewer's own CARTO backdrop, and the numbers were not the
 objection: the backdrop only has to match the output resolution rather than the vector
-zoom, so 1800 pixels over 13 degrees is z8 and 120 tiles rather than z11 and 6,675. What
-ruled it out is that a raster backdrop puts a licence condition on a PNG that travels
-without the page it was made for, and that baking a static asset out of a free tile service
-is not what the service is provisioned for. Natural Earth is public domain and owes
+zoom, so 1800 pixels over the banner's 12.4 degrees is z8 and 50 tiles rather than z11 and
+2,088. What ruled it out is that a raster backdrop puts a licence condition on a PNG that
+travels without the page it was made for, and that baking a static asset out of a free tile
+service is not what the service is provisioned for. Natural Earth is public domain and owes
 nothing.
 
 **A licence condition travels with the data, not with the page.** The credit is derived
