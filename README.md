@@ -27,19 +27,6 @@ $ wayfare status
 $ wayfare serve                     # viewer on http://localhost:8099
 ```
 
-## The stages
-
-- **acquire** ([`acquire.py`](wayfare/acquire.py)). The General Transit Feed Specification (GTFS) bundle for the region, plus the National Public Transport Access Nodes (NaPTAN) stop register. `ireland` takes its bundle from the NTA and skips NaPTAN, which covers Britain only.
-- **patterns** ([`gtfs.py`](wayfare/gtfs.py)). The timetable collapses to distinct ordered stop sequences, in DuckDB. `--modes` picks from the ten in `config.MODES`; the default is bus and coach, remembered in `meta.modes`.
-- **match** ([`match.py`](wayfare/match.py), [`valhalla.py`](wayfare/valhalla.py)). Each pattern becomes an ordered list of road edges, road modes only. Interruption-safe: it resumes from its last committed batch.
-- **trace** ([`trace.py`](wayfare/trace.py), [`osm.py`](wayfare/osm.py)). Non-road patterns with no operator shape, chiefly the London Underground and the Docklands Light Railway (DLR), cut out of OSM route relations by one cached Overpass query.
-- **snap** ([`snap.py`](wayfare/snap.py)). An operator's own rail shape gets the OSM way ids it does not carry, each vertex snapped onto the track beneath it, so overlapping services share the line they run over.
-- **routes** ([`osmroutes.py`](wayfare/osmroutes.py)). Services built from OSM route relations for the modes with no timetable at all, such as Great Britain's National Rail. `--cif` attributes trip counts from a Network Rail schedule.
-- **aggregate** ([`aggregate.py`](wayfare/aggregate.py)). Pattern-to-edges inverted to edge-to-services, keyed on the public service number. Non-road geometry goes into `segments`, needed for trams and ferries to be drawn.
-- **publish** ([`publish.py`](wayfare/publish.py)). One GeoJSON feature per line, then tippecanoe. Three tile layers come out: the banded road layer, `segments` and `track`.
-
-[`cli.py`](wayfare/cli.py) fronts these stages plus other subcommands.
-
 ## On a server
 
 ```console
@@ -62,6 +49,6 @@ $ docker compose up -d web          # viewer and renderer on :8099
 
 ## Further reading
 
-- [`docs/data.md`](docs/data.md) — the feeds, their sizes and traps, mode filtering, coverage gaps.
-- [`docs/pipeline.md`](docs/pipeline.md) — the stages, storage, DuckDB lessons, clustering, tiles.
-- [`docs/results.md`](docs/results.md) — measured runs, and [`docs/deploy.md`](docs/deploy.md) the scheduled refresh.
+- [`docs/pipeline.md`](docs/pipeline.md) — the nine stages, storage, clustering, tiles.
+- [`docs/data.md`](docs/data.md) — the feeds, their traps, mode filtering, coverage gaps, attribution.
+- [`docs/deploy.md`](docs/deploy.md) — the scheduled refresh, and the publish gate that guards it.
