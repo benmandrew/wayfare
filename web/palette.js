@@ -88,6 +88,7 @@ const PALETTE = {
   },
   "trackDefaultMode": "rail",
   "defaultArchive": "bus.pmtiles",
+  "basemapArchive": "basemap.pmtiles",
   "detailSentinel": "refs",
   "detailOnly": ["way", "refs", "name"],
   "roam": [-11.5, 49.4, 2.6, 61.3]

@@ -73,6 +73,7 @@ def render() -> str:
         "unavailable": {t: p.unavailable(t) for t in palette.THEMES},
         "trackDefaultMode": p.track_default_mode,
         "defaultArchive": p.default_archive,
+        "basemapArchive": p.basemap_archive,
         # The page needs the one name, not the list: it reads the presence of this
         # attribute as "this feature came from the detail band". `detailOnly` goes
         # out beside it so the page can say which list the name came from.

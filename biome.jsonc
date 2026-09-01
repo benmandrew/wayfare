@@ -7,7 +7,9 @@
   // `<script>` tags in `index.html` and `art.html`. Nothing checked any of it until
   // this file existed. Biome reads the script tags, so the pages need no extraction.
   //
-  // `web/vendor` is maplibre-gl and pmtiles as shipped, and is not ours to fix.
+  // `web/vendor` is maplibre-gl and pmtiles as shipped, plus the basemap style that
+  // `scripts/basemap_style.py` writes -- third-party bytes and generated ones,
+  // neither of them a file to hand-fix against a lint rule.
   "files": {
     "includes": ["web/**", "!web/vendor"]
   },

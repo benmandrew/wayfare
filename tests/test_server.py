@@ -21,7 +21,7 @@ from pathlib import Path
 import builders
 import pytest
 
-from wayfare import art, config, db, licences, server
+from wayfare import art, config, db, licences, palette, server
 
 # The preset that covers `builders.WINDOW_Q`, at a width small enough to draw fast.
 BASE = "area=cardiff&width=200"
@@ -709,6 +709,10 @@ def serve_at(tmp_path: Path, monkeypatch):
         out = tmp_path / "out"
         out.mkdir(exist_ok=True)
         (out / "wales.pmtiles").write_bytes(b"pmtiles")
+        # The backdrop sits in the same directory and is not a region. It is here
+        # so that every test asking what the index lists is asking it with one
+        # present, which is what the deployed shape looks like.
+        (out / palette.load().basemap_archive).write_bytes(b"pmtiles")
         (out / "notes.txt").write_text("not an archive")
         monkeypatch.setattr(server.Handler, "out_dir", out)
         monkeypatch.setattr(
@@ -916,6 +920,22 @@ def test_archives_lists_only_the_tile_archives(serve_at):
     base = serve_at()
     with _get(f"{base}/archives.json") as response:
         assert json.loads(response.read()) == ["wales.pmtiles"]
+
+
+def test_the_index_leaves_the_backdrop_out_but_still_serves_it(serve_at):
+    """The backdrop is an archive in the same directory read over the same ranges,
+    and it is not a region: it holds the basemap schema, so a page opening it as one
+    draws a `bus` layer against tiles that have none and takes the extract's bounds
+    as the country's. The pages ask for it by name instead.
+
+    Both halves matter. Listing it breaks the map; refusing to serve it removes the
+    map's backdrop, and the fallback for that is nothing at all."""
+    base = serve_at()
+    name = palette.load().basemap_archive
+    with _get(f"{base}/archives.json") as response:
+        assert name not in json.loads(response.read())
+    with _get(f"{base}/{name}") as response:
+        assert response.read() == b"pmtiles"
 
 
 def _connect(base: str) -> http.client.HTTPConnection:

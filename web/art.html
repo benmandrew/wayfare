@@ -469,6 +469,9 @@ input[type=color] {
 <script>document.getElementById("mapcss").media = "all";</script>
 <script src="vendor/maplibre-gl.js?v=4.7.1"></script>
 <script src="vendor/pmtiles.js?v=4.4.1"></script>
+<!-- The backdrop's cartography, shared with index.html. The picker draws the
+     same map at a smaller size, so it draws it from the same file. -->
+<script src="vendor/basemap-style.js?v=5.7.2"></script>
 <!-- The basemap credit, shared with index.html so the two cannot drift. -->
 <script src="credits.js"></script>
 <script>
@@ -1408,13 +1411,22 @@ function bounds() {
 const PICK_LINE = { light: "#3f6d9e", dark: "#79c6c9" };
 
 let pickMap = null;
+// The one PMTiles protocol on this page, shared by the backdrop and by the
+// archives drawn over it. `addProtocol` is global to MapLibre and the second
+// call for a name replaces the first, so two of them would leave whichever
+// registered first unable to open anything.
+let pickProtocol = null;
 // One network layer per archive that opened, so a theme change repaints all of
 // them rather than whichever one happened to be first.
 const pickLayers = [];
 let syncing = false;    // a camera move of our own, which must not be read back
 
 function initPicker() {
-  if (typeof maplibregl === "undefined") return; // no vendor bundle; no picker
+  // Both halves of the vendor bundle, because the backdrop is a PMTiles archive
+  // now rather than tiles off a URL: without the plugin there is no map under the
+  // window, no network over it, and nothing left for the picker to show. The
+  // studio's own half of this page needs neither and keeps working.
+  if (typeof maplibregl === "undefined" || typeof pmtiles === "undefined") return;
   $("pickField").hidden = false;
   $("pickToggle").addEventListener("click", () => showPicker(!!$("pickwrap").hidden));
   // Which does the building, if it is opening. See `showPicker`.
@@ -1423,7 +1435,7 @@ function initPicker() {
 
 // Everything a picker costs, and none of it paid until someone opens one. This
 // used to run from `boot()` unconditionally, so a reader who closed the picker
-// last visit still paid for a second WebGL context, the raster basemap,
+// last visit still paid for a second WebGL context, the backdrop,
 // `archives.json`, a `getHeader()` per archive and the whole road network drawn
 // into a box roughly 272 by 200 pixels -- held for the session, and never once on
 // screen. Two live WebGL contexts on one page is at the edge of what a
@@ -1433,6 +1445,20 @@ function initPicker() {
 // measure itself: constructed under `display: none` it comes up zero by zero.
 function buildPicker() {
   const b = bounds() || ISLES;
+  // Before the map, not inside `addNetwork` below, because the backdrop is a
+  // `pmtiles://` source in the style now. A style naming a protocol MapLibre has
+  // not been told about never finishes loading, so the `load` handler that calls
+  // `addNetwork` -- which is where this registration used to happen -- would
+  // never fire, and the picker would come up empty with nothing in the console
+  // to say why.
+  //
+  // `metadata: true` for the reason `addNetwork` gives: it is what lets an
+  // archive's own credit out of the file. The backdrop's credit is page-level,
+  // but the archives this same protocol opens a moment later are not.
+  if (!pickProtocol) {
+    pickProtocol = new pmtiles.Protocol({ metadata: true });
+    maplibregl.addProtocol("pmtiles", pickProtocol.tile);
+  }
   pickMap = new maplibregl.Map({
     container: "pickmap",
     // Emphatically not `hash`: this page's fragment is the whole design, and
@@ -1452,15 +1478,15 @@ function buildPicker() {
     attributionControl: { compact: true },
     style: {
       version: 8,
+      glyphs: BASEMAP_GLYPHS,
       sources: {
         basemap: {
-          type: "raster",
-          tiles: basemapTiles(theme),
-          tileSize: 256,
+          type: "vector",
+          url: "pmtiles://" + basemapUrl(),
           attribution: BASEMAP_CREDIT,
         },
       },
-      layers: [{ id: "basemap", type: "raster", source: "basemap" }],
+      layers: basemapLayers(theme),
     },
   });
   pickMap.touchZoomRotate.disableRotation();
@@ -1543,7 +1569,7 @@ function showPicker(open) {
 
 function repaintPicker() {
   if (!pickMap) return;
-  pickMap.getSource("basemap").setTiles(basemapTiles(theme));
+  repaintBasemap(pickMap, theme);
   for (const id of pickLayers) {
     if (pickMap.getLayer(id)) pickMap.setPaintProperty(id, "line-color", PICK_LINE[theme]);
   }
@@ -1554,22 +1580,19 @@ function repaintPicker() {
 // optional: a server holding a database but no tiles still gets a working
 // picker, which is the ordinary state of things between `match` and `publish`.
 async function addNetwork(map) {
-  if (typeof pmtiles === "undefined") return;
   let archives = [];
   try {
     archives = await (await fetch("archives.json")).json();
   } catch {
     archives = [];
   }
+  // The backdrop is already drawn and is not a region: opening it again here
+  // would add a `bus` layer over tiles that have no such thing. The viewer
+  // filters the same name out of the same index, for the same reason.
+  archives = archives.filter((name) => !name.endsWith(PALETTE.basemapArchive));
   // The convention on a static host with no index, the same fallback the viewer
   // makes -- out of the same file, so the two cannot pick different names.
   const wanted = archives.length ? archives : [`./${PALETTE.defaultArchive}`];
-  // `metadata: true`, and it is off by default: without it the plugin answers
-  // MapLibre's TileJSON request from the PMTiles header alone and the credit
-  // written into the archive's metadata block never leaves the file. This picker
-  // draws the published network, so it owes that credit as much as the viewer does.
-  const protocol = new pmtiles.Protocol({ metadata: true });
-  maplibregl.addProtocol("pmtiles", protocol.tile);
   // Every archive the server lists, as the viewer opens them: a multi-region
   // server holds one archive per region, and the first of them is one region's
   // network drawn under a window that may be framed over another. One failing
@@ -1581,7 +1604,7 @@ async function addNetwork(map) {
         try {
           const url = new URL(name, location.href).href;
           const archive = new pmtiles.PMTiles(url);
-          protocol.add(archive);
+          pickProtocol.add(archive);
           return { url, header: await archive.getHeader() };
         } catch {
           return null;

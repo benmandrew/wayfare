@@ -212,6 +212,19 @@ default_mode = "rail"
 # running deployment would have left the pages looking for a file nothing writes.
 default = "bus.pmtiles"
 
+# The backdrop. An archive like any other to a static host, and unlike any other
+# to everything else here: it holds the Protomaps basemap schema rather than
+# wayfare's, so opening it as a region would draw a `bus` layer against tiles
+# that have no such thing, widen the map's covered bounds to the extract's, and
+# put "Basemap" in the strapline beside the regions.
+#
+# So the name is reserved, once, and read by both sides. `server.archives` keeps
+# it out of `/archives.json`, which is the list of regions; the pages ask for it
+# by name, the way they asked for a tile server by URL before. They also filter
+# it out of whatever the index does return, because a deployment can have its
+# manifest written by something else -- the Ansible one globs a directory.
+basemap = "basemap.pmtiles"
+
 
 # --- Which band a feature came from ----------------------------------------
 #

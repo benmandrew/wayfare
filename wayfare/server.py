@@ -46,7 +46,7 @@ from urllib.parse import ParseResult, parse_qs, urlparse
 
 import duckdb
 
-from . import art, config, db, licences, logs
+from . import art, config, db, licences, logs, palette
 
 log = logs.get("server")
 
@@ -189,9 +189,23 @@ class BadRequest(ValueError):
 
 
 def archives(out_dir: Path) -> list[str]:
+    """Every region archive in the output directory, which is not every archive.
+
+    The basemap sits here too, because it is served over the same range requests
+    from the same directory and there is nowhere else for it to be. It is not a
+    region: it holds the Protomaps schema, so a page opening it as one draws a
+    `bus` layer against tiles that have none and takes the extract's bounds as
+    the country's. `map.toml` reserves the name; this is where the reservation is
+    kept.
+    """
     if not out_dir.is_dir():
         return []
-    return sorted(p.name for p in out_dir.iterdir() if p.name.endswith(ARTEFACT_SUFFIXES))
+    basemap = palette.load().basemap_archive
+    return sorted(
+        p.name
+        for p in out_dir.iterdir()
+        if p.name.endswith(ARTEFACT_SUFFIXES) and p.name != basemap
+    )
 
 
 # --- The render request -----------------------------------------------------

@@ -13,8 +13,18 @@
 // A plain script rather than a module: both pages are classic scripts served off
 // disk, and a module would make this the only thing on the page that needs an
 // origin.
+//
+// It stays page-level now that the backdrop is served from this origin too, and
+// that is the exception the paragraph above is drawing: a region archive's
+// credit belongs to whoever published that region's timetable, while this one
+// belongs to the cartography and is the same over every region on the map.
+// `tile-join` also drops the metadata block when it filters the extract, so an
+// archive-carried credit would be a credit the trim deletes.
+//
+// Protomaps built the tiles from OpenStreetMap, which is what the ODbL asks be
+// said. Their own style says exactly this pair.
 const BASEMAP_CREDIT =
-  '<a href="https://carto.com/attributions">CARTO</a> · ' +
+  '<a href="https://github.com/protomaps/basemaps">Protomaps</a> · ' +
   '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
 
 // Fold the credit down to its (i) before it is ever drawn open, which

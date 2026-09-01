@@ -8,16 +8,6 @@
      credit. -->
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Wayfare — public transport routes</title>
-<!-- The basemap is on another origin, so its first tile pays a DNS lookup, a TCP
-     handshake and a TLS handshake before a byte of it moves. None of that needs
-     anything from this page, so it can overlap the 803 KB library download
-     instead of queueing behind it. `crossorigin` because MapLibre sets
-     crossOrigin="anonymous" on a cross-origin tile: a preconnect without it
-     warms a different entry in the connection pool and buys nothing. Two
-     subdomains, because basemapTiles() spreads tiles over four and these are the
-     two the first screenful mostly comes from. -->
-<link rel="preconnect" href="https://a.basemaps.cartocdn.com" crossorigin>
-<link rel="preconnect" href="https://b.basemaps.cartocdn.com" crossorigin>
 <!-- Off the critical path, and this is the whole reason it is up here rather
      than in boot(). Nothing about the archive index depends on the library, so
      the two have no business queueing behind one another: starting the request
@@ -64,12 +54,20 @@ window.__heads = (async () => {
   try {
     const named = new URLSearchParams(location.search).get("tiles");
     const listed = named ? [named] : (await window.__archives) || [];
-    // The one place this name is written out rather than read from PALETTE.
-    // Reading it would mean loading palette.js ahead of this block, and this
+    // The one place these names are written out rather than read from PALETTE.
+    // Reading them would mean loading palette.js ahead of this block, and this
     // block is first on the page on purpose: it overlaps a round trip that the
     // measurements in the comment above are about. `test_viewer.py` pins the
-    // literal against `PALETTE.defaultArchive` instead.
-    for (const name of listed.length ? listed : ["./bus.pmtiles"]) {
+    // literals against `PALETTE.defaultArchive` and `PALETTE.basemapArchive`
+    // instead.
+    //
+    // The backdrop is prefetched alongside the regions and never instead of
+    // them. It is opened on every load whatever `?tiles=` names, and it is the
+    // one archive whose first tile is wanted before any of wayfare's own -- the
+    // map underneath has to be there while the network over it is still
+    // arriving.
+    const wanted = [...(listed.length ? listed : ["./bus.pmtiles"]), "./basemap.pmtiles"];
+    for (const name of wanted) {
       const url = new URL(name, location.href).href;
       heads.set(
         url,
@@ -417,6 +415,11 @@ body {
 <script>document.getElementById("mapcss").media = "all";</script>
 <script src="vendor/maplibre-gl.js?v=4.7.1"></script>
 <script src="vendor/pmtiles.js?v=4.4.1"></script>
+<!-- The backdrop's cartography: 55 layers of it, and the colours of both
+     flavours. Down here with the library rather than in <head> beside util.js,
+     because nothing reads it until a map is built and 64 KB parsed before the
+     boot overlay paints is 64 KB in front of the first thing a reader sees. -->
+<script src="vendor/basemap-style.js?v=5.7.2"></script>
 <!-- The basemap credit, shared with art.html so the two cannot drift. -->
 <script src="credits.js"></script>
 <script>
@@ -1003,7 +1006,15 @@ async function boot() {
   // that does not is a plain static host, where `bus.pmtiles` is the convention.
   // Already in flight since <head>; this is the await, not the request. The
   // promise catches its own failure, so [] here still means "no index".
-  ARCHIVES = (await window.__archives) || [];
+  // The backdrop is not a region and must never be opened as one: it holds the
+  // basemap schema, so it would draw a `bus` layer against tiles that have none
+  // and stretch the map's covered bounds to the whole extract. `server.archives`
+  // already keeps it out of the index it writes, and this is the other half --
+  // a deployment can have its manifest written by something else, and the one
+  // serving this in production globs a directory.
+  ARCHIVES = ((await window.__archives) || []).filter(
+    (name) => !name.endsWith(PALETTE.basemapArchive)
+  );
   // ?tiles= names one archive and only one, because its job is pointing the page
   // at a bucket rather than choosing between regions: the server's index is what
   // enumerates those. Everything the server lists otherwise.
@@ -1236,12 +1247,14 @@ const matchLayer = (r) => ({
 function buildStyle() {
   const sources = {
     basemap: {
-      type: "raster",
-      tiles: basemapTiles(theme),
-      // Read once, at style time: `setTiles` can swap the URLs for a theme change
-      // but there is no setter for tile size, and a connection that changed class
-      // mid-session is not worth rebuilding the style over.
-      tileSize: basemapTileSize(),
+      type: "vector",
+      url: "pmtiles://" + basemapUrl(),
+      // Unlike a region, which brings its own credit in its own metadata: the
+      // trim that builds this archive runs the tiles through tile-join, and
+      // that rewrites the metadata block without one. The credit is the same
+      // over every region on the map anyway, which is what makes one page-level
+      // constant the right shape for it where it is the wrong shape for a
+      // timetable's publisher.
       attribution: BASEMAP_CREDIT,
     },
   };
@@ -1293,15 +1306,21 @@ function buildStyle() {
   // on purpose -- a tram over a railway is the pair this most needs to separate,
   // and which one is on top is the answer the layer order already gives.
   //
-  // The fade is off because its default is 300 ms and what it costs is paid at
-  // the worst moment: for about eighteen frames of full-screen compositing it
-  // holds the old texture and the new one live together, which is precisely while
-  // the vector tiles over the top are still arriving and being parsed. The map
-  // option `fadeDuration` is a different setting and inert here, since the style
-  // has no symbol layers -- this is the one that was running.
-  const layers = [
-    { id: "basemap", type: "raster", source: "basemap", paint: { "raster-fade-duration": 0 } },
-  ];
+  // The backdrop's own 55 layers first, in the order its cartography puts them:
+  // ground, water, then the road mesh, then the labels over all of it. Every
+  // wayfare layer goes above every one of them, so nothing below this has to know
+  // how many the backdrop has.
+  //
+  // The place labels therefore draw *under* the bus network rather than over it.
+  // That is the wrong way round for a general-purpose map and the right way round
+  // for this one: the network is the subject, and a town name is the context that
+  // says where you are looking. Lifting the label layers above it would put grey
+  // text through every coloured line on the map.
+  //
+  // The map option `fadeDuration` is live now that ten symbol layers exist to
+  // fade, and is left at its 300 ms default: it is what makes a place name arrive
+  // as the tile lands rather than appear mid-pan.
+  const layers = [...basemapLayers(theme)];
   for (const r of REGIONS) layers.push(busLayer(r));
   for (const r of REGIONS) layers.push(trackShadowLayer(r));
   for (const r of REGIONS) layers.push(trackLayer(r));
@@ -1309,7 +1328,10 @@ function buildStyle() {
   for (const r of REGIONS) layers.push(segLayer(r));
   for (const r of REGIONS) layers.push(matchLayer(r));
 
-  return { version: 8, sources, layers };
+  // `glyphs` is not optional and its absence is silent: MapLibre resolves every
+  // `text-field` through it, and a style with symbol layers and no glyph
+  // endpoint draws the map correctly with nothing named on it.
+  return { version: 8, glyphs: BASEMAP_GLYPHS, sources, layers };
 }
 
 // The ids each family owns, one per region, which is what every filter, dimming
@@ -1363,15 +1385,16 @@ function start(missing) {
     // reports 2.6 to 3 -- seven to nine times the fragments of a one-to-one
     // surface. Fragments are this map's dominant graphics cost: every line layer
     // is translucent, so the whole road mesh is alpha-blended overdraw with no
-    // early-depth rejection, drawn over a raster basemap. The cap costs sharpness
-    // on exactly the devices that cannot afford the sharpness, and nothing
-    // anywhere else.
+    // early-depth rejection, drawn over a backdrop that is itself 55 layers deep.
+    // The cap costs sharpness on exactly the devices that cannot afford the
+    // sharpness, and nothing anywhere else.
     pixelRatio: weakDevice() ? Math.min(devicePixelRatio, 1.5) : devicePixelRatio,
     // The cache is per source and holds tiles that have left the screen, so the
     // default -- a viewport's worth times five zoom levels -- is four caches on
-    // this page: three archives and the basemap. A phone was holding around
-    // ninety parsed vector tiles and seventy-five decoded basemap textures to
-    // make a pan back instant. The cap trades that for a re-fetch.
+    // this page: three archives and the backdrop. A phone was holding around
+    // ninety parsed vector tiles to make a pan back instant, and the backdrop's
+    // are the heaviest of them, carrying the whole road mesh of the country at
+    // z14. The cap trades that for a re-fetch.
     maxTileCacheSize: 15,
     // This is a north-up thematic map. A pitch covers several times more tiles
     // toward the horizon, and both of the gestures that reach one are accidents
@@ -1844,7 +1867,7 @@ function wireTheme(map, ids) {
 
   $("theme").addEventListener("click", () => {
     toggleTheme($("theme"));
-    map.getSource("basemap").setTiles(basemapTiles(theme));
+    repaintBasemap(map, theme);
     repaintColours();
   });
 }

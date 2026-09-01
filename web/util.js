@@ -97,50 +97,58 @@ function weakDevice() {
 
 /* ---------- the basemap ---------- */
 
-const BASEMAP = {
-  light: "light_all",
-  dark:  "dark_all",
-};
+// The backdrop is a PMTiles archive on this origin, drawn with cartography
+// vendored into `vendor/basemap-style.js`. Serving it here is what makes panning
+// the map nobody else's business, and what stops a tile server's terms from
+// deciding whether this page has a backdrop at all: the one it used to draw
+// began painting "API KEY REQUIRED" diagonally across every keyless tile in
+// August 2026, with the requests still answering 200.
+//
+// Nothing here picks a resolution, and there is nothing to pick. A vector tile
+// is drawn at whatever the screen is from the same bytes, so one archive serves
+// a retina desktop and a phone on a slow radio alike -- the choice exists only
+// for a raster backdrop, where a PNG is drawn at the size it was rasterised at.
 
-// What the browser will say about the connection, where it says anything.
-// Save-Data is a header the user asked for and is honoured wherever it appears;
-// effectiveType is the browser's own estimate. Both are Chromium-only, so this is
-// an improvement where it exists and never a requirement -- Safari and Firefox
-// take the full basemap, exactly as every browser did before.
-function thriftyConnection() {
-  const c = navigator.connection;
-  if (!c) return false;
-  return Boolean(c.saveData) || ["slow-2g", "2g", "3g"].includes(c.effectiveType);
+// The one thing a vector style needs that a raster one did not. A style with
+// symbol layers and no glyph endpoint renders every label as nothing, silently,
+// and a map missing only its place names looks like a map of an empty country
+// rather than like a fault.
+//
+// Seven ranges of each of the three Noto stacks the style asks for, from this
+// origin like everything else -- `vendor/README.md` says which seven and why not
+// all 256. The version is that table's, and it is what makes a year of
+// `immutable` safe on a path whose bytes could otherwise change under it.
+const BASEMAP_GLYPHS = "vendor/fonts/{fontstack}/{range}.pbf?v=2025.10.31";
+
+// Resolved against the page, so a viewer opened out of a sub-directory or off a
+// file:// path asks for the archive beside it. Deliberately not read from
+// `archives.json`: that index lists regions, and the backdrop is not one --
+// `map.toml` says why the name is reserved rather than discovered.
+const basemapUrl = () => new URL(PALETTE.basemapArchive, location.href).href;
+
+// The vendored layers with the flavour's colours put back on them. The two
+// flavours differ in nothing but paint, which is why the file stores the
+// structure once, and which is also what makes a theme change a repaint.
+function basemapLayers(t) {
+  return BASEMAP_LAYERS.map((layer) => {
+    const paint = BASEMAP_PAINT[t][layer.id];
+    return paint ? { ...layer, paint } : layer;
+  });
 }
 
-// A slow radio and a slow processor are two reasons to draw a cheaper backdrop,
-// and they are common on the same phone rather than on different ones. The
-// connection alone was the trigger, so a low-end Android reporting
-// `effectiveType: "4g"` took the full-price basemap: a `@2x` tile is a
-// 512-pixel PNG decoded and uploaded as a megabyte of texture instead of 256 KB,
-// and with `tileSize: 256` the grid is the same size, so there is nothing saved
-// to pay for it.
-const thriftyBasemap = () => thriftyConnection() || weakDevice();
-
-// Cold profiling put the basemap at 447,036 bytes over 30 requests, 40.9% of
-// everything transferred, and blocking it took a throttled load from 19.4 s to
-// 12.1 s. It competes with the archive for the same pipe while being the context
-// rather than the subject, so where the device says it cannot afford it, it is
-// drawn at half resolution: `tileSize: 512` against 256-pixel tiles makes
-// MapLibre ask for one zoom level lower and scale it up, which is a quarter of
-// the tiles for a blurrier backdrop. The roads on top are unaffected -- they are
-// vector.
-const basemapTileSize = () => (thriftyBasemap() ? 512 : 256);
-
-function basemapTiles(t) {
-  // MapLibre has no {s} or {r} placeholder: expand the subdomains here and pick
-  // the retina variant up front. A thrifty device takes the plain tile whatever
-  // the screen is: a retina backdrop is the first thing to give up, whether what
-  // is short is the pipe underneath it or the memory it is decoded into.
-  const r = devicePixelRatio > 1.4 && !thriftyBasemap() ? "@2x" : "";
-  return ["a", "b", "c", "d"].map(
-    (s) => `https://${s}.basemaps.cartocdn.com/${BASEMAP[t]}/{z}/{x}/{y}${r}.png`
-  );
+// What `getSource("basemap").setTiles()` used to do in one call. A raster source
+// carried the flavour in its URL; a vector source carries it in the paint of 55
+// layers, so this walks them the way `wireTheme` already walks wayfare's own.
+//
+// Guarded on `getLayer`, because the studio's picker builds a subset of this
+// style and a missing layer there is not an error here.
+function repaintBasemap(map, t) {
+  for (const [id, paint] of Object.entries(BASEMAP_PAINT[t])) {
+    if (!map.getLayer(id)) continue;
+    for (const [prop, value] of Object.entries(paint)) {
+      map.setPaintProperty(id, prop, value);
+    }
+  }
 }
 
 /* ---------- how far a map may roam ---------- */

@@ -7,11 +7,48 @@ Nothing here is built or installed. [`index.html`](index.html) and [`art.html`](
 load MapLibre GL JS and the *PMTiles* protocol plugin (PMTiles is a single-file archive of
 map tiles) as local files out of `web/vendor/`, where unmodified `dist` builds of MapLibre
 GL JS 4.7.1 and pmtiles 4.4.1 are committed, both under the 3-Clause BSD licence.
-[`web/vendor/README.md`](vendor/README.md) records the versions and how to update them. The
-one thing still fetched from a third party is the raster basemap, from
-`basemaps.cartocdn.com`; point `BASEMAP` in [`web/util.js`](util.js) at a local tile source
-if panning the map should not be visible to anyone else. Both pages read it from there, so
-the map and the studio move together.
+[`web/vendor/README.md`](vendor/README.md) records the versions and how to update them.
+Nothing is fetched from a third party at all, the backdrop included. Both pages read it
+from the same place, so the map and the studio move together.
+
+## The backdrop
+
+The backdrop is `basemap.pmtiles`, an archive served out of the same output directory as
+the region archives and read over the same byte ranges. It is deliberately not in
+`/archives.json`: that index lists regions, and this is not one — `wayfare/map.toml`
+reserves the name, `server.archives` keeps it out, and both pages filter it out of whatever
+index they are handed. The cartography that draws it is vendored; see
+[`web/vendor/README.md`](vendor/README.md).
+
+**This repository does not build it.** It is an extract of the [Protomaps
+basemap](https://docs.protomaps.com/basemaps/downloads) planet build, cut to the box
+`map.toml` calls `roam` and then trimmed, and both halves of that want tools this project
+does not otherwise need — `pmtiles extract` from
+[go-pmtiles](https://github.com/protomaps/go-pmtiles), which is neither in nixpkgs nor in
+this project's image, and then `tile-join`, which is. The deployment builds it on a
+schedule of its own and drops it in beside the archives.
+
+What it must be, which is what the vendored style is generated against:
+
+| | |
+|---|---|
+| Schema | Protomaps basemap v4 |
+| Zooms | 0 to 14. Minor roads do not exist below 14 — the same central-London tile carries 194 of them at z14 and 10 at z13 |
+| Layers | `earth`, `landcover`, `water`, `roads`, `places`, `boundaries` |
+| Dropped | `buildings`, `pois`, `landuse`, and `path` features from `roads` |
+
+The drops are why it fits. A z14 extract of the British Isles is 1.61 GB untouched, 1.35 GB
+without buildings and points of interest — they compress well, being repetitive polygons —
+and 650 MB once land use goes with them. Dropping the footways, cycleways, pavements and
+indoor corridors that `roads` files under `kind=path` takes it to 515,847,526 bytes. That
+last step is about an edge cache rather than about the map: a CDN in front of this will not
+hold a file over 512 MB, and 515,847,526 bytes is 491.9 MiB — under that limit read as
+mebibytes and over it read as megabytes, which is a distinction the documentation does not
+draw. The deployment measures which it meant rather than guessing.
+
+Without the archive the map still draws: MapLibre reports the source as failed and every
+wayfare layer renders over blank ground. A checkout with no backdrop is the ordinary state
+of things, in the same way a checkout between `match` and `publish` has no tiles.
 
 ## Serve locally
 

@@ -154,6 +154,7 @@ class Palette:
     accents: dict[str, str]
     track_default_mode: str
     default_archive: str
+    basemap_archive: str
     detail_only: tuple[str, ...]
     detail_sentinel: str
     roam: tuple[float, float, float, float]
@@ -305,6 +306,7 @@ def load(path: Path = MAP_TOML) -> Palette:
         accents=raw["accents"],
         track_default_mode=raw["track"]["default_mode"],
         default_archive=raw["archive"]["default"],
+        basemap_archive=raw["archive"]["basemap"],
         detail_only=tuple(bands["detail_only"]),
         detail_sentinel=bands["sentinel"],
         roam=(roam["west"], roam["south"], roam["east"], roam["north"]),

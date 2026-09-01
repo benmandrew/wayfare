@@ -157,12 +157,17 @@
     "archive": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["default"],
+      "required": ["default", "basemap"],
       "properties": {
         "default": {
           "type": "string",
           "pattern": "^[A-Za-z0-9._-]+\\.pmtiles$",
           "description": "What `publish` writes when told neither a path nor to name the file for its region, and what both pages fall back to when there is no index to ask."
+        },
+        "basemap": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]+\\.pmtiles$",
+          "description": "The backdrop archive, which holds the Protomaps basemap schema rather than wayfare's. Reserved: `server.archives` keeps it out of the index and both pages filter it out of whatever index they are given, so it is never opened as a region."
         }
       }
     },

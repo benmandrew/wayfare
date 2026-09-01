@@ -114,14 +114,14 @@ def _declared(page: str, prop: str, value: str) -> int:
 
 
 def test_both_pages_take_the_basemap_credit_from_one_place():
-    assert "carto.com/attributions" in (WEB / "credits.js").read_text()
+    assert "protomaps/basemaps" in (WEB / "credits.js").read_text()
     for page in PAGES:
         text = _source(page)
         assert 'src="credits.js"' in text
         assert "BASEMAP_CREDIT" in text
         # The literal URL belongs in no page: a second spelling of the credit is a
         # spelling that will drift away from BASEMAP_CREDIT.
-        assert "carto.com/attributions" not in text
+        assert "protomaps/basemaps" not in text
 
 
 def test_both_pages_fold_the_credit_away_on_load():
@@ -170,7 +170,7 @@ def test_the_pages_take_what_they_share_from_one_place():
     and reads least: it is what stands between a service number out of a feed and
     the innerHTML of the card, and two of them is one that can be fixed alone."""
     shared = (WEB / "util.js").read_text()
-    for name in ("escapeHtml", "roamingBounds", "basemapTiles", "debounce", "bootTheme"):
+    for name in ("escapeHtml", "roamingBounds", "basemapLayers", "debounce", "bootTheme"):
         assert re.search(rf"(function|const)\s+{name}\b", shared), name
         for page in PAGES:
             assert not re.search(rf"(function|const)\s+{name}\b", _source(page)), (
@@ -437,34 +437,114 @@ def test_the_head_source_answers_only_what_it_wholly_holds():
     assert _holds("index.html", "heads.get(url) || null")
 
 
-def test_the_basemap_gives_up_resolution_when_the_link_says_it_is_slow():
-    """Cold profiling put the basemap at 40.9% of everything transferred, and 72.7%
-    on a retina screen. Both halves of the reduction are gated on the same check --
-    the retina variant and the tile size -- because either one alone leaves the
-    other paying full price.
+def test_the_backdrop_is_served_from_this_origin():
+    """The backdrop used to be raster tiles off a public CDN, which now paints "API
+    KEY REQUIRED" across a keyless tile. Nothing about that failure was visible to
+    this repository: the URL kept working, the tiles kept arriving, and only the
+    pixels changed.
 
-    Read out of `util.js`, which is where the check lives now, and neither page may
-    hold a basemap of its own: the studio's copy was the same six lines without the
-    check in them, so a slow link was honoured on the map and ignored on the page
-    beside it, with nothing to see either way."""
-    text = (WEB / "util.js").read_text()
-    assert re.search(r"function\s+thriftyConnection\s*\(\s*\)", text)
-    assert "devicePixelRatio > 1.4 && !thriftyBasemap()" in text
-    assert "thriftyBasemap() ? 512 : 256" in text
-    # Save-Data is the user asking; effectiveType is the browser guessing. Both.
-    assert "c.saveData" in text
-    assert "effectiveType" in text
-    # And the machine as well as the link. A slow processor and a fast radio are
-    # common together, and that phone was taking the full-price backdrop.
-    assert "thriftyConnection() || weakDevice()" in text
-    assert re.search(r"function\s+weakDevice\s*\(\s*\)", text)
-    assert "navigator.deviceMemory" in text
-    assert "navigator.hardwareConcurrency" in text
-    # A tile URL in a page is a second basemap; the preconnect in the viewer's head
-    # names the host and asks for nothing, so it is the template that is checked.
+    So what is asserted is the property that made it possible -- that a page draws
+    its backdrop from somewhere this deployment does not control. No page, and
+    nothing in `util.js`, may name a tile host or a raster tile template."""
+    sources = [_source(page) for page in PAGES] + [
+        (WEB / name).read_text() for name in ("util.js", "credits.js")
+    ]
+    for text in sources:
+        assert "{z}/{x}/{y}" not in text
+        assert "cartocdn" not in text
+        assert "://tile" not in text
+    # The archive is named once, in map.toml, and reaches the pages through
+    # PALETTE. A literal here would be a second name to rename.
+    util = (WEB / "util.js").read_text()
+    assert "PALETTE.basemapArchive" in util
+    assert re.search(r"const\s+basemapUrl\s*=", util)
+
+
+def test_the_style_names_a_glyph_endpoint():
+    """A vector style resolves every `text-field` through `glyphs`, and a style with
+    symbol layers and no glyph endpoint draws the whole map correctly with nothing
+    named on it -- no error, no warning, and a country of unlabelled roads.
+
+    The template is checked rather than the files, because MapLibre substitutes
+    `{fontstack}` and `{range}` itself and a wrong template is the failure that
+    reaches production."""
+    util = (WEB / "util.js").read_text()
+    assert "{fontstack}/{range}.pbf" in util
+    assert "vendor/fonts/" in util
     for page in PAGES:
-        assert 'src="util.js"' in _source(page), page
-        assert "{z}/{x}/{y}" not in _source(page), page
+        assert "glyphs: BASEMAP_GLYPHS" in _source(page), page
+
+
+def test_the_vendored_glyphs_cover_the_stacks_the_style_asks_for():
+    """A missing range is not an error either: MapLibre asks for
+    `vendor/fonts/<stack>/<range>.pbf`, takes a 404 as an empty range, and draws
+    the labels in it as nothing. The stacks come out of the style, so a style
+    version that adds a fourth font is what this catches."""
+    style = (WEB / "vendor" / "basemap-style.js").read_text()
+    stacks = set(re.findall(r'"text-font":\["([^"]+)"\]', style))
+    assert stacks, "no text-font in the vendored style"
+    for stack in stacks:
+        directory = WEB / "vendor" / "fonts" / stack
+        assert directory.is_dir(), stack
+        # The Latin block alone would leave a Welsh circumflex blank.
+        for start in ("0-255", "256-511", "768-1023", "7680-7935"):
+            assert (directory / f"{start}.pbf").is_file(), (stack, start)
+
+
+def test_the_vendored_style_needs_no_sprite_sheet():
+    """A sprite is a second asset to host and version, for a direction arrow, a
+    motorway shield around a number the road label already carries, and the dot
+    beside a town name. `scripts/basemap_style.py` drops the two layers that are
+    only an icon and strips `icon-*` off the one that is not, so the town names
+    still draw.
+
+    MapLibre resolves `icon-image` through `sprite`, and a style with neither
+    draws nothing for those layers and logs nothing either -- which is why the
+    absence is asserted rather than left to be noticed."""
+    style = (WEB / "vendor" / "basemap-style.js").read_text()
+    assert "icon-" not in style
+    for page in PAGES:
+        assert "sprite:" not in _source(page), page
+
+
+def test_every_painted_layer_is_a_layer_the_style_declares():
+    """`basemapLayers` merges paint onto structure by id and `repaintBasemap` walks
+    the same object at a theme change, so the two halves of the vendored style have
+    to name the same layers. A paint entry for an id that does not exist is a colour
+    that silently never applies, and `map.setPaintProperty` on a missing layer
+    throws."""
+    style = (WEB / "vendor" / "basemap-style.js").read_text()
+    ids = set(re.findall(r'\{"id":"([^"]+)"', style))
+    assert ids, "no layers in the vendored style"
+    flavours = re.findall(
+        r'^  "(light|dark)": \{$(.*?)^  \},$', style, re.MULTILINE | re.DOTALL
+    )
+    assert {f for f, _ in flavours} == {"light", "dark"}
+    for flavour, block in flavours:
+        painted = set(re.findall(r'^    "([^"]+)":', block, re.MULTILINE))
+        assert painted <= ids, (flavour, painted - ids)
+    # And both flavours colour the same layers, which is what makes a theme change a
+    # repaint rather than a rebuild: a layer painted in one and not the other would
+    # keep the previous flavour's colour after a toggle.
+    assert set(re.findall(r'^    "([^"]+)":', flavours[0][1], re.MULTILINE)) == set(
+        re.findall(r'^    "([^"]+)":', flavours[1][1], re.MULTILINE)
+    )
+
+
+def test_the_backdrop_is_not_opened_as_a_region():
+    """It holds the Protomaps schema rather than wayfare's, so a page opening it as
+    a region draws a `bus` layer against tiles that have no such thing, takes the
+    extract's bounds as the country's, and puts "Basemap" in the strapline.
+
+    `server.archives` keeps it out of the index it writes. Both pages filter it out
+    of whatever index they are handed, because a deployment can have its manifest
+    written by something else -- the one serving this in production globs a
+    directory."""
+    for page in PAGES:
+        assert "PALETTE.basemapArchive" in _source(page), page
+        assert re.search(r"filter\(\s*\(?name\)?\s*=>\s*!name\.endsWith", _source(page)), (
+            page
+        )
 
 
 # --- The pages on a small screen ----------------------------------------------
@@ -558,7 +638,13 @@ def test_every_vendored_url_carries_the_version_the_readme_names():
     bump being forgotten rather than on a number written twice."""
     table = (WEB / "vendor" / "README.md").read_text()
     versions = dict(re.findall(r"\|\s*\[`([\w.-]+)`\][^|]*\|\s*([\d.]+)\s*\|", table))
-    assert set(versions) == {"maplibre-gl.js", "maplibre-gl.css", "pmtiles.js"}
+    assert set(versions) == {
+        "maplibre-gl.js",
+        "maplibre-gl.css",
+        "pmtiles.js",
+        "basemap-style.js",
+        "fonts",
+    }
     for page in PAGES:
         text = _source(page)
         asked = dict(re.findall(r'"vendor/([\w.-]+)\?v=([\d.]+)"', text))
@@ -568,6 +654,13 @@ def test_every_vendored_url_carries_the_version_the_readme_names():
         # And no unversioned one alongside them, which would be the copy that goes
         # on being served out of a year-old cache.
         assert not re.search(r'"vendor/[\w.-]+"', text), page
+    # The glyph template is the one vendored URL written in `util.js` rather than in
+    # a page, because MapLibre builds the request from it rather than the page. It
+    # is served `immutable` like the rest, so it needs the query like the rest.
+    util = (WEB / "util.js").read_text()
+    glyphs = re.search(r'"vendor/(fonts)/\{fontstack\}/\{range\}\.pbf\?v=([\d.]+)"', util)
+    assert glyphs, "no versioned glyph template in util.js"
+    assert versions[glyphs.group(1)] == glyphs.group(2)
 
 
 def test_neither_page_lets_the_map_stylesheet_block_the_theme():
@@ -614,9 +707,6 @@ def test_the_map_is_constructed_with_the_settings_a_weak_device_needs():
     assert _holds("index.html", "map.touchZoomRotate.disableRotation();")
     for off in ("dragRotate", "touchPitch", "refreshExpiredTiles", "renderWorldCopies"):
         assert re.search(rf"{off}:\s*false", text), off
-    # The map option `fadeDuration` is a different setting and inert with no symbol
-    # layers, so the basemap's own paint is the one that had to be written.
-    assert _holds("index.html", '"raster-fade-duration": 0')
 
 
 def test_the_legend_scan_waits_for_a_tile_to_arrive():
