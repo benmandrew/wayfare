@@ -40,11 +40,10 @@ What it must be, which is what the vendored style is generated against:
 The drops are why it fits. A z14 extract of the British Isles is 1.61 GB untouched, 1.35 GB
 without buildings and points of interest — they compress well, being repetitive polygons —
 and 650 MB once land use goes with them. Dropping the footways, cycleways, pavements and
-indoor corridors that `roads` files under `kind=path` takes it to 515,847,526 bytes. That
-last step is about an edge cache rather than about the map: a CDN in front of this will not
-hold a file over 512 MB, and 515,847,526 bytes is 491.9 MiB — under that limit read as
-mebibytes and over it read as megabytes, which is a distinction the documentation does not
-draw. The deployment measures which it meant rather than guessing.
+indoor corridors that `roads` files under `kind=path` takes it to about 516 MB. That last
+step is about an edge cache rather than about the map: the CDN in front of the deployment
+will not hold a file over 512 MB, which turns out to mean 512 MiB, and the trimmed archive
+is 491.9 MiB. It is cached; without the `path` drop it would not be.
 
 Without the archive the map still draws: MapLibre reports the source as failed and every
 wayfare layer renders over blank ground. A checkout with no backdrop is the ordinary state
