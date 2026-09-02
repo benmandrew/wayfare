@@ -28,6 +28,12 @@ what that archive holds and who builds it:
     carries, and the dot beside a town name. The name itself still draws.
   * `source` is rewritten from `protomaps` to `basemap`, which is what the two
     pages have always called the backdrop's source.
+  * The dark flavour's colours are replaced with CARTO Dark Matter's, the raster
+    backdrop this one replaced and the ground the network on top was drawn
+    against. Protomaps paints a `#1f1f1f` earth under a `#34373d` background with
+    landcover tinted green, where Dark Matter puts background, landcover, land use
+    and parks alike at `#0e0e0e`. Ground is most of any frame, so that is most of
+    the difference in brightness. The light flavour is untouched.
 
 Paint is split from structure because the two flavours differ in nothing else --
 asserted below, not assumed. Their layer lists are identical and so is every
@@ -63,6 +69,91 @@ SPRITE_LAYERS = frozenset({"roads_oneway", "roads_shields"})
 
 SOURCE = "basemap"
 UPSTREAM_SOURCE = "protomaps"
+
+# CARTO Dark Matter's palette, mapped onto the Protomaps layer names. Values are
+# read from `mapboxgl/dark-matter.json` in CartoDB/basemap-styles, which is the
+# vector style the raster tiles were rendered from.
+#
+# Only the dark flavour takes it, and only the properties named here: the merge is
+# per property, so a line keeps the zoom expression that sets its width.
+#
+# Labels keep Protomaps' greys. Those are dimmer than Dark Matter's, and dropping
+# the ground from `#1f1f1f` to `#0e0e0e` raises their contrast rather than lowering
+# it, so the only label property below is the halo -- which is a ground colour
+# wherever it appears, and would otherwise ring every name in a lighter patch.
+DARK_MATTER: dict[str, dict[str, object]] = {
+    # Ground. Dark Matter draws landcover, land use and parks in the background
+    # colour, so nothing but water and roads breaks the black.
+    "background": {"background-color": "#0e0e0e"},
+    "earth": {"fill-color": "#0e0e0e"},
+    "landcover": {"fill-color": "#0e0e0e"},
+    # Water. The fill is Dark Matter's `water`, the lines its `waterway`, which is
+    # the brighter of the two.
+    "water": {"fill-color": "#2c353c"},
+    "water_stream": {"line-color": "#3f5a6d"},
+    "water_river": {"line-color": "#3f5a6d"},
+    "roads_runway": {"line-color": "#111111"},
+    "roads_taxiway": {"line-color": "#111111"},
+    # Surface roads. `#414758` is the slate Dark Matter gives everything from a
+    # minor road up to a trunk road, `#494949` the grey it reserves for a
+    # motorway, and `#0b0b0b` what it leaves a service road.
+    "roads_highway": {"line-color": "#494949"},
+    "roads_major": {"line-color": "#414758"},
+    "roads_link": {"line-color": "#414758"},
+    "roads_minor": {"line-color": "#414758"},
+    "roads_minor_service": {"line-color": "#0b0b0b"},
+    "roads_other": {"line-color": "#262626"},
+    "roads_pier": {"line-color": "#1c1c1c"},
+    # Casings depart from Dark Matter at the minor road, which it casings in the
+    # same `#414758` as the fill. Its casing is drawn under the fill and this one
+    # is drawn outside it through `line-gap-width`, so matching the colour would
+    # widen every minor road in the country rather than outline it.
+    "roads_highway_casing_early": {"line-color": "#232323"},
+    "roads_highway_casing_late": {"line-color": "#232323"},
+    "roads_major_casing_early": {"line-color": "#232323"},
+    "roads_major_casing_late": {"line-color": "#232323"},
+    "roads_link_casing": {"line-color": "#232323"},
+    "roads_minor_casing": {"line-color": "#1a1a1a"},
+    "roads_minor_service_casing": {"line-color": "#1c1c1c"},
+    # Bridges take their surface colour and tunnels a dimmer one. Dark Matter
+    # splits these by road class in a way that does not map -- its `tunnel_pri`
+    # is `#414758` against a `#161616` `tunnel_trunk` -- so the rule is stated
+    # here rather than copied.
+    "roads_tunnels_highway": {"line-color": "#414758"},
+    "roads_tunnels_major": {"line-color": "#161616"},
+    "roads_tunnels_link": {"line-color": "#161616"},
+    "roads_tunnels_minor": {"line-color": "#161616"},
+    "roads_tunnels_other": {"line-color": "#262626"},
+    "roads_tunnels_highway_casing": {"line-color": "#232323"},
+    "roads_tunnels_major_casing": {"line-color": "#232323"},
+    "roads_tunnels_link_casing": {"line-color": "#1a1a1a"},
+    "roads_tunnels_minor_casing": {"line-color": "#1a1a1a"},
+    "roads_tunnels_other_casing": {"line-color": "#1a1a1a"},
+    "roads_bridges_highway": {"line-color": "#494949"},
+    "roads_bridges_major": {"line-color": "#414758"},
+    "roads_bridges_link": {"line-color": "#414758"},
+    "roads_bridges_minor": {"line-color": "#414758"},
+    "roads_bridges_other": {"line-color": "#262626"},
+    "roads_bridges_highway_casing": {"line-color": "#232323"},
+    "roads_bridges_major_casing": {"line-color": "#232323"},
+    "roads_bridges_link_casing": {"line-color": "#232323"},
+    "roads_bridges_minor_casing": {"line-color": "#1a1a1a"},
+    "roads_bridges_other_casing": {"line-color": "#1a1a1a"},
+    "roads_rail": {"line-color": "#1a1a1a"},
+    "boundaries_country": {"line-color": "#606060"},
+    "boundaries": {"line-color": "#2c353c"},
+    "roads_labels_minor": {"text-halo-color": "#0e0e0e"},
+    "roads_labels_major": {"text-halo-color": "#0e0e0e"},
+    "earth_label_islands": {"text-halo-color": "#0e0e0e"},
+    "places_subplace": {"text-halo-color": "#0e0e0e"},
+    "places_region": {"text-halo-color": "#0e0e0e"},
+    "places_locality": {"text-halo-color": "#0e0e0e"},
+    "places_country": {"text-halo-color": "#0e0e0e"},
+    "water_waterway_label": {"text-halo-color": "#2c353c"},
+    "water_label_ocean": {"text-halo-color": "#2c353c"},
+    "water_label_lakes": {"text-halo-color": "#2c353c"},
+}
+
 
 FLAVOURS = ("light", "dark")
 
@@ -106,6 +197,39 @@ def structure(layer: dict[str, object]) -> dict[str, object]:
     out = {k: v for k, v in layer.items() if k != "paint"}
     if out.get("source") == UPSTREAM_SOURCE:
         out["source"] = SOURCE
+    return out
+
+
+def recolour(
+    layers: list[dict[str, object]], overrides: dict[str, dict[str, object]]
+) -> list[dict[str, object]]:
+    """Merge `overrides` onto each named layer's paint, property by property.
+
+    Every guard here catches a change that would otherwise be silent. A layer id
+    the style no longer has is an override that applies to nothing. A layer with no
+    paint of its own would gain one, and the two flavours have to colour the same
+    layer list for `repaintBasemap` to be a repaint rather than a rebuild. A
+    property the layer does not already set is a colour written into a key that
+    draws nothing, which is what a renamed paint property looks like from here.
+    """
+    by_id = {layer["id"]: layer for layer in layers}
+    missing = sorted(set(overrides) - set(by_id))
+    if missing:
+        raise SystemExit(f"overrides name layers the style does not have: {missing}")
+
+    out = []
+    for layer in layers:
+        override = overrides.get(str(layer["id"]))
+        if not override:
+            out.append(layer)
+            continue
+        paint = layer.get("paint")
+        if not isinstance(paint, dict) or not paint:
+            raise SystemExit(f"{layer['id']} has no paint to override")
+        unknown = sorted(set(override) - set(paint))
+        if unknown:
+            raise SystemExit(f"{layer['id']} does not set {unknown}")
+        out.append({**layer, "paint": {**paint, **override}})
     return out
 
 
@@ -157,6 +281,8 @@ def main() -> None:
         for f, layers in flavours.items()
     }
 
+    kept["dark"] = recolour(kept["dark"], DARK_MATTER)
+
     shapes = {f: [structure(layer) for layer in layers] for f, layers in kept.items()}
     if len({json.dumps(v, sort_keys=True) for v in shapes.values()}) != 1:
         raise SystemExit("flavours differ outside paint; the split below would lose that")
@@ -173,7 +299,10 @@ def main() -> None:
     GENERATED.write_text(render(args.version, shapes[FLAVOURS[0]], paint))
     kept_count = len(shapes[FLAVOURS[0]])
     dropped = len(flavours[FLAVOURS[0]]) - kept_count
-    print(f"{GENERATED.relative_to(ROOT)}: {kept_count} layers, {dropped} dropped")
+    print(
+        f"{GENERATED.relative_to(ROOT)}: {kept_count} layers, {dropped} dropped, "
+        f"{len(DARK_MATTER)} recoloured in dark"
+    )
 
 
 if __name__ == "__main__":
