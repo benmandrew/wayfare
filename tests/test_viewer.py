@@ -475,6 +475,26 @@ def test_the_style_names_a_glyph_endpoint():
         assert "glyphs: BASEMAP_GLYPHS" in _source(page), page
 
 
+def test_both_pages_declare_the_source_the_roam_mask_draws_from():
+    """`basemapLayers` returns a fill layer naming the `roam-mask` source, so a page
+    taking those layers and not declaring that source builds a style MapLibre
+    rejects. The coupling is the price of putting the mask where every caller of
+    `basemapLayers` gets it, and this is what makes the price visible.
+
+    The mask exists because `pmtiles extract --bbox` keeps whole tiles and clips
+    nothing inside them, so the backdrop overhangs the box by 19.90 degrees of
+    longitude at z4 and 0.21 at z7, and France, Denmark and southern Norway left
+    the map a step at a time on the way in."""
+    util = (WEB / "util.js").read_text()
+    assert 'const ROAM_MASK = "roam-mask"' in util
+    assert "function roamMaskSource()" in util
+    # The sea inside the box and the sea outside it are one colour, taken from the
+    # flavour rather than written down again.
+    assert 'BASEMAP_PAINT[t].water["fill-color"]' in util
+    for page in PAGES:
+        assert "[ROAM_MASK]: roamMaskSource()" in _source(page), page
+
+
 def test_the_vendored_glyphs_cover_the_stacks_the_style_asks_for():
     """A missing range is not an error either: MapLibre asks for
     `vendor/fonts/<stack>/<range>.pbf`, takes a 404 as an empty range, and draws

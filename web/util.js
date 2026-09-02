@@ -129,11 +129,17 @@ const basemapUrl = () => new URL(PALETTE.basemapArchive, location.href).href;
 // The vendored layers with the flavour's colours put back on them. The two
 // flavours differ in nothing but paint, which is why the file stores the
 // structure once, and which is also what makes a theme change a repaint.
+// The mask goes last, so it covers all 55 and nothing else: both pages push
+// their own layers after this, and every one of them belongs above it. A caller
+// taking these layers has to declare `roamMaskSource()` beside the basemap
+// source, and `tests/test_viewer.py` is what holds the two pages to that.
 function basemapLayers(t) {
-  return BASEMAP_LAYERS.map((layer) => {
+  const layers = BASEMAP_LAYERS.map((layer) => {
     const paint = BASEMAP_PAINT[t][layer.id];
     return paint ? { ...layer, paint } : layer;
   });
+  layers.push(roamMaskLayer(t));
+  return layers;
 }
 
 // What `getSource("basemap").setTiles()` used to do in one call. A raster source
@@ -148,6 +154,11 @@ function repaintBasemap(map, t) {
     for (const [prop, value] of Object.entries(paint)) {
       map.setPaintProperty(id, prop, value);
     }
+  }
+  // The mask is not in the vendored paint, taking its colour from the water in
+  // it, so it is repainted here rather than found by the loop above.
+  if (map.getLayer(ROAM_MASK)) {
+    map.setPaintProperty(ROAM_MASK, "fill-color", roamMaskColour(t));
   }
 }
 
@@ -192,4 +203,67 @@ function roamingBounds(el) {
   const aspect = Math.max(el.clientWidth, 1) / Math.max(el.clientHeight, 1);
   const grow = (Math.max(0, aspect * tall - wide) * 360) / 2;
   return [[w - grow, s], [e + grow, n]];
+}
+
+/* ---------- the sea outside the box ---------- */
+
+// `pmtiles extract --bbox` keeps every tile that intersects the box and does not
+// clip what is inside one, so the backdrop reaches past the box by however wide a
+// tile is at that zoom. Measured against this box: 19.90 degrees of longitude and
+// 5.21 of latitude at z4, 8.65 and 0.31 at z5, 3.02 at z6, and 0.21 from z7 down.
+// So France, Denmark and southern Norway drew at a country-wide view and then
+// left a step at a time on the way in, which reads as tiles failing rather than
+// as an edge.
+//
+// The page draws sea over everything outside the box instead, and the backdrop
+// then ends in the same place at every zoom. `roamingBounds` widens the box a
+// landscape window is framed against, so there is always a margin to cover, and
+// this is what fills it.
+//
+// The cut is a straight line and the eastern edge of the box runs inland through
+// the Pas-de-Calais rather than out at sea. That is what a rectangle costs, and
+// it is spent on the one corner of the map that carries no services.
+const ROAM_MASK = "roam-mask";
+
+const WORLD_RING = [
+  [-180, -MERC_MAX_LAT],
+  [180, -MERC_MAX_LAT],
+  [180, MERC_MAX_LAT],
+  [-180, MERC_MAX_LAT],
+  [-180, -MERC_MAX_LAT],
+];
+
+// The basemap's own water, read out of the flavour rather than written down a
+// second time -- the sea drawn inside the box and the sea drawn outside it have
+// to be one colour or the box has a visible edge.
+const roamMaskColour = (t) => BASEMAP_PAINT[t].water["fill-color"];
+
+// The world with the roam box cut out of it. Every ring after the first is a
+// hole whichever way it winds: MapLibre triangulates with earcut, which reads
+// the order rather than the direction.
+function roamMaskSource() {
+  const [w, s, e, n] = ISLES;
+  return {
+    type: "geojson",
+    data: {
+      type: "Feature",
+      properties: {},
+      geometry: {
+        type: "Polygon",
+        coordinates: [
+          WORLD_RING,
+          [[w, s], [e, s], [e, n], [w, n], [w, s]],
+        ],
+      },
+    },
+  };
+}
+
+function roamMaskLayer(t) {
+  return {
+    id: ROAM_MASK,
+    type: "fill",
+    source: ROAM_MASK,
+    paint: { "fill-color": roamMaskColour(t) },
+  };
 }

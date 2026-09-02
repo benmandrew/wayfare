@@ -45,6 +45,16 @@ step is about an edge cache rather than about the map: the CDN in front of the d
 will not hold a file over 512 MB, which turns out to mean 512 MiB, and the trimmed archive
 is 491.9 MiB. It is cached; without the `path` drop it would not be.
 
+Everything outside the roam box is painted over. `pmtiles extract --bbox` keeps every
+tile that intersects the box and clips nothing inside one, so at low zoom the backdrop
+reaches well past it: 19.90 degrees of longitude and 5.21 of latitude at z4, 8.65 and 0.31
+at z5, 3.02 at z6, and 0.21 from z7 down. France, Denmark and southern Norway therefore
+drew at a country-wide view and then left a step at a time on the way in, which reads as
+tiles failing rather than as an edge. [`util.js`](util.js) draws the basemap's own water
+colour over the margin instead, above all 55 backdrop layers and below every wayfare one,
+so the backdrop ends in the same place at every zoom. The cut is a rectangle's, and its
+eastern edge runs inland through the Pas-de-Calais.
+
 Without the archive the map still draws: MapLibre reports the source as failed and every
 wayfare layer renders over blank ground. A checkout with no backdrop is the ordinary state
 of things, in the same way a checkout between `match` and `publish` has no tiles.

@@ -1257,6 +1257,9 @@ function buildStyle() {
       // timetable's publisher.
       attribution: BASEMAP_CREDIT,
     },
+    // The sea outside the roam box, which `basemapLayers` draws over the
+    // backdrop's tile overhang. util.js says what the overhang is.
+    [ROAM_MASK]: roamMaskSource(),
   };
   for (const r of REGIONS) {
     sources[r.src] = {

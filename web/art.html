@@ -1485,6 +1485,7 @@ function buildPicker() {
           url: "pmtiles://" + basemapUrl(),
           attribution: BASEMAP_CREDIT,
         },
+        [ROAM_MASK]: roamMaskSource(),
       },
       layers: basemapLayers(theme),
     },
