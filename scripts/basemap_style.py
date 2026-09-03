@@ -33,7 +33,9 @@ what that archive holds and who builds it:
     against. Protomaps paints a `#1f1f1f` earth under a `#34373d` background with
     landcover tinted green, where Dark Matter puts background, landcover, land use
     and parks alike at `#0e0e0e`. Ground is most of any frame, so that is most of
-    the difference in brightness. The light flavour is untouched.
+    the difference in brightness.
+  * The water of both flavours is muted, which is the one colour here that is
+    neither Protomaps' nor Dark Matter's. `SEA` says why.
 
 Paint is split from structure because the two flavours differ in nothing else --
 asserted below, not assumed. Their layer lists are identical and so is every
@@ -87,11 +89,8 @@ DARK_MATTER: dict[str, dict[str, object]] = {
     "background": {"background-color": "#0e0e0e"},
     "earth": {"fill-color": "#0e0e0e"},
     "landcover": {"fill-color": "#0e0e0e"},
-    # Water. The fill is Dark Matter's `water`, the lines its `waterway`, which is
-    # the brighter of the two.
-    "water": {"fill-color": "#2c353c"},
-    "water_stream": {"line-color": "#3f5a6d"},
-    "water_river": {"line-color": "#3f5a6d"},
+    # Water is not here. `SEA` below owns it in both flavours, because the
+    # complaint it answers is about the light one too.
     "roads_runway": {"line-color": "#111111"},
     "roads_taxiway": {"line-color": "#111111"},
     # Surface roads. `#414758` is the slate Dark Matter gives everything from a
@@ -149,10 +148,41 @@ DARK_MATTER: dict[str, dict[str, object]] = {
     "places_region": {"text-halo-color": "#0e0e0e"},
     "places_locality": {"text-halo-color": "#0e0e0e"},
     "places_country": {"text-halo-color": "#0e0e0e"},
-    "water_waterway_label": {"text-halo-color": "#2c353c"},
-    "water_label_ocean": {"text-halo-color": "#2c353c"},
-    "water_label_lakes": {"text-halo-color": "#2c353c"},
 }
+
+
+# The sea, in both flavours, and the one override that is nobody else's palette.
+#
+# Water is most of the frame on a map of islands -- more of it than land at any
+# view that holds the whole country -- and this map draws a network of thin
+# coloured lines over the top. Both upstream flavours paint it as a subject
+# rather than as a backdrop: Protomaps gives the light one a saturated cyan, and
+# Dark Matter's own slate sits at seven times the relative luminance of the
+# `#0e0e0e` ground it is drawn beside. Muting it is what puts the lines back on
+# top of the map.
+#
+# The line is the rivers and streams, and it goes the other way in each flavour
+# for the same reason: it has to be visible where it actually runs, which is
+# inland, over the ground rather than over the sea. So it is darker than the
+# water on the light flavour and lighter on the dark one.
+#
+# The halo of a water label is a water colour wherever it appears, and would ring
+# every name in a patch of the old one.
+SEA = {
+    "light": {"fill": "#b9d5de", "line": "#7fa8b8"},
+    "dark": {"fill": "#181d21", "line": "#3f5a6d"},
+}
+
+
+def sea(fill: str, line: str) -> dict[str, dict[str, object]]:
+    return {
+        "water": {"fill-color": fill},
+        "water_stream": {"line-color": line},
+        "water_river": {"line-color": line},
+        "water_waterway_label": {"text-halo-color": fill},
+        "water_label_ocean": {"text-halo-color": fill},
+        "water_label_lakes": {"text-halo-color": fill},
+    }
 
 
 FLAVOURS = ("light", "dark")
@@ -282,6 +312,8 @@ def main() -> None:
     }
 
     kept["dark"] = recolour(kept["dark"], DARK_MATTER)
+    for flavour, colours in SEA.items():
+        kept[flavour] = recolour(kept[flavour], sea(colours["fill"], colours["line"]))
 
     shapes = {f: [structure(layer) for layer in layers] for f, layers in kept.items()}
     if len({json.dumps(v, sort_keys=True) for v in shapes.values()}) != 1:

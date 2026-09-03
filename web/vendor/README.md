@@ -36,8 +36,12 @@ The dark flavour is then repainted in CARTO Dark Matter's colours, which is the
 backdrop this one replaced. Most of that is the ground: Protomaps paints a
 `#1f1f1f` earth under a `#34373d` background where Dark Matter puts both at
 `#0e0e0e`, taking the relative luminance of the largest thing on screen from
-0.0137 to 0.0044. The light flavour is Protomaps' own. That script's docstring
-has the whole of it.
+0.0137 to 0.0044. The water of both flavours is then muted, which is the one
+colour in the file that is neither party's: on a map of islands the sea is most
+of the frame at any view that holds the country, and both upstreams paint it as a
+subject — a saturated cyan on the light flavour, and on the dark one a slate at
+seven times the luminance of the ground beside it. That script's docstring has
+the whole of it.
 
 `fonts` is glyph ranges for the three Noto stacks the style asks for, from
 [protomaps/basemaps-assets](https://github.com/protomaps/basemaps-assets). Seven
