@@ -150,7 +150,7 @@ body {
    uncapped stack does with the surplus is run off the bottom edge with no way to
    reach it. The cap clips the panels' shadows, which is the price of the scroll. */
 .stack--tl {
-  top: 12px; left: 12px; width: 272px;
+  top: 12px; left: 12px; width: 216px;
   max-height: calc(100% - 24px);
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -191,7 +191,20 @@ body {
 .chip.on { background: var(--accent); color: var(--bg); }
 
 /* --- legend --- */
-.legend { padding: 10px 12px; }
+/* Narrower than the stack it sits in, and the only panel that is. Nothing in it
+   is prose: eight mode names, a bar each and one row of ticks, so the width it
+   needs is the width of the widest of those and not the width of the panel above.
+   `align-self` is what lets it out of the column's stretch.
+
+   150px is the floor and the ticks set it: six labels reading 3 to 1000+ come to
+   107px of text, the bar under them is the panel less its padding, and below this
+   the two at the busy end start to touch. */
+.legend { padding: 10px 12px; width: 150px; align-self: flex-start; }
+/* The title column takes the whole row, so the buttons take the next one. The
+   floor `base.css` puts on it is 110px, which is what a 272px panel wanted: there
+   the row held the title and three of the four buttons and wrapped the fourth on
+   its own, which is a ragged two rows where this is a tidy one plus one. */
+.head > div { min-width: 100%; }
 .legend-title { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
 /* One row per mode, stacked, each bar the full width of the panel. Every ramp
    spans the same scale, so bars of one length under one set of ticks can be read
@@ -294,6 +307,11 @@ body {
 @media (max-width: 720px) {
   /* Inset from the notch as well as from the edge: in landscape the cut-out is
      over one of these columns. */
+  /* The legend gives its own width back here: a phone's stack is the screen less
+     its margins, and a 150px key inside it is a column of eight bars down one
+     edge. `align-self` goes with it -- left on `flex-start`, `width: auto` is the
+     content's own width, which is narrower still. */
+  .legend { width: auto; align-self: stretch; }
   .stack--tl, .stack--tr {
     width: auto;
     left: calc(10px + env(safe-area-inset-left, 0px));
@@ -358,7 +376,7 @@ body {
     </div>
     <div class="search">
       <label class="sr-only" for="q">Filter by service number</label>
-      <input id="q" type="search" placeholder="Filter by service number, e.g. 42, X57" autocomplete="off" spellcheck="false" aria-describedby="hint">
+      <input id="q" type="search" placeholder="Service, e.g. 42 or X57" autocomplete="off" spellcheck="false" aria-describedby="hint">
       <!-- The match count is written here as you type, so it has to be announced
            rather than merely updated. Polite: it should not interrupt a keystroke. -->
       <div class="hint" id="hint" role="status" aria-live="polite">Press <b>/</b> to search.</div>
@@ -878,6 +896,14 @@ const withoutTrackModes = (modes) => ["!", ["in", trackMode, ["literal", modes]]
 // until the body is parsed.
 $("theme").textContent = themeLabel();
 paintLegend();
+
+// The key is folded away at some widths and unfolded at others, and a fold has no
+// width to measure against. One observer catches every occasion the answer
+// changes -- the fold opening, the window resizing, a phone turning -- where the
+// call sites for each of them would be three and would go on being three.
+// `thinTicks` writes `hidden` on the labels and nothing on the row that holds
+// them, so this cannot set itself off.
+new ResizeObserver(thinTicks).observe($("ticks"));
 
 // `metadata: true` is what makes the archive's credit reach the map, and it is
 // off by default: without it the plugin answers MapLibre's TileJSON request from
@@ -2163,7 +2189,50 @@ function paintLegend() {
       return `<span style="left:${p}%;transform:translateX(-${p}%)">${label}</span>`;
     })
     .join("");
+  thinTicks();
 }
+
+// Then take out the ones that will not fit. Six numbers reading 3 to 1000+ are
+// 107px of text and want a bar of 270 to stand clear of each other, which is a
+// panel wider than the key needs for anything else in it -- and on the panel this
+// one is, "300" and "1000+" print on top of each other.
+//
+// Measured rather than counted, because how many fit is the reader's font size as
+// much as the panel's width, and neither is anything this can assume. What is
+// dropped is every second one, then every third, until what is left stands clear:
+// thinning from the left instead packs the labels at the low end and leaves a hole
+// before the last, which reads as a fault rather than as a scale. Both ends are
+// kept whatever the step, because they are the range, and that is the one thing a
+// bar with no numbers under it cannot say.
+//
+// Every tick is absolutely positioned, so hiding one moves none of the others and
+// one pass of measurements is enough.
+function thinTicks() {
+  const spans = [...$("ticks").children];
+  if (spans.length < 3) return;
+  for (const s of spans) s.hidden = false;
+  // Folded away, or not laid out yet: nothing has a width to compare, and the
+  // observer at the top runs this again the moment either changes.
+  if (!$("ticks").clientWidth) return;
+
+  const boxes = spans.map((s) => s.getBoundingClientRect());
+  const clear = (keep) =>
+    keep.every((i, n) => n === 0 || boxes[i].left >= boxes[keep[n - 1]].right + 6);
+  const last = spans.length - 1;
+  let keep = [];
+  for (let step = 1; step <= last; step++) {
+    keep = [];
+    for (let i = 0; i < last; i += step) keep.push(i);
+    keep.push(last);
+    // The two ends alone, which is where the loop stops whether they clear or not:
+    // a panel too narrow for both is one no step can rescue.
+    if (clear(keep) || step === last) break;
+  }
+  spans.forEach((s, i) => {
+    s.hidden = !keep.includes(i);
+  });
+}
+
 </script>
 </body>
 </html>
