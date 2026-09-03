@@ -170,7 +170,14 @@ def test_the_pages_take_what_they_share_from_one_place():
     and reads least: it is what stands between a service number out of a feed and
     the innerHTML of the card, and two of them is one that can be fixed alone."""
     shared = (WEB / "util.js").read_text()
-    for name in ("escapeHtml", "roamingBounds", "basemapLayers", "debounce", "bootTheme"):
+    for name in (
+        "escapeHtml",
+        "roamingBounds",
+        "holdInRoamBox",
+        "basemapLayers",
+        "debounce",
+        "bootTheme",
+    ):
         assert re.search(rf"(function|const)\s+{name}\b", shared), name
         for page in PAGES:
             assert not re.search(rf"(function|const)\s+{name}\b", _source(page)), (
@@ -475,11 +482,12 @@ def test_the_style_names_a_glyph_endpoint():
         assert "glyphs: BASEMAP_GLYPHS" in _source(page), page
 
 
-def test_both_pages_declare_the_source_the_roam_mask_draws_from():
-    """`basemapLayers` returns a fill layer naming the `roam-mask` source, so a page
-    taking those layers and not declaring that source builds a style MapLibre
-    rejects. The coupling is the price of putting the mask where every caller of
-    `basemapLayers` gets it, and this is what makes the price visible.
+def test_both_pages_add_the_roam_mask():
+    """A custom layer is the one layer a style literal cannot carry: MapLibre takes
+    it through `addLayer` and only once the style has loaded. So a page that takes
+    `basemapLayers` and never calls `addRoamMask` draws the backdrop's whole tile
+    overhang with nothing over it -- and does it silently, because a mask nobody
+    adds is not an error MapLibre has anything to say about.
 
     The mask exists because `pmtiles extract --bbox` keeps whole tiles and clips
     nothing inside them, so the backdrop overhangs the box by 19.90 degrees of
@@ -487,12 +495,32 @@ def test_both_pages_declare_the_source_the_roam_mask_draws_from():
     the map a step at a time on the way in."""
     util = (WEB / "util.js").read_text()
     assert 'const ROAM_MASK = "roam-mask"' in util
-    assert "function roamMaskSource()" in util
-    # The sea inside the box and the sea outside it are one colour, taken from the
-    # flavour rather than written down again.
-    assert 'BASEMAP_PAINT[t].water["fill-color"]' in util
+    assert 'type: "custom"' in util
     for page in PAGES:
-        assert "[ROAM_MASK]: roamMaskSource()" in _source(page), page
+        # `load` is a whole painted frame too late: it waits for the first complete
+        # rendering, which is the backdrop with its overhang already on screen.
+        wired = r'once\("style\.load".{0,60}addRoamMask\('
+        assert re.search(wired, _source(page), re.DOTALL), page
+
+
+def test_the_mask_can_read_a_colour_out_of_both_flavours():
+    """The margin is painted the colour MapLibre already draws where no tile
+    reaches, which is the flavour's own `background`, so the two agree by
+    construction rather than by being written down twice.
+
+    `glColour` parses that value as `#rrggbb` and has nothing to say about an
+    expression or a named colour. Upstream giving `background-color` either would
+    leave `parseInt` with a NaN, and the uniform then paints the margin
+    transparent -- which is the overhang back on the map with nothing in the
+    console to say why."""
+    style = (WEB / "vendor" / "basemap-style.js").read_text()
+    # Bounded to the one flavour, or a light flavour that had lost its background
+    # would pass on the dark one's.
+    light, _, dark = style.partition('"dark": {')
+    for flavour, block in (("light", light.partition('"light": {')[2]), ("dark", dark)):
+        assert re.search(
+            r'"background": \{"background-color":"#[0-9a-fA-F]{6}"\}', block
+        ), flavour
 
 
 def test_the_vendored_glyphs_cover_the_stacks_the_style_asks_for():

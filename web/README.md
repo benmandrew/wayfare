@@ -50,10 +50,43 @@ tile that intersects the box and clips nothing inside one, so at low zoom the ba
 reaches well past it: 19.90 degrees of longitude and 5.21 of latitude at z4, 8.65 and 0.31
 at z5, 3.02 at z6, and 0.21 from z7 down. France, Denmark and southern Norway therefore
 drew at a country-wide view and then left a step at a time on the way in, which reads as
-tiles failing rather than as an edge. [`util.js`](util.js) draws the basemap's own water
-colour over the margin instead, above all 55 backdrop layers and below every wayfare one,
-so the backdrop ends in the same place at every zoom. The cut is a rectangle's, and its
-eastern edge runs inland through the Pas-de-Calais.
+tiles failing rather than as an edge. [`util.js`](util.js) paints over the margin instead,
+above all 55 backdrop layers and below every wayfare one, so the backdrop ends in the same
+place at every zoom. The cut is a rectangle's, and its eastern edge runs inland through the
+Pas-de-Calais.
+
+What it paints is the flavour's own `background` colour, which is already what MapLibre
+draws wherever no tile reaches, so the margin reads as the end of the map. It painted the
+water colour until the margin was mistaken for the sea, which it had every reason to be:
+the two were one colour, on the argument that a difference between them would show the box
+as an edge. Showing the box as an edge is the point.
+
+How much of that margin a reader can reach is a second question, and `maxBounds` cannot
+answer it: the same number gates the zoom out, so a box narrowed to the zoom the camera is
+at is a box it can never leave. The box therefore stays as wide as the widest view needs,
+and `holdInRoamBox` holds the centre against the window's own width at the zoom being
+drawn, writing it onto the transform where maxBounds writes its own. Going through
+`setCenter` instead stops whatever the camera is doing, so the correction had to wait for
+the end of the gesture and arrived as a shunt sideways; written this way it corrects the
+frame about to be drawn and stops nothing. Above the zoom where the window is narrower than the box — z6.5 on a 1400 pixel
+window — nothing outside the box can be reached at all; below it the centre is pinned to
+the middle of the box, which is the least margin a view that has to hold the whole country
+can show.
+
+It covers wayfare's own layers as well as the backdrop's. A rail relation runs on to Lille
+and a ferry to Amsterdam, and drawn past the edge they are two lines over a ground nobody
+mapped — so the box is where this map draws, and that holds for the network too.
+`queryRenderedFeatures` reads geometry rather than pixels, so `insideRoamBox` is what stops
+the hover answering for a line the mask has covered.
+
+It is a custom layer and not a fill over a GeoJSON source, which is what it was. A GeoJSON
+source is tiled like any other and its tiles are built in a worker, so a fast zoom asks for
+a set that is not built yet while the backdrop's tiles for the same view are already in
+hand — and for those frames the overhang draws with nothing over it. A custom layer holds
+no tiles: it takes the same matrix as every other layer in the same frame, so there is no
+state in which the backdrop is drawn and the mask is not. The cost is that a style literal
+cannot carry it, so both pages call `addRoamMask` from `style.load` — which is before the
+first tile is asked for, where `load` is a whole painted frame too late.
 
 Without the archive the map still draws: MapLibre reports the source as failed and every
 wayfare layer renders over blank ground. A checkout with no backdrop is the ordinary state

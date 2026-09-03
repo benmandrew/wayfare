@@ -1466,7 +1466,6 @@ function buildPicker() {
     hash: false,
     bounds: [[b[0], b[1]], [b[2], b[3]]],
     fitBoundsOptions: { padding: 0, animate: false },
-    maxBounds: roamingBounds($("pickmap")),
     minZoom: 3,
     maxZoom: 17,
     dragRotate: false,
@@ -1485,11 +1484,14 @@ function buildPicker() {
           url: "pmtiles://" + basemapUrl(),
           attribution: BASEMAP_CREDIT,
         },
-        [ROAM_MASK]: roamMaskSource(),
       },
       layers: basemapLayers(theme),
     },
   });
+  // Not `maxBounds` in the constructor: the box is a function of the zoom, and
+  // util.js says why. The container is on screen by now -- `showPicker` is what
+  // builds this -- so it measures itself correctly the first time.
+  holdInRoamBox(pickMap, $("pickmap"));
   pickMap.touchZoomRotate.disableRotation();
   pickMap.keyboard.disableRotation();
   pickMap.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
@@ -1513,6 +1515,11 @@ function buildPicker() {
     $("bbox").value = next;
     changed();
   });
+
+  // The one layer that is not in the style above: MapLibre takes a custom layer
+  // through `addLayer` alone. On `style.load` because `load` is a frame too late
+  // -- util.js has that, and why the network below goes under it.
+  pickMap.once("style.load", () => addRoamMask(pickMap));
 
   pickMap.on("load", () => {
     addNetwork(pickMap);
@@ -1623,18 +1630,24 @@ async function addNetwork(map) {
       url: "pmtiles://" + r.url,
       maxzoom: r.header.maxZoom,
     });
-    map.addLayer({
-      id,
-      type: "line",
-      source: id,
-      "source-layer": PALETTE.layers.road,
-      layout: { "line-cap": "round", "line-join": "round" },
-      paint: {
-        "line-color": PICK_LINE[theme],
-        "line-opacity": 0.75,
-        "line-width": ["interpolate", ["linear"], ["zoom"], 6, 0.4, 10, 0.9, 14, 1.8],
+    map.addLayer(
+      {
+        id,
+        type: "line",
+        source: id,
+        "source-layer": PALETTE.layers.road,
+        layout: { "line-cap": "round", "line-join": "round" },
+        paint: {
+          "line-color": PICK_LINE[theme],
+          "line-opacity": 0.75,
+          "line-width": ["interpolate", ["linear"], ["zoom"], 6, 0.4, 10, 0.9, 14, 1.8],
+        },
       },
-    });
+      // Under the mask, which is already on the map: this runs off `load` and the
+      // mask goes on at `style.load`. The picker frames what will be drawn, and
+      // what is drawn stops at the box.
+      ROAM_MASK,
+    );
     pickLayers.push(id);
   });
 }

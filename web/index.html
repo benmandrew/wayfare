@@ -1257,9 +1257,6 @@ function buildStyle() {
       // timetable's publisher.
       attribution: BASEMAP_CREDIT,
     },
-    // The sea outside the roam box, which `basemapLayers` draws over the
-    // backdrop's tile overhang. util.js says what the overhang is.
-    [ROAM_MASK]: roamMaskSource(),
   };
   for (const r of REGIONS) {
     sources[r.src] = {
@@ -1369,7 +1366,6 @@ function start(missing) {
     hash: true, // shareable #zoom/lat/lon
     center: [-2.4, 54.2],
     zoom: 5.6,
-    maxBounds: roamingBounds($("map")),
     // Below this the tiles run out -- the overview build starts at z5 -- so
     // zooming further would drop the network rather than show more of it.
     //
@@ -1426,9 +1422,10 @@ function start(missing) {
   // orientation its labels and its bounds were drawn for.
   map.touchZoomRotate.disableRotation();
 
-  // A resize changes the aspect, and with it how wide the box has to be for the
-  // country to still fit top to bottom.
-  map.on("resize", () => map.setMaxBounds(roamingBounds(map.getContainer())));
+  // Not `maxBounds` in the constructor: how wide the box has to be depends on the
+  // zoom, so it is applied here and re-applied on every change of one. util.js has
+  // why, and why the widening is the only way into the masked margin.
+  holdInRoamBox(map, map.getContainer());
 
   // A #hash in the URL is someone sharing a place, so it outranks the framing.
   if (covered && !location.hash) {
@@ -1437,6 +1434,12 @@ function start(missing) {
 
   describeRegions(missing);
   addControls(map);
+
+  // The one layer that cannot be in `buildStyle`: MapLibre takes a custom layer
+  // through `addLayer` alone, and only once the style is loaded. util.js says why
+  // it is a custom layer, why it goes above every layer above and why this is
+  // `style.load` and not `load`.
+  map.once("style.load", () => addRoamMask(map));
 
   // Four things wired onto the one map, each handed the ids it addresses. None
   // of them is per-call: `start` runs once, and what they build lives as long as
@@ -1574,8 +1577,12 @@ function wireSelection(map, ids, card) {
     const box = slop
       ? [[point.x - slop, point.y - slop], [point.x + slop, point.y + slop]]
       : point;
+    // Outside the box nothing answers. The mask has painted over everything
+    // there, and a query reads geometry rather than pixels: the rail that carries
+    // on into France is still under the cursor with a layer drawn over it.
+    const inside = insideRoamBox(map.unproject(point));
     const at = (layers) =>
-      map.queryRenderedFeatures(box, { layers: liveLayers(map, layers) });
+      inside ? map.queryRenderedFeatures(box, { layers: liveLayers(map, layers) }) : [];
     const segHits = at(seg);
     const trackHits = segHits.length ? [] : at(track);
     const hits = segHits.length ? segHits : trackHits.length ? trackHits : at(bus);
