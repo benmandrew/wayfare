@@ -521,6 +521,33 @@ def test_a_journey_takes_its_own_days_over_its_services(ni_gtfs: Path):
     assert trips["VJ2"].startswith("NI-0000010")
 
 
+def test_a_timetable_nested_in_inner_zips_is_still_read(tmp_path, geometry_zip, ni_gtfs):
+    """Translink's upload of 2026-10-02 wrapped each operator group's XML in a
+    ZIP of its own. The feed built from that layout has to be the feed built
+    from the flat one."""
+    inner = tmp_path / "inner.zip"
+    with zipfile.ZipFile(inner, "w") as zf:
+        zf.writestr("TXC_24_2026-08-06T14-07-45.xml", TXC)
+    outer = tmp_path / "nested.zip"
+    with zipfile.ZipFile(outer, "w") as zf:
+        zf.write(inner, "Final Ulsterbus Data Set.zip")
+    out = translink.build_gtfs([outer], [geometry_zip], tmp_path / "nested-gtfs.zip")
+    nested = acquire.unpack_gtfs(out, dest=tmp_path / "nested-unpacked")
+    for table in ("routes.txt", "trips.txt", "stop_times.txt"):
+        assert (nested / table).read_text() == (ni_gtfs / table).read_text()
+
+
+def test_a_timetable_bundle_with_no_transxchange_is_refused(tmp_path, geometry_zip):
+    """An empty bundle is an operator group missing from the feed, which every
+    later stage would accept: the patterns read as departed and the archive is
+    published without them."""
+    empty = tmp_path / "empty.zip"
+    with zipfile.ZipFile(empty, "w") as zf:
+        zf.writestr("readme.txt", "no timetable here")
+    with pytest.raises(RuntimeError, match="no TransXChange"):
+        translink.build_gtfs([empty], [geometry_zip], tmp_path / "out.zip")
+
+
 def test_two_builds_of_one_publication_are_byte_identical(
     tmp_path, timetable_zip, geometry_zip
 ):

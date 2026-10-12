@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import itertools
 import json
 import re
@@ -716,14 +717,46 @@ def _service_id(days: tuple[int, ...], start: str, end: str) -> str:
     return "NI-" + "".join(str(d) for d in days) + f"-{start}-{end}"
 
 
+def _xml_members(zf: zipfile.ZipFile, dest: Path, prefix: str) -> Iterator[Path]:
+    """Every TransXChange file in an archive, at whatever depth it sits.
+
+    Translink does not keep to one layout. The XML has been at the top level, in
+    a folder, and -- from the upload of 2026-10-02 -- inside one inner ZIP per
+    operator group. A reader that knew only the top level found nothing in that
+    upload and said nothing, and the province was published without Ulsterbus.
+
+    An inner ZIP is read into memory because it is the compressed form, a few
+    megabytes, and `zipfile` needs to seek. Its stem joins the prefix so two
+    inner archives carrying one member name cannot overwrite each other.
+    """
+    for name in sorted(zf.namelist()):
+        lower = name.lower()
+        if lower.endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(zf.read(name))) as inner:
+                yield from _xml_members(inner, dest, f"{prefix}_{Path(name).stem}")
+        elif lower.endswith(".xml"):
+            target = dest / (prefix + "_" + Path(name).name)
+            with zf.open(name) as fin, target.open("wb") as fout:
+                shutil.copyfileobj(fin, fout)
+            yield target
+
+
 def _timetable_members(zips: Iterable[Path], dest: Path) -> Iterator[Path]:
     for z in zips:
+        found = 0
         with zipfile.ZipFile(z) as zf:
-            for name in sorted(n for n in zf.namelist() if n.lower().endswith(".xml")):
-                target = dest / (z.stem + "_" + Path(name).name)
-                with zf.open(name) as fin, target.open("wb") as fout:
-                    shutil.copyfileobj(fin, fout)
+            for target in _xml_members(zf, dest, z.stem):
+                found += 1
                 yield target
+        # Every bundle is one operator group, so an empty one is that group's
+        # services missing from the feed. `patterns` would read them as departed
+        # and `publish` would draw the region without them, which is a valid
+        # archive and a wrong map. Refusing here leaves the last good one served.
+        if not found:
+            raise RuntimeError(
+                f"{z.name} holds no TransXChange file; Translink has changed "
+                "the layout of the timetable bundle"
+            )
 
 
 def _created(path: Path) -> str:
