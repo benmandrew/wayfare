@@ -8,14 +8,15 @@ from wayfare import polyline
 def test_roundtrip_precision6():
     points = [(53.48, -2.245), (53.4801, -2.2400), (53.4805, -2.2312)]
     got = polyline.decode(polyline.encode(points, 6), 6)
-    assert got == pytest.approx(points, abs=1e-6)
+    assert got == [pytest.approx(p, abs=1e-6) for p in points]
 
 
 def test_known_precision5_vector():
     """The Google reference example, which pins the codec against a third party."""
-    assert polyline.decode("_p~iF~ps|U_ulLnnqC_mqNvxq`@", 5) == pytest.approx(
-        [(38.5, -120.2), (40.7, -120.95), (43.252, -126.453)], abs=1e-5
-    )
+    assert polyline.decode("_p~iF~ps|U_ulLnnqC_mqNvxq`@", 5) == [
+        pytest.approx(p, abs=1e-5)
+        for p in [(38.5, -120.2), (40.7, -120.95), (43.252, -126.453)]
+    ]
 
 
 def test_precision_matters():
