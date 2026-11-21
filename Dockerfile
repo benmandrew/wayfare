@@ -9,6 +9,12 @@
 # it afterwards -- leaves the compiler in that layer's history whatever the purge
 # does, and rebuilds it on every source change. Splitting the stages means editing
 # wayfare/ rebuilds only the last few layers.
+#
+# Nothing here pins a version, so security fixes arrive by rebuilding, not by
+# editing. The layer cache keys on the base image's digest: a build against an
+# unchanged base reuses the Debian packages and Python wheels it resolved last
+# time, and only a new upstream base, or a change to this file or pyproject.toml,
+# fetches current ones.
 
 FROM debian:bookworm-slim AS tippecanoe
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -80,7 +86,14 @@ FROM python:3.12-slim-bookworm
 # executes inside valhalla's own container -- both the committed Compose file and
 # the two the Ansible role renders on the deployed host agree on that. Restoring
 # it is this line plus 1.1 MB, and a healthcheck added for `web` later would need it.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+#
+# `apt-get upgrade` because the base image trails Debian's security archive. What
+# `install` adds comes from bookworm-security at build time, but what the base
+# already holds -- apt, openssl, libssl3 -- stays at whatever version upstream
+# last built it with until upstream rebuilds. Only this stage ships, so only this
+# stage upgrades.
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends \
         libsqlite3-0 zlib1g libcairo2 \
     && rm -rf /var/lib/apt/lists/*
 
