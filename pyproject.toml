@@ -9,7 +9,11 @@ description = "Public transport routes across Great Britain and Ireland"
 requires-python = ">=3.12"
 dependencies = [
     "requests>=2.32",
-    "duckdb>=1.1",
+    # Below 2 because 2.0 warns on every Arrow fetch from an `execute` result, the
+    # path `art.stream` reads through, and says the fetch now copies every row once
+    # more. Streaming exists to bound peak memory, so lifting this cap means moving
+    # those reads to `con.sql(...)` relations, not silencing the warning.
+    "duckdb>=1.1,<2",
 ]
 
 [project.optional-dependencies]

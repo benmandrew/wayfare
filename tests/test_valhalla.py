@@ -45,8 +45,8 @@ def test_lengths_are_converted_to_metres():
 
 def test_edge_geometry_is_sliced_from_the_shared_shape():
     m = valhalla._to_match(RESPONSE, source="shape")
-    assert m.edges[0].geom == pytest.approx(SHAPE[0:2], abs=1e-6)
-    assert m.edges[1].geom == pytest.approx(SHAPE[1:3], abs=1e-6)
+    assert m.edges[0].geom == [pytest.approx(p, abs=1e-6) for p in SHAPE[0:2]]
+    assert m.edges[1].geom == [pytest.approx(p, abs=1e-6) for p in SHAPE[1:3]]
 
 
 def test_edges_without_osm_identity_are_dropped():
